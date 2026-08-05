@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "profile_id": "blood_pressure",
+  "display_name": "Blood Pressure Lab",
+  "locked": true,
+  "max_recording_seconds": 600,
+  "adc_bits": 12,
+  "defaults": {
+    "pressure_analog_pin": "A0",
+    "optional_second_pressure_analog_pin": "A1",
+    "event_digital_pin": "D4"
+  },
+  "sensor_modes": {
+    "mpxv5100dp": {
+      "display_units": [
+        "counts",
+        "volts",
+        "nominal_kpa",
+        "nominal_mmhg",
+        "calibrated_pressure"
+      ],
+      "supports_app_calibration": true
+    },
+    "xgzp160201s_student_conditioned": {
+      "display_units": [
+        "counts",
+        "volts"
+      ],
+      "supports_app_calibration": false,
+      "required_metadata": [
+        "bridge_excitation_v",
+        "amplifier_type",
+        "nominal_gain",
+        "reference_offset_v",
+        "notes"
+      ]
+    }
+  },
+  "respiratory_flow_enabled": false,
+  "safety_notice": "Teaching and engineering use only; not a clinical blood-pressure monitor."
+}

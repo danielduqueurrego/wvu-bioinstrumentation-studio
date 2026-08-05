@@ -1,0 +1,77 @@
+{
+  "schema_version": "1.0",
+  "profile_id": "pulse_oximetry",
+  "display_name": "Pulse Oximetry Lab",
+  "locked": true,
+  "max_recording_seconds": 600,
+  "adc_bits": 12,
+  "optical_frame_rate_hz": 100,
+  "defaults": {
+    "reflection_analog_pin": "A0",
+    "transmission_analog_pin": "A1",
+    "red_digital_pin": "D4",
+    "infrared_digital_pin": "D5",
+    "green_digital_pin": "D6"
+  },
+  "led_control": {
+    "active_high": true,
+    "one_led_at_a_time": true,
+    "safe_idle_value": 0,
+    "measured_current_ma": {
+      "green": 6.72,
+      "red": 4.24,
+      "infrared": 6.16
+    },
+    "series_resistance_ohm": {
+      "green": 330,
+      "red": 680,
+      "infrared": 560
+    }
+  },
+  "ada4352": {
+    "output_min_v": 0.0,
+    "output_max_v": 5.0,
+    "gain_selection": "manual_dip_entry",
+    "allowed_transimpedance_ohm": [
+      315,
+      3500,
+      40200,
+      450000
+    ]
+  },
+  "standard_sequence": [
+    {
+      "state": "dark_1",
+      "settle_us": 250,
+      "acquire_us": 500
+    },
+    {
+      "state": "red",
+      "settle_us": 250,
+      "acquire_us": 750
+    },
+    {
+      "state": "dark_2",
+      "settle_us": 250,
+      "acquire_us": 500
+    },
+    {
+      "state": "infrared",
+      "settle_us": 250,
+      "acquire_us": 750
+    }
+  ],
+  "adc_reads_per_detector_per_state": 4,
+  "display_units": [
+    "counts",
+    "volts"
+  ],
+  "derived_preview": [
+    "dark_corrected_red",
+    "dark_corrected_infrared"
+  ],
+  "prohibited_outputs": [
+    "clinical_spo2"
+  ],
+  "safety_notice": "Raw optical teaching data only; no clinical SpO2 claim."
+}

@@ -1,0 +1,38 @@
+[package]
+name = "wvu_bioinstrumentation_studio"
+version = "0.1.0"
+description = "Firmware, acquisition, and calibration for BMEG 420L"
+authors = ["WVU BMEG 420L"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "wvu_bioinstrumentation_studio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+acceptance-harness = []
+
+[[bin]]
+name = "phase1_capture"
+path = "src/bin/phase1_capture.rs"
+required-features = ["acceptance-harness"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.19"
+chrono = { version = "0.4.45", features = ["serde"] }
+serialport = "4.9.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

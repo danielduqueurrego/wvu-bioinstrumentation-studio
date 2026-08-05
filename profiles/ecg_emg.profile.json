@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.0",
+  "profile_id": "ecg_emg",
+  "display_name": "ECG & EMG Lab",
+  "locked": true,
+  "max_recording_seconds": 600,
+  "adc_bits": 12,
+  "modes": {
+    "ecg": {
+      "default_sample_rate_hz": 1000,
+      "allowed_sample_rates_hz": [
+        500,
+        1000,
+        2000
+      ]
+    },
+    "emg": {
+      "default_sample_rate_hz": 2000,
+      "allowed_sample_rates_hz": [
+        1000,
+        2000,
+        4000
+      ]
+    }
+  },
+  "defaults": {
+    "signal_analog_pin": "A0",
+    "notch_analog_pin": "A1",
+    "lod_plus_digital_pin": "D2",
+    "lod_minus_digital_pin": "D3",
+    "event_digital_pin": "D4"
+  },
+  "channels": [
+    {
+      "id": "signal",
+      "type": "analog_input",
+      "required": true,
+      "configurable": true
+    },
+    {
+      "id": "notch",
+      "type": "analog_input",
+      "required": false,
+      "configurable": true
+    },
+    {
+      "id": "lod_plus",
+      "type": "digital_input",
+      "required": false,
+      "configurable": true
+    },
+    {
+      "id": "lod_minus",
+      "type": "digital_input",
+      "required": false,
+      "configurable": true
+    }
+  ],
+  "display_units": [
+    "counts",
+    "volts"
+  ],
+  "derived_metrics": [],
+  "safety_notice": "Teaching and engineering use only; not a medical device."
+}

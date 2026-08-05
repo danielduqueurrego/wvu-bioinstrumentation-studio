@@ -1,0 +1,17 @@
+CODEX_START_PROMPT.md
+README_FIRST.md
+SOURCE_NOTES.md
+assets/branding/WVU-CBE Logo.svg
+codex/CODEX_START_PROMPT.md
+docs/ACCEPTANCE_TEST_PLAN.md
+docs/ARCHITECTURE_AND_ROADMAP.md
+docs/HARDWARE_INTERFACE_SPECIFICATION.md
+docs/PRE_CODEX_CHECKLIST.md
+docs/PROJECT_DECISIONS.md
+docs/SOFTWARE_REQUIREMENTS_SPECIFICATION_v1.0.md
+docs/USB_PROTOCOL_SPECIFICATION_v0.1.md
+profiles/blood_pressure.profile.json
+profiles/ecg_emg.profile.json
+profiles/pulse_oximetry.profile.json
+schemas/lab-profile.schema.json
+scripts/check_environment.ps1
