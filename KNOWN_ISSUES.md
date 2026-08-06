@@ -11,9 +11,13 @@
   receive zero protocol bytes. The controlled firmware is currently restored and its normal
   handshake/Until-stopped acquisition pass; reset recovery remains unresolved and does not perform
   an automatic upload. See `logs/phase1_1_touch_reset_characterization_2026-08-06.md`.
-- The desktop application does not yet bundle an in-app reference-firmware installer. Controlled
-  Arduino CLI compile/upload plus independent protocol-identity verification passed; Arduino IDE
-  is a documented manual fallback. See `logs/phase1_1_reference_firmware_restore_2026-08-06.md`.
+- The Phase 2 firmware workflow now has a controlled in-app reference restore. Its real CLI
+  compile/upload/identity verification sequence passed on COM12; the explicitly separate
+  Phase 1.1 reset/retry recovery issue remains as described above.
+- Phase 2's post-fix UI inspection passed at 900 × 650 and wide/maximized windows. The exact
+  numeric Windows scaling and separate 1024 × 768, 1366 × 768, and 1920 × 1080 observations were
+  not recorded; they remain a nonblocking verification/documentation follow-up rather than a
+  reported layout defect. See `logs/phase2_firmware_workspace_acceptance_2026-08-06.md`.
 - Rust exists at `C:\Users\dd00055\.cargo\bin` but is not on the persistent PowerShell PATH.
   Prepend it for the session or repair the user PATH entry.
 - Phase 1 intentionally has no firmware editor, pulse-ox sequence, calibration wizard,

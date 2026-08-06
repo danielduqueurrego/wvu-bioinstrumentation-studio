@@ -1,5 +1,7 @@
 pub mod acquisition;
 pub mod arduino_cli;
+pub mod firmware_workflow;
+pub mod firmware_workspace;
 pub mod profiles;
 pub mod protocol;
 pub mod recording;
@@ -12,6 +14,8 @@ use tauri::{Manager, WindowEvent};
 struct AppState {
     /// Exactly one controller owns the Phase 1 session lifecycle. It has no frontend serial handle.
     session: session::SessionController,
+    /// One firmware workflow coordinates CLI jobs with the same serial-session boundary.
+    firmware: firmware_workflow::FirmwareWorkflow,
 }
 
 #[derive(Serialize)]
@@ -58,6 +62,140 @@ fn arduino_cli_version(cli_path: Option<String>) -> Result<arduino_cli::CommandL
     cli.version().map_err(|e| e.to_string())
 }
 
+fn firmware_error<T>(result: Result<T, firmware_workflow::FirmwareFailure>) -> Result<T, String> {
+    result.map_err(|failure| {
+        serde_json::to_string(&failure)
+            .unwrap_or_else(|error| format!("firmware workflow error: {error}"))
+    })
+}
+
+#[tauri::command]
+fn firmware_environment(
+    state: tauri::State<'_, AppState>,
+) -> firmware_workflow::FirmwareEnvironmentStatus {
+    state.firmware.environment()
+}
+
+#[tauri::command]
+fn list_firmware_templates() -> Vec<firmware_workspace::TemplateInfo> {
+    firmware_workspace::FirmwareWorkspace::templates()
+}
+
+#[tauri::command]
+fn create_firmware_project(
+    state: tauri::State<'_, AppState>,
+    request: firmware_workspace::CreateProjectRequest,
+) -> Result<firmware_workspace::FirmwareProject, String> {
+    state
+        .firmware
+        .workspace()
+        .create_project(request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_firmware_project(
+    state: tauri::State<'_, AppState>,
+    project_folder: String,
+) -> Result<firmware_workspace::FirmwareProject, String> {
+    state
+        .firmware
+        .workspace()
+        .open_project(&project_folder)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_firmware_project(
+    state: tauri::State<'_, AppState>,
+    request: firmware_workspace::SaveProjectRequest,
+) -> Result<firmware_workspace::FirmwareProject, String> {
+    state
+        .firmware
+        .workspace()
+        .save_project(request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_firmware_project_as(
+    state: tauri::State<'_, AppState>,
+    request: firmware_workspace::SaveAsProjectRequest,
+) -> Result<firmware_workspace::FirmwareProject, String> {
+    state
+        .firmware
+        .workspace()
+        .save_as_project(request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_recent_firmware_projects(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    state
+        .firmware
+        .workspace()
+        .recent_projects()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn restore_firmware_project_saved_source(
+    state: tauri::State<'_, AppState>,
+    project_folder: String,
+) -> Result<String, String> {
+    state
+        .firmware
+        .workspace()
+        .restore_saved_source(&project_folder)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_firmware_compile(
+    state: tauri::State<'_, AppState>,
+    request: firmware_workflow::CompileProjectRequest,
+) -> Result<firmware_workflow::FirmwareJobStatus, String> {
+    firmware_error(state.firmware.start_compile(request))
+}
+
+#[tauri::command]
+fn start_firmware_upload(
+    state: tauri::State<'_, AppState>,
+    request: firmware_workflow::UploadProjectRequest,
+) -> Result<firmware_workflow::FirmwareJobStatus, String> {
+    firmware_error(state.firmware.start_upload(request))
+}
+
+#[tauri::command]
+fn restore_wvu_reference_firmware(
+    state: tauri::State<'_, AppState>,
+    request: firmware_workflow::RestoreReferenceRequest,
+) -> Result<firmware_workflow::FirmwareJobStatus, String> {
+    firmware_error(state.firmware.start_restore_reference(request))
+}
+
+#[tauri::command]
+fn cancel_firmware_job(
+    state: tauri::State<'_, AppState>,
+) -> Result<firmware_workflow::FirmwareWorkflowStatus, String> {
+    firmware_error(state.firmware.cancel_active_job())
+}
+
+#[tauri::command]
+fn get_firmware_workflow_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<firmware_workflow::FirmwareWorkflowStatus, String> {
+    firmware_error(state.firmware.status())
+}
+
+#[tauri::command]
+fn verify_wvu_reference_firmware(
+    state: tauri::State<'_, AppState>,
+    port: String,
+) -> Result<firmware_workflow::FirmwareVerification, String> {
+    firmware_error(state.firmware.verify_existing_reference(port))
+}
+
 /// Combined Phase 1 connect/handshake/configure/start command. The worker owns transport I/O.
 #[tauri::command]
 fn start_simulator_recording(
@@ -81,6 +219,9 @@ fn start_hardware_recording(
     duration: recording::RecordingDuration,
 ) -> Result<session::SessionStatus, String> {
     checked_output_directory(&output_directory)?;
+    if !firmware_error(state.firmware.is_acquisition_allowed(&port))? {
+        return Err("firmware compatibility is not verified. Open Firmware, select the UNO R4 WiFi, and verify or restore the WVU reference firmware before acquisition.".into());
+    }
     if !serialport::available_ports()
         .map_err(|error| format!("could not enumerate serial ports: {error}"))?
         .iter()
@@ -228,15 +369,33 @@ fn checked_output_directory(value: &str) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The acquisition controller is intentionally shared with the firmware workflow:
+    // an upload first releases this one serial owner before Arduino CLI opens the port.
+    let session = session::SessionController::default();
+    let firmware = firmware_workflow::FirmwareWorkflow::new(session.clone());
+
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState {
-            session: session::SessionController::default(),
-        })
+        .manage(AppState { session, firmware })
         .invoke_handler(tauri::generate_handler![
             list_boards,
             list_serial_ports,
             arduino_cli_version,
+            firmware_environment,
+            list_firmware_templates,
+            create_firmware_project,
+            open_firmware_project,
+            save_firmware_project,
+            save_firmware_project_as,
+            list_recent_firmware_projects,
+            restore_firmware_project_saved_source,
+            start_firmware_compile,
+            start_firmware_upload,
+            restore_wvu_reference_firmware,
+            cancel_firmware_job,
+            get_firmware_workflow_status,
+            verify_wvu_reference_firmware,
             start_simulator_recording,
             start_hardware_recording,
             reset_board_and_retry,

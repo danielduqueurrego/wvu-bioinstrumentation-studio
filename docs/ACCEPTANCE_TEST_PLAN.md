@@ -58,6 +58,39 @@
 
 ## Later engineering tests
 
+## Phase 2 required acceptance tests
+
+### Project and editor
+
+- Create each controlled template into a matching one-INO project folder.
+- Open, save, Save As, restore saved source, and reject invalid/path-traversal names.
+- Preserve UTF-8 source; show unsaved state and prevent compile/upload until the source is saved.
+- Verify CodeMirror find/replace, undo/redo, bracket matching, line navigation, and keyboard save
+  shortcuts without hidden source transformation.
+
+### Compile and upload
+
+- Report missing Arduino CLI/core with exact remediation while keeping editing usable.
+- Compile a valid controlled reference and A0 example; capture size, RAM, warnings/errors, and
+  parsable source locations.
+- Reject upload while acquisition is active, while the project is unsaved, without confirmation,
+  or without a current matching compile artifact.
+- Upload an A0 ASCII/non-WVU sketch, report upload success, and disable Acquisition without
+  describing the board as failed.
+- Restore the controlled reference through the application workflow and independently require
+  HELLO, CAPABILITIES, PONG, protocol v0.1, build `0x00010001`, device `0x554E4F34`, and zero
+  CRC failures before Acquisition is enabled.
+- Exercise same-port, changed-port, delayed-port, no-return, ambiguous-return, and unrelated-port
+  handling with deterministic tests. Record the real observed reset/re-enumeration path.
+
+### Firmware/acquisition coordination
+
+- After verified reference restore, complete a 30-second A0-only, 12-bit, 1000 samples/s
+  recording and validate BMEG/CSV/metadata counts, monotonicity, conversion, and integrity
+  counters.
+- Verify the Firmware view at the documented desktop viewport/scaling matrix before marking the
+  interactive UI portion of Phase 2 accepted.
+
 - ECG: 1000 samples/s for 10 minutes.
 - EMG: 2000 samples/s for 10 minutes.
 - Aggregate: four channels at 2000 samples/s.

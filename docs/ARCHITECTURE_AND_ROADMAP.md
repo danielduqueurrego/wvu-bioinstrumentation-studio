@@ -118,6 +118,30 @@ The firmware must:
 - Stop safely on command timeout or reset.
 - Support simulator-compatible message semantics.
 
+## Phase 2 firmware-workspace flow
+
+```text
+CodeMirror editor -> explicit Save -> single-file project.json model
+                         |
+                  Arduino CLI compile (argument array)
+                         |
+                current-source build artifact
+                         |
+explicit confirmed upload -> release shared SessionController serial handle
+                         |
+ Arduino CLI touch reset / upload -> serial-number-first port rediscovery
+                         |
+    declared non-WVU sketch                 declared WVU reference
+      -> Acquisition disabled          -> production HELLO/CAPABILITIES/PONG
+                                               + identity verification
+                                                     |
+                                           Acquisition re-enabled
+```
+
+`FirmwareWorkflow` coordinates one active compile/upload job and shares the same
+`SessionController` clone held by Tauri application state. It never exposes a serial handle to
+the frontend and keeps a job visible until its terminal result and diagnostic log are published.
+
 ## 6. Development phases
 
 ### Phase 1 — tested vertical slice

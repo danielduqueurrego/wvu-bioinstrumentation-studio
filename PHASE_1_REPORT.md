@@ -176,6 +176,31 @@ conversion, and metadata `until_stopped` / `user` / `complete`. Details:
   this noninteractive agent desktop. It is documented as pending, not passed, in
   `logs/phase1_1_responsive_ui_verification_2026-08-06.md`.
 
-Phase 1.1 normal recording/data-integrity acceptance is passed. Overall Phase 1.1 follow-up
-closure and its requested commit remain pending the accurately recorded visual matrix; the
-physical disconnect test may be committed separately after user participation.
+Phase 1.1 normal recording/data-integrity implementation is committed as `cdc2c8e`.
+The accurately recorded visual matrix and physical disconnect test remain separately pending
+manual follow-ups; neither is represented as passed by this report.
+
+## Phase 2 firmware-workspace implementation note — 2026-08-06
+
+Phase 2 adds the single-file CodeMirror 6 firmware workspace, versioned local project model,
+Arduino CLI compile/upload workflow, serial-number-first returning-port selection, and explicit
+controlled reference restore. It retains the Phase 1 session controller as the sole serial owner:
+the workflow releases that controller before upload and verifies the reference through the same
+production parser/session handshake afterward.
+
+Controller-level hardware evidence passed on UNO R4 WiFi COM12 / serial `48CA4360243C` / core
+1.6.0. The workflow compiled and uploaded the declared non-WVU A0 ASCII template (52,032 bytes
+flash, 6,740 bytes RAM), correctly disabled Acquisition, compiled/restored the controlled
+reference (53,508 bytes flash, 7,940 bytes RAM), and verified protocol 0.1, build `0x00010001`,
+device `0x554E4F34`, three valid frames, and zero CRC failures. A following Arduino-alone
+30-second A0 recording yielded 29,930 contiguous samples in 29.929 board seconds at exactly
+1000.000 Hz; all CRC, invalid-frame, sequence, overflow, disconnect, and reconnect counters
+were zero. BMEG/CSV/metadata streaming validation passed with 29,930 records/rows and direct
+voltage conversion checks. See the Phase 2 logs for paths and exact CLI arguments.
+
+This is not a new Phase 1 acceptance claim. The post-fix Firmware-page inspection passed at
+900 × 650 and wide/maximized windows: the editor expands into the available workspace, the
+environment panel remains readable, the console is accessible, and neither page-level horizontal
+overflow nor clipping/overlap was reported. The exact numeric Windows scaling and separate
+1024 × 768, 1366 × 768, and 1920 × 1080 observations were not recorded and remain a clearly
+labeled Phase 2 documentation follow-up. See the Phase 2 workspace acceptance log.

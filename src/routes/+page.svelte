@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import LivePlot from '$lib/components/LivePlot.svelte';
+  import type FirmwareWorkspaceComponent from '$lib/components/FirmwareWorkspace.svelte';
   import { connectionActions } from '$lib/connection-actions';
   import { durationRequest, isTimedDurationValid, type RecordingDurationRequest } from '$lib/duration';
   import logoUrl from '../../assets/branding/WVU-CBE Logo.svg';
@@ -44,6 +45,7 @@
     diagnostics: ConnectionDiagnostics;
   };
   type HandshakeRetryResult = { handshake_succeeded: boolean; diagnostics: ConnectionDiagnostics };
+  type FirmwareWorkflowStatus = { compatibility: string };
 
   const emptyIntegrity: Integrity = {
     received_packets: 0, crc_failures: 0, invalid_frames: 0, unsupported_versions: 0,
@@ -80,6 +82,8 @@
     elapsed_seconds: 0
   };
   let polling = false;
+  let FirmwareWorkspace: typeof FirmwareWorkspaceComponent | undefined;
+  let firmwareCompatibility = 'unknown';
 
   $: if (source === 'hardware') {
     note = 'A0 raw floating/uncalibrated engineering communication test; no human signal.';
@@ -90,7 +94,7 @@
   $: timedDurationValid = isTimedDurationValid(timedSeconds);
   $: duration = durationRequest(durationMode, timedSeconds);
   $: canStart = session.state === 'Disconnected'
-    && (source === 'simulator' || Boolean(selectedPort))
+    && (source === 'simulator' || (Boolean(selectedPort) && firmwareCompatibility === 'wvu_protocol_compatible'))
     && (durationMode === 'until_stopped' || timedDurationValid);
   $: isActive = activeStates.includes(session.state);
   $: recoveryActions = connectionActions({
@@ -150,6 +154,14 @@
       statusMessage = `Session status error: ${String(error)}`;
     } finally {
       polling = false;
+    }
+  }
+
+  async function refreshFirmwareCompatibility() {
+    try {
+      firmwareCompatibility = (await invoke<FirmwareWorkflowStatus>('get_firmware_workflow_status')).compatibility;
+    } catch {
+      firmwareCompatibility = 'unknown';
     }
   }
 
@@ -226,11 +238,24 @@
     }
   }
 
+  async function selectView(nextView: string) {
+    if (nextView === 'Firmware' && !FirmwareWorkspace) {
+      const module = await import('$lib/components/FirmwareWorkspace.svelte');
+      FirmwareWorkspace = module.default;
+    }
+    view = nextView;
+  }
+
   onMount(() => {
     void refreshBoards();
     void pollSession();
+    void refreshFirmwareCompatibility();
     const timer = window.setInterval(() => void pollSession(), 40); // 25 Hz; no per-sample events.
-    return () => window.clearInterval(timer);
+    const firmwareTimer = window.setInterval(() => void refreshFirmwareCompatibility(), 750);
+    return () => {
+      window.clearInterval(timer);
+      window.clearInterval(firmwareTimer);
+    };
   });
 </script>
 
@@ -249,12 +274,12 @@
     <aside class="navigation">
       <nav aria-label="Primary">
         {#each ['Home', 'Firmware', 'Acquisition', 'Diagnostics'] as item}
-          <button class:active={view === item} aria-current={view === item ? 'page' : undefined} onclick={() => view = item}>{item}</button>
+          <button class:active={view === item} aria-current={view === item ? 'page' : undefined} onclick={() => void selectView(item)}>{item}</button>
         {/each}
       </nav>
     </aside>
 
-    <main class="content">
+    <main class="content" class:wide-content={view === 'Firmware' || view === 'Acquisition'}>
       {#if view === 'Home'}
         <h2>Home</h2>
         <p class="notice">Teaching and engineering equipment only — not a medical device. Phase 1 permits Arduino-alone, simulator, or safe bench-signal work only.</p>
@@ -263,11 +288,13 @@
           <button class="gold" onclick={() => { source = 'simulator'; view = 'Acquisition'; }}>Open simulator acquisition</button>
         </div>
       {:else if view === 'Firmware'}
-        <h2>Firmware</h2>
-        <p>Phase 1 uses the approved safe UNO R4 WiFi template and Arduino CLI adapter. D4, D5, and D6 are initialized LOW and never driven HIGH.</p>
+        {#if FirmwareWorkspace}<FirmwareWorkspace />{/if}
       {:else if view === 'Acquisition'}
         <h2>Acquisition</h2>
         <p class="notice">Raw A0 only. A floating A0 test is uncalibrated; no physiological interpretation or hidden filtering is performed.</p>
+        {#if source === 'hardware' && firmwareCompatibility !== 'wvu_protocol_compatible'}
+          <p class="warning" role="status">Hardware recording is disabled until the selected UNO R4 WiFi proves the controlled WVU firmware identity. Open <button class="inline-action" onclick={() => void selectView('Firmware')}>Firmware</button> and use Verify WVU firmware or Restore WVU reference firmware.</p>
+        {/if}
 
         <section class="panel" aria-labelledby="setup-title">
           <h3 id="setup-title">Session setup</h3>
@@ -401,8 +428,12 @@
   .navigation { background: #e8edf1; padding: clamp(.7rem, 2vw, 1.25rem) .75rem; } nav { display: grid; gap: .45rem; }
   button { min-height: 2.5rem; border: 1px solid #002855; border-radius: .3rem; background: #fff; color: #002855; padding: .55rem .75rem; font-weight: 650; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
   button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #EEAA00; outline-offset: 2px; }
-  button:disabled { cursor: not-allowed; opacity: .55; } button.active, button:not(:disabled):hover { background: #002855; color: #fff; } button.gold { background: #EEAA00; color: #17222e; } button.stop { background: #9d2424; border-color: #761a1a; color: #fff; }
-  .content { min-width: 0; width: min(100%, 1500px); padding: clamp(1rem, 3vw, 1.75rem); overflow-wrap: anywhere; }
+  button:disabled { cursor: not-allowed; opacity: .55; } button.active, button:not(:disabled):hover { background: #002855; color: #fff; } button.gold { background: #EEAA00; color: #17222e; } button.stop { background: #9d2424; border-color: #761a1a; color: #fff; } button.inline-action { display: inline; min-height: auto; padding: 0; border: 0; background: transparent; color: #002855; text-decoration: underline; }
+  /* Keep prose-oriented pages comfortably readable, but let the data-dense Firmware and
+     Acquisition workspaces use the available desktop width.  `width: 100%` also avoids
+     percentage sizing being resolved against an intrinsic grid size on some WebView builds. */
+  .content { min-width: 0; width: 100%; max-width: 72rem; justify-self: start; padding: clamp(1rem, 3vw, 1.75rem); overflow-wrap: anywhere; }
+  .content.wide-content { max-width: none; justify-self: stretch; }
   h2 { margin-top: 0; } h3 { margin: 0 0 .8rem; } .notice, .warning { border-left: 5px solid #EEAA00; background: #fff8e8; padding: .75rem; } .warning { border-color: #9b6700; }
   .panel { min-width: 0; margin: 1rem 0; padding: clamp(.8rem, 2vw, 1rem); background: #fff; border: 1px solid #d7dde2; border-radius: .35rem; }
   .control-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .8rem; align-items: end; }

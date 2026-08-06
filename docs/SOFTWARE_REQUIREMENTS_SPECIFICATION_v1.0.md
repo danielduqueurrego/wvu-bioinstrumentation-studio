@@ -68,11 +68,26 @@ Before acquisition, the application shall verify:
 
 The application shall provide a single-file `.ino` editor with syntax highlighting, line numbers, search, undo/redo, compile-error navigation, restore-template, save-as, and modified-template status.
 
+For the UNO R4 WiFi classroom workflow, a project shall contain exactly one source file named
+`<ProjectName>.ino` and a versioned `project.json` in the matching project folder. The application
+shall validate Arduino/Windows-safe names, prevent source-path traversal, use an explicit
+overwrite confirmation, preserve UTF-8 source without hidden transformations, and warn before
+discarding unsaved changes. Controlled templates shall be copied to a student project; they shall
+not be modified in place.
+
 ### FR-005 Compile and upload
 
 The application shall call Arduino CLI as a subprocess, capture structured output where supported, report build size, show actionable errors, and upload to the selected UNO R4 WiFi. A controlled-firmware
 installation shall not be considered verified from uploader exit status alone: the host shall receive
 CRC-valid protocol identity frames and verify the expected build/device identity before acquisition.
+
+Compile and upload shall be separate user actions. Upload shall require a current successful
+compile of the saved source, explicit confirmation, one selected supported board, and no active
+acquisition/recording. The uploader shall release the application serial session first, handle
+bounded reset/bootloader/application-port re-enumeration without assuming a fixed COM number, and
+record exact argument arrays, output, timing, exit code, board identity, and verification result.
+A non-WVU sketch may report successful upload, but it shall disable Acquisition and explain that
+the controlled reference must be restored before binary acquisition is possible.
 
 ### FR-006 Pin assignment
 

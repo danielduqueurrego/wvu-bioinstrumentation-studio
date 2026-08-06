@@ -66,6 +66,104 @@ arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port <CURRENT_UNO_PORT
 Rediscover the port with `arduino-cli board list`; do not assume COM12. The safe Phase 1
 sketch forces D4, D5, and D6 LOW.
 
+## Phase 2 firmware workspace
+
+The **Firmware** view is a one-file Arduino workspace for the UNO R4 WiFi. A project is a
+student-selected folder containing exactly:
+
+```text
+<ProjectName>/
+  <ProjectName>.ino
+  project.json
+```
+
+`project.json` records the project schema, target/FQBN, timestamps, template origin,
+optional notes and remembered COM port, and the last successful compile/upload identity.
+Project names must begin with an ASCII letter and contain only letters, digits, and underscores;
+the sketch file always matches the project folder name. Saves use a temporary sibling file then
+rename where Windows permits it. Existing non-empty project folders are never overwritten.
+
+The workspace supplies five version-controlled templates: blank UNO R4 WiFi, an ASCII A0
+example, the byte-identical WVU protocol reference, a D4/D5/D6-LOW digital-output example,
+and an ASCII serial diagnostic. Templates are copied into student projects; the controlled
+reference source in `firmware/reference_unor4wifi/` is never edited by the workspace.
+
+Arduino CLI is located from `C:\\arduino-cli\\arduino-cli.exe`, the current `PATH`, or the
+instructor-controlled `BMEG_ARDUINO_CLI` environment variable. Editing and saving stay
+available if the CLI or `arduino:renesas_uno` core is absent; the Firmware environment panel
+shows the exact missing prerequisite and install command. Compile and upload use argument arrays,
+capture command/output/duration/exit code, and write JSON workflow logs under the application
+data directory—not the student project folder.
+
+Upload is deliberate: the current saved source must have compiled successfully, a single
+detected UNO R4 WiFi must be selected, acquisition must be stopped, and the user must confirm the
+board/port warning. Arduino CLI performs the 1200-bps reset/upload transition; the workflow
+rediscovers the returning application port using the UNO serial number where available and never
+chooses an unrelated port. A non-WVU sketch is a successful upload but disables Acquisition.
+**Restore WVU reference firmware** is a separate confirmed action that compiles the repository
+reference, uploads it, and requires HELLO, CAPABILITIES, PONG, protocol v0.1,
+build `0x00010001`, device `0x554E4F34`, and zero CRC failures before re-enabling Acquisition.
+
+For a reproducible controller-level hardware sequence (A0 ASCII upload, compatibility block,
+reference restore, protocol verification, and 30-second raw A0 recording), run:
+
+```powershell
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase2_firmware_capture
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase2_firmware_capture -- validate <recording.bmeg>
+```
+
+The harness uses the same workspace, firmware workflow, and serial session controller as the
+Tauri commands. It creates only a temporary student project and ignored temporary recordings.
+
+## Phase 2 firmware workspace
+
+The **Firmware** view is a one-file Arduino workspace for the UNO R4 WiFi. A project is a
+student-selected folder containing exactly:
+
+```text
+<ProjectName>/
+  <ProjectName>.ino
+  project.json
+```
+
+`project.json` records the project schema, target/FQBN, timestamps, template origin,
+optional notes and remembered COM port, and the last successful compile/upload identity.
+Project names must begin with an ASCII letter and contain only letters, digits, and underscores;
+the sketch file always matches the project folder name. Saves use a temporary sibling file then
+rename where Windows permits it. Existing non-empty project folders are never overwritten.
+
+The workspace supplies five version-controlled templates: blank UNO R4 WiFi, an ASCII A0
+example, the byte-identical WVU protocol reference, a D4/D5/D6-LOW digital-output example,
+and an ASCII serial diagnostic. Templates are copied into student projects; the controlled
+reference source in `firmware/reference_unor4wifi/` is never edited by the workspace.
+
+Arduino CLI is located from `C:\arduino-cli\arduino-cli.exe`, the current `PATH`, or the
+instructor-controlled `BMEG_ARDUINO_CLI` environment variable. Editing and saving stay
+available if the CLI or `arduino:renesas_uno` core is absent; the Firmware environment panel
+shows the exact missing prerequisite and install command. Compile and upload use argument arrays,
+capture command/output/duration/exit code, and write JSON workflow logs under the application
+data directory—not the student project folder.
+
+Upload is deliberate: the current saved source must have compiled successfully, a single
+detected UNO R4 WiFi must be selected, acquisition must be stopped, and the user must confirm the
+board/port warning. Arduino CLI performs the 1200-bps reset/upload transition; the workflow
+rediscovers the returning application port using the UNO serial number where available and never
+chooses an unrelated port. A non-WVU sketch is a successful upload but disables Acquisition.
+**Restore WVU reference firmware** is a separate confirmed action that compiles the repository
+reference, uploads it, and requires HELLO, CAPABILITIES, PONG, protocol v0.1,
+build `0x00010001`, device `0x554E4F34`, and zero CRC failures before re-enabling Acquisition.
+
+For a reproducible controller-level hardware sequence (A0 ASCII upload, compatibility block,
+reference restore, protocol verification, and 30-second raw A0 recording), run:
+
+```powershell
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase2_firmware_capture
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase2_firmware_capture -- validate <recording.bmeg>
+```
+
+The harness uses the same workspace, firmware workflow, and serial session controller as the
+Tauri commands. It creates only a temporary student project and ignored temporary recordings.
+
 ## Acceptance harness
 
 The feature-gated harness calls the same nonblocking session start/status path as Tauri

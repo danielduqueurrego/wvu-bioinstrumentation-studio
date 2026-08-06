@@ -26,6 +26,26 @@
   free space, and finalizes under a 250 MiB controlled-stop guard.
 - Internet: not required for normal operation after installation
 
+## Phase 2 firmware workspace decisions
+
+- A student firmware project contains exactly one Arduino source file and `project.json` in a
+  matching project folder. Multi-file Arduino projects are deferred.
+- Project source remains local to the student-selected folder. Controlled templates are
+  version-controlled read-only sources; creating a project copies a template and never writes it.
+- CodeMirror 6 is the embedded C++/Arduino editor. It performs no hidden source transformation.
+- Compile and upload are separate deliberate operations. Upload needs a successful compile of the
+  current saved source, an explicit confirmation, one discovered UNO R4 WiFi, and no active
+  acquisition session.
+- Arduino CLI upload/reset behavior is treated as a bounded re-enumeration workflow. Returning
+  boards match by serial number first and never by an unrelated COM port; without a serial number,
+  only the original port is accepted.
+- A declared non-WVU student sketch may upload successfully but disables Acquisition. The
+  controlled reference firmware is restored only through its explicit confirmation action and is
+  protocol/identity verified before Acquisition becomes available.
+- Compile/upload logs are application diagnostic data rather than student source files. They
+  record project/source hashes, selected-board identifiers, CLI/core versions, exact argument
+  arrays, stages, output, exit status, and verification evidence.
+
 ## Technology stack
 
 - Firmware: Arduino C++

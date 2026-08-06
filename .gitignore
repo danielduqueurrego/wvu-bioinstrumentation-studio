@@ -5,6 +5,8 @@ node_modules
 /package
 /src-tauri/target
 /recordings
+/student-projects
+/firmware-projects
 /logs/firmware_build_*/
 *.bmeg
 *.bmeg.part
