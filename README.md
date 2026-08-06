@@ -139,6 +139,33 @@ cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --b
 cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase3a_profile_capture -- hardware emg 30
 ```
 
+## Phase 3B bench validation
+
+The **Validation** view is an instructor-only, bench-validation workflow for the locked ECG and
+EMG raw-output profiles. It creates a separate versioned evidence document tied to the exact
+profile ID/version/hash and controlled firmware identity. It guides distinct baseline, DC sweep,
+sine, saturation-margin, and three-repeat runs, retaining the raw BMEG/metadata/CSV triplet for
+each run. It computes transparent engineering metrics only; it neither filters raw samples nor
+creates clinical or physiological results.
+
+Every validation workflow repeats the safety boundary: **bench-validation use only; no person or
+electrode system may be connected; not a medical device.** A finalized SHA-256 evidence hash is
+an integrity check, not authentication or human-use authorization. Validation-aware recordings
+embed a compact validation context while the immutable full evidence remains separate. Existing
+BMEG files remain readable.
+
+The deterministic simulator acceptance harness exercises the production parser, writer, metadata,
+CSV exporter, evidence finalization, and manifest-verified package import without opening a
+serial port:
+
+```powershell
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase3b_validation_capture
+```
+
+See `docs/VALIDATION_EVIDENCE_SCHEMA_v1.md` and `docs/BENCH_VALIDATION_WORKFLOW.md`. Physical
+ECG/EMG module characterization requires documented safe bench sources and remains separate from
+this simulator evidence.
+
 ## Phase 2 firmware workspace
 
 The **Firmware** view is a one-file Arduino workspace for the UNO R4 WiFi. A project is a

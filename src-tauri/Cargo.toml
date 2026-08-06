@@ -32,6 +32,11 @@ name = "phase3a_profile_capture"
 path = "src/bin/phase3a_profile_capture.rs"
 required-features = ["acceptance-harness"]
 
+[[bin]]
+name = "phase3b_validation_capture"
+path = "src/bin/phase3b_validation_capture.rs"
+required-features = ["acceptance-harness"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

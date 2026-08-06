@@ -97,6 +97,20 @@ Profile files are versioned JSON, validated against a schema, and cannot be sile
   device/no human-connected recording authorized. No physiological quantity or interpretation is
   created by Phase 3A.
 
+## Phase 3B bench-validation evidence decisions
+
+- Validation evidence is a separate versioned JSON model, linked to a locked profile ID/version/
+  canonical hash and exact controlled firmware build/device identity. It never mutates the
+  profile snapshot embedded in a recording.
+- Draft/finalized/retired evidence states are instructor-only workflow operations. Finalized
+  evidence is immutable and SHA-256 integrity protected; the hash detects changes but is not an
+  authorship signature, authentication mechanism, or authorization for human use.
+- Every validation run uses the production session controller and is recorded as a separate raw
+  BMEG/metadata/CSV session with a compact validation context. Metrics are computed from retained
+  raw samples without hidden filtering.
+- Bench validation remains strictly no-person/no-electrode/not-medical-device work even when an
+  evidence record matches a profile. No physical module result is inferred from simulator evidence.
+
 ## Measurement policy
 
 - Default output is raw ADC counts.

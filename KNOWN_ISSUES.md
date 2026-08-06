@@ -22,6 +22,10 @@
   3440 × 1392 / 100% scaling. Separate 900 × 650, 1024 × 768, 1366 × 768, 1920 × 1080,
   maximized, 125%, and 150% viewport/scaling observations remain pending documentation follow-up;
   they are not claimed as tested. See `logs/phase3a_manual_ui_verification_2026-08-06.md`.
+- Phase 3B simulator validation is available, but physical ECG and EMG module/interface evidence
+  cannot be claimed until a safe 0–5 V bench source, module identifiers, and instructor-entered
+  equipment/criteria are available. No person or electrode system may be used to close that gap.
+  The Phase 3B viewport/scaling matrix is also pending manual inspection.
 - Rust exists at `C:\Users\dd00055\.cargo\bin` but is not on the persistent PowerShell PATH.
   Prepend it for the session or repair the user PATH entry.
 - Phase 1 intentionally has no firmware editor, pulse-ox sequence, calibration wizard,

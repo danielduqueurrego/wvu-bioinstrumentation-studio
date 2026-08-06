@@ -6,8 +6,10 @@ pub mod profiles;
 pub mod protocol;
 pub mod recording;
 pub mod session;
+pub mod validation;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tauri::{Manager, WindowEvent};
 
@@ -18,6 +20,9 @@ struct AppState {
     firmware: firmware_workflow::FirmwareWorkflow,
     /// Profiles are independent of firmware editing but bind every Phase 3A recording.
     profiles: profiles::ProfileStore,
+    /// Separate, instructor-authored evidence records bind bench validation to a
+    /// frozen profile and controlled firmware identity.
+    validations: validation::ValidationStore,
 }
 
 #[derive(Serialize)]
@@ -31,6 +36,47 @@ struct RecentPoint {
 struct SerialPortInfo {
     port: String,
     kind: String,
+}
+
+#[derive(Deserialize)]
+struct CreateValidationDraftRequest {
+    profile_id: String,
+    validation_id: String,
+    hardware: validation::ValidationHardware,
+    equipment: Vec<validation::EquipmentItem>,
+    test_conditions: BTreeMap<String, String>,
+    notes: String,
+}
+
+#[derive(Deserialize)]
+struct ValidationRunStartRequest {
+    port: Option<String>,
+    output_directory: String,
+    duration: recording::RecordingDuration,
+    profile_id: String,
+    validation_id: String,
+    test_type: validation::ValidationTestType,
+    run_number: u32,
+    bench_validation_acknowledged: bool,
+    source_description: String,
+    source_setpoint_v: Option<f64>,
+    source_offset_v: Option<f64>,
+    source_frequency_hz: Option<f64>,
+    source_peak_to_peak_v: Option<f64>,
+    equipment_metadata: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct CompleteValidationRunRequest {
+    validation_id: String,
+    test_type: validation::ValidationTestType,
+    run_number: u32,
+    source_description: String,
+    source_setpoint_v: Option<f64>,
+    source_frequency_hz: Option<f64>,
+    source_peak_to_peak_v: Option<f64>,
+    criteria: Vec<validation::AcceptanceCriterion>,
+    notes: String,
 }
 
 #[tauri::command]
@@ -296,6 +342,301 @@ fn import_profile_package(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn list_validation_evidence(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<validation::ValidationEvidence>, String> {
+    state.validations.list().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_profile_validation_status(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+) -> Result<validation::ValidationStatusSummary, String> {
+    let profile = state
+        .profiles
+        .get_locked(&profile_id)
+        .map_err(|error| error.to_string())?;
+    state
+        .validations
+        .profile_status(&profile)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn create_validation_draft(
+    state: tauri::State<'_, AppState>,
+    request: CreateValidationDraftRequest,
+) -> Result<validation::ValidationEvidence, String> {
+    ensure_validation_session_idle(&state)?;
+    let mode = state.profiles.mode().map_err(|error| error.to_string())?;
+    let profile = state
+        .profiles
+        .get_locked(&request.profile_id)
+        .map_err(|error| error.to_string())?;
+    ensure_bench_validation_profile(&profile)?;
+    let created = state
+        .validations
+        .create_draft(
+            mode.clone(),
+            &profile,
+            request.validation_id.clone(),
+            request.hardware.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+    state
+        .validations
+        .update_draft_details(
+            mode,
+            &created.validation_id,
+            request.hardware,
+            request.equipment,
+            request.test_conditions,
+            request.notes,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_validation_simulator_recording(
+    state: tauri::State<'_, AppState>,
+    request: ValidationRunStartRequest,
+) -> Result<session::SessionStatus, String> {
+    checked_output_directory(&request.output_directory)?;
+    let mode = state.profiles.mode().map_err(|error| error.to_string())?;
+    if mode != profiles::ProfileMode::InstructorAuthoring {
+        return Err("Student mode cannot start an instructor bench-validation run.".into());
+    }
+    let profile = state
+        .profiles
+        .get_locked(&request.profile_id)
+        .map_err(|error| error.to_string())?;
+    ensure_bench_validation_profile(&profile)?;
+    let evidence = state
+        .validations
+        .get(&request.validation_id)
+        .map_err(|error| error.to_string())?;
+    if evidence.status != validation::ValidationEvidenceStatus::Draft {
+        return Err("validation runs may be added only to a draft validation record".into());
+    }
+    evidence
+        .matches_profile(&profile)
+        .map_err(|error| error.to_string())?;
+    if !request.bench_validation_acknowledged {
+        return Err("acknowledge that validation is bench-only with no person or electrode system connected".into());
+    }
+    let context = validation_context_from_request(&request, true)?;
+    state
+        .session
+        .start_simulator_validation(
+            profile.snapshot(true),
+            request.duration,
+            PathBuf::from(request.output_directory),
+            context,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_validation_hardware_recording(
+    state: tauri::State<'_, AppState>,
+    request: ValidationRunStartRequest,
+) -> Result<session::SessionStatus, String> {
+    checked_output_directory(&request.output_directory)?;
+    let port = request
+        .port
+        .clone()
+        .ok_or_else(|| "select a detected UNO R4 WiFi port for hardware validation".to_string())?;
+    let mode = state.profiles.mode().map_err(|error| error.to_string())?;
+    if mode != profiles::ProfileMode::InstructorAuthoring {
+        return Err("Student mode cannot start an instructor bench-validation run.".into());
+    }
+    let profile = state
+        .profiles
+        .get_locked(&request.profile_id)
+        .map_err(|error| error.to_string())?;
+    ensure_bench_validation_profile(&profile)?;
+    let evidence = state
+        .validations
+        .get(&request.validation_id)
+        .map_err(|error| error.to_string())?;
+    if evidence.status != validation::ValidationEvidenceStatus::Draft {
+        return Err("validation runs may be added only to a draft validation record".into());
+    }
+    evidence
+        .matches_profile(&profile)
+        .map_err(|error| error.to_string())?;
+    if !request.bench_validation_acknowledged {
+        return Err("acknowledge that validation is bench-only with no person or electrode system connected".into());
+    }
+    if !firmware_error(state.firmware.is_acquisition_allowed(&port))? {
+        return Err("Bench validation requires verified controlled WVU firmware on the selected UNO R4 WiFi.".into());
+    }
+    let cli = arduino_cli::ArduinoCli::discover(None).map_err(|error| error.to_string())?;
+    if !cli
+        .boards()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|board| board.port.eq_ignore_ascii_case(&port))
+    {
+        return Err("select a currently detected Arduino UNO R4 WiFi port; unrelated serial ports are not allowed".into());
+    }
+    let context = validation_context_from_request(&request, false)?;
+    state
+        .session
+        .start_serial_validation(
+            profile.snapshot(true),
+            port,
+            request.duration,
+            PathBuf::from(request.output_directory),
+            context,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn complete_validation_run(
+    state: tauri::State<'_, AppState>,
+    request: CompleteValidationRunRequest,
+) -> Result<validation::ValidationEvidence, String> {
+    ensure_validation_session_idle(&state)?;
+    let mode = state.profiles.mode().map_err(|error| error.to_string())?;
+    let summary = state
+        .session
+        .status()
+        .map_err(|error| error.to_string())?
+        .last_summary
+        .ok_or_else(|| {
+            "stop and finalize the validation recording before computing its metrics".to_string()
+        })?;
+    let context = summary
+        .validation_context
+        .as_ref()
+        .ok_or_else(|| "the latest recording is not a validation run".to_string())?;
+    if context.validation_id != request.validation_id
+        || context.test_type != request.test_type.label()
+        || context.run_number != request.run_number
+    {
+        return Err("the latest finalized recording does not match this validation ID, test type, and run number".into());
+    }
+    let (_metrics_summary, metrics) = validation::metrics_for_validation_run(
+        PathBuf::from(&summary.bmeg_path).as_path(),
+        &request.test_type,
+        request.source_setpoint_v,
+        request.source_frequency_hz,
+    )
+    .map_err(|error| error.to_string())?;
+    let criteria = validation::evaluate_criteria(&metrics, &request.criteria);
+    state
+        .validations
+        .add_run(
+            mode,
+            &request.validation_id,
+            validation::ValidationRun {
+                run_number: request.run_number,
+                test_type: request.test_type,
+                source_description: request.source_description,
+                source_setpoint_v: request.source_setpoint_v,
+                source_frequency_hz: request.source_frequency_hz,
+                source_peak_to_peak_v: request.source_peak_to_peak_v,
+                bmeg_path: summary.bmeg_path,
+                metadata_path: summary.metadata_path,
+                csv_path: summary.csv_path,
+                raw_sample_count: summary.samples,
+                algorithm_version: validation::METRIC_ALGORITHM_VERSION.into(),
+                metrics,
+                criteria,
+                notes: request.notes,
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_validation_acceptance_summary(
+    state: tauri::State<'_, AppState>,
+    validation_id: String,
+    summary: Vec<validation::CriterionResult>,
+    accepted: bool,
+) -> Result<validation::ValidationEvidence, String> {
+    ensure_validation_session_idle(&state)?;
+    let mode = state.profiles.mode().map_err(|error| error.to_string())?;
+    state
+        .validations
+        .set_acceptance_summary(mode, &validation_id, summary, accepted)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn finalize_validation_evidence(
+    state: tauri::State<'_, AppState>,
+    validation_id: String,
+    profile_id: String,
+) -> Result<validation::ValidationEvidence, String> {
+    ensure_validation_session_idle(&state)?;
+    let mode = state.profiles.mode().map_err(|error| error.to_string())?;
+    let profile = state
+        .profiles
+        .get_locked(&profile_id)
+        .map_err(|error| error.to_string())?;
+    ensure_bench_validation_profile(&profile)?;
+    state
+        .validations
+        .finalize(mode, &validation_id, &profile)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn retire_validation_evidence(
+    state: tauri::State<'_, AppState>,
+    validation_id: String,
+) -> Result<(), String> {
+    ensure_validation_session_idle(&state)?;
+    let mode = state.profiles.mode().map_err(|error| error.to_string())?;
+    state
+        .validations
+        .retire(mode, &validation_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn export_validation_package(
+    state: tauri::State<'_, AppState>,
+    validation_id: String,
+    destination: String,
+) -> Result<String, String> {
+    ensure_validation_session_idle(&state)?;
+    let mode = state.profiles.mode().map_err(|error| error.to_string())?;
+    if destination.trim().is_empty() || destination.contains('\0') {
+        return Err("choose a valid validation package folder".into());
+    }
+    state
+        .validations
+        .export_package(mode, &validation_id, &PathBuf::from(destination))
+        .map(|path| path.display().to_string())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn import_validation_package(
+    state: tauri::State<'_, AppState>,
+    source: String,
+    profile_id: String,
+) -> Result<validation::ValidationEvidence, String> {
+    ensure_validation_session_idle(&state)?;
+    let mode = state.profiles.mode().map_err(|error| error.to_string())?;
+    let profile = state
+        .profiles
+        .get_locked(&profile_id)
+        .map_err(|error| error.to_string())?;
+    ensure_bench_validation_profile(&profile)?;
+    state
+        .validations
+        .import_package(mode, &PathBuf::from(source), &profile)
+        .map_err(|error| error.to_string())
+}
+
 /// Combined Phase 1 connect/handshake/configure/start command. The worker owns transport I/O.
 #[tauri::command]
 fn start_simulator_recording(
@@ -537,6 +878,99 @@ fn checked_output_directory(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_validation_session_idle(state: &AppState) -> Result<(), String> {
+    if state
+        .session
+        .is_recording()
+        .map_err(|error| error.to_string())?
+    {
+        Err("stop and finalize the active acquisition before changing validation evidence".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_bench_validation_profile(profile: &profiles::AcquisitionProfile) -> Result<(), String> {
+    if matches!(profile.category.as_str(), "ecg" | "emg") {
+        Ok(())
+    } else {
+        Err(
+            "bench validation is available only for the locked ECG or EMG raw-output profiles"
+                .into(),
+        )
+    }
+}
+
+fn validation_context_from_request(
+    request: &ValidationRunStartRequest,
+    simulator: bool,
+) -> Result<recording::ValidationRunContext, String> {
+    if request.run_number == 0
+        || request.validation_id.trim().is_empty()
+        || request.source_description.trim().is_empty()
+    {
+        return Err(
+            "validation ID, nonzero run number, and source description are required".into(),
+        );
+    }
+    for value in [request.source_setpoint_v, request.source_peak_to_peak_v] {
+        if value.is_some_and(|volts| !(0.0..=5.0).contains(&volts)) {
+            return Err("bench source voltage values must remain within 0 to 5 V".into());
+        }
+    }
+    if request
+        .source_frequency_hz
+        .is_some_and(|frequency| frequency <= 0.0)
+    {
+        return Err("bench sine frequency must be positive".into());
+    }
+    Ok(recording::ValidationRunContext {
+        validation_id: request.validation_id.clone(),
+        test_type: request.test_type.label().into(),
+        run_number: request.run_number,
+        bench_only: true,
+        source_description: request.source_description.clone(),
+        source_setpoint_v: request.source_setpoint_v,
+        source_offset_v: request.source_offset_v,
+        source_frequency_hz: request.source_frequency_hz,
+        source_peak_to_peak_v: request.source_peak_to_peak_v,
+        equipment_metadata: request.equipment_metadata.clone(),
+        simulator_parameters: if simulator {
+            BTreeMap::from([
+                ("seed".into(), "phase3b-deterministic-v1".into()),
+                ("test_type".into(), request.test_type.label().into()),
+                (
+                    "offset_v".into(),
+                    request.source_offset_v.unwrap_or(2.5).to_string(),
+                ),
+                (
+                    "setpoint_v".into(),
+                    request
+                        .source_setpoint_v
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "frequency_hz".into(),
+                    request
+                        .source_frequency_hz
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "peak_to_peak_v".into(),
+                    request
+                        .source_peak_to_peak_v
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                ),
+            ])
+        } else {
+            BTreeMap::new()
+        },
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // The acquisition controller is intentionally shared with the firmware workflow:
@@ -544,6 +978,7 @@ pub fn run() {
     let session = session::SessionController::default();
     let firmware = firmware_workflow::FirmwareWorkflow::new(session.clone());
     let profiles = profiles::ProfileStore::default();
+    let validations = validation::ValidationStore::default();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -552,6 +987,7 @@ pub fn run() {
             session,
             firmware,
             profiles,
+            validations,
         })
         .invoke_handler(tauri::generate_handler![
             list_boards,
@@ -580,6 +1016,17 @@ pub fn run() {
             retire_profile,
             export_profile_package,
             import_profile_package,
+            list_validation_evidence,
+            get_profile_validation_status,
+            create_validation_draft,
+            start_validation_simulator_recording,
+            start_validation_hardware_recording,
+            complete_validation_run,
+            set_validation_acceptance_summary,
+            finalize_validation_evidence,
+            retire_validation_evidence,
+            export_validation_package,
+            import_validation_package,
             start_simulator_recording,
             start_hardware_recording,
             start_profile_simulator_recording,
@@ -617,12 +1064,21 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::checked_output_directory;
+    use super::{checked_output_directory, ensure_bench_validation_profile};
+    use crate::profiles::built_in_profiles;
 
     #[test]
     fn command_input_validation_rejects_empty_or_nul_directories() {
         assert!(checked_output_directory("").is_err());
         assert!(checked_output_directory("recordings\0bad").is_err());
         assert!(checked_output_directory("recordings").is_ok());
+    }
+
+    #[test]
+    fn bench_validation_command_guard_allows_only_locked_ecg_or_emg_profiles() {
+        let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
+        assert!(ensure_bench_validation_profile(&profiles[0]).is_err());
+        assert!(ensure_bench_validation_profile(&profiles[1]).is_ok());
+        assert!(ensure_bench_validation_profile(&profiles[2]).is_ok());
     }
 }

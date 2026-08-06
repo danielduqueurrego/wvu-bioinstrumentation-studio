@@ -209,6 +209,10 @@ On firmware startup, acquisition stop, command timeout, communication failure, o
 - Phase 3A locks raw ECG/EMG A0 acquisition to 12-bit / 1000 samples/s for bench-only validation.
   No person, electrode, or module-to-person connection is authorized; no clinical or physiological
   interpretation is available.
+- Phase 3B may associate versioned instructor-authored analog-interface bench-validation evidence
+  with the locked ECG/EMG profile only when profile ID/version/hash and controlled firmware
+  identity match. It shall preserve separate raw recordings, transparent metrics, criteria, and
+  manifest-verified evidence packages. Bench validation never authorizes human-connected use.
 
 ### Pulse Oximetry
 

@@ -4,6 +4,7 @@ use crate::{profiles::ProfileSnapshot, protocol::IntegrityCounters};
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{BufReader, BufWriter, Read, Write},
     path::Path,
@@ -125,6 +126,28 @@ pub struct RecordingMetadata {
     /// metadata sidecar. Files made before this field existed remain legacy/general recordings.
     #[serde(default)]
     pub profile_snapshot: Option<ProfileSnapshot>,
+    /// Optional Phase 3B provenance for a single bench-validation run. The full
+    /// immutable validation evidence remains a separate JSON document/package so
+    /// the BMEG header stays compact and legacy BMEG readers remain compatible.
+    #[serde(default)]
+    pub validation_context: Option<ValidationRunContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ValidationRunContext {
+    pub validation_id: String,
+    pub test_type: String,
+    pub run_number: u32,
+    pub bench_only: bool,
+    pub source_description: String,
+    pub source_setpoint_v: Option<f64>,
+    pub source_offset_v: Option<f64>,
+    pub source_frequency_hz: Option<f64>,
+    pub source_peak_to_peak_v: Option<f64>,
+    #[serde(default)]
+    pub equipment_metadata: BTreeMap<String, String>,
+    #[serde(default)]
+    pub simulator_parameters: BTreeMap<String, String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RawSample {
@@ -244,7 +267,10 @@ pub fn export_bmeg_csv(bmeg: &Path, csv: &Path) -> Result<u64, RecordingError> {
     let first_timestamp = input.metadata.utc_start.timestamp_micros();
     let mut writer = BufWriter::new(File::create(csv)?);
     let profile = input.metadata.profile_snapshot.clone();
-    if profile.is_some() {
+    let validation = input.metadata.validation_context.clone();
+    if profile.is_some() && validation.is_some() {
+        writer.write_all(b"sample_sequence,timestamp_us,elapsed_seconds,channel,adc_counts,volts,status_flags,profile_id,profile_version,signal_label,validation_id,validation_test_type,validation_run_number\n")?;
+    } else if profile.is_some() {
         writer.write_all(b"sample_sequence,timestamp_us,elapsed_seconds,channel,adc_counts,volts,status_flags,profile_id,profile_version,signal_label\n")?;
     } else {
         writer.write_all(
@@ -256,7 +282,23 @@ pub fn export_bmeg_csv(bmeg: &Path, csv: &Path) -> Result<u64, RecordingError> {
     while let Some(sample) = input.next_sample()? {
         let start = *origin.get_or_insert(sample.timestamp_us);
         let elapsed = (sample.timestamp_us.saturating_sub(start)) as f64 / 1_000_000.0;
-        if let Some(snapshot) = profile.as_ref() {
+        if let (Some(snapshot), Some(context)) = (profile.as_ref(), validation.as_ref()) {
+            writeln!(
+                writer,
+                "{},{},{elapsed:.6},{},{},{:.6},1,{},{},{},{},{},{}",
+                sample.sequence,
+                sample.timestamp_us,
+                csv_field(&snapshot.profile.acquisition.analog_pin),
+                sample.counts,
+                f64::from(sample.counts) * 5.0 / 4095.0,
+                csv_field(&snapshot.profile.profile_id),
+                csv_field(&snapshot.profile.profile_version),
+                csv_field(&snapshot.profile.export.signal_name),
+                csv_field(&context.validation_id),
+                csv_field(&context.test_type),
+                context.run_number,
+            )?;
+        } else if let Some(snapshot) = profile.as_ref() {
             writeln!(
                 writer,
                 "{},{},{elapsed:.6},{},{},{:.6},1,{},{},{}",
@@ -349,6 +391,7 @@ mod tests {
             final_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
             completion_status: "complete".into(),
             profile_snapshot: None,
+            validation_context: None,
         };
         let bmeg = dir.path().join("r.bmeg");
         let mut w = BmegWriter::create(&bmeg, &meta).unwrap_or_else(|e| panic!("{e}"));
@@ -450,6 +493,7 @@ mod tests {
             final_free_disk_bytes: Some(1),
             completion_status: "complete".into(),
             profile_snapshot: None,
+            validation_context: None,
         };
         let mut old = serde_json::to_value(metadata).unwrap_or_else(|e| panic!("{e}"));
         let object = old
@@ -513,6 +557,7 @@ mod tests {
             final_free_disk_bytes: None,
             completion_status: "complete".into(),
             profile_snapshot: Some(profile.clone()),
+            validation_context: None,
         };
         let bmeg = dir.path().join("profile.bmeg");
         let mut writer = BmegWriter::create(&bmeg, &metadata).unwrap_or_else(|e| panic!("{e}"));
@@ -536,5 +581,96 @@ mod tests {
             .contains("profile_id"));
         metadata.profile_snapshot = None;
         assert!(metadata.profile_snapshot.is_none());
+    }
+
+    #[test]
+    fn validation_context_round_trips_and_extends_only_validation_csv() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let profile = crate::profiles::built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "ecg")
+            .unwrap_or_else(|| panic!("missing ECG profile"))
+            .snapshot(true);
+        let metadata = RecordingMetadata {
+            utc_start: Utc::now(),
+            local_start: Local::now(),
+            board: "Simulator".into(),
+            com_port: "SIM".into(),
+            fqbn: "simulator".into(),
+            arduino_cli_version: "n/a".into(),
+            uno_r4_core_version: "n/a".into(),
+            firmware_build: 0x0001_0001,
+            protocol_version: "0.1".into(),
+            analog_pin: "A0".into(),
+            adc_bits: 12,
+            requested_sample_rate_hz: 1_000,
+            measured_sample_rate_hz: 1_000.0,
+            total_samples: 2,
+            integrity: IntegrityCounters::default(),
+            app_version: "test".into(),
+            simulator: true,
+            utc_stop: None,
+            local_stop: None,
+            host_elapsed_seconds: None,
+            board_elapsed_seconds: None,
+            recording_status: "complete".into(),
+            bmeg_filename: "validation.bmeg".into(),
+            csv_filename: None,
+            notes: "bench only".into(),
+            duration_mode: Some("timed".into()),
+            requested_duration_seconds: Some(10),
+            stop_reason: Some(StopReason::TimedComplete),
+            initial_free_disk_bytes: None,
+            final_free_disk_bytes: None,
+            completion_status: "complete".into(),
+            profile_snapshot: Some(profile),
+            validation_context: Some(ValidationRunContext {
+                validation_id: "wvu.validation.001".into(),
+                test_type: "dc_operating_range_sweep".into(),
+                run_number: 1,
+                bench_only: true,
+                source_description: "2.5 V safe source".into(),
+                source_setpoint_v: Some(2.5),
+                source_offset_v: None,
+                source_frequency_hz: None,
+                source_peak_to_peak_v: None,
+                equipment_metadata: BTreeMap::new(),
+                simulator_parameters: BTreeMap::from([("seed".into(), "test".into())]),
+            }),
+        };
+        let bmeg = dir.path().join("validation.bmeg");
+        let csv = dir.path().join("validation.csv");
+        let mut writer = BmegWriter::create(&bmeg, &metadata).unwrap_or_else(|e| panic!("{e}"));
+        writer
+            .write(RawSample {
+                sequence: 0,
+                timestamp_us: 0,
+                counts: 2048,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        writer
+            .write(RawSample {
+                sequence: 1,
+                timestamp_us: 1_000,
+                counts: 2048,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        writer.finish().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            export_bmeg_csv(&bmeg, &csv).unwrap_or_else(|e| panic!("{e}")),
+            2
+        );
+        let read_back = BmegReader::open(&bmeg).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            read_back.metadata.validation_context,
+            metadata.validation_context
+        );
+        let header = std::fs::read_to_string(csv).unwrap_or_else(|e| panic!("{e}"));
+        assert!(header
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains("validation_run_number"));
     }
 }

@@ -153,6 +153,14 @@ the frontend and keeps a job visible until its terminal result and diagnostic lo
 - No human authorization, module characterization, physiological interpretation, leads-off,
   optional notch channel, or EMG 2000 Hz work
 
+### Phase 3B — analog-interface bench validation
+
+- Instructor-only draft/finalized validation evidence tied to locked profile and firmware identity
+- Raw-data-preserving baseline, DC, sine, saturation-margin, and repeatability run evidence
+- Transparent engineering metrics and local instructor-defined criteria
+- Manifest-hashed validation package export/import and explicit legacy recording compatibility
+- Bench sources or simulator only; no human/electrode system, physiological analysis, or medical claim
+
 ### Phase 1 — tested vertical slice
 
 - Repository and toolchain
