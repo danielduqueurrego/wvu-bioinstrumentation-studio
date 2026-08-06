@@ -9,7 +9,8 @@
 static const uint8_t MAGIC[] = {'B','M','E','G'};
 static const uint8_t PROTOCOL_MAJOR = 0, PROTOCOL_MINOR = 1;
 static const uint16_t MAX_PAYLOAD = 1024;
-static const uint32_t FIRMWARE_BUILD = 0x00010000UL;
+// Build 1.1 fixes the HELLO device-ID payload offset.
+static const uint32_t FIRMWARE_BUILD = 0x00010001UL;
 static const uint32_t COMMAND_TIMEOUT_US = 5000000UL;
 static const uint8_t LED_PINS[] = {4, 5, 6};
 static const uint8_t BATCH_SAMPLES = 10;
@@ -44,7 +45,7 @@ void sendFrame(uint8_t type, const uint8_t* payload, uint16_t length) {
   // to preserve the requested 1000 samples/s schedule.
   if (type != SAMPLE_BATCH) Serial.flush();
 }
-void sendHello() { uint8_t p[12]; writeU32(p,FIRMWARE_BUILD); writeU32(p,0x554E4F34UL); p[8]=1; p[9]=12; p[10]=1; p[11]=0; sendFrame(HELLO,p,sizeof(p)); }
+void sendHello() { uint8_t p[12]; writeU32(p,FIRMWARE_BUILD); writeU32(p+4,0x554E4F34UL); p[8]=1; p[9]=12; p[10]=1; p[11]=0; sendFrame(HELLO,p,sizeof(p)); }
 void sendCapabilities() { uint8_t p[] = {12,1,6,0}; sendFrame(CAPABILITIES,p,sizeof(p)); }
 void sendError(uint8_t code) { uint8_t p[] = {code}; sendFrame(ERROR_MESSAGE,p,1); }
 void sendBatch() { if(batchCount==0) return; uint8_t p[20+BATCH_SAMPLES*2]; writeU32(p,sampleSequence-batchCount); writeU64(p+4,batchFirstTimestamp); writeU32(p+12,1000); p[16]=1; p[17]=batchCount; writeU16(p+18,1); for(uint8_t i=0;i<batchCount;i++) writeU16(p+20+i*2,batch[i]); sendFrame(SAMPLE_BATCH,p,20+batchCount*2); batchCount=0; }

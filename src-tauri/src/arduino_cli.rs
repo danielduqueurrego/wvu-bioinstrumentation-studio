@@ -14,7 +14,7 @@ pub struct CommandLog {
     pub stderr: String,
     pub duration_ms: u128,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BoardInfo {
     pub port: String,
     pub name: String,

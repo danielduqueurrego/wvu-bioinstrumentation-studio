@@ -9,6 +9,11 @@ pub const HEADER_LEN: usize = 14;
 pub const CRC_LEN: usize = 2;
 pub const MAX_PAYLOAD_LEN: usize = 1024;
 
+/// Immutable identity expected from the controlled Phase 1 UNO R4 WiFi sketch.
+/// The matching values are encoded in `firmware/reference_unor4wifi`'s HELLO frame.
+pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0001;
+pub const REFERENCE_DEVICE_ID: u32 = 0x554e_4f34;
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MessageType {
@@ -382,6 +387,39 @@ mod tests {
         let frames = parser.push(&bytes);
         assert_eq!(frames.len(), 3);
         assert_eq!(parser.stats.crc_failures, 0);
+    }
+    #[test]
+    fn back_to_back_identity_frames_preserve_the_hello_payload() {
+        let hello_payload = vec![0x00, 0x00, 0x01, 0x00, 0x34, 0x4f, 0x4e, 0x55, 1, 12, 1, 0];
+        let frames = [
+            Frame {
+                message_type: MessageType::Hello,
+                flags: 0,
+                sequence: 8,
+                payload: hello_payload.clone(),
+            },
+            Frame {
+                message_type: MessageType::Capabilities,
+                flags: 0,
+                sequence: 9,
+                payload: vec![12, 1, 6, 0],
+            },
+            Frame {
+                message_type: MessageType::Pong,
+                flags: 0,
+                sequence: 10,
+                payload: vec![],
+            },
+        ];
+        let bytes = frames.iter().try_fold(Vec::new(), |mut bytes, frame| {
+            bytes.extend(encode_frame(frame)?);
+            Ok::<_, ProtocolError>(bytes)
+        });
+        let mut parser = FrameParser::default();
+        let decoded = parser.push(&bytes.unwrap_or_default());
+        assert_eq!(decoded[0].payload, hello_payload);
+        assert_eq!(decoded[1].message_type, MessageType::Capabilities);
+        assert_eq!(decoded[2].message_type, MessageType::Pong);
     }
     #[test]
     fn incomplete_identity_frame_is_rejected_and_parser_resynchronizes() {

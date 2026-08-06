@@ -113,3 +113,69 @@ Perform the user-assisted physical unplug/replug acceptance test: unplug the UNO
 WiFi during a recording, verify incomplete finalization, reconnect/redetect its port,
 and require an explicit new acquisition. Then begin Phase 2 only after recording the
 result.
+
+## Phase 1.1 follow-up status — 2026-08-06
+
+The accepted Phase 1 evidence above is preserved. Phase 1.1 adds explicit `timed` and
+`until_stopped` duration modes, bounded long-recording storage safeguards, controlled
+application-close finalization, structured handshake diagnostics, controlled firmware identity
+checking, and a responsive Acquisition layout with a `ResizeObserver`-driven uPlot resize path.
+It does not add biomedical interpretation, optical sequencing, or calibration workflow.
+
+### Controlled firmware identity and normal handshake
+
+An analog ASCII test sketch had replaced the reference firmware. The user initially restored the
+repository sketch through Arduino IDE, but a production-parser probe then reproduced a source
+defect in the original HELLO payload: the firmware build and device ID were written at the same
+offset. The controlled v0.1 correction writes the device ID at byte offset four and uses build
+`0x00010001`. Arduino CLI compiled (53,508 bytes flash; 7,940 bytes RAM) and uploaded that exact
+controlled binary to rediscovered COM12. Independent production-parser proof after the final
+upload: HELLO/CAPABILITIES/PONG true; CRC/invalid/noise counts zero; protocol 0.1; build
+`0x00010001`; device `0x554E4F34`. The normal production handshake passed in 1261 ms with 64
+bytes and three valid frames. Details: `logs/phase1_1_reference_firmware_restore_2026-08-06.md`.
+
+### Simulator and hardware acceptance
+
+The latest production-controller simulator Until-stopped run manually stopped cleanly with 18,760
+samples, 1,899 valid packets, 1000.000 Hz, zero integrity failures, a readable BMEG/CSV/metadata
+triplet, and bounded display history. The deterministic 900,000-sample 15-minute-equivalent soak
+also passed with its fixed 1,500-point display history.
+
+The required Arduino-alone floating-A0 Until-stopped hardware run passed through the production
+session controller. It ran for 121.495 host seconds (121.119 seconds of board timestamps), then
+manually finalized 121,120 samples and 12,480 valid packets at exactly 1000.000 Hz. CRC failures,
+invalid/unsupported frames, missing/duplicate/out-of-order sequences, firmware/host overflows,
+disconnects, and reconnects were all zero. BMEG/metadata/CSV streaming validation passed: 121,120
+records/rows, contiguous 0–121119 sequences, monotonic timestamps, correct direct voltage
+conversion, and metadata `until_stopped` / `user` / `complete`. Details:
+`logs/phase1_1_indefinite_recording_acceptance_2026-08-06.md` and
+`logs/phase1_1_export_validation_2026-08-06.md`.
+
+### Verification results
+
+| Command | Result |
+|---|---|
+| `cargo fmt --manifest-path src-tauri\Cargo.toml -- --check` | Passed |
+| `cargo check --manifest-path src-tauri\Cargo.toml` | Passed |
+| `cargo test --manifest-path src-tauri\Cargo.toml` | Passed: 33 Rust tests |
+| `cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings` | Passed |
+| `npm run check` | Passed: zero errors and warnings |
+| `npm test` | Passed: 6 frontend tests in 3 files |
+| `npm run build` | Passed |
+| `npm run tauri build` | Passed: current MSI and NSIS bundles |
+| Release application launch | Passed; launched and closed cleanly, no serial session opened |
+
+### Separately reported follow-ups
+
+- Reset/retry hardware recovery remains unresolved. Its 1200-bps touch rediscovered COM12 but
+  later received zero protocol bytes; re-uploading the controlled binary restored normal protocol
+  operation. This does not affect the credible normal-acquisition counters. See
+  `logs/phase1_1_touch_reset_characterization_2026-08-06.md`.
+- Physical unplug/replug has not been performed; it requires the user's participation.
+- The requested manual window-size and Windows-scaling matrix has not been visually observed in
+  this noninteractive agent desktop. It is documented as pending, not passed, in
+  `logs/phase1_1_responsive_ui_verification_2026-08-06.md`.
+
+Phase 1.1 normal recording/data-integrity acceptance is passed. Overall Phase 1.1 follow-up
+closure and its requested commit remain pending the accurately recorded visual matrix; the
+physical disconnect test may be committed separately after user participation.

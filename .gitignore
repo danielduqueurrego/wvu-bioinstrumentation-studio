@@ -5,7 +5,9 @@ node_modules
 /package
 /src-tauri/target
 /recordings
+/logs/firmware_build_*/
 *.bmeg
+*.bmeg.part
 *.metadata.json
 *.events.csv
 .env

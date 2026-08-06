@@ -40,6 +40,9 @@
 ### Recording
 
 - A 60-second hardware or simulator recording is created.
+- A user-selected Until stopped recording remains active until manual Stop, disconnect, fault, or
+  storage guard; it must not use a hidden duration limit.
+- Long recording safeguards warn below 1 GiB free and finalize safely below 250 MiB free.
 - `.bmeg`, `.metadata.json`, and `.csv` are readable.
 - Sample sequence and timestamp columns are present.
 - Integrity counters are saved.

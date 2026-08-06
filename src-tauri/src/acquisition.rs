@@ -28,6 +28,9 @@ pub struct AcquisitionSnapshot {
     pub config_ack_seen: bool,
     pub pong_seen: bool,
     pub status_seen: bool,
+    pub firmware_build: Option<u32>,
+    pub firmware_board_id: Option<u32>,
+    pub skipped_noise_bytes: u64,
 }
 pub struct AcquisitionController {
     pub state: AcquisitionState,
@@ -43,6 +46,8 @@ pub struct AcquisitionController {
     config_ack_seen: bool,
     pong_seen: bool,
     status_seen: bool,
+    firmware_build: Option<u32>,
+    firmware_board_id: Option<u32>,
 }
 impl AcquisitionController {
     pub fn new(sender: SyncSender<RawSample>) -> Self {
@@ -60,6 +65,8 @@ impl AcquisitionController {
             config_ack_seen: false,
             pong_seen: false,
             status_seen: false,
+            firmware_build: None,
+            firmware_board_id: None,
         }
     }
     pub fn configure(&mut self) -> Result<(), &'static str> {
@@ -93,7 +100,25 @@ impl AcquisitionController {
     fn ingest_frame(&mut self, frame: Frame) {
         self.monitor.observe_frame(&frame);
         match frame.message_type {
-            MessageType::Hello => self.hello_seen = true,
+            MessageType::Hello => {
+                self.hello_seen = true;
+                if frame.payload.len() >= 4 {
+                    self.firmware_build = Some(u32::from_le_bytes([
+                        frame.payload[0],
+                        frame.payload[1],
+                        frame.payload[2],
+                        frame.payload[3],
+                    ]));
+                }
+                if frame.payload.len() >= 8 {
+                    self.firmware_board_id = Some(u32::from_le_bytes([
+                        frame.payload[4],
+                        frame.payload[5],
+                        frame.payload[6],
+                        frame.payload[7],
+                    ]));
+                }
+            }
             MessageType::Capabilities => self.capabilities_seen = true,
             MessageType::ConfigAck => self.config_ack_seen = true,
             MessageType::Pong => self.pong_seen = true,
@@ -156,6 +181,9 @@ impl AcquisitionController {
             config_ack_seen: self.config_ack_seen,
             pong_seen: self.pong_seen,
             status_seen: self.status_seen,
+            firmware_build: self.firmware_build,
+            firmware_board_id: self.firmware_board_id,
+            skipped_noise_bytes: self.parser.stats.skipped_noise_bytes,
         }
     }
 }
@@ -268,5 +296,21 @@ mod tests {
         }
         let snapshot = c.snapshot();
         assert!(snapshot.hello_seen && snapshot.capabilities_seen && snapshot.pong_seen);
+    }
+
+    #[test]
+    fn hello_identity_uses_the_documented_payload_offsets() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        let hello = Frame {
+            message_type: MessageType::Hello,
+            flags: 0,
+            sequence: 0,
+            payload: vec![0x01, 0x00, 0x01, 0x00, 0x34, 0x4f, 0x4e, 0x55, 1, 12, 1, 0],
+        };
+        controller.ingest_bytes(&crate::protocol::encode_frame(&hello).unwrap_or_default());
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.firmware_build, Some(0x0001_0001));
+        assert_eq!(snapshot.firmware_board_id, Some(0x554e_4f34));
     }
 }

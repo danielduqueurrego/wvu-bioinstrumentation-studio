@@ -7,6 +7,7 @@ pub mod session;
 
 use serde::Serialize;
 use std::path::PathBuf;
+use tauri::{Manager, WindowEvent};
 
 struct AppState {
     /// Exactly one controller owns the Phase 1 session lifecycle. It has no frontend serial handle.
@@ -62,12 +63,12 @@ fn arduino_cli_version(cli_path: Option<String>) -> Result<arduino_cli::CommandL
 fn start_simulator_recording(
     state: tauri::State<'_, AppState>,
     output_directory: String,
-    seconds: u32,
+    duration: recording::RecordingDuration,
 ) -> Result<session::SessionStatus, String> {
     checked_output_directory(&output_directory)?;
     state
         .session
-        .start_simulator(seconds, PathBuf::from(output_directory))
+        .start_simulator(duration, PathBuf::from(output_directory))
         .map_err(|error| error.to_string())
 }
 
@@ -77,7 +78,7 @@ fn start_hardware_recording(
     state: tauri::State<'_, AppState>,
     port: String,
     output_directory: String,
-    seconds: u32,
+    duration: recording::RecordingDuration,
 ) -> Result<session::SessionStatus, String> {
     checked_output_directory(&output_directory)?;
     if !serialport::available_ports()
@@ -101,7 +102,65 @@ fn start_hardware_recording(
     }
     state
         .session
-        .start_serial(port, seconds, PathBuf::from(output_directory))
+        .start_serial(port, duration, PathBuf::from(output_directory))
+        .map_err(|error| error.to_string())
+}
+
+/// Explicit recovery action for a previously discovered UNO R4 WiFi. It performs
+/// only a 1200-bps touch/reset and a fresh protocol handshake; it never uploads firmware.
+#[tauri::command]
+fn reset_board_and_retry(
+    state: tauri::State<'_, AppState>,
+    port: String,
+) -> Result<session::ResetRetryResult, String> {
+    if port.trim().is_empty() || port.contains('\0') {
+        return Err("select a valid discovered UNO R4 WiFi port".into());
+    }
+    let cli = arduino_cli::ArduinoCli::discover(None).map_err(|error| error.to_string())?;
+    let board = cli
+        .boards()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|board| board.port.eq_ignore_ascii_case(&port))
+        .ok_or_else(|| {
+            "selected port is not a currently discovered Arduino UNO R4 WiFi; refresh devices first"
+                .to_string()
+        })?;
+    state
+        .session
+        .reset_and_retry(session::ResetTarget {
+            port: board.port,
+            serial_number: board.serial_number,
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Explicit no-reset retry for a discovered UNO R4 WiFi. This is distinct from
+/// Reset and retry so normal connection attempts never touch the board at 1200 bps.
+#[tauri::command]
+fn retry_hardware_handshake(
+    state: tauri::State<'_, AppState>,
+    port: String,
+) -> Result<session::HandshakeRetryResult, String> {
+    if port.trim().is_empty() || port.contains('\0') {
+        return Err("select a valid discovered UNO R4 WiFi port".into());
+    }
+    let cli = arduino_cli::ArduinoCli::discover(None).map_err(|error| error.to_string())?;
+    let board = cli
+        .boards()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|board| board.port.eq_ignore_ascii_case(&port))
+        .ok_or_else(|| {
+            "selected port is not a currently discovered Arduino UNO R4 WiFi; refresh devices first"
+                .to_string()
+        })?;
+    state
+        .session
+        .retry_handshake(session::ResetTarget {
+            port: board.port,
+            serial_number: board.serial_number,
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -180,12 +239,31 @@ pub fn run() {
             arduino_cli_version,
             start_simulator_recording,
             start_hardware_recording,
+            reset_board_and_retry,
+            retry_hardware_handshake,
             stop_recording,
             disconnect_session,
             get_session_status,
             get_recent_display_data,
             export_session_csv
         ])
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let session = window.state::<AppState>().session.clone();
+                if matches!(session.is_recording(), Ok(true)) {
+                    // There is no dialog plugin in this intentionally small Phase 1 shell.
+                    // Preventing close and finalizing first avoids silently abandoning a writer.
+                    api.prevent_close();
+                    let closing_window = window.clone();
+                    std::thread::spawn(move || {
+                        let _ = session
+                            .request_stop_with_reason(recording::StopReason::ApplicationClose);
+                        let _ = session.wait_for_worker();
+                        let _ = closing_window.close();
+                    });
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {
             eprintln!("WVU Bioinstrumentation Studio failed to start: {error}")

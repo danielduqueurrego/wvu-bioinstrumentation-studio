@@ -46,3 +46,46 @@ assets/branding/               supplied logo, preserved byte-for-byte
    runs and poll bounded snapshots from the Svelte Acquisition view at 25 Hz.
 4. Read back `.bmeg`, metadata, and CSV outputs; run simulator acceptance before an
    Arduino-alone, floating-A0 60-second production-controller capture.
+
+## Phase 1.1 plan — 2026-08-06
+
+1. Replace the fixed maximum-duration session request with an explicit, serialized
+   `Timed` or `UntilStopped` mode, retaining validated timed presets and a manual stop.
+2. Keep sample data streaming by adding injectable preflight/periodic disk-space checks,
+   periodic flushes, and a single metadata-aware finalization path for user, timed,
+   disconnect, storage, close, and fault outcomes.
+3. Expose duration, elapsed time, remaining time (timed only), storage, and stop reason
+   in the controller/Tauri status. Exercise the same transport path in simulator tests.
+4. Reflow the desktop UI with responsive grids and a resize-observed uPlot container;
+   record manual window-size observations and then perform hardware/physical-disconnect
+   acceptance with Arduino alone and raw floating A0.
+
+## Phase 1.1 reset/reconnect completion plan — 2026-08-06
+
+1. Preserve the observed distinction between a nonresponsive USB CDC session and missing
+   firmware. Add bounded, structured handshake diagnostics (open state, byte/frame/CRC counts,
+   identity/PONG state, elapsed time, failure category, and next action) and retry PING without
+   automatically resetting a board.
+2. Add a user-initiated 1200-bps **Reset board and retry** path. It must release the port, touch
+   only a discovered UNO R4 WiFi, poll Arduino/serial enumeration for a bounded period, match a
+   returning device by serial/FQBN before port name, then perform a fresh production handshake.
+   It will never upload firmware or reset during acquisition.
+3. Cover deterministic reset matching and handshake outcomes with mocks, including delayed and
+   changed-port returns, unrelated ports, ambiguity, no return, cancellation, and reset prohibition
+   while recording. Keep real reset verification separate from those tests.
+4. Repeat normal and post-touch handshakes, then perform the two-minute raw floating-A0
+   Until-stopped recording and export validation. Only after that normal run passes will the
+   user-assisted physical unplug/reconnect sequence be requested and documented.
+
+## Phase 1.1 controlled firmware recovery plan — 2026-08-06
+
+1. Treat the installed sketch as unknown after the Arduino analog-reading test and verify no
+   interactive monitor, production app, or diagnostic worker owns the selected UNO port.
+2. Compile and upload only `firmware/reference_unor4wifi/reference_unor4wifi.ino` to the
+   rediscovered UNO R4 WiFi. Do not restore the ESP32-S3 connectivity firmware.
+3. Use the production protocol parser to prove CRC-valid HELLO, CAPABILITIES, and PONG plus
+   reference build identity before testing the Tauri session controller.
+4. Run normal handshake and Until-stopped recording/export acceptance. Retain reset/retry as a
+   separately reported recovery result if the fresh reference firmware still exposes a reset defect.
+5. Complete only accurate manual UI and user-assisted disconnect evidence, then review current
+   work and commit without amending the accepted Phase 1 baseline.

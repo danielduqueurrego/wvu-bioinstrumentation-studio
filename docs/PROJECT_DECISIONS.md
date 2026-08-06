@@ -16,7 +16,14 @@
 - Desktop operating system: Windows 11 first
 - Communication: USB only
 - Concurrent boards: one
-- Normal recording duration: up to 10 minutes
+- UNO R4 WiFi recovery: normal handshake retry first; a 1200-bps touch reset is an explicit
+  idle-only user action with USB re-enumeration matching and no implicit firmware upload.
+- Controlled Phase 1 reference firmware identity: protocol v0.1, build `0x00010001`, and
+  UNO R4 device ID `0x554E4F34`. A successful upload is not sufficient evidence; a
+  production-parser HELLO/CAPABILITIES/PONG probe must verify these values.
+- Recording duration: explicit Timed presets/custom duration or user-selected **Until stopped**.
+  Until-stopped recording has no hidden time limit; it streams to disk, warns below 1 GiB
+  free space, and finalizes under a 250 MiB controlled-stop guard.
 - Internet: not required for normal operation after installation
 
 ## Technology stack

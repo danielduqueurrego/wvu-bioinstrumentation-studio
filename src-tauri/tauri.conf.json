@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "WVU Bioinstrumentation Studio",
-        "width": 1180,
-        "height": 760,
-        "minWidth": 960,
-        "minHeight": 640
+        "width": 1280,
+        "height": 840,
+        "minWidth": 900,
+        "minHeight": 650
       }
     ],
     "security": {

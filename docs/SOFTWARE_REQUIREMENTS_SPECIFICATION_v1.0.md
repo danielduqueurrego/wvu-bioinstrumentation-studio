@@ -70,7 +70,9 @@ The application shall provide a single-file `.ino` editor with syntax highlighti
 
 ### FR-005 Compile and upload
 
-The application shall call Arduino CLI as a subprocess, capture structured output where supported, report build size, show actionable errors, and upload to the selected UNO R4 WiFi.
+The application shall call Arduino CLI as a subprocess, capture structured output where supported, report build size, show actionable errors, and upload to the selected UNO R4 WiFi. A controlled-firmware
+installation shall not be considered verified from uploader exit status alone: the host shall receive
+CRC-valid protocol identity frames and verify the expected build/device identity before acquisition.
 
 ### FR-006 Pin assignment
 
@@ -99,7 +101,10 @@ The application shall:
 
 ### FR-009 Recording
 
-The application shall support recordings up to at least 600 seconds and write continuously to disk.
+The application shall support timed recordings up to at least 600 seconds and a user-selected
+**Until stopped** mode. It shall write continuously to disk, keep memory bounded, check available
+storage before and during an until-stopped recording, warn below 1 GiB free, and safely finalize
+before available storage falls below a 250 MiB critical threshold.
 
 ### FR-010 Session metadata
 
@@ -118,6 +123,8 @@ Required session fields:
 - Requested sample rate
 - Measured sample rate
 - Packet/sample loss counts
+- Duration mode, requested duration when timed, actual duration, and stop reason
+- Initial and final observed free disk space when available
 
 Optional fields:
 

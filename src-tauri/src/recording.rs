@@ -10,6 +10,77 @@ use std::{
 };
 pub const BMEG_MAGIC: &[u8; 8] = b"BMEGREC1";
 pub const BMEG_RECORD_BYTES: usize = 14;
+
+/// A user-selected recording duration.  The tagged representation makes an
+/// indefinite recording unambiguous at the Tauri boundary: it can never be
+/// mistaken for a timed recording with zero seconds.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum RecordingDuration {
+    Timed { seconds: u64 },
+    UntilStopped,
+}
+
+impl RecordingDuration {
+    pub const MIN_TIMED_SECONDS: u64 = 10;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Timed { seconds } if *seconds < Self::MIN_TIMED_SECONDS => {
+                Err("timed recordings must be at least 10 seconds")
+            }
+            Self::Timed { .. } | Self::UntilStopped => Ok(()),
+        }
+    }
+
+    pub fn requested_seconds(&self) -> Option<u64> {
+        match self {
+            Self::Timed { seconds } => Some(*seconds),
+            Self::UntilStopped => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Timed { .. } => "timed",
+            Self::UntilStopped => "until_stopped",
+        }
+    }
+}
+
+/// The single authoritative reason a session's recording was finalized.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    #[default]
+    User,
+    TimedComplete,
+    Disconnect,
+    StorageGuard,
+    ApplicationClose,
+    Fault,
+}
+
+impl StopReason {
+    pub fn recording_status(self) -> &'static str {
+        match self {
+            Self::User => "stopped_by_user",
+            Self::TimedComplete => "complete",
+            Self::Disconnect => "disconnected",
+            Self::StorageGuard => "storage_guard",
+            Self::ApplicationClose => "application_close",
+            Self::Fault => "faulted",
+        }
+    }
+
+    pub fn is_complete(self) -> bool {
+        matches!(
+            self,
+            Self::User | Self::TimedComplete | Self::ApplicationClose
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecordingMetadata {
     pub utc_start: DateTime<Utc>,
@@ -37,6 +108,19 @@ pub struct RecordingMetadata {
     pub bmeg_filename: String,
     pub csv_filename: Option<String>,
     pub notes: String,
+    /// Optional fields preserve read compatibility with Phase 1.0 sidecars.
+    #[serde(default)]
+    pub duration_mode: Option<String>,
+    #[serde(default)]
+    pub requested_duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub stop_reason: Option<StopReason>,
+    #[serde(default)]
+    pub initial_free_disk_bytes: Option<u64>,
+    #[serde(default)]
+    pub final_free_disk_bytes: Option<u64>,
+    #[serde(default)]
+    pub completion_status: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RawSample {
@@ -78,6 +162,14 @@ impl BmegWriter {
         self.records += 1;
         Ok(())
     }
+
+    /// Periodic flushing bounds the amount of validated data held by the OS
+    /// buffer during a long recording without retaining samples in memory.
+    pub fn flush(&mut self) -> Result<(), RecordingError> {
+        self.writer.flush()?;
+        Ok(())
+    }
+
     pub fn finish(mut self) -> Result<(), RecordingError> {
         self.writer.flush()?;
         Ok(())
@@ -218,6 +310,12 @@ mod tests {
             bmeg_filename: "r.bmeg".into(),
             csv_filename: None,
             notes: "test".into(),
+            duration_mode: Some("timed".into()),
+            requested_duration_seconds: Some(10),
+            stop_reason: None,
+            initial_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
+            final_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
+            completion_status: "complete".into(),
         };
         let bmeg = dir.path().join("r.bmeg");
         let mut w = BmegWriter::create(&bmeg, &meta).unwrap_or_else(|e| panic!("{e}"));
@@ -271,5 +369,71 @@ mod tests {
             BmegReader::open(&path),
             Err(RecordingError::Json(_))
         ));
+    }
+
+    #[test]
+    fn duration_is_explicit_and_rejects_short_timed_requests() {
+        assert!(RecordingDuration::Timed { seconds: 9 }.validate().is_err());
+        assert!(RecordingDuration::Timed { seconds: 10 }.validate().is_ok());
+        assert!(RecordingDuration::UntilStopped.validate().is_ok());
+        let json = serde_json::to_string(&RecordingDuration::UntilStopped)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(json.contains("until_stopped"));
+        assert!(!json.contains('0'));
+    }
+
+    #[test]
+    fn phase_one_metadata_without_new_fields_still_deserializes() {
+        let metadata = RecordingMetadata {
+            utc_start: Utc::now(),
+            local_start: Local::now(),
+            board: "simulator".into(),
+            com_port: "SIM".into(),
+            fqbn: "simulator".into(),
+            arduino_cli_version: "n/a".into(),
+            uno_r4_core_version: "n/a".into(),
+            firmware_build: 1,
+            protocol_version: "0.1".into(),
+            analog_pin: "A0".into(),
+            adc_bits: 12,
+            requested_sample_rate_hz: 1000,
+            measured_sample_rate_hz: 1000.0,
+            total_samples: 0,
+            integrity: IntegrityCounters::default(),
+            app_version: "test".into(),
+            simulator: true,
+            utc_stop: None,
+            local_stop: None,
+            host_elapsed_seconds: None,
+            board_elapsed_seconds: None,
+            recording_status: "complete".into(),
+            bmeg_filename: "r.bmeg".into(),
+            csv_filename: None,
+            notes: "test".into(),
+            duration_mode: Some("timed".into()),
+            requested_duration_seconds: Some(10),
+            stop_reason: Some(StopReason::TimedComplete),
+            initial_free_disk_bytes: Some(1),
+            final_free_disk_bytes: Some(1),
+            completion_status: "complete".into(),
+        };
+        let mut old = serde_json::to_value(metadata).unwrap_or_else(|e| panic!("{e}"));
+        let object = old
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("metadata is not an object"));
+        for name in [
+            "duration_mode",
+            "requested_duration_seconds",
+            "stop_reason",
+            "initial_free_disk_bytes",
+            "final_free_disk_bytes",
+            "completion_status",
+        ] {
+            object.remove(name);
+        }
+        let restored: RecordingMetadata =
+            serde_json::from_value(old).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(restored.duration_mode, None);
+        assert_eq!(restored.completion_status, "");
     }
 }
