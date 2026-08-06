@@ -54,6 +54,10 @@ Typical signals:
 - LOD-: D3
 - Event marker: D4
 
+For Phase 3A, the locked raw ECG/EMG profiles use only A0 at 12 bits and 1000 samples/s for a
+simulator, UNO-alone, or safe 0–5 V direct bench-input test. Optional notch and leads-off inputs
+are deferred. No person, electrode system, or module-to-person connection is authorized.
+
 ### Pulse Oximetry
 
 - Reflection: A0

@@ -63,6 +63,7 @@ Before acquisition, the application shall verify:
 - Configured pin validity
 - Available output directory
 - Required session metadata
+- Locked profile schema/integrity and explicit bench-only acknowledgement when required
 
 ### FR-004 Sketch editing
 
@@ -140,6 +141,7 @@ Required session fields:
 - Packet/sample loss counts
 - Duration mode, requested duration when timed, actual duration, and stop reason
 - Initial and final observed free disk space when available
+- Immutable acquisition-profile snapshot, integrity hash, lock/source state, and acknowledgement
 
 Optional fields:
 
@@ -204,6 +206,9 @@ On firmware startup, acquisition stop, command timeout, communication failure, o
 - Default ADC resolution: 12 bits
 - Display/export: counts and volts
 - No derived heart rate or EMG envelope
+- Phase 3A locks raw ECG/EMG A0 acquisition to 12-bit / 1000 samples/s for bench-only validation.
+  No person, electrode, or module-to-person connection is authorized; no clinical or physiological
+  interpretation is available.
 
 ### Pulse Oximetry
 

@@ -115,6 +115,30 @@ cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --b
 The harness uses the same workspace, firmware workflow, and serial session controller as the
 Tauri commands. It creates only a temporary student project and ignored temporary recordings.
 
+## Phase 3A locked ECG and EMG profiles
+
+Phase 3A adds the **General A0 — Development**, **ECG Module — Raw Output**, and **EMG Module —
+Raw Output** locked profiles. All are UNO R4 WiFi / A0 / 12-bit / 1000 samples/s and display only
+raw ADC counts or direct Arduino input volts (`counts * 5.0 / 4095.0`). ECG and EMG are explicitly
+bench-validation profiles: **not a medical device and no human-connected recording is authorized**.
+They require a session-local acknowledgement before recording.
+
+Student mode is the default and can select valid locked profiles only. Instructor authoring mode
+requires an explicit local acknowledgement, is not authentication, and creates new finalized
+versions from drafts rather than editing a locked package. Every recording freezes the selected
+profile snapshot into BMEG/metadata/CSV provenance. Legacy BMEG files remain readable and are
+shown as general/legacy data, never inferred to be ECG or EMG. See
+`docs/ACQUISITION_PROFILE_SCHEMA_v1.md` for the schema, SHA-256 integrity behavior, and built-in
+profile hashes.
+
+Bench-only controller captures can be reproduced with:
+
+```powershell
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase3a_profile_capture -- simulator development 10
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase3a_profile_capture -- hardware ecg 30
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase3a_profile_capture -- hardware emg 30
+```
+
 ## Phase 2 firmware workspace
 
 The **Firmware** view is a one-file Arduino workspace for the UNO R4 WiFi. A project is a

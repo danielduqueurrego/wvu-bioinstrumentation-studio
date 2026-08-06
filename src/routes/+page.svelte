@@ -1,10 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { open, save } from '@tauri-apps/plugin-dialog';
   import LivePlot from '$lib/components/LivePlot.svelte';
+  import OperatingModeControl from '$lib/components/OperatingModeControl.svelte';
   import type FirmwareWorkspaceComponent from '$lib/components/FirmwareWorkspace.svelte';
   import { connectionActions } from '$lib/connection-actions';
   import { durationRequest, isTimedDurationValid, type RecordingDurationRequest } from '$lib/duration';
+  import type { OperatingMode } from '$lib/operating-mode';
   import logoUrl from '../../assets/branding/WVU-CBE Logo.svg';
 
   type Point = { sequence: number; timestamp_us: number; counts: number };
@@ -21,7 +24,7 @@
     board_elapsed_seconds: number; host_elapsed_seconds: number; bmeg_path: string; csv_path: string;
     metadata_path: string; recording_status: string; duration: Duration; stop_reason: string;
     completion_status: string; initial_free_disk_bytes?: number; final_free_disk_bytes?: number;
-    integrity: Integrity; error?: string;
+    integrity: Integrity; error?: string; profile?: ProfileSnapshot;
   };
   type SessionStatus = {
     state: string; board: string; port: string; protocol_version: string; simulator: boolean;
@@ -46,6 +49,18 @@
   };
   type HandshakeRetryResult = { handshake_succeeded: boolean; diagnostics: ConnectionDiagnostics };
   type FirmwareWorkflowStatus = { compatibility: string };
+  type AcquisitionProfile = {
+    schema_version: number; profile_id: string; profile_version: string; display_name: string;
+    category: string; status: 'locked' | 'draft' | 'retired'; source: 'built_in' | 'instructor';
+    description: string; target_board: string; fqbn: string;
+    required_firmware: { protocol_major: number; protocol_minor_min: number; build: string; device: string };
+    acquisition: { analog_pin: string; adc_resolution_bits: number; sample_rate_hz: number; allowed_duration_modes: string[]; timed_presets_seconds: number[]; minimum_custom_duration_seconds: number };
+    display: { primary_quantity: string; channel_label: string; raw_units_label: string; voltage_units_label: string; voltage_reference_v: number; plot_min_v: number; plot_max_v: number };
+    safety: { bench_only: boolean; human_connection_authorized: boolean; not_medical_device: boolean; notices: string[] };
+    export: { signal_name: string; include_profile_snapshot: boolean };
+    integrity: { canonical_hash_algorithm: string; canonical_hash: string };
+  };
+  type ProfileSnapshot = { bench_notice_acknowledged: boolean; profile: AcquisitionProfile };
 
   const emptyIntegrity: Integrity = {
     received_packets: 0, crc_failures: 0, invalid_frames: 0, unsupported_versions: 0,
@@ -53,14 +68,6 @@
     missing_sample_sequences: 0, duplicate_sample_sequences: 0, out_of_order_sample_sequences: 0,
     firmware_overflows: 0, host_channel_overflows: 0, reconnects: 0, disconnect_events: 0
   };
-  const timedPresets = [
-    { value: '10', label: '10 seconds' },
-    { value: '30', label: '30 seconds' },
-    { value: '60', label: '60 seconds' },
-    { value: '300', label: '5 minutes' },
-    { value: '600', label: '10 minutes' },
-    { value: 'custom', label: 'Custom' }
-  ];
   const activeStates = ['Connecting', 'Connected', 'Configured', 'Acquiring', 'Stopping'];
 
   let view = 'Home';
@@ -84,6 +91,16 @@
   let polling = false;
   let FirmwareWorkspace: typeof FirmwareWorkspaceComponent | undefined;
   let firmwareCompatibility = 'unknown';
+  let acquisitionProfiles: AcquisitionProfile[] = [];
+  let selectedProfileId = 'wvu.bmeg420l.general.a0.development.v1';
+  let operatingMode: OperatingMode = 'student';
+  let modeChangeInFlight = false;
+  let benchNoticeAcknowledged = false;
+  let instructorAcknowledgement = false;
+  let draftId = 'wvu.bmeg420l.instructor.example.v1';
+  let draftDescription = '';
+  let finalDraftVersion = '1.0.1';
+  let authoringDraft: AcquisitionProfile | undefined;
 
   $: if (source === 'hardware') {
     note = 'A0 raw floating/uncalibrated engineering communication test; no human signal.';
@@ -91,11 +108,16 @@
     note = 'Simulator waveform; no human signal.';
   }
   $: timedSeconds = durationPreset === 'custom' ? Number(customSeconds) : Number(durationPreset);
+  $: activeProfile = acquisitionProfiles.find((profile) => profile.profile_id === selectedProfileId);
+  $: instructorModeActive = operatingMode === 'instructor_authoring';
+  $: profileTimedPresets = activeProfile?.acquisition.timed_presets_seconds ?? [10, 30, 60, 300, 600];
   $: timedDurationValid = isTimedDurationValid(timedSeconds);
   $: duration = durationRequest(durationMode, timedSeconds);
   $: canStart = session.state === 'Disconnected'
     && (source === 'simulator' || (Boolean(selectedPort) && firmwareCompatibility === 'wvu_protocol_compatible'))
-    && (durationMode === 'until_stopped' || timedDurationValid);
+    && Boolean(activeProfile)
+    && (durationMode === 'until_stopped' || timedDurationValid)
+    && (!activeProfile?.category || !['ecg', 'emg'].includes(activeProfile.category) || benchNoticeAcknowledged);
   $: isActive = activeStates.includes(session.state);
   $: recoveryActions = connectionActions({
     source,
@@ -165,6 +187,114 @@
     }
   }
 
+  async function refreshProfiles() {
+    try {
+      acquisitionProfiles = await invoke<AcquisitionProfile[]>('list_acquisition_profiles');
+      if (!acquisitionProfiles.some((profile) => profile.profile_id === selectedProfileId)) {
+        selectedProfileId = acquisitionProfiles[0]?.profile_id ?? '';
+      }
+      const confirmedMode = await invoke<OperatingMode>('get_profile_mode');
+      if (!modeChangeInFlight) operatingMode = confirmedMode;
+    } catch (error) {
+      statusMessage = `Profile error: ${String(error)}`;
+    }
+  }
+
+  function selectProfile() {
+    benchNoticeAcknowledged = false;
+    durationPreset = String(profileTimedPresets.includes(60) ? 60 : profileTimedPresets[0] ?? 10);
+    statusMessage = activeProfile
+      ? `${activeProfile.display_name} selected. ${activeProfile.status === 'locked' ? 'Protected settings are locked by the approved profile.' : 'Draft profile selected.'}`
+      : 'Select a valid locked acquisition profile.';
+  }
+
+  async function commitProfileMode(mode: OperatingMode) {
+    modeChangeInFlight = true;
+    try {
+      operatingMode = await invoke<OperatingMode>('set_profile_mode', {
+        mode,
+        acknowledgement: mode === 'instructor_authoring' && instructorAcknowledgement
+      });
+      statusMessage = operatingMode === 'instructor_authoring'
+        ? 'Instructor authoring mode is enabled locally. It is a workflow guard, not authentication.'
+        : 'Student mode is enabled. Locked profile settings cannot be edited.';
+    } catch (error) {
+      // The backend remains authoritative if a local command failure occurs.
+      try {
+        operatingMode = await invoke<OperatingMode>('get_profile_mode');
+      } catch {
+        operatingMode = 'student';
+      }
+      statusMessage = `Mode change error: ${String(error)}`;
+    } finally {
+      modeChangeInFlight = false;
+    }
+  }
+
+  function onModeConfirmed(mode: OperatingMode) {
+    if (modeChangeInFlight || session.state !== 'Disconnected') return;
+    void commitProfileMode(mode);
+  }
+
+  function onInstructorBlocked() {
+    statusMessage = 'Confirm that instructor mode can change acquisition settings, then select Instructor authoring.';
+  }
+
+  async function duplicateDraft() {
+    try {
+      authoringDraft = await invoke<AcquisitionProfile>('duplicate_profile_to_draft', { profileId: selectedProfileId, draftId });
+      draftDescription = authoringDraft.description;
+      statusMessage = `Draft ${authoringDraft.profile_id} created. Only its descriptive field is editable in this Phase 3A interface.`;
+    } catch (error) { statusMessage = `Draft error: ${String(error)}`; }
+  }
+
+  async function finalizeDraft() {
+    if (!authoringDraft) return;
+    try {
+      await invoke<AcquisitionProfile>('update_profile_draft_description', { profileId: authoringDraft.profile_id, profileVersion: authoringDraft.profile_version, description: draftDescription });
+      const finalized = await invoke<AcquisitionProfile>('finalize_profile_draft', { profileId: authoringDraft.profile_id, profileVersion: authoringDraft.profile_version, finalVersion: finalDraftVersion });
+      authoringDraft = undefined;
+      await refreshProfiles();
+      selectedProfileId = finalized.profile_id;
+      statusMessage = `Finalized ${finalized.display_name} ${finalized.profile_version}; its SHA-256 integrity hash is now locked.`;
+    } catch (error) { statusMessage = `Finalize error: ${String(error)}`; }
+  }
+
+  async function importProfilePackage() {
+    try {
+      const selected = await open({ multiple: false, filters: [{ name: 'Acquisition profile', extensions: ['json'] }] });
+      if (typeof selected !== 'string') return;
+      const imported = await invoke<AcquisitionProfile>('import_profile_package', { source: selected });
+      await refreshProfiles();
+      selectedProfileId = imported.profile_id;
+      statusMessage = `Imported and validated locked profile ${imported.profile_id} ${imported.profile_version}.`;
+    } catch (error) { statusMessage = `Profile import error: ${String(error)}`; }
+  }
+
+  async function exportProfilePackage() {
+    if (!activeProfile) return;
+    try {
+      const destination = await save({ defaultPath: `${activeProfile.profile_id}_${activeProfile.profile_version}.profile.json`, filters: [{ name: 'Acquisition profile', extensions: ['json'] }] });
+      if (!destination) return;
+      await invoke('export_profile_package', { profileId: activeProfile.profile_id, profileVersion: activeProfile.profile_version, destination });
+      statusMessage = `Exported the validated locked profile package to ${destination}.`;
+    } catch (error) { statusMessage = `Profile export error: ${String(error)}`; }
+  }
+
+  async function retireSelectedProfile() {
+    if (!activeProfile || activeProfile.source !== 'instructor') return;
+    try {
+      await invoke('retire_profile', {
+        profileId: activeProfile.profile_id,
+        profileVersion: activeProfile.profile_version
+      });
+      const retiredName = `${activeProfile.display_name} ${activeProfile.profile_version}`;
+      await refreshProfiles();
+      selectedProfileId = acquisitionProfiles[0]?.profile_id ?? '';
+      statusMessage = `Retired ${retiredName} from the active selection list. Existing recording provenance remains unchanged.`;
+    } catch (error) { statusMessage = `Retire error: ${String(error)}`; }
+  }
+
   async function startRecording() {
     if (!canStart) {
       statusMessage = 'Choose a valid timed duration of at least 10 seconds, or select Until stopped.';
@@ -173,8 +303,8 @@
     statusMessage = 'Connecting through the Rust production session controller…';
     try {
       session = source === 'simulator'
-        ? await invoke<SessionStatus>('start_simulator_recording', { outputDirectory, duration })
-        : await invoke<SessionStatus>('start_hardware_recording', { port: selectedPort, outputDirectory, duration });
+        ? await invoke<SessionStatus>('start_profile_simulator_recording', { outputDirectory, duration, profileId: selectedProfileId, benchNoticeAcknowledged })
+        : await invoke<SessionStatus>('start_profile_hardware_recording', { port: selectedPort, outputDirectory, duration, profileId: selectedProfileId, benchNoticeAcknowledged });
       view = 'Acquisition';
     } catch (error) {
       statusMessage = `Start error: ${String(error)}`;
@@ -250,6 +380,7 @@
     void refreshBoards();
     void pollSession();
     void refreshFirmwareCompatibility();
+    void refreshProfiles();
     const timer = window.setInterval(() => void pollSession(), 40); // 25 Hz; no per-sample events.
     const firmwareTimer = window.setInterval(() => void refreshFirmwareCompatibility(), 750);
     return () => {
@@ -296,6 +427,37 @@
           <p class="warning" role="status">Hardware recording is disabled until the selected UNO R4 WiFi proves the controlled WVU firmware identity. Open <button class="inline-action" onclick={() => void selectView('Firmware')}>Firmware</button> and use Verify WVU firmware or Restore WVU reference firmware.</p>
         {/if}
 
+        <section class="panel profile-panel" aria-labelledby="profile-title">
+          <div class="panel-heading"><div><h3 id="profile-title">Acquisition profile</h3><p class="help">Profiles bind protected acquisition settings, safety notices, firmware requirements, and export provenance.</p></div><span class:locked={!instructorModeActive} class="mode-badge">{instructorModeActive ? 'Instructor authoring' : 'Student mode'}</span></div>
+          <OperatingModeControl bind:operatingMode bind:instructorAcknowledgement disabled={session.state !== 'Disconnected' || modeChangeInFlight} {onModeConfirmed} {onInstructorBlocked} />
+          {#if instructorModeActive}
+            <section class="authoring" aria-label="Instructor draft profile workflow">
+              <p class="warning">Instructor mode is a local workflow guard, not strong authentication. Finalizing creates a new locked version; it does not alter built-in profiles.</p>
+              <div class="control-grid"><label>New draft profile ID <input bind:value={draftId} /></label><div class="field-action"><span>Draft from selected locked profile</span><button onclick={duplicateDraft}>Duplicate to draft</button></div></div>
+              {#if authoringDraft}<div class="control-grid"><label>Draft description <input bind:value={draftDescription} /></label><label>Final version <input bind:value={finalDraftVersion} placeholder="1.0.1" /></label><div class="field-action"><span>Finalize immutable package</span><button class="gold" onclick={finalizeDraft}>Validate and finalize</button></div></div>{/if}
+              <div class="button-pair"><button onclick={importProfilePackage}>Import locked profile package</button><button onclick={exportProfilePackage} disabled={!activeProfile}>Export selected profile</button>{#if activeProfile?.source === 'instructor'}<button onclick={retireSelectedProfile}>Retire selected instructor profile</button>{/if}</div>
+            </section>
+          {/if}
+          <label>Approved profile
+            <select bind:value={selectedProfileId} onchange={selectProfile} disabled={session.state !== 'Disconnected'}>
+              {#each acquisitionProfiles as profile}<option value={profile.profile_id}>{profile.display_name} — {profile.profile_version}</option>{/each}
+            </select>
+          </label>
+          {#if activeProfile}
+            <div class="profile-details">
+              <span><strong>Profile</strong>{activeProfile.profile_id} / {activeProfile.profile_version}</span><span><strong>Category / source</strong>{activeProfile.category} / {activeProfile.source}</span><span><strong>Lock status</strong>{activeProfile.status}; protected pin, ADC, rate, firmware requirement, safety, and units cannot be changed in Student mode.</span>
+              <span><strong>Channel / units</strong>{activeProfile.display.channel_label}; {activeProfile.display.raw_units_label} and Arduino input {activeProfile.display.voltage_units_label} only</span><span><strong>Protected acquisition</strong>{activeProfile.acquisition.analog_pin}, {activeProfile.acquisition.adc_resolution_bits} bit, {activeProfile.acquisition.sample_rate_hz} samples/s</span><span><strong>Firmware requirement</strong>Protocol {activeProfile.required_firmware.protocol_major}.{activeProfile.required_firmware.protocol_minor_min}+; build {activeProfile.required_firmware.build}; device {activeProfile.required_firmware.device}</span>
+              <span class="profile-hash"><strong>Integrity</strong>{activeProfile.integrity.canonical_hash_algorithm} {activeProfile.integrity.canonical_hash}</span>
+            </div>
+            {#each activeProfile.safety.notices as notice}<p class="warning profile-notice">{notice}</p>{/each}
+            {#if ['ecg', 'emg'].includes(activeProfile.category)}
+              <label class="acknowledgement"><input type="checkbox" bind:checked={benchNoticeAcknowledged} disabled={session.state !== 'Disconnected'} /> I acknowledge this {activeProfile.category.toUpperCase()} profile is bench-validation only. No human-connected recording is authorized.</label>
+            {/if}
+          {:else}
+            <p class="error">No valid locked profile is available. Refresh the application or contact the instructor.</p>
+          {/if}
+        </section>
+
         <section class="panel" aria-labelledby="setup-title">
           <h3 id="setup-title">Session setup</h3>
           <div class="control-grid">
@@ -314,9 +476,9 @@
               </label>
             {/if}
             <label>Output folder <input bind:value={outputDirectory} disabled={session.state !== 'Disconnected'} aria-describedby="output-help" /></label>
-            <label>Analog pin <input value="A0" readonly /></label>
-            <label>ADC resolution <input value="12 bit" readonly /></label>
-            <label>Sample rate <input value="1000 samples/s" readonly /></label>
+            <label>Analog pin <input value={activeProfile?.acquisition.analog_pin ?? '—'} readonly title="Protected by the selected profile" /></label>
+            <label>ADC resolution <input value={activeProfile ? `${activeProfile.acquisition.adc_resolution_bits} bit` : '—'} readonly title="Protected by the selected profile" /></label>
+            <label>Sample rate <input value={activeProfile ? `${activeProfile.acquisition.sample_rate_hz} samples/s` : '—'} readonly title="Protected by the selected profile" /></label>
             <label>Test note <input bind:value={note} readonly /></label>
           </div>
           <p id="output-help" class="help">Files use a controlled timestamped Phase 1 name. Existing files are never overwritten.</p>
@@ -335,7 +497,7 @@
             <div class="duration-controls">
               <label>Timed preset
                 <select bind:value={durationPreset} disabled={session.state !== 'Disconnected'}>
-                  {#each timedPresets as preset}<option value={preset.value}>{preset.label}</option>{/each}
+                  {#each profileTimedPresets as preset}<option value={String(preset)}>{preset >= 60 ? `${preset / 60} minute${preset === 60 ? '' : 's'}` : `${preset} seconds`}</option>{/each}<option value="custom">Custom</option>
                 </select>
               </label>
               {#if durationPreset === 'custom'}
@@ -395,6 +557,7 @@
         {#if session.last_summary}
           <section class="panel paths">
             <h3>Finalized files</h3>
+            {#if session.last_summary.profile}<p><strong>Profile provenance:</strong> {session.last_summary.profile.profile.profile_id} {session.last_summary.profile.profile.profile_version}</p>{/if}
             <p title={session.last_summary.bmeg_path}>{session.last_summary.bmeg_path}</p>
             <p title={session.last_summary.metadata_path}>{session.last_summary.metadata_path}</p>
             <p title={session.last_summary.csv_path}>{session.last_summary.csv_path}</p>
@@ -436,6 +599,11 @@
   .content.wide-content { max-width: none; justify-self: stretch; }
   h2 { margin-top: 0; } h3 { margin: 0 0 .8rem; } .notice, .warning { border-left: 5px solid #EEAA00; background: #fff8e8; padding: .75rem; } .warning { border-color: #9b6700; }
   .panel { min-width: 0; margin: 1rem 0; padding: clamp(.8rem, 2vw, 1rem); background: #fff; border: 1px solid #d7dde2; border-radius: .35rem; }
+  .panel-heading { display: flex; min-width: 0; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: start; } .panel-heading .help { max-width: 75ch; }
+  .mode-badge { border: 1px solid #855a00; border-radius: 999px; padding: .35rem .6rem; background: #fff4dd; color: #684600; font-weight: 700; white-space: nowrap; } .mode-badge.locked { border-color: #176c33; background: #eaf6ee; color: #174f27; }
+  .profile-panel > label { margin-top: .8rem; } .profile-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: .55rem; margin-top: .8rem; } .profile-details span { min-width: 0; padding: .6rem .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; overflow-wrap: anywhere; } .profile-details strong { display: block; color: #42515d; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; } .profile-hash { font-family: Consolas, "Cascadia Code", monospace; font-size: .82rem; } .profile-notice { margin: .6rem 0 0; }
+  .acknowledgement { display: flex; gap: .55rem; align-items: flex-start; margin-top: .75rem; padding: .7rem; background: #fff4dd; border: 1px solid #9b6700; font-weight: 700; } .acknowledgement input { width: auto; min-height: auto; margin-top: .2rem; } .authoring { margin-top: .8rem; padding-top: .8rem; border-top: 1px solid #d7dde2; }
+  .button-pair { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .8rem; } .button-pair button { flex: 0 1 18rem; }
   .control-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .8rem; align-items: end; }
   label, .field-action { min-width: 0; display: grid; gap: .3rem; font-weight: 600; } .field-action > span { font-size: .9rem; }
   input, select { min-width: 0; width: 100%; min-height: 2.4rem; border: 1px solid #8493a0; border-radius: .25rem; background: #fff; padding: .35rem .5rem; }

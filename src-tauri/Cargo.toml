@@ -27,6 +27,11 @@ name = "phase2_firmware_capture"
 path = "src/bin/phase2_firmware_capture.rs"
 required-features = ["acceptance-harness"]
 
+[[bin]]
+name = "phase3a_profile_capture"
+path = "src/bin/phase3a_profile_capture.rs"
+required-features = ["acceptance-harness"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -40,6 +45,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 serialport = "4.9.0"
 fs2 = "0.4.3"
 tauri-plugin-dialog = "2"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3.27.0"

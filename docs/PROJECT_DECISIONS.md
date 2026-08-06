@@ -84,6 +84,19 @@ Instructor-controlled profiles are required for:
 
 Profile files are versioned JSON, validated against a schema, and cannot be silently changed by the student interface.
 
+## Phase 3A ECG/EMG profile decisions
+
+- Phase 3A includes locked General A0, ECG raw-output, and EMG raw-output packages. All bind A0,
+  12-bit ADC, 1000 samples/s, direct 0–5 V Arduino input conversion, the controlled v0.1
+  firmware identity, and timed/Until-stopped duration rules.
+- SHA-256 covers deterministic canonical profile serialization excluding the hash field. It is
+  integrity detection only—not a signature, authentication system, or human-use authorization.
+- Student mode is default. Instructor authoring is a local acknowledged workflow guard; drafts
+  must be finalized to a new locked version and cannot mutate built-ins.
+- ECG/EMG profile selection, metadata, CSV, and BMEG provenance always say bench-only/not medical
+  device/no human-connected recording authorized. No physiological quantity or interpretation is
+  created by Phase 3A.
+
 ## Measurement policy
 
 - Default output is raw ADC counts.

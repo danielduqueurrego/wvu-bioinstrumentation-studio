@@ -5,6 +5,7 @@
 //! under a short mutex so polling the UI never waits for serial I/O.
 use crate::{
     acquisition::{AcquisitionController, AcquisitionSnapshot},
+    profiles::{built_in_profiles, ProfileSnapshot, ProfileStatus},
     protocol::{
         encode_frame, Frame, FrameParser, IntegrityCounters, MessageType, SampleBatch,
         REFERENCE_DEVICE_ID, REFERENCE_FIRMWARE_BUILD,
@@ -188,6 +189,7 @@ pub struct SessionSummary {
     pub final_free_disk_bytes: Option<u64>,
     pub integrity: IntegrityCounters,
     pub error: Option<String>,
+    pub profile: ProfileSnapshot,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -210,6 +212,7 @@ pub struct SessionStatus {
     pub connection_diagnostics: Option<ConnectionDiagnostics>,
     pub last_error: Option<String>,
     pub last_summary: Option<SessionSummary>,
+    pub profile: Option<ProfileSnapshot>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -256,6 +259,7 @@ struct SessionRuntime {
     storage_warning: Option<String>,
     stop_reason: Option<StopReason>,
     connection_diagnostics: Option<ConnectionDiagnostics>,
+    profile: Option<ProfileSnapshot>,
 }
 
 impl Default for SessionController {
@@ -286,6 +290,7 @@ impl SessionController {
                 storage_warning: None,
                 stop_reason: None,
                 connection_diagnostics: None,
+                profile: None,
             })),
             cancel: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
@@ -319,10 +324,21 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: PathBuf,
     ) -> Result<SessionStatus, SessionError> {
+        self.start_simulator_with_profile(default_general_profile()?, duration, output_dir)
+    }
+
+    pub fn start_simulator_with_profile(
+        &self,
+        profile: ProfileSnapshot,
+        duration: RecordingDuration,
+        output_dir: PathBuf,
+    ) -> Result<SessionStatus, SessionError> {
         self.validate_duration(&duration)?;
-        self.begin_session(true, "Simulator", "SIM", duration.clone())?;
+        self.begin_session(true, "Simulator", "SIM", duration.clone(), profile.clone())?;
         let controller = self.clone();
-        self.spawn_worker(move || controller.capture_simulator_worker(duration, output_dir))?;
+        self.spawn_worker(move || {
+            controller.capture_simulator_worker(profile, duration, output_dir)
+        })?;
         self.status()
     }
 
@@ -333,11 +349,27 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: PathBuf,
     ) -> Result<SessionStatus, SessionError> {
+        self.start_serial_with_profile(default_general_profile()?, port_name, duration, output_dir)
+    }
+
+    pub fn start_serial_with_profile(
+        &self,
+        profile: ProfileSnapshot,
+        port_name: String,
+        duration: RecordingDuration,
+        output_dir: PathBuf,
+    ) -> Result<SessionStatus, SessionError> {
         self.validate_duration(&duration)?;
-        self.begin_session(false, "Arduino UNO R4 WiFi", &port_name, duration.clone())?;
+        self.begin_session(
+            false,
+            "Arduino UNO R4 WiFi",
+            &port_name,
+            duration.clone(),
+            profile.clone(),
+        )?;
         let controller = self.clone();
         self.spawn_worker(move || {
-            controller.capture_serial_worker(port_name, duration, output_dir)
+            controller.capture_serial_worker(profile, port_name, duration, output_dir)
         })?;
         self.status()
     }
@@ -348,9 +380,18 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: &Path,
     ) -> Result<SessionSummary, SessionError> {
+        self.capture_simulator_with_profile(default_general_profile()?, duration, output_dir)
+    }
+
+    pub fn capture_simulator_with_profile(
+        &self,
+        profile: ProfileSnapshot,
+        duration: RecordingDuration,
+        output_dir: &Path,
+    ) -> Result<SessionSummary, SessionError> {
         self.validate_duration(&duration)?;
-        self.begin_session(true, "Simulator", "SIM", duration.clone())?;
-        self.capture_simulator_worker(duration, output_dir.to_path_buf())?;
+        self.begin_session(true, "Simulator", "SIM", duration.clone(), profile.clone())?;
+        self.capture_simulator_worker(profile, duration, output_dir.to_path_buf())?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "simulator session did not produce a summary",
         ))
@@ -363,8 +404,18 @@ impl SessionController {
         output_dir: &Path,
     ) -> Result<SessionSummary, SessionError> {
         let duration = RecordingDuration::Timed { seconds };
-        self.begin_session(true, "Simulator", "SIM", duration.clone())?;
-        self.capture_simulator_worker(duration, output_dir.to_path_buf())?;
+        self.begin_session(
+            true,
+            "Simulator",
+            "SIM",
+            duration.clone(),
+            default_general_profile()?,
+        )?;
+        self.capture_simulator_worker(
+            default_general_profile()?,
+            duration,
+            output_dir.to_path_buf(),
+        )?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "simulator session did not produce a summary",
         ))
@@ -377,9 +428,35 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: &Path,
     ) -> Result<SessionSummary, SessionError> {
+        self.capture_serial_with_profile(
+            default_general_profile()?,
+            port_name,
+            duration,
+            output_dir,
+        )
+    }
+
+    pub fn capture_serial_with_profile(
+        &self,
+        profile: ProfileSnapshot,
+        port_name: &str,
+        duration: RecordingDuration,
+        output_dir: &Path,
+    ) -> Result<SessionSummary, SessionError> {
         self.validate_duration(&duration)?;
-        self.begin_session(false, "Arduino UNO R4 WiFi", port_name, duration.clone())?;
-        self.capture_serial_worker(port_name.to_owned(), duration, output_dir.to_path_buf())?;
+        self.begin_session(
+            false,
+            "Arduino UNO R4 WiFi",
+            port_name,
+            duration.clone(),
+            profile.clone(),
+        )?;
+        self.capture_serial_worker(
+            profile,
+            port_name.to_owned(),
+            duration,
+            output_dir.to_path_buf(),
+        )?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "serial session did not produce a summary",
         ))
@@ -653,7 +730,9 @@ impl SessionController {
         board: &str,
         port: &str,
         duration: RecordingDuration,
+        profile: ProfileSnapshot,
     ) -> Result<(), SessionError> {
+        validate_profile_snapshot(&profile)?;
         let mut runtime = self.lock_runtime()?;
         if runtime.state != SessionState::Disconnected {
             return Err(SessionError::State(
@@ -681,6 +760,7 @@ impl SessionController {
         } else {
             Some(ConnectionDiagnostics::new(port))
         };
+        runtime.profile = Some(profile);
         self.cancel.store(false, Ordering::Release);
         let mut stop_reason = self
             .stop_reason
@@ -712,13 +792,14 @@ impl SessionController {
 
     fn capture_simulator_worker(
         &self,
+        profile: ProfileSnapshot,
         duration: RecordingDuration,
         output_dir: PathBuf,
     ) -> Result<(), SessionError> {
         let result = (|| {
             let mut simulator = SimulatorIo::new(duration.clone())?;
             self.set_state(SessionState::Connected)?;
-            self.capture_transport(&mut simulator, true, "SIM", duration, &output_dir)
+            self.capture_transport(&mut simulator, true, "SIM", profile, duration, &output_dir)
         })();
         self.finish_worker_error(&result)?;
         result
@@ -726,6 +807,7 @@ impl SessionController {
 
     fn capture_serial_worker(
         &self,
+        profile: ProfileSnapshot,
         port_name: String,
         duration: RecordingDuration,
         output_dir: PathBuf,
@@ -742,7 +824,7 @@ impl SessionController {
             // wait_for_handshake passively listens through the bounded startup grace
             // before its first PING, so a healthy board can announce itself first.
             self.set_state(SessionState::Connected)?;
-            self.capture_transport(&mut port, false, &port_name, duration, &output_dir)
+            self.capture_transport(&mut port, false, &port_name, profile, duration, &output_dir)
         })();
         self.finish_worker_error(&result)?;
         result
@@ -753,11 +835,12 @@ impl SessionController {
         io: &mut T,
         simulator: bool,
         source: &str,
+        profile: ProfileSnapshot,
         duration: RecordingDuration,
         output_dir: &Path,
     ) -> Result<(), SessionError> {
         // Collect tooling provenance before START so no external command can delay raw intake.
-        let (temporary_bmeg, bmeg, csv, metadata) = self.allocate_paths(output_dir)?;
+        let (temporary_bmeg, bmeg, csv, metadata) = self.allocate_paths(output_dir, &profile)?;
         let initial_free_disk_bytes = self.free_disk_space(output_dir)?;
         self.update_disk_space(initial_free_disk_bytes)?;
         if initial_free_disk_bytes < DISK_CRITICAL_BYTES {
@@ -768,7 +851,8 @@ impl SessionController {
                 DISK_CRITICAL_BYTES / (1024 * 1024)
             )));
         }
-        let mut initial_meta = self.initial_metadata(simulator, source, &bmeg, &duration)?;
+        let mut initial_meta =
+            self.initial_metadata(simulator, source, &bmeg, &duration, &profile)?;
         initial_meta.initial_free_disk_bytes = Some(initial_free_disk_bytes);
         let (tx, rx) = sync_channel(4_096);
         let mut acquisition = AcquisitionController::new(tx);
@@ -777,7 +861,7 @@ impl SessionController {
             io,
             MessageType::Configure,
             1,
-            vec![0xe8, 3, 0, 0, 12, 1, 0, 0],
+            configure_payload(&profile.profile.acquisition)?,
         )?;
         self.wait_until(io, &mut acquisition, |s| s.config_ack_seen, "CONFIG_ACK")?;
         acquisition.configure().map_err(SessionError::State)?;
@@ -913,6 +997,7 @@ impl SessionController {
             error: terminal_error
                 .as_ref()
                 .map(std::string::ToString::to_string),
+            profile,
         };
         self.set_summary(summary.clone())?;
         self.set_runtime_stop_reason(reason)?;
@@ -958,6 +1043,7 @@ impl SessionController {
         let mut next_ping = started + startup_grace;
         let mut ping_attempts = 0u32;
         let mut bytes_received = 0u64;
+        let mut valid_packets_seen = 0u64;
         let mut buffer = [0u8; 256];
 
         while Instant::now() < deadline {
@@ -989,6 +1075,17 @@ impl SessionController {
                 }
             }
             let snapshot = acquisition.snapshot();
+            if snapshot.integrity.received_packets > valid_packets_seen {
+                // A fragmented valid handshake is progress.  Do not inject an
+                // unnecessary PING between its HELLO/CAPABILITIES/PONG frames.
+                // Passive HELLO/CAPABILITIES traffic must not postpone the
+                // first scheduled PING, because the required PONG has not yet
+                // been solicited.
+                valid_packets_seen = snapshot.integrity.received_packets;
+                if ping_attempts > 0 {
+                    next_ping = Instant::now() + ping_interval;
+                }
+            }
             self.update_snapshot(&snapshot)?;
             if snapshot.hello_seen && snapshot.capabilities_seen && snapshot.pong_seen {
                 if let Some(category) = firmware_identity_failure_category(&snapshot) {
@@ -1119,6 +1216,7 @@ impl SessionController {
         source: &str,
         bmeg: &Path,
         duration: &RecordingDuration,
+        profile: &ProfileSnapshot,
     ) -> Result<RecordingMetadata, SessionError> {
         let (arduino_cli_version, uno_r4_core_version) = if simulator {
             ("not applicable".into(), "not applicable".into())
@@ -1154,9 +1252,9 @@ impl SessionController {
             uno_r4_core_version,
             firmware_build: REFERENCE_FIRMWARE_BUILD,
             protocol_version: "0.1".into(),
-            analog_pin: "A0".into(),
-            adc_bits: 12,
-            requested_sample_rate_hz: 1_000,
+            analog_pin: profile.profile.acquisition.analog_pin.clone(),
+            adc_bits: profile.profile.acquisition.adc_resolution_bits,
+            requested_sample_rate_hz: profile.profile.acquisition.sample_rate_hz,
             measured_sample_rate_hz: 0.0,
             total_samples: 0,
             integrity: IntegrityCounters::default(),
@@ -1170,7 +1268,11 @@ impl SessionController {
             bmeg_filename: file_name_string(bmeg).unwrap_or_else(|_| "recording.bmeg".into()),
             csv_filename: None,
             notes: if simulator {
-                "Deterministic simulator waveform; no human signal.".into()
+                match profile.profile.category.as_str() {
+                    "ecg" => "Synthetic ECG-like teaching waveform; nonphysiological and not a physical module validation.".into(),
+                    "emg" => "Synthetic EMG-like teaching waveform; nonphysiological and not a physical module validation.".into(),
+                    _ => "Deterministic simulator waveform; no human signal.".into(),
+                }
             } else {
                 "A0 raw floating/uncalibrated engineering communication test; no human signal."
                     .into()
@@ -1181,17 +1283,26 @@ impl SessionController {
             initial_free_disk_bytes: None,
             final_free_disk_bytes: None,
             completion_status: "active".into(),
+            profile_snapshot: Some(profile.clone()),
         })
     }
 
     fn allocate_paths(
         &self,
         output_dir: &Path,
+        profile: &ProfileSnapshot,
     ) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), SessionError> {
         fs::create_dir_all(output_dir)?;
         let stamp = Local::now().format("%Y%m%d_%H%M%S");
         for run in 1..=99 {
-            let base = output_dir.join(format!("{stamp}_Phase1_A0_Run{run:02}"));
+            let name = match profile.profile.category.as_str() {
+                "development" => "Phase1_A0".to_string(),
+                category => format!(
+                    "Phase3A_{}",
+                    crate::profiles::safe_filename_component(category)
+                ),
+            };
+            let base = output_dir.join(format!("{stamp}_{name}_Run{run:02}"));
             let bmeg = base.with_extension("bmeg");
             let csv = base.with_extension("csv");
             let metadata = base.with_extension("metadata.json");
@@ -1362,6 +1473,7 @@ impl SessionController {
             connection_diagnostics: runtime.connection_diagnostics.clone(),
             last_error: runtime.last_error.clone(),
             last_summary: runtime.last_summary.clone(),
+            profile: runtime.profile.clone(),
         }
     }
 
@@ -1427,6 +1539,56 @@ fn file_name_string(path: &Path) -> Result<String, SessionError> {
         .and_then(|name| name.to_str())
         .map(str::to_owned)
         .ok_or(SessionError::State("recording filename is invalid"))
+}
+
+fn default_general_profile() -> Result<ProfileSnapshot, SessionError> {
+    let profile = built_in_profiles()
+        .map_err(|error| SessionError::Protocol(error.to_string()))?
+        .into_iter()
+        .find(|profile| profile.category == "development")
+        .ok_or(SessionError::State("the General A0 profile is unavailable"))?;
+    Ok(profile.snapshot(false))
+}
+
+fn validate_profile_snapshot(snapshot: &ProfileSnapshot) -> Result<(), SessionError> {
+    snapshot
+        .profile
+        .validate()
+        .map_err(|error| SessionError::Protocol(error.to_string()))?;
+    if snapshot.profile.status != ProfileStatus::Locked {
+        return Err(SessionError::State(
+            "only a validated locked profile may start acquisition",
+        ));
+    }
+    if snapshot.profile.requires_bench_acknowledgement() && !snapshot.bench_notice_acknowledged {
+        return Err(SessionError::State(
+            "acknowledge the bench-only ECG/EMG notice before recording",
+        ));
+    }
+    Ok(())
+}
+
+fn configure_payload(
+    settings: &crate::profiles::AcquisitionSettings,
+) -> Result<Vec<u8>, SessionError> {
+    let pin = match settings.analog_pin.as_str() {
+        "A0" => 0,
+        "A1" => 1,
+        "A2" => 2,
+        "A3" => 3,
+        "A4" => 4,
+        "A5" => 5,
+        _ => return Err(SessionError::State("profile analog pin is unsupported")),
+    };
+    if settings.adc_resolution_bits != 12 || settings.sample_rate_hz != 1_000 {
+        return Err(SessionError::State(
+            "profile requests an unsupported firmware configuration",
+        ));
+    }
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&settings.sample_rate_hz.to_le_bytes());
+    payload.extend_from_slice(&[settings.adc_resolution_bits, 1, pin, 0]);
+    Ok(payload)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1969,6 +2131,7 @@ mod tests {
                 "Arduino UNO R4 WiFi",
                 "COM12",
                 RecordingDuration::Timed { seconds: 10 },
+                default_general_profile().unwrap_or_else(|e| panic!("{e}")),
             )
             .unwrap_or_else(|e| panic!("{e}"));
         session
@@ -2149,7 +2312,13 @@ mod tests {
         let duration = RecordingDuration::Timed { seconds: 15 * 60 };
         let bmeg = dir.path().join("soak.bmeg");
         let metadata = session
-            .initial_metadata(true, "SIM", &bmeg, &duration)
+            .initial_metadata(
+                true,
+                "SIM",
+                &bmeg,
+                &duration,
+                &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
+            )
             .unwrap_or_else(|e| panic!("{e}"));
         let mut writer = BmegWriter::create(&bmeg, &metadata).unwrap_or_else(|e| panic!("{e}"));
         let (sender, receiver) = sync_channel(4_096);
@@ -2260,6 +2429,7 @@ mod tests {
                 "Simulator",
                 "SIM",
                 RecordingDuration::Timed { seconds: 2 },
+                default_general_profile().unwrap_or_else(|e| panic!("{e}")),
             )
             .unwrap_or_else(|e| panic!("{e}"));
         session
@@ -2271,22 +2441,58 @@ mod tests {
             reads: 0,
             fail_after: 300,
         };
-        assert!(session
+        let capture_error = session
             .capture_transport(
                 &mut transport,
                 true,
                 "SIM",
+                default_general_profile().unwrap_or_else(|e| panic!("{e}")),
                 RecordingDuration::Timed { seconds: 2 },
                 dir.path(),
             )
-            .is_err());
-        let summary = session
-            .status()
-            .unwrap_or_else(|e| panic!("{e}"))
-            .last_summary
-            .unwrap_or_else(|| panic!("missing interrupted summary"));
+            .err()
+            .unwrap_or_else(|| panic!("disconnecting transport unexpectedly completed"));
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        let summary = status.last_summary.unwrap_or_else(|| {
+            panic!(
+                "missing interrupted summary after {capture_error}; state={:?}, reads={}",
+                status.state, transport.reads
+            )
+        });
         assert_eq!(summary.recording_status, "disconnected");
         assert_eq!(summary.integrity.disconnect_events, 1);
         assert!(BmegReader::open(Path::new(&summary.bmeg_path)).is_ok());
+    }
+
+    #[test]
+    fn profile_acknowledgement_and_snapshot_are_enforced_before_acquisition() {
+        let session = SessionController::default();
+        let ecg = built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "ecg")
+            .unwrap_or_else(|| panic!("missing ECG profile"));
+        assert!(session
+            .begin_session(
+                true,
+                "Simulator",
+                "SIM",
+                RecordingDuration::Timed { seconds: 10 },
+                ecg.snapshot(false)
+            )
+            .is_err());
+        let snapshot = ecg.snapshot(true);
+        session
+            .begin_session(
+                true,
+                "Simulator",
+                "SIM",
+                RecordingDuration::Timed { seconds: 10 },
+                snapshot.clone(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.profile, Some(snapshot));
+        session.disconnect().unwrap_or_else(|e| panic!("{e}"));
     }
 }

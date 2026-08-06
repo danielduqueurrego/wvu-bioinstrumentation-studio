@@ -144,6 +144,15 @@ the frontend and keeps a job visible until its terminal result and diagnostic lo
 
 ## 6. Development phases
 
+### Phase 3A — locked raw ECG/EMG profile foundation
+
+- Versioned validated profile packages and SHA-256 integrity checks
+- Student selection and locally acknowledged instructor draft/finalize workflow
+- Frozen profile snapshot in BMEG/metadata/CSV provenance
+- Bench-only ECG/EMG A0 raw acquisition at 12-bit / 1000 Hz
+- No human authorization, module characterization, physiological interpretation, leads-off,
+  optional notch channel, or EMG 2000 Hz work
+
 ### Phase 1 — tested vertical slice
 
 - Repository and toolchain

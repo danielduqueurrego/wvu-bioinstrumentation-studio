@@ -18,6 +18,10 @@
   numeric Windows scaling and separate 1024 × 768, 1366 × 768, and 1920 × 1080 observations were
   not recorded; they remain a nonblocking verification/documentation follow-up rather than a
   reported layout defect. See `logs/phase2_firmware_workspace_acceptance_2026-08-06.md`.
+- Phase 3A is accepted for its bench-only profile framework and focused manual verification at
+  3440 × 1392 / 100% scaling. Separate 900 × 650, 1024 × 768, 1366 × 768, 1920 × 1080,
+  maximized, 125%, and 150% viewport/scaling observations remain pending documentation follow-up;
+  they are not claimed as tested. See `logs/phase3a_manual_ui_verification_2026-08-06.md`.
 - Rust exists at `C:\Users\dd00055\.cargo\bin` but is not on the persistent PowerShell PATH.
   Prepend it for the session or repair the user PATH entry.
 - Phase 1 intentionally has no firmware editor, pulse-ox sequence, calibration wizard,

@@ -16,6 +16,8 @@ struct AppState {
     session: session::SessionController,
     /// One firmware workflow coordinates CLI jobs with the same serial-session boundary.
     firmware: firmware_workflow::FirmwareWorkflow,
+    /// Profiles are independent of firmware editing but bind every Phase 3A recording.
+    profiles: profiles::ProfileStore,
 }
 
 #[derive(Serialize)]
@@ -196,6 +198,104 @@ fn verify_wvu_reference_firmware(
     firmware_error(state.firmware.verify_existing_reference(port))
 }
 
+#[tauri::command]
+fn list_acquisition_profiles(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<profiles::AcquisitionProfile>, String> {
+    state.profiles.list().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_profile_mode(state: tauri::State<'_, AppState>) -> Result<profiles::ProfileMode, String> {
+    state.profiles.mode().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_profile_mode(
+    state: tauri::State<'_, AppState>,
+    mode: profiles::ProfileMode,
+    acknowledgement: bool,
+) -> Result<profiles::ProfileMode, String> {
+    state
+        .profiles
+        .set_mode(mode, acknowledgement)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn duplicate_profile_to_draft(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    draft_id: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .duplicate_to_draft(&profile_id, &draft_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_profile_draft_description(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    profile_version: String,
+    description: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .update_draft_description(&profile_id, &profile_version, description)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn finalize_profile_draft(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    profile_version: String,
+    final_version: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .finalize_draft(&profile_id, &profile_version, final_version)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn retire_profile(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    profile_version: String,
+) -> Result<(), String> {
+    state
+        .profiles
+        .retire(&profile_id, &profile_version)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn export_profile_package(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    profile_version: String,
+    destination: String,
+) -> Result<(), String> {
+    state
+        .profiles
+        .export_profile(&profile_id, &profile_version, &PathBuf::from(destination))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn import_profile_package(
+    state: tauri::State<'_, AppState>,
+    source: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .import_profile(&PathBuf::from(source))
+        .map_err(|error| error.to_string())
+}
+
 /// Combined Phase 1 connect/handshake/configure/start command. The worker owns transport I/O.
 #[tauri::command]
 fn start_simulator_recording(
@@ -207,6 +307,29 @@ fn start_simulator_recording(
     state
         .session
         .start_simulator(duration, PathBuf::from(output_directory))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_profile_simulator_recording(
+    state: tauri::State<'_, AppState>,
+    output_directory: String,
+    duration: recording::RecordingDuration,
+    profile_id: String,
+    bench_notice_acknowledged: bool,
+) -> Result<session::SessionStatus, String> {
+    checked_output_directory(&output_directory)?;
+    let profile = state
+        .profiles
+        .get_locked(&profile_id)
+        .map_err(|error| error.to_string())?;
+    state
+        .session
+        .start_simulator_with_profile(
+            profile.snapshot(bench_notice_acknowledged),
+            duration,
+            PathBuf::from(output_directory),
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -244,6 +367,53 @@ fn start_hardware_recording(
     state
         .session
         .start_serial(port, duration, PathBuf::from(output_directory))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_profile_hardware_recording(
+    state: tauri::State<'_, AppState>,
+    port: String,
+    output_directory: String,
+    duration: recording::RecordingDuration,
+    profile_id: String,
+    bench_notice_acknowledged: bool,
+) -> Result<session::SessionStatus, String> {
+    checked_output_directory(&output_directory)?;
+    let profile = state
+        .profiles
+        .get_locked(&profile_id)
+        .map_err(|error| error.to_string())?;
+    if !firmware_error(state.firmware.is_acquisition_allowed(&port))? {
+        return Err("Profile requires the controlled WVU firmware. Verify or restore it in Firmware before hardware recording.".into());
+    }
+    if !serialport::available_ports()
+        .map_err(|error| format!("could not enumerate serial ports: {error}"))?
+        .iter()
+        .any(|candidate| candidate.port_name.eq_ignore_ascii_case(&port))
+    {
+        return Err("select a currently enumerated serial port".into());
+    }
+    let cli = arduino_cli::ArduinoCli::discover(None).map_err(|error| error.to_string())?;
+    if !cli
+        .boards()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .any(|board| board.port.eq_ignore_ascii_case(&port))
+    {
+        return Err(
+            "selected port is not a detected Arduino UNO R4 WiFi; refresh boards or use Simulator"
+                .into(),
+        );
+    }
+    state
+        .session
+        .start_serial_with_profile(
+            profile.snapshot(bench_notice_acknowledged),
+            port,
+            duration,
+            PathBuf::from(output_directory),
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -373,11 +543,16 @@ pub fn run() {
     // an upload first releases this one serial owner before Arduino CLI opens the port.
     let session = session::SessionController::default();
     let firmware = firmware_workflow::FirmwareWorkflow::new(session.clone());
+    let profiles = profiles::ProfileStore::default();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState { session, firmware })
+        .manage(AppState {
+            session,
+            firmware,
+            profiles,
+        })
         .invoke_handler(tauri::generate_handler![
             list_boards,
             list_serial_ports,
@@ -396,8 +571,19 @@ pub fn run() {
             cancel_firmware_job,
             get_firmware_workflow_status,
             verify_wvu_reference_firmware,
+            list_acquisition_profiles,
+            get_profile_mode,
+            set_profile_mode,
+            duplicate_profile_to_draft,
+            update_profile_draft_description,
+            finalize_profile_draft,
+            retire_profile,
+            export_profile_package,
+            import_profile_package,
             start_simulator_recording,
             start_hardware_recording,
+            start_profile_simulator_recording,
+            start_profile_hardware_recording,
             reset_board_and_retry,
             retry_hardware_handshake,
             stop_recording,

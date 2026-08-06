@@ -1,6 +1,6 @@
 //! Phase 1 `.bmeg`: `BMEGREC1` + u16 JSON-header length + UTF-8 header + fixed records.
 //! Each record is little-endian: u32 sample sequence, u64 timestamp_us, u16 ADC counts.
-use crate::protocol::IntegrityCounters;
+use crate::{profiles::ProfileSnapshot, protocol::IntegrityCounters};
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -121,6 +121,10 @@ pub struct RecordingMetadata {
     pub final_free_disk_bytes: Option<u64>,
     #[serde(default)]
     pub completion_status: String,
+    /// Phase 3A writes a frozen profile into both the BMEG JSON header and the
+    /// metadata sidecar. Files made before this field existed remain legacy/general recordings.
+    #[serde(default)]
+    pub profile_snapshot: Option<ProfileSnapshot>,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RawSample {
@@ -239,27 +243,55 @@ pub fn export_bmeg_csv(bmeg: &Path, csv: &Path) -> Result<u64, RecordingError> {
     let mut input = BmegReader::open(bmeg)?;
     let first_timestamp = input.metadata.utc_start.timestamp_micros();
     let mut writer = BufWriter::new(File::create(csv)?);
-    writer.write_all(
-        b"sample_sequence,timestamp_us,elapsed_seconds,channel,adc_counts,volts,status_flags\n",
-    )?;
+    let profile = input.metadata.profile_snapshot.clone();
+    if profile.is_some() {
+        writer.write_all(b"sample_sequence,timestamp_us,elapsed_seconds,channel,adc_counts,volts,status_flags,profile_id,profile_version,signal_label\n")?;
+    } else {
+        writer.write_all(
+            b"sample_sequence,timestamp_us,elapsed_seconds,channel,adc_counts,volts,status_flags\n",
+        )?;
+    }
     let mut count = 0u64;
     let mut origin = None;
     while let Some(sample) = input.next_sample()? {
         let start = *origin.get_or_insert(sample.timestamp_us);
         let elapsed = (sample.timestamp_us.saturating_sub(start)) as f64 / 1_000_000.0;
-        writeln!(
-            writer,
-            "{},{},{elapsed:.6},A0,{},{:.6},1",
-            sample.sequence,
-            sample.timestamp_us,
-            sample.counts,
-            f64::from(sample.counts) * 5.0 / 4095.0
-        )?;
+        if let Some(snapshot) = profile.as_ref() {
+            writeln!(
+                writer,
+                "{},{},{elapsed:.6},{},{},{:.6},1,{},{},{}",
+                sample.sequence,
+                sample.timestamp_us,
+                csv_field(&snapshot.profile.acquisition.analog_pin),
+                sample.counts,
+                f64::from(sample.counts) * 5.0 / 4095.0,
+                csv_field(&snapshot.profile.profile_id),
+                csv_field(&snapshot.profile.profile_version),
+                csv_field(&snapshot.profile.export.signal_name)
+            )?;
+        } else {
+            writeln!(
+                writer,
+                "{},{},{elapsed:.6},A0,{},{:.6},1",
+                sample.sequence,
+                sample.timestamp_us,
+                sample.counts,
+                f64::from(sample.counts) * 5.0 / 4095.0
+            )?;
+        }
         count += 1;
     }
     let _ = first_timestamp; // retained for future host/board latency diagnostics.
     writer.flush()?;
     Ok(count)
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
 }
 pub fn write_csv(path: &Path, samples: &[RawSample]) -> Result<(), RecordingError> {
     let mut writer = BufWriter::new(File::create(path)?);
@@ -316,6 +348,7 @@ mod tests {
             initial_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
             final_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
             completion_status: "complete".into(),
+            profile_snapshot: None,
         };
         let bmeg = dir.path().join("r.bmeg");
         let mut w = BmegWriter::create(&bmeg, &meta).unwrap_or_else(|e| panic!("{e}"));
@@ -416,6 +449,7 @@ mod tests {
             initial_free_disk_bytes: Some(1),
             final_free_disk_bytes: Some(1),
             completion_status: "complete".into(),
+            profile_snapshot: None,
         };
         let mut old = serde_json::to_value(metadata).unwrap_or_else(|e| panic!("{e}"));
         let object = old
@@ -435,5 +469,72 @@ mod tests {
             serde_json::from_value(old).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(restored.duration_mode, None);
         assert_eq!(restored.completion_status, "");
+    }
+
+    #[test]
+    fn profile_provenance_is_embedded_and_csv_is_profile_aware() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let profile = crate::profiles::built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "ecg")
+            .unwrap_or_else(|| panic!("missing ECG profile"))
+            .snapshot(true);
+        let mut metadata = RecordingMetadata {
+            utc_start: Utc::now(),
+            local_start: Local::now(),
+            board: "Simulator".into(),
+            com_port: "SIM".into(),
+            fqbn: "simulator".into(),
+            arduino_cli_version: "n/a".into(),
+            uno_r4_core_version: "n/a".into(),
+            firmware_build: 0x0001_0001,
+            protocol_version: "0.1".into(),
+            analog_pin: "A0".into(),
+            adc_bits: 12,
+            requested_sample_rate_hz: 1000,
+            measured_sample_rate_hz: 0.0,
+            total_samples: 1,
+            integrity: IntegrityCounters::default(),
+            app_version: "test".into(),
+            simulator: true,
+            utc_stop: None,
+            local_stop: None,
+            host_elapsed_seconds: None,
+            board_elapsed_seconds: None,
+            recording_status: "complete".into(),
+            bmeg_filename: "profile.bmeg".into(),
+            csv_filename: None,
+            notes: "synthetic".into(),
+            duration_mode: Some("timed".into()),
+            requested_duration_seconds: Some(10),
+            stop_reason: Some(StopReason::TimedComplete),
+            initial_free_disk_bytes: None,
+            final_free_disk_bytes: None,
+            completion_status: "complete".into(),
+            profile_snapshot: Some(profile.clone()),
+        };
+        let bmeg = dir.path().join("profile.bmeg");
+        let mut writer = BmegWriter::create(&bmeg, &metadata).unwrap_or_else(|e| panic!("{e}"));
+        writer
+            .write(RawSample {
+                sequence: 0,
+                timestamp_us: 0,
+                counts: 2048,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        writer.finish().unwrap_or_else(|e| panic!("{e}"));
+        let read_back = BmegReader::open(&bmeg).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(read_back.metadata.profile_snapshot, Some(profile));
+        let csv = dir.path().join("profile.csv");
+        assert_eq!(
+            export_bmeg_csv(&bmeg, &csv).unwrap_or_else(|e| panic!("{e}")),
+            1
+        );
+        assert!(std::fs::read_to_string(csv)
+            .unwrap_or_default()
+            .contains("profile_id"));
+        metadata.profile_snapshot = None;
+        assert!(metadata.profile_snapshot.is_none());
     }
 }

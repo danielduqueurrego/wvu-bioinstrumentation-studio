@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "profile_id": "wvu.bmeg420l.general.a0.development.v1",
+  "profile_version": "1.0.0",
+  "display_name": "General A0 — Development",
+  "category": "development",
+  "status": "locked",
+  "source": "built_in",
+  "description": "General raw A0 development acquisition.",
+  "target_board": "Arduino UNO R4 WiFi",
+  "fqbn": "arduino:renesas_uno:unor4wifi",
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 1, "build": "0x00010001", "device": "0x554E4F34" },
+  "acquisition": { "analog_pin": "A0", "adc_resolution_bits": 12, "sample_rate_hz": 1000, "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10 },
+  "display": { "primary_quantity": "arduino_input_volts", "channel_label": "A0 raw input", "raw_units_label": "ADC counts", "voltage_units_label": "V", "voltage_reference_v": 5.0, "plot_min_v": 0.0, "plot_max_v": 5.0 },
+  "safety": { "bench_only": true, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching and bench-validation use only.", "Not a medical device.", "No human-connected recording is authorized in this phase."] },
+  "export": { "signal_name": "general_a0_raw_input", "include_profile_snapshot": true },
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "028bc317057b90f1f070cd215ce8d9d6200214819c32494a492a3af51661b77e" }
+}

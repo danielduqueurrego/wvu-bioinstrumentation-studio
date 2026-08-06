@@ -209,9 +209,11 @@ fn validate_recording(
     let mut csv_reader = BufReader::new(fs::File::open(csv)?);
     let mut header = String::new();
     csv_reader.read_line(&mut header)?;
-    if header.trim_end()
-        != "sample_sequence,timestamp_us,elapsed_seconds,channel,adc_counts,volts,status_flags"
-    {
+    let header = header.trim_end();
+    let legacy_header =
+        "sample_sequence,timestamp_us,elapsed_seconds,channel,adc_counts,volts,status_flags";
+    let profile_header = "sample_sequence,timestamp_us,elapsed_seconds,channel,adc_counts,volts,status_flags,profile_id,profile_version,signal_label";
+    if header != legacy_header && header != profile_header {
         return Err("unexpected CSV header".into());
     }
     let mut records = 0u64;
@@ -237,7 +239,7 @@ fn validate_recording(
             return Err("CSV ended before BMEG records".into());
         }
         let fields: Vec<_> = row.trim_end().split(',').collect();
-        if fields.len() != 7 || fields[3] != "A0" || fields[6] != "1" {
+        if !(fields.len() == 7 || fields.len() == 10) || fields[3] != "A0" || fields[6] != "1" {
             return Err("CSV row did not match the documented Phase 1 format".into());
         }
         if fields[0].parse::<u32>()? != sample.sequence
