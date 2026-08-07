@@ -2,11 +2,12 @@
 
 ## Scope and result
 
-**Phase 3B implementation complete. Simulator workflow accepted. Physical ECG and EMG validation
-pending. Manual Validation-page viewport/scaling verification pending. Overall Phase 3B
-acceptance: pending.** This work is strictly bench-validation engineering. No person, electrode
-system, ECG/EMG module connected to a person, or biomedical accessory was used. The simulator
-acceptance did not open a serial port.
+**Phase 3B implementation complete. Simulator workflow accepted. Manual Validation-page
+viewport/scaling verification complete at 100%. Physical USB disconnect/reconnect verification
+complete. Reset/retry remains a documented limitation. Physical ECG and EMG validation pending.
+Overall Phase 3B acceptance: pending.** This work is strictly bench-validation engineering. No
+person, electrode system, ECG/EMG module connected to a person, or biomedical accessory was used.
+The simulator acceptance did not open a serial port.
 
 The app now has a versioned validation-evidence model with draft, finalized, and retired states;
 canonical SHA-256 integrity; profile ID/version/hash and firmware build/device matching; raw-data
@@ -63,7 +64,7 @@ The following completed after the Phase 3B implementation:
 
 - `cargo fmt --manifest-path src-tauri\Cargo.toml -- --check`
 - `cargo check --manifest-path src-tauri\Cargo.toml`
-- `cargo test --manifest-path src-tauri\Cargo.toml` — **58 passed**
+- `cargo test --manifest-path src-tauri\Cargo.toml` — **59 passed**
 - `cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings`
 - `npm run check` — 0 errors, 0 warnings
 - `npm test` — **21 passed** across 8 files
@@ -83,4 +84,13 @@ It contains seven BMEG/CSV/metadata triplets (BMEG 143,127–143,183 bytes; CSV
 
 - Separate physical ECG and EMG bench-interface test sets.
 - Instructor-driven criteria and profile association using actual matching hardware evidence.
-- Manual Validation-page viewport/scaling/accessibility matrix.
+- Validation-page 125% and 150% scaling observations.
+
+## Non-hardware follow-up
+
+The full 900 × 650, 1024 × 768, 1366 × 768, 1920 × 1080, and maximized Validation-page matrix
+passed at 100% Windows scaling; see `logs/phase3b_manual_ui_verification_2026-08-06.md`. A
+user-assisted UNO USB disconnect/reconnect run finalized a readable incomplete recording and
+required an explicit separate post-reconnect session; see
+`logs/phase1_physical_disconnect_verification_2026-08-06.md`. The physical test involved only
+floating A0 and no ECG/EMG module, so neither profile is Bench validated.

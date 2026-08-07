@@ -1,21 +1,27 @@
 # Phase 3B manual Validation UI verification — 2026-08-06
 
-## Status: pending
+## Status: passed for recorded 100% scaling viewport matrix
 
-No manual Phase 3B Validation-page viewport/scaling inspection has been performed during this
-implementation run. Do not infer results from Phase 3A or earlier Firmware/Acquisition layout
-tests.
+Manual inspection was performed in the packaged application at Windows display scaling **100%**.
+User-supplied narrow and wide/maximized screenshots were reviewed as representative evidence; they
+are not committed. No clipping, overlap, page-level horizontal overflow, inaccessible controls,
+collapsed panels, or other visual defects were observed.
 
 | Viewport | Windows scaling | Result | Notes |
 | --- | --- | --- | --- |
-| 900 × 650 | not recorded | pending | Validate stacked panels, tables, focus, and no page overflow. |
-| 1024 × 768 | not recorded | pending | Validate workflow controls and long IDs/equipment values. |
-| 1366 × 768 | not recorded | pending | Validate run/criteria tables and diagnostics access. |
-| 1920 × 1080 | not recorded | pending | Validate wide panel allocation and status labels. |
-| Maximized | not recorded | pending | Validate maximum-width behavior. |
+| 900 × 650 | 100% | passed | Panels remained usable; no global overflow or hidden primary action. |
+| 1024 × 768 | 100% | passed | Workflow controls, run/criteria tables, and long values remained reachable. |
+| 1366 × 768 | 100% | passed | Dashboard and diagnostic elements remained readable. |
+| 1920 × 1080 | 100% | passed | Wide layout remained readable without excessive control stretching. |
+| Maximized | 100% | passed | Status labels, package controls, and tables remained accessible. |
 
-The Validation page constrains horizontal scrolling, if needed, to the run/criteria table wrapper;
-this implementation detail is not a manual acceptance result. Required manual checks remain:
-Student permission blocking, Instructor acknowledgement, draft/resume/finalize/retire,
-export/import, keyboard navigation, focus visibility, long text wrapping, and no page-level
-horizontal overflow.
+The Validation page constrains horizontal scrolling, if needed, to the run/criteria table wrapper.
+At 100%, the Student/Instructor permission controls, safety acknowledgement, draft/resume/
+finalize/retire actions, export/import controls, long IDs/equipment values, keyboard focus
+visibility, and no-page-overflow behavior were manually inspected.
+
+| Display scaling | Result | Notes |
+| --- | --- | --- |
+| 100% | passed | All required viewport rows above were inspected. |
+| 125% | pending | Not inspected; not claimed. |
+| 150% | pending | Not inspected; not claimed. |

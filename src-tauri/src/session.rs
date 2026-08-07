@@ -1580,10 +1580,24 @@ impl SessionController {
     }
 
     fn status_from_runtime(runtime: &SessionRuntime) -> SessionStatus {
-        let elapsed_seconds = runtime
-            .started_at
-            .map(|started| started.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+        let elapsed_seconds = if matches!(
+            runtime.state,
+            SessionState::Acquiring | SessionState::Stopping
+        ) {
+            runtime
+                .started_at
+                .map(|started| started.elapsed().as_secs_f64())
+                .unwrap_or(0.0)
+        } else {
+            // A completed or faulted recording must keep the capture duration
+            // measured by the worker, rather than continuing to count from the
+            // session's initial handshake/start time while the UI is reviewed.
+            runtime
+                .last_summary
+                .as_ref()
+                .map(|summary| summary.host_elapsed_seconds)
+                .unwrap_or(0.0)
+        };
         let remaining_seconds = match runtime.duration.as_ref() {
             Some(RecordingDuration::Timed { seconds }) => {
                 Some((*seconds as f64 - elapsed_seconds).max(0.0))
@@ -2492,6 +2506,43 @@ mod tests {
         assert_eq!(summary.stop_reason, StopReason::User);
         assert_eq!(summary.completion_status, "complete");
         assert!(summary.samples > 0);
+    }
+
+    #[test]
+    fn finalized_status_keeps_capture_elapsed_time_stable() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        session
+            .start_simulator(
+                RecordingDuration::Timed { seconds: 10 },
+                dir.path().to_path_buf(),
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session
+            .status()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .state
+            != SessionState::Acquiring
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        session
+            .request_stop()
+            .unwrap_or_else(|error| panic!("{error}"));
+        session
+            .wait_for_worker()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let summary = session
+            .status()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .last_summary
+            .unwrap_or_else(|| panic!("missing finalized summary"));
+        thread::sleep(Duration::from_millis(50));
+        let status = session.status().unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(status.state, SessionState::Disconnected);
+        assert!((status.elapsed_seconds - summary.host_elapsed_seconds).abs() < 0.000_001);
     }
 
     #[test]

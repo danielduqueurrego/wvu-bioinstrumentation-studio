@@ -7,8 +7,9 @@ production controller, its Tauri command path, recording/export path, and final
 60-second hardware evidence pass with credible zero-loss counters. No person or
 biomedical accessory was connected.
 
-Physical unplug/replug is **not performed** because it requires the user's manual
-participation. Automated terminal-disconnect finalization is covered by test.
+Physical unplug/replug was later verified on 2026-08-07 with the user's manual participation;
+the original normal-acquisition acceptance remains unchanged. See
+`logs/phase1_physical_disconnect_verification_2026-08-06.md`.
 
 ## Environment
 
@@ -95,8 +96,11 @@ The final generated files are intentionally ignored:
 - Automated terminal-disconnect finalization: passed. The session finalizes a readable
   `disconnected` recording, increments the disconnect counter, faults visibly, and
   requires an explicit new start.
-- Physical unplug/replug: not performed. It must be conducted with the user present;
-  no automatic concatenation/restart is implemented.
+- Physical unplug/replug: passed on 2026-08-07. The app faulted visibly without crashing,
+  finalized a readable incomplete 30,690-sample recording with stop reason `disconnect`,
+  rediscovered COM12 after reconnect, reverified the controlled identity, and required a
+  separate successful 9,970-sample recording. No automatic concatenation/restart is implemented.
+  See `logs/phase1_physical_disconnect_verification_2026-08-06.md`.
 
 ## Known limitations
 
@@ -109,10 +113,9 @@ The final generated files are intentionally ignored:
 
 ## Exact next recommended task
 
-Perform the user-assisted physical unplug/replug acceptance test: unplug the UNO R4
-WiFi during a recording, verify incomplete finalization, reconnect/redetect its port,
-and require an explicit new acquisition. Then begin Phase 2 only after recording the
-result.
+The physical unplug/replug acceptance test is complete. The next remaining hardware work is
+separate Phase 3B ECG/EMG bench validation with documented safe sources; no human-connected work
+is authorized.
 
 ## Phase 1.1 follow-up status — 2026-08-06
 
@@ -171,14 +174,15 @@ conversion, and metadata `until_stopped` / `user` / `complete`. Details:
   later received zero protocol bytes; re-uploading the controlled binary restored normal protocol
   operation. This does not affect the credible normal-acquisition counters. See
   `logs/phase1_1_touch_reset_characterization_2026-08-06.md`.
-- Physical unplug/replug has not been performed; it requires the user's participation.
+- Physical unplug/replug passed on 2026-08-07; see
+  `logs/phase1_physical_disconnect_verification_2026-08-06.md`.
 - The requested manual window-size and Windows-scaling matrix has not been visually observed in
   this noninteractive agent desktop. It is documented as pending, not passed, in
   `logs/phase1_1_responsive_ui_verification_2026-08-06.md`.
 
 Phase 1.1 normal recording/data-integrity implementation is committed as `cdc2c8e`.
-The accurately recorded visual matrix and physical disconnect test remain separately pending
-manual follow-ups; neither is represented as passed by this report.
+The accurately recorded broad Phase 1.1 visual matrix remains a separate pending manual
+follow-up; physical disconnect is now represented as passed above.
 
 ## Phase 2 firmware-workspace implementation note — 2026-08-06
 

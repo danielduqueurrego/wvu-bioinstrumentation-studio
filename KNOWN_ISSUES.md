@@ -1,8 +1,9 @@
 # Known issues
 
-- Physical USB unplug/replug remains pending because it requires the user's manual participation.
-  Automated terminal-disconnect finalization passes; the design requires an explicit new
-  acquisition after a disconnect and never concatenates sessions.
+- Physical UNO USB unplug/replug passed on 2026-08-07 with a controlled incomplete disconnect
+  finalization, explicit COM12 rediscovery, protocol re-verification, and a separate successful
+  post-reconnect recording. It does not resolve the separate Reset board and retry limitation.
+  See `logs/phase1_physical_disconnect_verification_2026-08-06.md`.
 - The requested manual responsive-layout matrix remains pending. Source/build evidence and a
   packaged-app launch pass, but this agent cannot inspect the interactive Tauri desktop surface at
   900 × 650, the larger viewports, or 125%/150% Windows scaling. See
@@ -25,7 +26,8 @@
 - Phase 3B simulator validation is available, but physical ECG and EMG module/interface evidence
   cannot be claimed until a safe 0–5 V bench source, module identifiers, and instructor-entered
   equipment/criteria are available. No person or electrode system may be used to close that gap.
-  The Phase 3B viewport/scaling matrix is also pending manual inspection.
+  The Phase 3B Validation-page viewport matrix passed at 100%; 125% and 150% scaling remain
+  pending manual inspection.
 - Rust exists at `C:\Users\dd00055\.cargo\bin` but is not on the persistent PowerShell PATH.
   Prepend it for the session or repair the user PATH entry.
 - Phase 1 intentionally has no firmware editor, pulse-ox sequence, calibration wizard,

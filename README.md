@@ -164,7 +164,9 @@ cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --b
 
 See `docs/VALIDATION_EVIDENCE_SCHEMA_v1.md` and `docs/BENCH_VALIDATION_WORKFLOW.md`. Physical
 ECG/EMG module characterization requires documented safe bench sources and remains separate from
-this simulator evidence.
+this simulator evidence. The Validation-page matrix passed at 100% Windows scaling and a
+UNO-alone USB disconnect/reconnect run passed; neither result validates an ECG/EMG module or
+authorizes human-connected use.
 
 ## Phase 2 firmware workspace
 
