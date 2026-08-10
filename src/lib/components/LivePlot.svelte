@@ -2,13 +2,15 @@
   import { onMount } from 'svelte';
   import uPlot from 'uplot';
   import { pulseoxAmbientSubtractedPreview, visibleChannels } from '$lib/multichannel';
+  import { displayedValue, displayUnitLabel, type DisplayUnit, type RecordingCalibration } from '$lib/calibration';
   import 'uplot/dist/uPlot.min.css';
 
   type PlotChannel = { id: string; label: string; csv_name: string };
   export let samples: Array<{ timestamp_us: number; values: number[] }> = [];
   export let channels: PlotChannel[] = [];
   export let visibleChannelIds: string[] = [];
-  export let volts = false;
+  export let channelUnits: Record<string, DisplayUnit> = {};
+  export let calibration: RecordingCalibration = { adc_reference_v: 5, mpxv_sensor_supply_v: 5, channel_units: {}, active_calibrations: [] };
   export let adcBits = 12;
   export let pulseoxPreview = false;
   // The Acquisition page advances this once per bounded display snapshot.  Multiple
@@ -36,20 +38,19 @@
   function chartData(): uPlot.AlignedData {
     const bounded = samples.slice(-maximum);
     const active = displayChannels();
-    const fullScale = Math.pow(2, adcBits) - 1;
     const x = bounded.map((point) => point.timestamp_us / 1_000_000);
     const values = active.map((channel) => {
       const index = channels.findIndex((candidate) => candidate.id === channel.id);
       return bounded.map((point) => {
         const value = previewValues(point.values)[index] ?? 0;
-        return volts ? value * 5.0 / fullScale : value;
+        return displayedValue(value, channel.id, channelUnits[channel.id] ?? 'counts', adcBits, calibration);
       });
     });
     return [x, ...values];
   }
 
   function currentSignature() {
-    return `${channels.map((channel) => channel.id).join('|')}/${visibleChannelIds.join('|')}/${pulseoxPreview}/${volts}/${adcBits}`;
+    return `${channels.map((channel) => channel.id).join('|')}/${visibleChannelIds.join('|')}/${pulseoxPreview}/${JSON.stringify(channelUnits)}/${JSON.stringify(calibration)}/${adcBits}`;
   }
 
   function createPlot() {
@@ -66,7 +67,7 @@
           {},
           ...active.map((channel, index) => ({ label: channel.label, stroke: colors[index % colors.length], width: 2 }))
         ],
-        axes: [{}, { label: volts ? 'Arduino input volts' : 'ADC counts' }],
+        axes: [{}, { label: new Set(active.map((channel) => displayUnitLabel(channelUnits[channel.id] ?? 'counts'))).size === 1 ? displayUnitLabel(channelUnits[active[0]?.id] ?? 'counts') : 'Mixed units' }],
         legend: { show: true }
       },
       chartData(),
@@ -99,14 +100,16 @@
     const _samples = samples;
     const _channels = channels;
     const _visible = visibleChannelIds;
-    const _volts = volts;
+    const _units = channelUnits;
+    const _calibration = calibration;
     const _adcBits = adcBits;
     const _pulseoxPreview = pulseoxPreview;
     void _revision;
     void _samples;
     void _channels;
     void _visible;
-    void _volts;
+    void _units;
+    void _calibration;
     void _adcBits;
     void _pulseoxPreview;
     if (plot) update();

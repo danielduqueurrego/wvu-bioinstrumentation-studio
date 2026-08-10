@@ -31,5 +31,6 @@
 - The explicit 1200-bps Reset board and retry limitation is unchanged. Normal protocol v0.2
   acquisition and controlled firmware upload/restore work; recovery should not silently upload
   firmware.
-- Phase 4 deliberately has no physiological interpretation, clinical SpO2, heart-rate analysis,
-  BP estimation, EMG activation/fatigue analysis, pressure calibration, or automatic filtering.
+- Phase 5 deliberately has no physiological interpretation, clinical SpO2, heart-rate analysis,
+  SBP/DBP estimation, EMG activation/fatigue analysis, force conversion, or automatic filtering.
+  Its MPXV and student-generated XGZP conversions are engineering-unit tools only.

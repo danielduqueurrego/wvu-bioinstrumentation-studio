@@ -50,7 +50,10 @@ v0.1 single-count records remain readable. Readers treat absent profile provenan
 legacy/general-development recording and never infer a course modality.
 
 v0.2 CSV begins with `record_sequence,t_us` (or `cycle_index,t_us` for pulse ox) followed by the
-frozen profile's raw field names. Legacy CSV remains unchanged.
+frozen profile's raw fields. Phase 5 may append direct-voltage and documented engineering-unit
+columns beside the raw fields. The `RecordingMetadata.calibration` snapshot—not the immutable
+profile—records Vref, Vs, selected display units, and active calibration parameters. Legacy CSV
+remains readable under its documented 5.0 V conversion assumption.
 
 ## Local authoring workflow
 

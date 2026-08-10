@@ -302,6 +302,17 @@ snapshot, markers, and integrity counters in BMEG, CSV, and metadata. It shall n
 physiological values, apply hidden filtering, or make clinical claims. Optional Phase 3B physical
 characterization remains an instructor tool and is not a normal-course-recording prerequisite.
 
+## Phase 5 calibration-and-units amendment
+
+The application shall preserve raw ADC counts and add optional derived engineering display/export
+values without changing BMEG records. It shall compute Arduino-input volts using the frozen ADC
+resolution and configurable recorded Vref. For course MPXV channels it may compute kPa and mmHg
+with the documented local transfer equation and stored Vs. For BP A2 it may fit and save a local
+linear `MPXV_mmHg = slope × XGZP_volts + offset` calibration from a selected synchronized interval
+or two or more manual points, reporting slope, offset, R², and paired sample count without an
+automatic accept/reject threshold. It shall not calculate SBP, DBP, SpO2, heart rate, EMG force,
+fatigue, or any physiological conclusion.
+
 ## 7. Deferred requirements
 
 - macOS/Linux

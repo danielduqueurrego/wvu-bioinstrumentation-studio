@@ -5,6 +5,7 @@
 //! under a short mutex so polling the UI never waits for serial I/O.
 use crate::{
     acquisition::{AcquisitionController, AcquisitionSnapshot},
+    calibration::RecordingCalibration,
     profiles::{built_in_profiles, ProfileSnapshot, ProfileStatus},
     protocol::{
         encode_frame, Frame, FrameParser, IntegrityCounters, MessageType, SampleBatch,
@@ -191,6 +192,7 @@ pub struct SessionSummary {
     pub integrity: IntegrityCounters,
     pub error: Option<String>,
     pub profile: ProfileSnapshot,
+    pub calibration: RecordingCalibration,
     pub active_digital_output_mask: Option<u8>,
     pub final_digital_output_mask: Option<u8>,
 }
@@ -216,6 +218,7 @@ pub struct SessionStatus {
     pub last_error: Option<String>,
     pub last_summary: Option<SessionSummary>,
     pub profile: Option<ProfileSnapshot>,
+    pub calibration: RecordingCalibration,
     pub digital_output_mask: Option<u8>,
 }
 
@@ -264,8 +267,22 @@ struct SessionRuntime {
     stop_reason: Option<StopReason>,
     connection_diagnostics: Option<ConnectionDiagnostics>,
     profile: Option<ProfileSnapshot>,
+    calibration: RecordingCalibration,
     markers: Vec<RecordingMarker>,
     digital_output_mask: Option<u8>,
+}
+
+/// Immutable inputs for one production capture worker.  Keeping these together
+/// avoids a parallel set of positional parameters drifting as recording
+/// provenance evolves.
+#[derive(Clone)]
+struct CaptureRequest {
+    simulator: bool,
+    source: String,
+    profile: ProfileSnapshot,
+    duration: RecordingDuration,
+    output_dir: PathBuf,
+    calibration: RecordingCalibration,
 }
 
 impl Default for SessionController {
@@ -297,6 +314,7 @@ impl SessionController {
                 stop_reason: None,
                 connection_diagnostics: None,
                 profile: None,
+                calibration: RecordingCalibration::default(),
                 markers: Vec::new(),
                 digital_output_mask: None,
             })),
@@ -369,11 +387,37 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: PathBuf,
     ) -> Result<SessionStatus, SessionError> {
+        self.start_simulator_with_profile_and_calibration(
+            profile,
+            duration,
+            output_dir,
+            RecordingCalibration::default(),
+        )
+    }
+
+    /// Starts a profile recording with a frozen, display/export-only calibration snapshot.
+    pub fn start_simulator_with_profile_and_calibration(
+        &self,
+        profile: ProfileSnapshot,
+        duration: RecordingDuration,
+        output_dir: PathBuf,
+        calibration: RecordingCalibration,
+    ) -> Result<SessionStatus, SessionError> {
         self.validate_duration(&duration)?;
-        self.begin_session(true, "Simulator", "SIM", duration.clone(), profile.clone())?;
+        calibration
+            .validate()
+            .map_err(|error| SessionError::Protocol(error.to_string()))?;
+        self.begin_session(
+            true,
+            "Simulator",
+            "SIM",
+            duration.clone(),
+            profile.clone(),
+            calibration.clone(),
+        )?;
         let controller = self.clone();
         self.spawn_worker(move || {
-            controller.capture_simulator_worker(profile, duration, output_dir)
+            controller.capture_simulator_worker(profile, duration, output_dir, calibration)
         })?;
         self.status()
     }
@@ -395,17 +439,38 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: PathBuf,
     ) -> Result<SessionStatus, SessionError> {
+        self.start_serial_with_profile_and_calibration(
+            profile,
+            port_name,
+            duration,
+            output_dir,
+            RecordingCalibration::default(),
+        )
+    }
+
+    pub fn start_serial_with_profile_and_calibration(
+        &self,
+        profile: ProfileSnapshot,
+        port_name: String,
+        duration: RecordingDuration,
+        output_dir: PathBuf,
+        calibration: RecordingCalibration,
+    ) -> Result<SessionStatus, SessionError> {
         self.validate_duration(&duration)?;
+        calibration
+            .validate()
+            .map_err(|error| SessionError::Protocol(error.to_string()))?;
         self.begin_session(
             false,
             "Arduino UNO R4 WiFi",
             &port_name,
             duration.clone(),
             profile.clone(),
+            calibration.clone(),
         )?;
         let controller = self.clone();
         self.spawn_worker(move || {
-            controller.capture_serial_worker(profile, port_name, duration, output_dir)
+            controller.capture_serial_worker(profile, port_name, duration, output_dir, calibration)
         })?;
         self.status()
     }
@@ -426,8 +491,20 @@ impl SessionController {
         output_dir: &Path,
     ) -> Result<SessionSummary, SessionError> {
         self.validate_duration(&duration)?;
-        self.begin_session(true, "Simulator", "SIM", duration.clone(), profile.clone())?;
-        self.capture_simulator_worker(profile, duration, output_dir.to_path_buf())?;
+        self.begin_session(
+            true,
+            "Simulator",
+            "SIM",
+            duration.clone(),
+            profile.clone(),
+            RecordingCalibration::default(),
+        )?;
+        self.capture_simulator_worker(
+            profile,
+            duration,
+            output_dir.to_path_buf(),
+            RecordingCalibration::default(),
+        )?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "simulator session did not produce a summary",
         ))
@@ -446,11 +523,13 @@ impl SessionController {
             "SIM",
             duration.clone(),
             default_general_profile()?,
+            RecordingCalibration::default(),
         )?;
         self.capture_simulator_worker(
             default_general_profile()?,
             duration,
             output_dir.to_path_buf(),
+            RecordingCalibration::default(),
         )?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "simulator session did not produce a summary",
@@ -486,12 +565,14 @@ impl SessionController {
             port_name,
             duration.clone(),
             profile.clone(),
+            RecordingCalibration::default(),
         )?;
         self.capture_serial_worker(
             profile,
             port_name.to_owned(),
             duration,
             output_dir.to_path_buf(),
+            RecordingCalibration::default(),
         )?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "serial session did not produce a summary",
@@ -767,8 +848,12 @@ impl SessionController {
         port: &str,
         duration: RecordingDuration,
         profile: ProfileSnapshot,
+        calibration: RecordingCalibration,
     ) -> Result<(), SessionError> {
         validate_profile_snapshot(&profile)?;
+        calibration
+            .validate()
+            .map_err(|error| SessionError::Protocol(error.to_string()))?;
         let mut runtime = self.lock_runtime()?;
         if runtime.state != SessionState::Disconnected {
             return Err(SessionError::State(
@@ -798,6 +883,7 @@ impl SessionController {
             Some(ConnectionDiagnostics::new(port))
         };
         runtime.profile = Some(profile);
+        runtime.calibration = calibration;
         runtime.markers.clear();
         self.cancel.store(false, Ordering::Release);
         let mut stop_reason = self
@@ -833,11 +919,22 @@ impl SessionController {
         profile: ProfileSnapshot,
         duration: RecordingDuration,
         output_dir: PathBuf,
+        calibration: RecordingCalibration,
     ) -> Result<(), SessionError> {
         let result = (|| {
             let mut simulator = SimulatorIo::new(&profile, duration.clone())?;
             self.set_state(SessionState::Connected)?;
-            self.capture_transport(&mut simulator, true, "SIM", profile, duration, &output_dir)
+            self.capture_transport(
+                &mut simulator,
+                CaptureRequest {
+                    simulator: true,
+                    source: "SIM".into(),
+                    profile,
+                    duration,
+                    output_dir,
+                    calibration,
+                },
+            )
         })();
         self.finish_worker_error(&result)?;
         result
@@ -849,6 +946,7 @@ impl SessionController {
         port_name: String,
         duration: RecordingDuration,
         output_dir: PathBuf,
+        calibration: RecordingCalibration,
     ) -> Result<(), SessionError> {
         let result = (|| {
             let mut port = serialport::new(&port_name, CONTROLLED_SERIAL_BAUD)
@@ -862,7 +960,17 @@ impl SessionController {
             // wait_for_handshake passively listens through the bounded startup grace
             // before its first PING, so a healthy board can announce itself first.
             self.set_state(SessionState::Connected)?;
-            self.capture_transport(&mut port, false, &port_name, profile, duration, &output_dir)
+            self.capture_transport(
+                &mut port,
+                CaptureRequest {
+                    simulator: false,
+                    source: port_name,
+                    profile,
+                    duration,
+                    output_dir,
+                    calibration,
+                },
+            )
         })();
         self.finish_worker_error(&result)?;
         result
@@ -871,15 +979,19 @@ impl SessionController {
     fn capture_transport<T: Read + Write>(
         &self,
         io: &mut T,
-        simulator: bool,
-        source: &str,
-        profile: ProfileSnapshot,
-        duration: RecordingDuration,
-        output_dir: &Path,
+        request: CaptureRequest,
     ) -> Result<(), SessionError> {
+        let CaptureRequest {
+            simulator,
+            source,
+            profile,
+            duration,
+            output_dir,
+            calibration,
+        } = request;
         // Collect tooling provenance before START so no external command can delay raw intake.
-        let (temporary_bmeg, bmeg, csv, metadata) = self.allocate_paths(output_dir, &profile)?;
-        let initial_free_disk_bytes = self.free_disk_space(output_dir)?;
+        let (temporary_bmeg, bmeg, csv, metadata) = self.allocate_paths(&output_dir, &profile)?;
+        let initial_free_disk_bytes = self.free_disk_space(&output_dir)?;
         self.update_disk_space(initial_free_disk_bytes)?;
         if initial_free_disk_bytes < DISK_CRITICAL_BYTES {
             return Err(SessionError::Storage(format!(
@@ -890,7 +1002,7 @@ impl SessionController {
             )));
         }
         let mut initial_meta =
-            self.initial_metadata(simulator, source, &bmeg, &duration, &profile)?;
+            self.initial_metadata(simulator, &source, &bmeg, &duration, &profile, calibration)?;
         initial_meta.initial_free_disk_bytes = Some(initial_free_disk_bytes);
         let (tx, rx) = sync_channel(4_096);
         let mut acquisition = AcquisitionController::new(tx);
@@ -958,7 +1070,7 @@ impl SessionController {
                 last_flush = Instant::now();
             }
             if last_disk_check.elapsed() >= DISK_CHECK_INTERVAL {
-                let free = self.free_disk_space(output_dir)?;
+                let free = self.free_disk_space(&output_dir)?;
                 self.update_disk_space(free)?;
                 if free < DISK_CRITICAL_BYTES {
                     stop_reason = Some(self.set_stop_reason_once(StopReason::StorageGuard)?);
@@ -1004,7 +1116,7 @@ impl SessionController {
         let host_elapsed = started.elapsed().as_secs_f64();
         let board_elapsed = board_elapsed_seconds(&snapshot);
         let recording_status = reason.recording_status();
-        let final_free_disk_bytes = self.free_disk_space(output_dir).ok();
+        let final_free_disk_bytes = self.free_disk_space(&output_dir).ok();
         if let Some(free) = final_free_disk_bytes {
             self.update_disk_space(free)?;
         }
@@ -1060,6 +1172,7 @@ impl SessionController {
                 .as_ref()
                 .map(std::string::ToString::to_string),
             profile,
+            calibration: final_meta.calibration.clone().unwrap_or_default(),
             active_digital_output_mask,
             final_digital_output_mask,
         };
@@ -1281,6 +1394,7 @@ impl SessionController {
         bmeg: &Path,
         duration: &RecordingDuration,
         profile: &ProfileSnapshot,
+        calibration: RecordingCalibration,
     ) -> Result<RecordingMetadata, SessionError> {
         let (arduino_cli_version, uno_r4_core_version, board_serial) = if simulator {
             ("not applicable".into(), "not applicable".into(), None)
@@ -1380,6 +1494,7 @@ impl SessionController {
             // never create the retired Phase 3B context.
             validation_context: None,
             markers: Vec::new(),
+            calibration: Some(calibration),
         })
     }
 
@@ -1591,6 +1706,7 @@ impl SessionController {
             last_error: runtime.last_error.clone(),
             last_summary: runtime.last_summary.clone(),
             profile: runtime.profile.clone(),
+            calibration: runtime.calibration.clone(),
             digital_output_mask: runtime.digital_output_mask,
         }
     }
@@ -2057,11 +2173,21 @@ impl SimulatorIo {
                 2 => 2.5 + (phase * 1.5).sin() * 0.35,
                 _ => 2.5 + (phase * 0.2).sin() * 0.8,
             },
-            "course_blood_pressure" => match field {
-                0 => 2.4 + (phase * 1.2).sin() * 0.35,
-                1 => 2.5 + (phase * 0.08).sin() * 0.9,
-                _ => 2.45 + (phase * 0.08 + 0.2).sin() * 0.75,
-            },
+            "course_blood_pressure" => {
+                // The deterministic simulator has an explicit MPXV-to-XGZP
+                // relationship so students can exercise the Phase 5 linear-fit
+                // workflow without calling it a physical sensor validation.
+                let mpxv_volts = 2.5 + (phase * 0.08).sin() * 0.9;
+                match field {
+                    0 => 2.4 + (phase * 1.2).sin() * 0.35,
+                    1 => mpxv_volts,
+                    _ => {
+                        let mpxv_mmhg = ((mpxv_volts / 5.0 - 0.04) / 0.009) * 7.5006;
+                        // Synthetic mapping: MPXV mmHg = 120 * XGZP volts - 10.
+                        ((mpxv_mmhg + 10.0) / 120.0).clamp(0.0, 5.0)
+                    }
+                }
+            }
             "course_pulseox" => {
                 let state = field % 4;
                 let dark = matches!(state, 1 | 3);
@@ -2414,6 +2540,7 @@ mod tests {
                 "COM12",
                 RecordingDuration::Timed { seconds: 10 },
                 default_general_profile().unwrap_or_else(|e| panic!("{e}")),
+                RecordingCalibration::default(),
             )
             .unwrap_or_else(|e| panic!("{e}"));
         session
@@ -2437,7 +2564,7 @@ mod tests {
                 Duration::ZERO,
                 Duration::from_millis(100),
                 3,
-                Duration::from_millis(1),
+                Duration::from_millis(25),
             )
             .unwrap_or_else(|e| panic!("{e}"));
         let diagnostics = session
@@ -2637,6 +2764,7 @@ mod tests {
                 &bmeg,
                 &duration,
                 &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
+                RecordingCalibration::default(),
             )
             .unwrap_or_else(|e| panic!("{e}"));
         let mut writer =
@@ -2691,7 +2819,14 @@ mod tests {
         };
         let bmeg = dir.path().join("multifield-soak.bmeg");
         let metadata = session
-            .initial_metadata(true, "SIM", &bmeg, &duration, &profile)
+            .initial_metadata(
+                true,
+                "SIM",
+                &bmeg,
+                &duration,
+                &profile,
+                RecordingCalibration::default(),
+            )
             .unwrap_or_else(|e| panic!("{e}"));
         let mut writer = BmegWriter::create_synchronized(&bmeg, &metadata, fields as usize)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -2828,6 +2963,7 @@ mod tests {
                 "SIM",
                 RecordingDuration::Timed { seconds: 2 },
                 default_general_profile().unwrap_or_else(|e| panic!("{e}")),
+                RecordingCalibration::default(),
             )
             .unwrap_or_else(|e| panic!("{e}"));
         session
@@ -2845,11 +2981,14 @@ mod tests {
         let capture_error = session
             .capture_transport(
                 &mut transport,
-                true,
-                "SIM",
-                default_general_profile().unwrap_or_else(|e| panic!("{e}")),
-                RecordingDuration::Timed { seconds: 2 },
-                dir.path(),
+                CaptureRequest {
+                    simulator: true,
+                    source: "SIM".into(),
+                    profile: default_general_profile().unwrap_or_else(|e| panic!("{e}")),
+                    duration: RecordingDuration::Timed { seconds: 2 },
+                    output_dir: dir.path().to_path_buf(),
+                    calibration: RecordingCalibration::default(),
+                },
             )
             .err()
             .unwrap_or_else(|| panic!("disconnecting transport unexpectedly completed"));
@@ -2879,7 +3018,8 @@ mod tests {
                 "Simulator",
                 "SIM",
                 RecordingDuration::Timed { seconds: 10 },
-                ecg.snapshot(false)
+                ecg.snapshot(false),
+                RecordingCalibration::default(),
             )
             .is_ok());
         session.disconnect().unwrap_or_else(|e| panic!("{e}"));
@@ -2891,11 +3031,104 @@ mod tests {
                 "SIM",
                 RecordingDuration::Timed { seconds: 10 },
                 snapshot.clone(),
+                RecordingCalibration::default(),
             )
             .unwrap_or_else(|e| panic!("{e}"));
         let status = session.status().unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(status.profile, Some(snapshot));
         session.disconnect().unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn bp_simulator_supports_a_deterministic_xgzp_reference_fit() {
+        let profile = built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_blood_pressure")
+            .unwrap_or_else(|| panic!("missing BP profile"))
+            .snapshot(false);
+        let simulator = SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let points = (0..1_000)
+            .map(|sequence| {
+                let reference_volts = crate::calibration::counts_to_volts(
+                    simulator.signal_counts(sequence, 1),
+                    12,
+                    5.0,
+                )
+                .unwrap_or_else(|e| panic!("{e}"));
+                let xgzp_volts = crate::calibration::counts_to_volts(
+                    simulator.signal_counts(sequence, 2),
+                    12,
+                    5.0,
+                )
+                .unwrap_or_else(|e| panic!("{e}"));
+                crate::calibration::CalibrationPoint {
+                    input_voltage: xgzp_volts,
+                    reference_value: crate::calibration::mpxv_mmhg(reference_volts, 5.0)
+                        .unwrap_or_else(|e| panic!("{e}")),
+                }
+            })
+            .collect::<Vec<_>>();
+        let fit = crate::calibration::fit_linear(&points).unwrap_or_else(|e| panic!("{e}"));
+        assert!((fit.slope - 120.0).abs() < 0.25);
+        assert!((fit.offset + 10.0).abs() < 1.0);
+        assert!(fit.r_squared > 0.999);
+    }
+
+    #[test]
+    fn completed_bp_bmeg_fit_uses_the_requested_interval() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let profile = built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_blood_pressure")
+            .unwrap_or_else(|| panic!("missing BP profile"))
+            .snapshot(false);
+        let bmeg = dir.path().join("bp-calibration.bmeg");
+        let session = SessionController::default();
+        let metadata = session
+            .initial_metadata(
+                true,
+                "SIM",
+                &bmeg,
+                &RecordingDuration::Timed { seconds: 10 },
+                &profile,
+                RecordingCalibration::default(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let simulator = SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut writer =
+            BmegWriter::create_synchronized(&bmeg, &metadata, 3).unwrap_or_else(|e| panic!("{e}"));
+        for sequence in 0..2_000 {
+            writer
+                .write_record(&SynchronizedRecord {
+                    sequence,
+                    timestamp_us: u64::from(sequence) * 5_000,
+                    status_flags: 0,
+                    counts: vec![
+                        simulator.signal_counts(sequence, 0),
+                        simulator.signal_counts(sequence, 1),
+                        simulator.signal_counts(sequence, 2),
+                    ],
+                })
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        writer.finish().unwrap_or_else(|e| panic!("{e}"));
+        let fit =
+            crate::calibration::fit_xgzp_from_recording(&crate::calibration::XgzpFitRequest {
+                bmeg_path: bmeg.display().to_string(),
+                start_seconds: 2.0,
+                end_seconds: 8.0,
+                adc_reference_v: 5.0,
+                mpxv_sensor_supply_v: 5.0,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fit.paired_samples, 1_201);
+        assert!((fit.slope - 120.0).abs() < 0.25);
+        assert!((fit.offset + 10.0).abs() < 1.0);
+        assert!(fit.r_squared > 0.999);
     }
 
     #[test]

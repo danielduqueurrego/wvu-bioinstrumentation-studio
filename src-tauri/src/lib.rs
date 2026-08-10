@@ -1,5 +1,6 @@
 pub mod acquisition;
 pub mod arduino_cli;
+pub mod calibration;
 pub mod firmware_workflow;
 pub mod firmware_workspace;
 pub mod profiles;
@@ -18,6 +19,8 @@ struct AppState {
     firmware: firmware_workflow::FirmwareWorkflow,
     /// Profiles are independent of firmware editing but bind every Phase 3A recording.
     profiles: profiles::ProfileStore,
+    /// Student-facing local calibration presets. They never modify a locked profile.
+    calibrations: calibration::CalibrationStore,
 }
 
 #[derive(Serialize)]
@@ -321,6 +324,77 @@ fn import_profile_package(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn list_calibrations(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    channel_id: String,
+) -> Result<Vec<calibration::CalibrationPreset>, String> {
+    state
+        .calibrations
+        .list(&profile_id, &channel_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_calibration(
+    state: tauri::State<'_, AppState>,
+    calibration: calibration::CalibrationPreset,
+) -> Result<calibration::CalibrationPreset, String> {
+    state
+        .calibrations
+        .save(calibration)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_calibration(
+    state: tauri::State<'_, AppState>,
+    calibration_id: String,
+) -> Result<(), String> {
+    state
+        .calibrations
+        .delete(&calibration_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn fit_xgzp_calibration(
+    request: calibration::XgzpFitRequest,
+) -> Result<calibration::LinearFit, String> {
+    calibration::fit_xgzp_from_recording(&request).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn fit_manual_linear_calibration(
+    points: Vec<calibration::CalibrationPoint>,
+) -> Result<calibration::LinearFit, String> {
+    calibration::fit_linear(&points).map_err(|error| error.to_string())
+}
+
+fn checked_recording_calibration(
+    profile: &profiles::AcquisitionProfile,
+    calibration: calibration::RecordingCalibration,
+) -> Result<calibration::RecordingCalibration, String> {
+    calibration.validate().map_err(|error| error.to_string())?;
+    for preset in &calibration.active_calibrations {
+        if preset.profile_id != profile.profile_id {
+            return Err("a calibration can be used only with the profile that created it".into());
+        }
+        if !profile
+            .acquisition
+            .resolved_channels()
+            .iter()
+            .any(|channel| channel.id == preset.channel_id)
+        {
+            return Err(
+                "a calibration can be used only with a channel in the selected profile".into(),
+            );
+        }
+    }
+    Ok(calibration)
+}
+
 /// Combined Phase 1 connect/handshake/configure/start command. The worker owns transport I/O.
 #[tauri::command]
 fn start_simulator_recording(
@@ -342,18 +416,21 @@ fn start_profile_simulator_recording(
     duration: recording::RecordingDuration,
     profile_id: String,
     bench_notice_acknowledged: bool,
+    calibration: Option<calibration::RecordingCalibration>,
 ) -> Result<session::SessionStatus, String> {
     checked_output_directory(&output_directory)?;
     let profile = state
         .profiles
         .get_locked(&profile_id)
         .map_err(|error| error.to_string())?;
+    let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())?;
     state
         .session
-        .start_simulator_with_profile(
+        .start_simulator_with_profile_and_calibration(
             profile.snapshot(bench_notice_acknowledged),
             duration,
             PathBuf::from(output_directory),
+            calibration,
         )
         .map_err(|error| error.to_string())
 }
@@ -403,6 +480,7 @@ fn start_profile_hardware_recording(
     duration: recording::RecordingDuration,
     profile_id: String,
     bench_notice_acknowledged: bool,
+    calibration: Option<calibration::RecordingCalibration>,
 ) -> Result<session::SessionStatus, String> {
     checked_output_directory(&output_directory)?;
     let profile = state
@@ -431,13 +509,15 @@ fn start_profile_hardware_recording(
                 .into(),
         );
     }
+    let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())?;
     state
         .session
-        .start_serial_with_profile(
+        .start_serial_with_profile_and_calibration(
             profile.snapshot(bench_notice_acknowledged),
             port,
             duration,
             PathBuf::from(output_directory),
+            calibration,
         )
         .map_err(|error| error.to_string())
 }
@@ -583,6 +663,7 @@ pub fn run() {
     let session = session::SessionController::default();
     let firmware = firmware_workflow::FirmwareWorkflow::new(session.clone());
     let profiles = profiles::ProfileStore::default();
+    let calibrations = calibration::CalibrationStore::default();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -591,6 +672,7 @@ pub fn run() {
             session,
             firmware,
             profiles,
+            calibrations,
         })
         .invoke_handler(tauri::generate_handler![
             list_boards,
@@ -620,6 +702,11 @@ pub fn run() {
             retire_profile,
             export_profile_package,
             import_profile_package,
+            list_calibrations,
+            save_calibration,
+            delete_calibration,
+            fit_xgzp_calibration,
+            fit_manual_linear_calibration,
             start_simulator_recording,
             start_hardware_recording,
             start_profile_simulator_recording,

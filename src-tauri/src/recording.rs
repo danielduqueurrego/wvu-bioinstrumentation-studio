@@ -2,7 +2,14 @@
 //! Legacy Phase 1–3 records are `u32 sequence, u64 timestamp_us, u16 ADC counts`.
 //! Phase 4 profile-aware records preserve a synchronized frame as
 //! `u32 sequence, u64 timestamp_us, u16 status_flags, u16[field_count] counts`.
-use crate::{profiles::ProfileSnapshot, protocol::IntegrityCounters};
+use crate::{
+    calibration::{
+        apply_linear, counts_to_volts, mpxv_kpa, mpxv_mmhg, RecordingCalibration,
+        DEFAULT_ADC_REFERENCE_V, DEFAULT_MPXV_SUPPLY_V,
+    },
+    profiles::ProfileSnapshot,
+    protocol::IntegrityCounters,
+};
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -141,6 +148,10 @@ pub struct RecordingMetadata {
     /// Manual, non-protocol experiment annotations. Markers never alter or remove raw samples.
     #[serde(default)]
     pub markers: Vec<RecordingMarker>,
+    /// Phase 5 derived-unit settings captured at recording start. Raw BMEG records
+    /// remain ADC counts regardless of whether any of these conversions are selected.
+    #[serde(default)]
+    pub calibration: Option<RecordingCalibration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -207,6 +218,8 @@ pub enum RecordingError {
     Truncated,
     #[error("recording record shape does not match the profile field layout")]
     InvalidRecordShape,
+    #[error("CSV conversion: {0}")]
+    Csv(String),
 }
 impl BmegWriter {
     pub fn create(path: &Path, metadata: &RecordingMetadata) -> Result<Self, RecordingError> {
@@ -472,18 +485,55 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
     let snapshot = input
         .metadata
         .profile_snapshot
-        .as_ref()
+        .clone()
         .ok_or(RecordingError::InvalidRecordShape)?;
     let fields = snapshot.profile.acquisition.record_field_names();
     let pulseox = matches!(
         snapshot.profile.acquisition.acquisition_mode,
         crate::profiles::AcquisitionMode::Pulseox4State
     );
+    let calibration = input.metadata.calibration.clone().unwrap_or_default();
+    let adc_reference_v =
+        if calibration.adc_reference_v.is_finite() && calibration.adc_reference_v > 0.0 {
+            calibration.adc_reference_v
+        } else {
+            // Legacy files predate explicit Vref metadata and retain the documented 5 V assumption.
+            DEFAULT_ADC_REFERENCE_V
+        };
+    let sensor_supply_v =
+        if calibration.mpxv_sensor_supply_v.is_finite() && calibration.mpxv_sensor_supply_v > 0.0 {
+            calibration.mpxv_sensor_supply_v
+        } else {
+            DEFAULT_MPXV_SUPPLY_V
+        };
     let mut writer = BufWriter::new(File::create(csv)?);
     if pulseox {
         writeln!(writer, "cycle_index,t_us,{}", fields.join(","))?;
     } else {
-        writeln!(writer, "record_sequence,t_us,{}", fields.join(","))?;
+        let channels = snapshot.profile.acquisition.resolved_channels();
+        let mut columns = Vec::new();
+        for channel in &channels {
+            columns.push(channel.csv_name.clone());
+            columns.push(voltage_column_name(&channel.csv_name));
+            match channel.id.as_str() {
+                "mpxv" if calibration.for_channel("mpxv").is_some() => {
+                    columns.push("mpxv_kPa".into());
+                    columns.push("mpxv_mmHg".into());
+                }
+                "pressure" if calibration.for_channel("pressure").is_some() => {
+                    columns.push("pressure_kPa".into())
+                }
+                "xgzp"
+                    if calibration
+                        .for_channel("xgzp")
+                        .is_some_and(|preset| preset.output_units.eq_ignore_ascii_case("mmHg")) =>
+                {
+                    columns.push("xgzp_mmHg".into())
+                }
+                _ => {}
+            }
+        }
+        writeln!(writer, "record_sequence,t_us,{}", columns.join(","))?;
     }
     let mut count = 0u64;
     while let Some(record) = input.next_record()? {
@@ -491,14 +541,62 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
             return Err(RecordingError::InvalidRecordShape);
         }
         write!(writer, "{},{}", record.sequence, record.timestamp_us)?;
-        for counts in record.counts {
-            write!(writer, ",{counts}")?;
+        if pulseox {
+            for counts in record.counts {
+                write!(writer, ",{counts}")?;
+            }
+        } else {
+            let channels = snapshot.profile.acquisition.resolved_channels();
+            for (index, counts) in record.counts.iter().copied().enumerate() {
+                let channel = channels
+                    .get(index)
+                    .ok_or(RecordingError::InvalidRecordShape)?;
+                let volts = counts_to_volts(counts, input.metadata.adc_bits, adc_reference_v)
+                    .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                write!(writer, ",{counts},{volts:.6}")?;
+                match channel.id.as_str() {
+                    "mpxv" if calibration.for_channel("mpxv").is_some() => {
+                        let kpa = mpxv_kpa(volts, sensor_supply_v)
+                            .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                        let mmhg = mpxv_mmhg(volts, sensor_supply_v)
+                            .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                        write!(writer, ",{kpa:.6},{mmhg:.6}")?;
+                    }
+                    "pressure" if calibration.for_channel("pressure").is_some() => {
+                        let kpa = mpxv_kpa(volts, sensor_supply_v)
+                            .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                        write!(writer, ",{kpa:.6}")?;
+                    }
+                    "xgzp"
+                        if calibration.for_channel("xgzp").is_some_and(|preset| {
+                            preset.output_units.eq_ignore_ascii_case("mmHg")
+                        }) =>
+                    {
+                        let value = apply_linear(
+                            volts,
+                            calibration
+                                .for_channel("xgzp")
+                                .ok_or(RecordingError::InvalidRecordShape)?,
+                        )
+                        .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                        write!(writer, ",{value:.6}")?;
+                    }
+                    _ => {}
+                }
+            }
         }
         writer.write_all(b"\n")?;
         count += 1;
     }
     writer.flush()?;
     Ok(count)
+}
+
+fn voltage_column_name(raw_column: &str) -> String {
+    raw_column
+        .strip_suffix("_counts")
+        .map(|base| format!("{base}_V"))
+        .unwrap_or_else(|| format!("{raw_column}_V"))
 }
 
 fn csv_field(value: &str) -> String {
@@ -569,6 +667,7 @@ mod tests {
             profile_snapshot: None,
             validation_context: None,
             markers: Vec::new(),
+            calibration: None,
         };
         let bmeg = dir.path().join("r.bmeg");
         let mut w = BmegWriter::create(&bmeg, &meta).unwrap_or_else(|e| panic!("{e}"));
@@ -675,6 +774,7 @@ mod tests {
             profile_snapshot: None,
             validation_context: None,
             markers: Vec::new(),
+            calibration: None,
         };
         let mut old = serde_json::to_value(metadata).unwrap_or_else(|e| panic!("{e}"));
         let object = old
@@ -746,6 +846,7 @@ mod tests {
                 timestamp_us: 0,
                 label: "baseline".into(),
             }],
+            calibration: None,
         };
         let bmeg = dir.path().join("profile.bmeg");
         let mut writer =
@@ -770,6 +871,61 @@ mod tests {
         assert!(std::fs::read_to_string(csv)
             .unwrap_or_default()
             .starts_with("record_sequence,t_us,ecg_counts"));
+        let bp = crate::profiles::built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_blood_pressure")
+            .unwrap_or_else(|| panic!("missing BP profile"))
+            .snapshot(false);
+        metadata.profile_snapshot = Some(bp.clone());
+        metadata.calibration = Some(RecordingCalibration {
+            adc_reference_v: 5.0,
+            mpxv_sensor_supply_v: 5.0,
+            channel_units: BTreeMap::new(),
+            active_calibrations: vec![
+                crate::calibration::fixed_mpxv_calibration(
+                    bp.profile.profile_id.clone(),
+                    "mpxv".into(),
+                    5.0,
+                    5.0,
+                )
+                .unwrap_or_else(|e| panic!("{e}")),
+                crate::calibration::CalibrationPreset {
+                    schema_version: 1,
+                    calibration_id: "team.xgzp".into(),
+                    profile_id: bp.profile.profile_id.clone(),
+                    channel_id: "xgzp".into(),
+                    calibration_type: crate::calibration::CalibrationType::Linear,
+                    input_quantity: "volts".into(),
+                    output_quantity: "pressure".into(),
+                    output_units: "mmHg".into(),
+                    parameters: BTreeMap::from([("slope".into(), 100.0), ("offset".into(), -5.0)]),
+                    created_at: Utc::now(),
+                    label: "Team XGZP".into(),
+                },
+            ],
+        });
+        let bp_bmeg = dir.path().join("bp.bmeg");
+        let bp_csv = dir.path().join("bp.csv");
+        let mut bp_writer = BmegWriter::create_synchronized(&bp_bmeg, &metadata, 3)
+            .unwrap_or_else(|e| panic!("{e}"));
+        bp_writer
+            .write_record(&SynchronizedRecord {
+                sequence: 1,
+                timestamp_us: 1_000,
+                status_flags: 1,
+                counts: vec![100, 2048, 2048],
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        bp_writer.finish().unwrap_or_else(|e| panic!("{e}"));
+        export_bmeg_csv(&bp_bmeg, &bp_csv).unwrap_or_else(|e| panic!("{e}"));
+        let bp_text = std::fs::read_to_string(bp_csv).unwrap_or_else(|e| panic!("{e}"));
+        assert!(bp_text.starts_with("record_sequence,t_us,ppg_counts,ppg_V,mpxv_counts,mpxv_V,mpxv_kPa,mpxv_mmHg,xgzp_counts,xgzp_V,xgzp_mmHg"));
+        assert!(BmegReader::open(&bp_bmeg)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .metadata
+            .calibration
+            .is_some());
         metadata.profile_snapshot = None;
         assert!(metadata.profile_snapshot.is_none());
     }
@@ -833,6 +989,7 @@ mod tests {
                 simulator_parameters: BTreeMap::from([("seed".into(), "test".into())]),
             }),
             markers: Vec::new(),
+            calibration: None,
         };
         let bmeg = dir.path().join("validation.bmeg");
         let csv = dir.path().join("validation.csv");
@@ -867,7 +1024,7 @@ mod tests {
         let header = std::fs::read_to_string(csv).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             header.lines().next(),
-            Some("record_sequence,t_us,ecg_counts")
+            Some("record_sequence,t_us,ecg_counts,ecg_V")
         );
     }
 }

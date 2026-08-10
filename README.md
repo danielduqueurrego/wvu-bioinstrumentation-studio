@@ -4,7 +4,7 @@ Windows teaching software for BMEG 420L. It is **not a medical device** and neve
 diagnostic or treatment advice. The app records raw engineering signals and preserves the timing,
 channel map, firmware identity, profile snapshot, and integrity counters needed for course work.
 
-## Current Phase 4 capabilities
+## Current Phase 5 capabilities
 
 - One UNO R4 WiFi at a time, with controlled protocol v0.2 firmware:
   build `0x00010002`, device `0x554E4F34`, USB CDC configured at 921600 baud.
@@ -17,17 +17,21 @@ channel map, firmware identity, profile snapshot, and integrity counters needed 
 - A firmware workspace for one-file UNO projects plus locked, profile-aware course capture and
   display-only plot groups. Formal analog-module characterization is outside the runtime app
   scope and does not gate ordinary course capture.
+- A lightweight **Calibration & Units** card: raw counts, stored-reference volts, MPXV kPa/mmHg,
+  and a student-created XGZP linear mmHg conversion. These are derived display/export values;
+  raw BMEG values remain authoritative.
 
 See [course profile mapping](docs/COURSE_ACQUISITION_PROFILES.md),
 [protocol v0.2](docs/USB_PROTOCOL_SPECIFICATION_v0.2.md), and
-[profile schema](docs/ACQUISITION_PROFILE_SCHEMA_v1.md).
+[profile schema](docs/ACQUISITION_PROFILE_SCHEMA_v1.md), and
+[calibration and units](docs/CALIBRATION_AND_UNITS.md).
 
 ## Safety boundary
 
 Follow BMEG 420L lab instructions and instructor safety procedures. Do not use this app for
-diagnosis or clinical decisions. The app does not calculate heart rate, SpO2, blood pressure, EMG
+diagnosis or clinical decisions. The app does not calculate heart rate, SpO2, SBP/DBP, EMG
 activation/fatigue, or any physiological interpretation. Raw ADC counts remain authoritative;
-volts are direct Arduino-input conversion only, never calibrated physiological units.
+calibration produces only documented engineering display/export values, never physiological units.
 
 The reference firmware makes D4/D5/D6 LOW at startup, idle, Stop, protocol/configuration errors,
 and watchdog faults. D4 may be HIGH only during the configured BP/PPG capture; D5/D6 are active
@@ -75,9 +79,9 @@ never held in RAM. Metadata includes start/stop time, duration mode, profile sna
 board/port, active analog pins, digital mapping, ADC/rate, markers, free space, completion/stop
 reason, and integrity counters. CSV streams from BMEG after finalization.
 
-For Phase 4 BMEG/CSV, leading columns are `record_sequence,t_us` (or `cycle_index,t_us` for
-pulse ox), followed by profile-defined raw count fields. Existing Phase 1–3 single-channel BMEG
-files remain readable and are never relabelled as course profiles.
+For Phase 5 BMEG/CSV, leading columns are `record_sequence,t_us` (or `cycle_index,t_us` for
+pulse ox), followed by profile-defined raw count fields and direct voltage/selected engineering
+columns. Existing Phase 1–4 BMEG files remain readable and are never relabelled as course profiles.
 
 ## Controlled acceptance harnesses
 

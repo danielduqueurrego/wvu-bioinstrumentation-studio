@@ -213,12 +213,15 @@ Formal characterization is an external instructor engineering activity and never
 - Preflight and clipping guidance
 - Raw and dark-corrected export
 
-### Phase 5 — Blood Pressure
+### Phase 5 — class calibration and engineering units
 
-- MPXV nominal conversion
-- MPXV calibration workflow
-- XGZP raw counts/volts
-- Event markers and pressure-specific metadata
+- Raw counts remain authoritative in BMEG; Vref/Vs/calibration snapshots are metadata only.
+- Direct counts-to-volts conversion uses the recorded ADC resolution and Vref.
+- MPXV uses the documented kPa/mmHg equation without silent clamping.
+- Students may fit and locally save an XGZP linear mmHg calibration against synchronized MPXV data
+  or manual points; no quality threshold or validation state is imposed.
+- CSV adds volts and selected engineering columns beside raw counts; no physiological analysis is
+  added.
 
 ### Phase 6 — packaging and classroom hardening
 

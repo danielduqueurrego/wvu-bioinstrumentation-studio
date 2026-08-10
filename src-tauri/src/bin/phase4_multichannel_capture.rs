@@ -128,7 +128,17 @@ fn validate(
         .to_owned();
     let expected_header = match profile.acquisition.acquisition_mode {
         AcquisitionMode::Simultaneous => {
-            format!("record_sequence,t_us,{}", expected_fields.join(","))
+            let columns = expected_fields
+                .iter()
+                .flat_map(|field| {
+                    let volts = field
+                        .strip_suffix("_counts")
+                        .map(|base| format!("{base}_V"))
+                        .unwrap_or_else(|| format!("{field}_V"));
+                    [field.clone(), volts]
+                })
+                .collect::<Vec<_>>();
+            format!("record_sequence,t_us,{}", columns.join(","))
         }
         AcquisitionMode::Pulseox4State => format!("cycle_index,t_us,{}", expected_fields.join(",")),
     };

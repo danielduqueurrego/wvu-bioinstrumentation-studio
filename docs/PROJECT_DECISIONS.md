@@ -110,7 +110,8 @@ Profile files are versioned JSON, validated against a schema, and cannot be sile
 - Default output is raw ADC counts.
 - Volts may be displayed as a direct conversion.
 - MPXV5100DP may additionally display nominal or calibrated kPa/mmHg.
-- XGZP160201S is counts/volts only in the application; student-built bridge conditioning and calibration are handled outside the app.
+- XGZP160201S remains raw counts/volts by default. Students may save a local linear mmHg
+  conversion against the synchronized MPXV reference; it is not a validation state or a clinical result.
 - No clinical SpO2 estimate.
 - No automatic heart-rate, EMG-envelope, blood-pressure, or diagnostic interpretation in v1.
 
@@ -127,8 +128,9 @@ Profile files are versioned JSON, validated against a schema, and cannot be sile
 - Course profiles are locked at their prescribed maps. Instructor drafts may make a unique A0–A5
   general-development map, but no built-in profile is edited in place.
 - Course capture stores raw counts as authoritative data. Counts-to-Arduino-input-volts display is
-  explicit. No SpO2, heart rate, pressure estimate, calibration fit, EMG activation/fatigue, or
-  automatic filter is added in Phase 4.
+  explicit. Phase 5 permits only documented engineering MPXV and student-linear-XGZP conversions
+  as display/CSV layers. No SpO2, heart rate, SBP/DBP estimate, EMG activation/fatigue, force
+  conversion, or automatic filter is added.
 
 ## Branding
 
