@@ -38,3 +38,7 @@
   `0x00010003` before an instructor-authored resource mapping can be captured on hardware. The
   application never performs that upload automatically; use the Firmware workspace’s explicit
   Restore WVU reference firmware action after reviewing the selected lab.
+- Phase 6 catalog/versioning automated and focused user inspection passed. Factory course labs are
+  bundled and require no import; catalog reads never create revisions. Remaining Phase 6 work is
+  the separate controlled-firmware, simulator/UNO smoke, and full UI acceptance sequence. See
+  `logs/phase6_lab_catalog_versioning_acceptance_2026-08-10.md`.

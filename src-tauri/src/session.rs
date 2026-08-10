@@ -2188,6 +2188,7 @@ struct SimulatorIo {
     sample_period_us: u32,
     channel_count: u8,
     pulseox: bool,
+    adc_resolution_bits: u8,
     output_mask: u8,
 }
 
@@ -2208,6 +2209,7 @@ impl SimulatorIo {
             sample_period_us: 1_000,
             channel_count: 1,
             pulseox: false,
+            adc_resolution_bits: profile.profile.acquisition.adc_resolution_bits,
             output_mask: 0,
         };
         simulator.queue(
@@ -2333,7 +2335,7 @@ impl SimulatorIo {
             }
             _ => 2.5 + (phase * 2.0).sin() * 1.1,
         };
-        let full_scale = if self.pulseox { 16_383.0 } else { 4_095.0 };
+        let full_scale = f64::from((1u32 << self.adc_resolution_bits) - 1);
         (volts * full_scale / 5.0).round().clamp(0.0, full_scale) as u16
     }
 }
@@ -2414,6 +2416,7 @@ impl Write for SimulatorIo {
                                     "invalid simulator simultaneous channel layout",
                                 ));
                             }
+                            self.adc_resolution_bits = payload[1];
                             self.pulseox = false;
                             self.sample_period_us = 1_000_000
                                 / u32::from_le_bytes([
@@ -2429,6 +2432,7 @@ impl Write for SimulatorIo {
                                     "invalid simulator pulse-ox layout",
                                 ));
                             }
+                            self.adc_resolution_bits = payload[1];
                             self.pulseox = true;
                             self.sample_period_us = u32::from_le_bytes([
                                 payload[2], payload[3], payload[4], payload[5],
@@ -3179,13 +3183,13 @@ mod tests {
             .map(|sequence| {
                 let reference_volts = crate::calibration::counts_to_volts(
                     simulator.signal_counts(sequence, 1),
-                    12,
+                    profile.profile.acquisition.adc_resolution_bits,
                     5.0,
                 )
                 .unwrap_or_else(|e| panic!("{e}"));
                 let xgzp_volts = crate::calibration::counts_to_volts(
                     simulator.signal_counts(sequence, 2),
-                    12,
+                    profile.profile.acquisition.adc_resolution_bits,
                     5.0,
                 )
                 .unwrap_or_else(|e| panic!("{e}"));
@@ -3268,10 +3272,10 @@ mod tests {
         };
         let emg = configure_payload(&lookup("course_emg_force").acquisition, None)
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(emg, vec![0, 12, 232, 3, 0, 0, 4, 0, 1, 2, 3, 0]);
+        assert_eq!(emg, vec![0, 14, 232, 3, 0, 0, 4, 0, 1, 2, 3, 0]);
         let bp = configure_payload(&lookup("course_blood_pressure").acquisition, None)
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(bp, vec![0, 12, 200, 0, 0, 0, 3, 0, 1, 2, 1]);
+        assert_eq!(bp, vec![0, 14, 200, 0, 0, 0, 3, 0, 1, 2, 1]);
         let pulseox = configure_payload(&lookup("course_pulseox").acquisition, None)
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(pulseox, vec![1, 14, 232, 3, 0, 0, 2, 0, 1, 5, 6]);
@@ -3330,7 +3334,7 @@ mod tests {
         assert_eq!(
             configure_payload(&ecg.acquisition, Some(&capabilities))
                 .unwrap_or_else(|error| panic!("{error}")),
-            vec![0, 12, 244, 1, 0, 0, 1, 2, 0]
+            vec![0, 14, 244, 1, 0, 0, 1, 2, 0]
         );
 
         let mut emg = lookup("course_emg_force");
@@ -3358,7 +3362,7 @@ mod tests {
         assert_eq!(
             configure_payload(&bp.acquisition, Some(&capabilities))
                 .unwrap_or_else(|error| panic!("{error}")),
-            vec![0, 12, 250, 0, 0, 0, 3, 3, 4, 5, 1]
+            vec![0, 14, 250, 0, 0, 0, 3, 3, 4, 5, 1]
         );
 
         let mut pulse = lookup("course_pulseox");

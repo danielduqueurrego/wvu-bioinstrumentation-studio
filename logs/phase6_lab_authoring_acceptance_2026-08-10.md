@@ -1,6 +1,6 @@
 # Phase 6 lab authoring acceptance — 2026-08-10
 
-Status: **automated implementation verification passed; simulator, UNO smoke, and manual UI acceptance pending.**
+Status: **catalog/versioning blocker fixed in automated verification; focused catalog, simulator, UNO smoke, and manual UI acceptance pending.**
 
 ## Implemented workflow
 
@@ -11,7 +11,8 @@ Status: **automated implementation verification passed; simulator, UNO smoke, an
   and leaves completed recording snapshots unchanged.
 - Simultaneous editor supports one to six unique A0–A5 channels, labels, CSV fields, conversion
   capability, default visibility, plot group, supported 100/200/250/500/1000 Hz rate, 12/14-bit
-  ADC, and safe D4–D6 output declaration.
+  ADC, and safe D4–D6 output declaration. All five shipped factory profiles now default to 14-bit
+  ADC acquisition.
 - The firmware/host protocol is v0.3 / build `0x00010003`; CAPABILITIES carries ADC, channel,
   mode, output, and rate limits. A saved offline lab is checked against those limits before
   CONFIGURE.
@@ -33,5 +34,7 @@ Status: **automated implementation verification passed; simulator, UNO smoke, an
   `0x00010003` (no automatic upload is permitted).
 - Simulator and UNO smoke captures of instructor-edited ECG, multi-channel, D4, and pulse-ox labs.
 - Full manual Lab Manager/Firmware/Acquisition viewport matrix at actual Windows scaling.
+- Focused factory-catalog and explicit-save verification in
+  `phase6_lab_catalog_versioning_acceptance_2026-08-10.md`.
 - No Phase 6 source acceptance claim is made until the explicit user-assisted simulator/UNO and UI
   checks below are completed.

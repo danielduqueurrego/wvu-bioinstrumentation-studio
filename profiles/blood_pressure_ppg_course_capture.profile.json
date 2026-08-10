@@ -11,7 +11,7 @@
   "fqbn": "arduino:renesas_uno:unor4wifi",
   "required_firmware": { "protocol_major": 0, "protocol_minor_min": 3, "build": "0x00010003", "device": "0x554E4F34" },
   "acquisition": {
-    "analog_pin": "A0", "adc_resolution_bits": 12, "sample_rate_hz": 200,
+    "analog_pin": "A0", "adc_resolution_bits": 14, "sample_rate_hz": 200,
     "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
     "acquisition_mode": "simultaneous",
     "channels": [
@@ -27,5 +27,5 @@
   "export": { "signal_name": "blood_pressure_ppg_course_capture", "include_profile_snapshot": true },
   "plot_defaults": { "groups": [{ "channel_ids": ["ppg"] }, { "channel_ids": ["mpxv"] }, { "channel_ids": ["xgzp"] }] },
   "associated_sketch": { "name": "WVU Reference Firmware", "is_wvu_reference": true },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "06cca7fd5717ca960ce2af75607af4479ed69d5be4e1d5e429127a5d372a31e5" }
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "18e9d0fc8e90612d0747e0bf455b5fcfc034d29c084078987342565cdc820d45" }
 }

@@ -204,7 +204,7 @@ On firmware startup, acquisition stop, command timeout, communication failure, o
 - Leads-off signals: digital inputs
 - Default ECG sample rate: 1000 samples/s
 - Default EMG sample rate: 2000 samples/s
-- Default ADC resolution: 12 bits
+- Default ADC resolution: 14 bits
 - Display/export: counts and volts
 - No derived heart rate or EMG envelope
 - Current course profiles preserve raw ECG/EMG capture variables at their locked profile settings.
@@ -291,9 +291,9 @@ medical-device boundary. The controlled application shall support the UNO R4 WiF
 v0.2 (extended by v0.3 resource capability advertisement) for one to six sequentially sampled analog inputs in a synchronized logical frame and one
 fixed pulse-ox four-state cycle mode. Course profiles shall capture the following raw variables:
 
-- ECG: A0 at 12 bit / 1000 frames/s.
-- EMG + force: A0, A1, A2, A3 at 12 bit / 1000 frames/s.
-- BP + PPG: A0, A1, A2 at 12 bit / 200 frames/s with D4 green active only while acquiring.
+- ECG: A0 at 14 bit / 1000 frames/s.
+- EMG + force: A0, A1, A2, A3 at 14 bit / 1000 frames/s.
+- BP + PPG: A0, A1, A2 at 14 bit / 200 frames/s with D4 green active only while acquiring.
 - Pulse ox raw TX/RX: A0/A1 at 14 bit; D5 RED, DARK, D6 IR, DARK; approximately 1 ms/state and
   250 cycles/s, preserving all eight state values per cycle.
 

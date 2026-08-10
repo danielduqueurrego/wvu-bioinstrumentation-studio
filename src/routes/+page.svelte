@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { open, save } from '@tauri-apps/plugin-dialog';
   import LivePlot from '$lib/components/LivePlot.svelte';
   import LabManager from '$lib/components/LabManager.svelte';
   import type { LabProfile } from '$lib/labs';
@@ -158,13 +157,6 @@
   let modeChangeInFlight = false;
   let benchNoticeAcknowledged = false;
   let instructorAcknowledgement = false;
-  let draftId = 'wvu.bmeg420l.instructor.example.v1';
-  let draftDescription = '';
-  let finalDraftVersion = '1.0.1';
-  let authoringDraft: AcquisitionProfile | undefined;
-  let draftPins = 'A0';
-  let draftSampleRate = 1000;
-  let draftAdcBits = 12;
   let traceVisibility: VisibleChannelMap = {};
   let traceProfileKey = '';
   let plotGroups: PlotGroup[] = [];
@@ -715,87 +707,6 @@
 
   function onInstructorBlocked() {
     statusMessage = 'Confirm that instructor mode can change acquisition settings, then select Instructor authoring.';
-  }
-
-  async function duplicateDraft() {
-    try {
-      authoringDraft = await invoke<AcquisitionProfile>('duplicate_profile_to_draft', { profileId: selectedProfileId, draftId });
-      draftDescription = authoringDraft.description;
-      draftPins = (authoringDraft.acquisition.channels?.length ? authoringDraft.acquisition.channels : [{ pin: authoringDraft.acquisition.analog_pin }]).map((channel) => channel.pin).join(', ');
-      draftSampleRate = authoringDraft.acquisition.sample_rate_hz;
-      draftAdcBits = authoringDraft.acquisition.adc_resolution_bits;
-      statusMessage = `Draft ${authoringDraft.profile_id} created. Only its descriptive field is editable in this Phase 3A interface.`;
-    } catch (error) { statusMessage = `Draft error: ${String(error)}`; }
-  }
-
-  async function updateDraftChannels() {
-    if (!authoringDraft) return;
-    const pins = draftPins.split(',').map((pin) => pin.trim().toUpperCase()).filter(Boolean);
-    const allowed = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5'];
-    if (!pins.length || pins.length > 6 || pins.some((pin) => !allowed.includes(pin)) || new Set(pins).size !== pins.length) {
-      statusMessage = 'General Analog draft pins must be unique A0–A5 values, separated by commas.';
-      return;
-    }
-    try {
-      authoringDraft = await invoke<AcquisitionProfile>('update_profile_draft_acquisition', {
-        profileId: authoringDraft.profile_id,
-        profileVersion: authoringDraft.profile_version,
-        acquisition: {
-          analog_pin: pins[0], adc_resolution_bits: Number(draftAdcBits), sample_rate_hz: Number(draftSampleRate),
-          allowed_duration_modes: ['timed', 'until_stopped'], timed_presets_seconds: [10, 30, 60, 300, 600], minimum_custom_duration_seconds: 10,
-          acquisition_mode: 'simultaneous',
-          channels: pins.map((pin, index) => ({ pin, id: `channel_${index + 1}`, label: pin, csv_name: `${pin.toLowerCase()}_counts`, units: 'ADC counts' }))
-        }
-      });
-      statusMessage = `Updated draft synchronized channels: ${pins.join(', ')} at ${draftSampleRate} frames/s.`;
-    } catch (error) { statusMessage = `Draft channel update error: ${String(error)}`; }
-  }
-
-  async function finalizeDraft() {
-    if (!authoringDraft) return;
-    try {
-      await invoke<AcquisitionProfile>('update_profile_draft_description', { profileId: authoringDraft.profile_id, profileVersion: authoringDraft.profile_version, description: draftDescription });
-      const finalized = await invoke<AcquisitionProfile>('finalize_profile_draft', { profileId: authoringDraft.profile_id, profileVersion: authoringDraft.profile_version, finalVersion: finalDraftVersion });
-      authoringDraft = undefined;
-      await refreshProfiles();
-      selectedProfileId = finalized.profile_id;
-      statusMessage = `Finalized ${finalized.display_name} ${finalized.profile_version}; its SHA-256 integrity hash is now locked.`;
-    } catch (error) { statusMessage = `Finalize error: ${String(error)}`; }
-  }
-
-  async function importProfilePackage() {
-    try {
-      const selected = await open({ multiple: false, filters: [{ name: 'Acquisition profile', extensions: ['json'] }] });
-      if (typeof selected !== 'string') return;
-      const imported = await invoke<AcquisitionProfile>('import_profile_package', { source: selected });
-      await refreshProfiles();
-      selectedProfileId = imported.profile_id;
-      statusMessage = `Imported and validated locked profile ${imported.profile_id} ${imported.profile_version}.`;
-    } catch (error) { statusMessage = `Profile import error: ${String(error)}`; }
-  }
-
-  async function exportProfilePackage() {
-    if (!activeProfile) return;
-    try {
-      const destination = await save({ defaultPath: `${activeProfile.profile_id}_${activeProfile.profile_version}.profile.json`, filters: [{ name: 'Acquisition profile', extensions: ['json'] }] });
-      if (!destination) return;
-      await invoke('export_profile_package', { profileId: activeProfile.profile_id, profileVersion: activeProfile.profile_version, destination });
-      statusMessage = `Exported the validated locked profile package to ${destination}.`;
-    } catch (error) { statusMessage = `Profile export error: ${String(error)}`; }
-  }
-
-  async function retireSelectedProfile() {
-    if (!activeProfile || activeProfile.source !== 'instructor') return;
-    try {
-      await invoke('retire_profile', {
-        profileId: activeProfile.profile_id,
-        profileVersion: activeProfile.profile_version
-      });
-      const retiredName = `${activeProfile.display_name} ${activeProfile.profile_version}`;
-      await refreshProfiles();
-      selectedProfileId = acquisitionProfiles[0]?.profile_id ?? '';
-      statusMessage = `Retired ${retiredName} from the active selection list. Existing recording provenance remains unchanged.`;
-    } catch (error) { statusMessage = `Retire error: ${String(error)}`; }
   }
 
   async function startRecording() {

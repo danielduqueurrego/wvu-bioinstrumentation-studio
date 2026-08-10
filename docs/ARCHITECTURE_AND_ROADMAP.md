@@ -226,8 +226,9 @@ Formal characterization is an external instructor engineering activity and never
 
 ### Phase 6 — instructor lab authoring and configurable workflows
 
-- Instructor-only Lab Manager with immutable active revisions, history, duplicate, retire/restore,
-  import/export, and course-default restore
+- Instructor-only Lab Manager with immutable factory definitions plus explicit local revisions,
+  history, duplicate, retire/restore, import/export, and course-default activation. Catalog reads
+  are pure; only explicit instructor write commands mutate local state.
 - One-to-six configurable simultaneous analog channels with unique A0–A5, labels, CSV fields,
   rate/ADC selection, calibration allowance, default visibility, and default plot groups
 - Safe D4–D6 output declarations and capability-checked configuration

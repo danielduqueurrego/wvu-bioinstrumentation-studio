@@ -11,7 +11,9 @@ channel map, firmware identity, profile snapshot, and integrity counters needed 
 - Synchronized logical analog frames with one to six unique A0–A5 inputs; ADC reads are sequential
   within a frame, not electrically simultaneous.
 - Locked course captures: ECG (A0); EMG + force (A0–A3); blood pressure + PPG (A0–A2, D4 green);
-  and pulse-ox TX/RX raw capture (A0/A1, D5 red, D6 IR).
+  and pulse-ox TX/RX raw capture (A0/A1, D5 red, D6 IR). All shipped course profiles default to
+  14-bit ADC acquisition; instructors may explicitly select a firmware-supported alternative in a
+  new lab revision.
 - Timed and **Until stopped** recording, bounded uPlot display updates, markers, continuous BMEG,
   profile-aware CSV, metadata, storage guards, disconnect finalization, and simulator support.
 - A firmware workspace for one-file UNO projects plus locked, profile-aware course capture and
@@ -20,10 +22,12 @@ channel map, firmware identity, profile snapshot, and integrity counters needed 
 - A lightweight **Calibration & Units** card: raw counts, stored-reference volts, MPXV kPa/mmHg,
   and a student-created XGZP linear mmHg conversion. These are derived display/export values;
   raw BMEG values remain authoritative.
-- An Instructor-only **Manage Labs** workflow that creates immutable active revisions of course
-  labs. It supports pin/channel/rate/ADC/output/plot-default changes, fixed pulse-ox phase
-  configuration, export/import, retirement/restore, and restoration of shipped course defaults.
-  Editing a lab never changes the snapshot stored in an earlier recording.
+- An Instructor-only **Manage Labs** workflow with five always-available factory course labs.
+  Editing opens an in-memory draft; only explicit **Save changes** creates one immutable active
+  instructor revision. It supports pin/channel/rate/ADC/output/plot-default changes, fixed
+  pulse-ox phase configuration, export/import, retirement/restore, and factory-default
+  activation. Reading, selecting, acquiring, plotting, calibrating, or navigating never creates
+  a lab version. Earlier recording snapshots never change.
 
 See [course profile mapping](docs/COURSE_ACQUISITION_PROFILES.md),
 [protocol v0.3](docs/USB_PROTOCOL_SPECIFICATION_v0.3.md),

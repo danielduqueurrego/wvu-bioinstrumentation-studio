@@ -265,10 +265,12 @@ fn create_blank_simultaneous_lab(
 fn save_lab_draft(
     state: tauri::State<'_, AppState>,
     draft: profiles::AcquisitionProfile,
+    base_version: Option<String>,
+    request_id: String,
 ) -> Result<profiles::AcquisitionProfile, String> {
     state
         .profiles
-        .save_lab_draft(draft)
+        .save_lab_draft(draft, base_version, request_id)
         .map_err(|error| error.to_string())
 }
 
@@ -296,6 +298,26 @@ fn restore_course_default_lab(
 }
 
 #[tauri::command]
+fn set_active_lab_version(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    profile_version: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .set_active_version(&profile_id, &profile_version)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn reset_local_lab_customizations(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .profiles
+        .reset_local_customizations()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn get_profile_mode(state: tauri::State<'_, AppState>) -> Result<profiles::ProfileMode, String> {
     state.profiles.mode().map_err(|error| error.to_string())
 }
@@ -309,57 +331,6 @@ fn set_profile_mode(
     state
         .profiles
         .set_mode(mode, acknowledgement)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn duplicate_profile_to_draft(
-    state: tauri::State<'_, AppState>,
-    profile_id: String,
-    draft_id: String,
-) -> Result<profiles::AcquisitionProfile, String> {
-    state
-        .profiles
-        .duplicate_to_draft(&profile_id, &draft_id)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn update_profile_draft_description(
-    state: tauri::State<'_, AppState>,
-    profile_id: String,
-    profile_version: String,
-    description: String,
-) -> Result<profiles::AcquisitionProfile, String> {
-    state
-        .profiles
-        .update_draft_description(&profile_id, &profile_version, description)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn update_profile_draft_acquisition(
-    state: tauri::State<'_, AppState>,
-    profile_id: String,
-    profile_version: String,
-    acquisition: profiles::AcquisitionSettings,
-) -> Result<profiles::AcquisitionProfile, String> {
-    state
-        .profiles
-        .update_draft_acquisition(&profile_id, &profile_version, acquisition)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn finalize_profile_draft(
-    state: tauri::State<'_, AppState>,
-    profile_id: String,
-    profile_version: String,
-    final_version: String,
-) -> Result<profiles::AcquisitionProfile, String> {
-    state
-        .profiles
-        .finalize_draft(&profile_id, &profile_version, final_version)
         .map_err(|error| error.to_string())
 }
 
@@ -775,12 +746,10 @@ pub fn run() {
             save_lab_draft,
             restore_retired_lab,
             restore_course_default_lab,
+            set_active_lab_version,
+            reset_local_lab_customizations,
             get_profile_mode,
             set_profile_mode,
-            duplicate_profile_to_draft,
-            update_profile_draft_description,
-            update_profile_draft_acquisition,
-            finalize_profile_draft,
             retire_profile,
             export_profile_package,
             import_profile_package,

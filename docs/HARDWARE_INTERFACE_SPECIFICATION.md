@@ -51,9 +51,9 @@ Typical signals:
 
 ### ECG and EMG / force
 
-- ECG: A0 = conditioned ECG output, 12 bit, 1000 frames/s
+- ECG: A0 = conditioned ECG output, 14 bit, 1000 frames/s
 - EMG / force: A0 = raw EMG; A1 = analog rectified EMG; A2 = EMG envelope; A3 = pressure/force
-  surrogate, 12 bit, 1000 synchronized frames/s
+  surrogate, 14 bit, 1000 synchronized frames/s
 
 The individual analog conversions are ordered sequentially within a logical frame. They share a
 frame sequence/timestamp but are not physically simultaneous conversions. The app preserves raw

@@ -7,20 +7,25 @@ not account-based or cryptographic authorization. It configures BMEG 420L course
 not create a generic MCU sequencer, perform physiological interpretation, or authorize clinical use.
 
 Student mode sees active locked lab revisions only. Instructor mode can list historical revisions,
-edit, duplicate, import/export, retire/restore, and restore a shipped course default. The explicit
+edit, duplicate, import/export, retire/restore, activate a revision, and restore a shipped course default. The explicit
 Instructor acknowledgement and the backend mode check are both required for authoring commands.
 
 ## Versioning and recording snapshots
 
-**Edit selected lab** creates a draft with the next patch version. **Save changes as new version**
-validates the draft, computes its SHA-256 integrity hash, locks it, and makes it active for future
-sessions. It never changes an older lab or a completed recording. Recordings retain the selected
+The five shipped course labs are immutable factory definitions and are always available without an
+import. **Edit selected lab** creates an in-memory draft based on the current version. It does not
+touch the catalog. **Save changes as new version** atomically verifies that base, allocates the
+next patch version, computes its SHA-256 integrity hash, locks it, and makes it active for future
+sessions. Repeating the same save request returns that one revision rather than allocating another.
+Cancel/close discards the draft with no catalog write. Recordings retain the selected
 lab/profile snapshot, firmware identity, pin map, rate, ADC resolution, output map, calibration
 snapshot, and markers.
 
-Retiring removes a revision from the active Student list without deleting it or any recording
-snapshot. Restoring a course default creates a new active instructor revision from the shipped
-package; it is not a destructive rollback.
+Local instructor/imported revisions may be retired without deleting their recording snapshots.
+Factory definitions cannot be retired. Restoring a course default activates that immutable factory
+definition; if it is already active, it is a no-op. **Reset local customizations** is an explicit,
+confirmed instructor action that removes local overrides/custom labs only—never shipped defaults
+or recordings.
 
 ## Simultaneous analog labs
 
@@ -73,14 +78,15 @@ responsible for explicit Save, Save As, Compile, Upload, and Restore Reference F
 
 Lab export is portable JSON and excludes recordings, local calibration presets, absolute machine
 paths, compiled artifacts, and firmware binaries. Import validates schema, resource safety,
-supported parameters, version conflicts, and integrity; it never silently overwrites a revision.
+supported parameters, version conflicts, and integrity; an exact installed version is a no-op and
+a same-ID/version content collision is rejected rather than silently incremented or overwritten.
 
 ## Current templates
 
 | Template | Default mapping | Rate / ADC | Default plots |
 | --- | --- | --- | --- |
-| ECG | A0 ECG | 1000 Hz / 12-bit | ECG |
-| EMG + Force | A0 raw, A1 rectified, A2 envelope, A3 pressure | 1000 Hz / 12-bit | one per signal |
-| Blood Pressure + PPG | A0 PPG, A1 MPXV, A2 XGZP, D4 green while recording | 200 Hz / 12-bit | one per signal |
+| ECG | A0 ECG | 1000 Hz / 14-bit | ECG |
+| EMG + Force | A0 raw, A1 rectified, A2 envelope, A3 pressure | 1000 Hz / 14-bit | one per signal |
+| Blood Pressure + PPG | A0 PPG, A1 MPXV, A2 XGZP, D4 green while recording | 200 Hz / 14-bit | one per signal |
 | Pulse Oximetry | TX A0, RX A1, RED D5, IR D6 | 1000 µs dwell / 14-bit | TX previews / RX previews |
 | General / Blank simultaneous | Instructor-defined 1–6 inputs | advertised supported settings | one per signal |

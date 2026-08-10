@@ -24,7 +24,7 @@ export type LabAcquisition = {
 
 export type LabProfile = {
   schema_version: number; profile_id: string; profile_version: string; display_name: string; category: string;
-  status: 'locked' | 'draft' | 'retired'; source: 'built_in' | 'instructor'; description: string;
+  status: 'locked' | 'draft' | 'retired'; source: 'built_in' | 'instructor' | 'imported'; description: string;
   target_board: string; fqbn: string;
   required_firmware: { protocol_major: number; protocol_minor_min: number; build: string; device: string };
   acquisition: LabAcquisition;

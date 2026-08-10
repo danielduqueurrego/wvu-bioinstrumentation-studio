@@ -32,6 +32,7 @@ pub enum ProfileStatus {
 pub enum ProfileSource {
     BuiltIn,
     Instructor,
+    Imported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -665,9 +666,15 @@ pub struct ProfileStore {
 }
 struct ProfileRuntime {
     mode: ProfileMode,
+    /// Factory profiles are compiled into the application and never written to
+    /// the local catalog. `profiles` holds them alongside local profiles only
+    /// to make historical lookup straightforward; `factory_keys` prevents a
+    /// local file from overriding or retiring a shipped definition.
+    factory_keys: BTreeSet<(String, String)>,
     profiles: BTreeMap<(String, String), AcquisitionProfile>,
     retired: BTreeSet<(String, String)>,
     active_versions: BTreeMap<String, String>,
+    completed_save_requests: BTreeMap<String, (String, String)>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -679,11 +686,16 @@ pub struct LabListEntry {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedLabState {
+    #[serde(default)]
     profiles: Vec<AcquisitionProfile>,
     #[serde(default)]
     retired: Vec<(String, String)>,
     #[serde(default)]
     active_versions: BTreeMap<String, String>,
+    /// Durable idempotency records prevent a frontend retry of the same
+    /// explicit Save action from allocating another version.
+    #[serde(default)]
+    completed_save_requests: BTreeMap<String, (String, String)>,
 }
 
 impl Default for ProfileStore {
@@ -693,22 +705,43 @@ impl Default for ProfileStore {
             .unwrap_or_else(std::env::temp_dir)
             .join("WVU Bioinstrumentation Studio")
             .join("profiles");
-        Self::with_root(root).unwrap_or_else(|_| Self {
-            root: std::env::temp_dir(),
-            runtime: Arc::new(Mutex::new(ProfileRuntime {
-                mode: ProfileMode::Student,
-                profiles: BTreeMap::new(),
-                retired: BTreeSet::new(),
-                active_versions: BTreeMap::new(),
-            })),
-        })
+        Self::with_root(root).unwrap_or_else(|_| Self::factory_only(std::env::temp_dir()))
     }
 }
 impl ProfileStore {
+    /// Last-resort read-only fallback for an unavailable local catalog. The
+    /// class defaults remain available even if a user-data path is malformed
+    /// or temporarily inaccessible; this fallback never writes a catalog.
+    fn factory_only(root: PathBuf) -> Self {
+        let mut profiles = BTreeMap::new();
+        let mut factory_keys = BTreeSet::new();
+        for profile in built_in_profiles().unwrap_or_default() {
+            let key = pkey(&profile);
+            factory_keys.insert(key.clone());
+            profiles.insert(key, profile);
+        }
+        let active_versions = profiles
+            .values()
+            .map(|profile| (profile.profile_id.clone(), profile.profile_version.clone()))
+            .collect();
+        Self {
+            root,
+            runtime: Arc::new(Mutex::new(ProfileRuntime {
+                mode: ProfileMode::Student,
+                factory_keys,
+                profiles,
+                retired: BTreeSet::new(),
+                active_versions,
+                completed_save_requests: BTreeMap::new(),
+            })),
+        }
+    }
     pub fn with_root(root: PathBuf) -> Result<Self, ProfileError> {
         let mut profiles = BTreeMap::new();
+        let mut factory_keys = BTreeSet::new();
         for profile in built_in_profiles()? {
             let key = pkey(&profile);
+            factory_keys.insert(key.clone());
             profiles.insert(key, profile);
         }
         let mut active_versions: BTreeMap<String, String> = profiles
@@ -716,6 +749,7 @@ impl ProfileStore {
             .map(|profile| (profile.profile_id.clone(), profile.profile_version.clone()))
             .collect();
         let mut retired = BTreeSet::new();
+        let mut completed_save_requests = BTreeMap::new();
         let state_path = root.join("lab_state.json");
         if state_path.exists() {
             let text = fs::read_to_string(&state_path).map_err(|source| ProfileError::Read {
@@ -725,48 +759,52 @@ impl ProfileStore {
             let persisted: PersistedLabState = serde_json::from_str(&text)?;
             for profile in persisted.profiles {
                 profile.validate()?;
-                profiles.insert(pkey(&profile), profile);
+                let key = pkey(&profile);
+                // Factory definitions are resolved from bundled resources. A
+                // stale local copy may never replace the class default merely
+                // because it has the same identity.
+                if !factory_keys.contains(&key) {
+                    profiles.insert(key, profile);
+                }
             }
-            retired.extend(persisted.retired);
+            retired.extend(
+                persisted
+                    .retired
+                    .into_iter()
+                    .filter(|key| !factory_keys.contains(key)),
+            );
             for (id, version) in persisted.active_versions {
-                if profiles.contains_key(&(id.clone(), version.clone())) {
+                let key = (id.clone(), version.clone());
+                if profiles.contains_key(&key) && !factory_keys.contains(&key) {
                     active_versions.insert(id, version);
                 }
             }
-        }
-        // Phase 3A–5 stored individual finalized instructor profiles under
-        // `locked/`. Import them once into the new version-history runtime so
-        // an application upgrade does not hide a student's/instructor's existing
-        // local labs merely because Phase 6 introduced `lab_state.json`.
-        let legacy_dir = root.join("locked");
-        if legacy_dir.is_dir() {
-            for entry in fs::read_dir(&legacy_dir).map_err(|source| ProfileError::Read {
-                path: legacy_dir.display().to_string(),
-                source,
-            })? {
-                let entry = entry.map_err(|source| ProfileError::Read {
-                    path: legacy_dir.display().to_string(),
-                    source,
-                })?;
-                let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                    continue;
+            for (request_id, key) in persisted.completed_save_requests {
+                if profiles.contains_key(&key) && !factory_keys.contains(&key) {
+                    // Retain only usable idempotency entries. They are reads
+                    // on startup and do not trigger any catalog write.
+                    // A request ID is opaque but bounded by the saving API.
+                    if valid_operation_id(&request_id) {
+                        // We intentionally keep the last successful result.
+                        // Replaying it returns this exact revision.
+                        //
+                        // No version is allocated during this reconciliation.
+                        //
+                        // (The insertion is into runtime memory only.)
+                        completed_save_requests.insert(request_id, key);
+                    }
                 }
-                let profile = load_profile(&path)?;
-                let key = pkey(&profile);
-                active_versions
-                    .entry(profile.profile_id.clone())
-                    .or_insert_with(|| profile.profile_version.clone());
-                profiles.entry(key).or_insert(profile);
             }
         }
         Ok(Self {
             root,
             runtime: Arc::new(Mutex::new(ProfileRuntime {
                 mode: ProfileMode::Student,
+                factory_keys,
                 profiles,
                 retired,
                 active_versions,
+                completed_save_requests,
             })),
         })
     }
@@ -791,17 +829,16 @@ impl ProfileStore {
     }
     pub fn list(&self) -> Result<Vec<AcquisitionProfile>, ProfileError> {
         let runtime = self.lock()?;
-        Ok(runtime
-            .profiles
-            .iter()
-            .filter(|(key, profile)| {
-                profile.status == ProfileStatus::Locked
-                    && !runtime.retired.contains(*key)
-                    && runtime.active_versions.get(&profile.profile_id)
-                        == Some(&profile.profile_version)
-            })
-            .map(|(_, profile)| profile.clone())
-            .collect())
+        let mut active = BTreeMap::new();
+        for (key, profile) in &runtime.profiles {
+            if profile.status != ProfileStatus::Locked || runtime.retired.contains(key) {
+                continue;
+            }
+            if runtime.active_versions.get(&profile.profile_id) == Some(&profile.profile_version) {
+                active.insert(profile.profile_id.clone(), profile.clone());
+            }
+        }
+        Ok(active.into_values().collect())
     }
 
     /// Instructor-only Lab Manager inventory. It includes historical and retired revisions,
@@ -837,23 +874,16 @@ impl ProfileStore {
             .ok_or_else(|| ProfileError::Validation("select a valid active locked profile".into()))
     }
 
-    /// Begins a new editable revision of the selected active lab. The immutable active
-    /// revision stays available to existing recordings and Student mode until Save changes.
+    /// Begins an entirely detached editor draft. It does not insert a profile,
+    /// allocate a revision, mark an active version, or write `lab_state.json`.
+    /// Only `save_lab_draft` creates a local revision.
     pub fn begin_lab_edit(&self, profile_id: &str) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
         let current = self.get_locked(profile_id)?;
         let mut draft = current;
-        draft.profile_version = next_patch_version(&draft.profile_version)?;
         draft.status = ProfileStatus::Draft;
         draft.source = ProfileSource::Instructor;
         draft.integrity.canonical_hash.clear();
-        let mut runtime = self.lock()?;
-        if runtime.profiles.contains_key(&pkey(&draft)) {
-            return Err(ProfileError::Validation(
-                "the next lab revision already exists; choose another active revision".into(),
-            ));
-        }
-        runtime.profiles.insert(pkey(&draft), draft.clone());
         Ok(draft)
     }
 
@@ -877,11 +907,10 @@ impl ProfileStore {
         draft.status = ProfileStatus::Draft;
         draft.source = ProfileSource::Instructor;
         draft.integrity.canonical_hash.clear();
-        let mut runtime = self.lock()?;
+        let runtime = self.lock()?;
         if runtime.profiles.keys().any(|(id, _)| id == lab_id) {
             return Err(ProfileError::Validation("lab ID already exists".into()));
         }
-        runtime.profiles.insert(pkey(&draft), draft.clone());
         Ok(draft)
     }
 
@@ -911,39 +940,67 @@ impl ProfileStore {
         draft.source = ProfileSource::Instructor;
         draft.status = ProfileStatus::Draft;
         draft.integrity.canonical_hash.clear();
-        let mut runtime = self.lock()?;
+        let runtime = self.lock()?;
         if runtime.profiles.contains_key(&pkey(&draft)) {
             return Err(ProfileError::Validation(
                 "lab ID/version already exists".into(),
             ));
         }
-        runtime.profiles.insert(pkey(&draft), draft.clone());
         Ok(draft)
     }
 
-    /// Saves the complete editable lab draft as the next active locked revision. The
-    /// backend preserves its ID/version/status/source so a stale UI cannot elevate a
-    /// different locked profile or replace history.
+    /// Atomically creates exactly one active local revision for a deliberate
+    /// instructor Save. A request ID makes retried UI calls idempotent, and a
+    /// base-version check rejects a stale editor rather than guessing a new
+    /// version.
     pub fn save_lab_draft(
         &self,
         edited: AcquisitionProfile,
+        base_version: Option<String>,
+        request_id: String,
     ) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
-        let key = pkey(&edited);
-        let mut runtime = self.lock()?;
-        let existing = runtime
-            .profiles
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| ProfileError::Validation("lab draft not found".into()))?;
-        if existing.status != ProfileStatus::Draft {
+        if !valid_operation_id(&request_id) {
             return Err(ProfileError::Validation(
-                "only a lab draft may be saved".into(),
+                "save request ID is invalid".into(),
+            ));
+        }
+        let mut runtime = self.lock()?;
+        if let Some(key) = runtime.completed_save_requests.get(&request_id) {
+            return runtime.profiles.get(key).cloned().ok_or_else(|| {
+                ProfileError::Validation("saved lab revision is unavailable".into())
+            });
+        }
+        let requested_id = edited.profile_id.clone();
+        let audit_base_version = base_version.clone();
+        let allocated_version = match base_version {
+            Some(base) => {
+                if runtime.active_versions.get(&requested_id) != Some(&base) {
+                    return Err(ProfileError::Validation(
+                        "this lab changed since the editor opened; reload the latest version before saving"
+                            .into(),
+                    ));
+                }
+                next_patch_version(&base)?
+            }
+            None => {
+                if runtime.profiles.keys().any(|(id, _)| id == &requested_id) {
+                    return Err(ProfileError::Validation(
+                        "lab ID already exists; use Edit to create a new revision".into(),
+                    ));
+                }
+                "1.0.0".into()
+            }
+        };
+        let key = (requested_id.clone(), allocated_version.clone());
+        if runtime.profiles.contains_key(&key) {
+            return Err(ProfileError::Validation(
+                "the requested lab revision already exists; reload before saving".into(),
             ));
         }
         let mut finalized = edited;
-        finalized.profile_id = existing.profile_id;
-        finalized.profile_version = existing.profile_version;
+        finalized.profile_id = requested_id;
+        finalized.profile_version = allocated_version;
         // Validate editable fields before the immutable hash exists, then lock and
         // validate the final canonical document.
         finalized.status = ProfileStatus::Draft;
@@ -959,143 +1016,35 @@ impl ProfileStore {
             finalized.profile_version.clone(),
         );
         runtime.retired.remove(&pkey(&finalized));
-        let persisted = self.persisted_state(&runtime);
-        drop(runtime);
-        self.persist_state(&persisted)?;
-        Ok(finalized)
-    }
-    pub fn duplicate_to_draft(
-        &self,
-        profile_id: &str,
-        draft_id: &str,
-    ) -> Result<AcquisitionProfile, ProfileError> {
-        self.require_instructor()?;
-        if !valid_profile_id(draft_id) {
-            return Err(ProfileError::Validation("invalid draft profile ID".into()));
-        }
-        let locked = self.get_locked(profile_id)?;
-        let mut draft = locked;
-        draft.profile_id = draft_id.into();
-        draft.status = ProfileStatus::Draft;
-        draft.source = ProfileSource::Instructor;
-        draft.integrity.canonical_hash.clear();
-        let mut runtime = self.lock()?;
-        if runtime.profiles.keys().any(|(id, _)| id == draft_id) {
-            return Err(ProfileError::Validation("profile ID already exists".into()));
-        }
-        runtime.profiles.insert(pkey(&draft), draft.clone());
-        Ok(draft)
-    }
-    pub fn update_draft_description(
-        &self,
-        profile_id: &str,
-        profile_version: &str,
-        description: String,
-    ) -> Result<AcquisitionProfile, ProfileError> {
-        self.require_instructor()?;
-        let mut runtime = self.lock()?;
-        let draft = runtime
-            .profiles
-            .get_mut(&(profile_id.into(), profile_version.into()))
-            .ok_or_else(|| ProfileError::Validation("draft not found".into()))?;
-        if draft.status != ProfileStatus::Draft {
-            return Err(ProfileError::Validation(
-                "only a draft may be edited".into(),
-            ));
-        }
-        if description.trim().is_empty() {
-            return Err(ProfileError::Validation("description is required".into()));
-        }
-        draft.description = description;
-        Ok(draft.clone())
-    }
-
-    /// Instructor-authored drafts may remap the general analog channel list. The draft remains
-    /// unusable in Student mode until it is validated, finalized, and hash-locked as a new
-    /// profile version.
-    pub fn update_draft_acquisition(
-        &self,
-        profile_id: &str,
-        profile_version: &str,
-        acquisition: AcquisitionSettings,
-    ) -> Result<AcquisitionProfile, ProfileError> {
-        self.require_instructor()?;
-        let mut runtime = self.lock()?;
-        let draft = runtime
-            .profiles
-            .get_mut(&(profile_id.into(), profile_version.into()))
-            .ok_or_else(|| ProfileError::Validation("draft not found".into()))?;
-        if draft.status != ProfileStatus::Draft {
-            return Err(ProfileError::Validation(
-                "only a draft may be edited".into(),
-            ));
-        }
-        if draft.category != "development" {
-            return Err(ProfileError::Validation(
-                "only a General Analog development draft may remap runtime channels".into(),
-            ));
-        }
-        draft.plot_defaults = PlotDefaults {
-            groups: acquisition
-                .resolved_channels()
-                .into_iter()
-                .map(|channel| PlotDefaultGroup {
-                    channel_ids: vec![channel.id],
-                })
-                .collect(),
-        };
-        draft.acquisition = acquisition;
-        draft.validate()?;
-        Ok(draft.clone())
-    }
-    pub fn finalize_draft(
-        &self,
-        profile_id: &str,
-        profile_version: &str,
-        final_version: String,
-    ) -> Result<AcquisitionProfile, ProfileError> {
-        self.require_instructor()?;
-        if !valid_semver(&final_version) {
-            return Err(ProfileError::Validation(
-                "final version must be MAJOR.MINOR.PATCH".into(),
-            ));
-        }
-        let mut runtime = self.lock()?;
-        let mut final_profile = runtime
-            .profiles
-            .get(&(profile_id.into(), profile_version.into()))
-            .cloned()
-            .ok_or_else(|| ProfileError::Validation("draft not found".into()))?;
-        if final_profile.status != ProfileStatus::Draft {
-            return Err(ProfileError::Validation(
-                "only a draft may be finalized".into(),
-            ));
-        }
-        final_profile.profile_version = final_version;
-        final_profile.status = ProfileStatus::Locked;
-        final_profile.source = ProfileSource::Instructor;
-        final_profile.refresh_hash()?;
-        final_profile.validate()?;
-        let key = pkey(&final_profile);
-        if runtime.profiles.contains_key(&key) {
-            return Err(ProfileError::Validation(
-                "profile ID/version already exists".into(),
-            ));
-        }
-        runtime.profiles.insert(key, final_profile.clone());
-        runtime.active_versions.insert(
-            final_profile.profile_id.clone(),
-            final_profile.profile_version.clone(),
+        runtime.completed_save_requests.insert(
+            request_id.clone(),
+            (
+                finalized.profile_id.clone(),
+                finalized.profile_version.clone(),
+            ),
         );
         let persisted = self.persisted_state(&runtime);
         drop(runtime);
         self.persist_state(&persisted)?;
-        Ok(final_profile)
+        self.append_lab_write_log(
+            "save_new_version",
+            &finalized.profile_id,
+            audit_base_version.as_deref(),
+            Some(&finalized.profile_version),
+            &request_id,
+        )?;
+        Ok(finalized)
     }
     pub fn retire(&self, profile_id: &str, profile_version: &str) -> Result<(), ProfileError> {
         self.require_instructor()?;
         let mut runtime = self.lock()?;
         let key = (profile_id.into(), profile_version.into());
+        if runtime.factory_keys.contains(&key) {
+            return Err(ProfileError::Validation(
+                "shipped course defaults cannot be retired; use Restore course default to make one active"
+                    .into(),
+            ));
+        }
         runtime
             .profiles
             .get(&key)
@@ -1107,6 +1056,13 @@ impl ProfileStore {
         let persisted = self.persisted_state(&runtime);
         drop(runtime);
         self.persist_state(&persisted)?;
+        self.append_lab_write_log(
+            "retire",
+            profile_id,
+            Some(profile_version),
+            None,
+            "explicit",
+        )?;
         Ok(())
     }
     pub fn restore_retired(
@@ -1117,6 +1073,11 @@ impl ProfileStore {
         self.require_instructor()?;
         let key = (profile_id.to_string(), profile_version.to_string());
         let mut runtime = self.lock()?;
+        if runtime.factory_keys.contains(&key) {
+            return Err(ProfileError::Validation(
+                "factory definitions are always available and do not need restoring".into(),
+            ));
+        }
         let profile = runtime
             .profiles
             .get(&key)
@@ -1134,6 +1095,13 @@ impl ProfileStore {
         let persisted = self.persisted_state(&runtime);
         drop(runtime);
         self.persist_state(&persisted)?;
+        self.append_lab_write_log(
+            "restore_retired",
+            profile_id,
+            Some(profile_version),
+            Some(profile_version),
+            "explicit",
+        )?;
         Ok(profile)
     }
     pub fn restore_course_default(
@@ -1141,42 +1109,98 @@ impl ProfileStore {
         profile_id: &str,
     ) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
-        let mut restored = built_in_profiles()?
+        let restored = built_in_profiles()?
             .into_iter()
             .find(|profile| profile.profile_id == profile_id)
             .ok_or_else(|| {
                 ProfileError::Validation("no shipped course default exists for this lab".into())
             })?;
-        let runtime = self.lock()?;
-        let highest = runtime
-            .profiles
-            .keys()
-            .filter(|(id, _)| id == profile_id)
-            .map(|(_, version)| version.clone())
-            .max_by(|left, right| version_key(left).cmp(&version_key(right)));
-        drop(runtime);
-        restored.profile_version =
-            next_patch_version(highest.as_deref().unwrap_or(&restored.profile_version))?;
-        restored.status = ProfileStatus::Locked;
-        restored.source = ProfileSource::Instructor;
-        restored.integrity.canonical_hash.clear();
-        restored.refresh_hash()?;
-        restored.validate()?;
         let mut runtime = self.lock()?;
-        runtime.profiles.insert(pkey(&restored), restored.clone());
+        if runtime.active_versions.get(profile_id) == Some(&restored.profile_version) {
+            return Ok(restored);
+        }
         runtime.active_versions.insert(
             restored.profile_id.clone(),
             restored.profile_version.clone(),
         );
-        runtime.retired.remove(&pkey(&restored));
         let persisted = self.persisted_state(&runtime);
         drop(runtime);
         self.persist_state(&persisted)?;
+        self.append_lab_write_log(
+            "restore_factory_default",
+            profile_id,
+            None,
+            Some(&restored.profile_version),
+            "explicit",
+        )?;
         Ok(restored)
+    }
+    /// Explicitly activates one previously saved local revision. Reading or
+    /// selecting a lab never calls this method.
+    pub fn set_active_version(
+        &self,
+        profile_id: &str,
+        profile_version: &str,
+    ) -> Result<AcquisitionProfile, ProfileError> {
+        self.require_instructor()?;
+        let key = (profile_id.to_string(), profile_version.to_string());
+        let mut runtime = self.lock()?;
+        if runtime.factory_keys.contains(&key) {
+            drop(runtime);
+            return self.restore_course_default(profile_id);
+        }
+        let profile = runtime
+            .profiles
+            .get(&key)
+            .filter(|profile| profile.status == ProfileStatus::Locked)
+            .cloned()
+            .ok_or_else(|| ProfileError::Validation("local lab revision not found".into()))?;
+        if runtime.retired.contains(&key) {
+            return Err(ProfileError::Validation(
+                "restore this retired lab revision before making it active".into(),
+            ));
+        }
+        if runtime.active_versions.get(profile_id) == Some(&profile_version.to_string()) {
+            return Ok(profile);
+        }
+        runtime
+            .active_versions
+            .insert(profile_id.to_string(), profile_version.to_string());
+        let persisted = self.persisted_state(&runtime);
+        drop(runtime);
+        self.persist_state(&persisted)?;
+        self.append_lab_write_log(
+            "set_active_version",
+            profile_id,
+            None,
+            Some(profile_version),
+            "explicit",
+        )?;
+        Ok(profile)
+    }
+    /// Removes only local instructor/imported overrides. Factory definitions
+    /// and recordings remain intact. The action is intentionally explicit and
+    /// intended for a classroom catalog reset, never for normal startup.
+    pub fn reset_local_customizations(&self) -> Result<(), ProfileError> {
+        self.require_instructor()?;
+        let mut runtime = self.lock()?;
+        let factory_keys = runtime.factory_keys.clone();
+        runtime.profiles.retain(|key, _| factory_keys.contains(key));
+        runtime.retired.clear();
+        runtime.active_versions = runtime
+            .profiles
+            .values()
+            .map(|profile| (profile.profile_id.clone(), profile.profile_version.clone()))
+            .collect();
+        runtime.completed_save_requests.clear();
+        let persisted = self.persisted_state(&runtime);
+        drop(runtime);
+        self.persist_state(&persisted)?;
+        self.append_lab_write_log("reset_local_customizations", "all", None, None, "explicit")
     }
     pub fn import_profile(&self, path: &Path) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
-        let profile = load_profile(path)?;
+        let mut profile = load_profile(path)?;
         if profile.status != ProfileStatus::Locked {
             return Err(ProfileError::Validation(
                 "only finalized locked profile packages may be imported".into(),
@@ -1184,19 +1208,36 @@ impl ProfileStore {
         }
         let mut runtime = self.lock()?;
         let key = pkey(&profile);
-        if runtime.profiles.contains_key(&key) {
+        if let Some(existing) = runtime.profiles.get(&key) {
+            if existing.canonical_bytes()? == profile.canonical_bytes()? {
+                return Err(ProfileError::Validation(
+                    "this exact lab version is already installed; no catalog change was made"
+                        .into(),
+                ));
+            }
             return Err(ProfileError::Validation(
-                "profile ID/version already exists".into(),
+                "an installed lab has the same ID and version but different content; import it with a new lab ID"
+                    .into(),
             ));
         }
+        profile.source = ProfileSource::Imported;
+        profile.integrity.canonical_hash.clear();
+        profile.refresh_hash()?;
+        profile.validate()?;
         runtime.profiles.insert(key, profile.clone());
         runtime
             .active_versions
-            .entry(profile.profile_id.clone())
-            .or_insert_with(|| profile.profile_version.clone());
+            .insert(profile.profile_id.clone(), profile.profile_version.clone());
         let persisted = self.persisted_state(&runtime);
         drop(runtime);
         self.persist_state(&persisted)?;
+        self.append_lab_write_log(
+            "import",
+            &profile.profile_id,
+            None,
+            Some(&profile.profile_version),
+            "explicit",
+        )?;
         Ok(profile)
     }
     pub fn export_profile(
@@ -1239,11 +1280,26 @@ impl ProfileStore {
             profiles: runtime
                 .profiles
                 .values()
-                .filter(|profile| profile.source == ProfileSource::Instructor)
+                .filter(|profile| profile.source != ProfileSource::BuiltIn)
                 .cloned()
                 .collect(),
-            retired: runtime.retired.iter().cloned().collect(),
-            active_versions: runtime.active_versions.clone(),
+            retired: runtime
+                .retired
+                .iter()
+                .filter(|key| !runtime.factory_keys.contains(*key))
+                .cloned()
+                .collect(),
+            active_versions: runtime
+                .active_versions
+                .iter()
+                .filter(|(id, version)| {
+                    !runtime
+                        .factory_keys
+                        .contains(&((*id).clone(), (*version).clone()))
+                })
+                .map(|(id, version)| (id.clone(), version.clone()))
+                .collect(),
+            completed_save_requests: runtime.completed_save_requests.clone(),
         }
     }
     fn persist_state(&self, state: &PersistedLabState) -> Result<(), ProfileError> {
@@ -1286,6 +1342,43 @@ impl ProfileStore {
             }
         })
     }
+    fn append_lab_write_log(
+        &self,
+        operation: &str,
+        lab_id: &str,
+        base_version: Option<&str>,
+        new_version: Option<&str>,
+        request_id: &str,
+    ) -> Result<(), ProfileError> {
+        fs::create_dir_all(&self.root).map_err(|source| ProfileError::Write {
+            path: self.root.display().to_string(),
+            source,
+        })?;
+        let path = self.root.join("lab_write_audit.log");
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| ProfileError::Write {
+                path: path.display().to_string(),
+                source,
+            })?;
+        writeln!(
+            file,
+            "{}\tLAB_WRITE\t{}\t{}\t{}\t{}\trequest={}",
+            Utc::now().to_rfc3339(),
+            operation,
+            lab_id,
+            base_version.unwrap_or("-"),
+            new_version.unwrap_or("-"),
+            request_id
+        )
+        .map_err(|source| ProfileError::Write {
+            path: path.display().to_string(),
+            source,
+        })
+    }
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, ProfileRuntime>, ProfileError> {
         self.runtime
             .lock()
@@ -1305,6 +1398,12 @@ fn valid_profile_id(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
+}
+fn valid_operation_id(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 fn valid_semver(value: &str) -> bool {
     let fields: Vec<_> = value.split('.').collect();
@@ -1400,7 +1499,9 @@ mod tests {
         };
         let ecg = lookup("course_ecg");
         assert_eq!(ecg.acquisition.record_field_names(), ["ecg_counts"]);
+        assert_eq!(ecg.acquisition.adc_resolution_bits, 14);
         let emg = lookup("course_emg_force");
+        assert_eq!(emg.acquisition.adc_resolution_bits, 14);
         assert_eq!(emg.acquisition.analog_pins(), ["A0", "A1", "A2", "A3"]);
         assert_eq!(
             emg.acquisition.record_field_names(),
@@ -1412,6 +1513,7 @@ mod tests {
             ]
         );
         let bp = lookup("course_blood_pressure");
+        assert_eq!(bp.acquisition.adc_resolution_bits, 14);
         assert_eq!(bp.acquisition.analog_pins(), ["A0", "A1", "A2"]);
         assert_eq!(
             bp.acquisition
@@ -1428,6 +1530,9 @@ mod tests {
         assert_eq!(pulseox.acquisition.analog_pins(), ["A0", "A1"]);
         assert_eq!(pulseox.acquisition.record_field_names().len(), 8);
         assert_eq!(pulseox.acquisition.state_dwell_us, Some(1_000));
+        assert_eq!(pulseox.acquisition.adc_resolution_bits, 14);
+        let general = lookup("development");
+        assert_eq!(general.acquisition.adc_resolution_bits, 14);
     }
 
     #[test]
@@ -1456,70 +1561,61 @@ mod tests {
         assert!(profile.verify_integrity().is_err());
     }
     #[test]
-    fn instructor_draft_finalization_and_retirement_are_controlled() {
+    fn drafts_are_detached_and_one_explicit_save_creates_one_revision() {
         let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let store = ProfileStore::with_root(dir.path().into()).unwrap_or_else(|e| panic!("{e}"));
+        let root = dir.path().join("profiles");
+        let store = ProfileStore::with_root(root.clone()).unwrap_or_else(|e| panic!("{e}"));
         assert!(store
-            .duplicate_to_draft("wvu.bmeg420l.ecg.course.capture.v1", "example.ecg.draft")
+            .begin_lab_edit("wvu.bmeg420l.ecg.course.capture.v1")
             .is_err());
         store
             .set_mode(ProfileMode::InstructorAuthoring, true)
             .unwrap_or_else(|e| panic!("{e}"));
-        let draft = store
-            .duplicate_to_draft("wvu.bmeg420l.ecg.course.capture.v1", "example.ecg.draft")
+        let mut draft = store
+            .begin_lab_edit("wvu.bmeg420l.ecg.course.capture.v1")
             .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(draft.profile_version, "1.0.0");
+        assert_eq!(store.list_all().unwrap_or_default().len(), 5);
+        assert!(!root.join("lab_state.json").exists());
+        draft.description.push_str(" edited");
         let final_profile = store
-            .finalize_draft(&draft.profile_id, &draft.profile_version, "1.0.1".into())
+            .save_lab_draft(draft.clone(), Some("1.0.0".into()), "save-ecg-0001".into())
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(final_profile.verify_integrity().is_ok());
-        store
-            .retire(&final_profile.profile_id, &final_profile.profile_version)
+        assert_eq!(final_profile.profile_version, "1.0.1");
+        assert_eq!(store.list_all().unwrap_or_default().len(), 6);
+        let retried = store
+            .save_lab_draft(draft, Some("1.0.0".into()), "save-ecg-0001".into())
             .unwrap_or_else(|e| panic!("{e}"));
-        assert!(!store
-            .list()
-            .unwrap_or_default()
-            .iter()
-            .any(|p| p.profile_id == final_profile.profile_id));
+        assert_eq!(retried.profile_version, "1.0.1");
+        assert_eq!(store.list_all().unwrap_or_default().len(), 6);
+        let audit =
+            fs::read_to_string(root.join("lab_write_audit.log")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(audit.lines().count(), 1);
+        assert!(audit.contains("save_new_version"));
     }
 
     #[test]
-    fn instructor_can_remap_only_a_general_analog_draft() {
+    fn factory_defaults_are_available_after_repeated_read_only_initialization() {
         let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
-        let store =
-            ProfileStore::with_root(dir.path().into()).unwrap_or_else(|error| panic!("{error}"));
-        store
-            .set_mode(ProfileMode::InstructorAuthoring, true)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let draft = store
-            .duplicate_to_draft(
-                "wvu.bmeg420l.general.analog.development.v2",
-                "example.general.draft",
-            )
-            .unwrap_or_else(|error| panic!("{error}"));
-        let mut settings = draft.acquisition.clone();
-        settings.channels = (0..6)
-            .map(|index| ProfileChannel {
-                pin: format!("A{index}"),
-                id: format!("channel_{index}"),
-                label: format!("Channel {index}"),
-                csv_name: format!("channel_{index}_counts"),
-                units: "ADC counts".into(),
-                allowed_conversions: vec!["counts_volts".into()],
-                default_display_unit: Some("counts".into()),
-                default_visible: true,
-            })
-            .collect();
-        let remapped = store
-            .update_draft_acquisition(&draft.profile_id, &draft.profile_version, settings)
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(remapped.acquisition.analog_pins().len(), 6);
-        assert!(store
-            .update_draft_acquisition(
-                "wvu.bmeg420l.ecg.course.capture.v1",
-                "1.0.0",
-                remapped.acquisition,
-            )
-            .is_err());
+        let root = dir.path().join("profiles");
+        for _ in 0..100 {
+            let store =
+                ProfileStore::with_root(root.clone()).unwrap_or_else(|error| panic!("{error}"));
+            let names: Vec<_> = store
+                .list()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .into_iter()
+                .map(|profile| profile.display_name)
+                .collect();
+            assert_eq!(names.len(), 5);
+            assert!(names.contains(&"ECG — Course Capture".into()));
+            assert!(names.contains(&"EMG + Force — Course Capture".into()));
+            assert!(names.contains(&"Blood Pressure + PPG — Course Capture".into()));
+            assert!(names.contains(&"Pulse Oximetry — TX + RX Raw Capture".into()));
+            assert!(names.contains(&"General Analog — Development".into()));
+        }
+        assert!(!root.join("lab_state.json").exists());
     }
     #[test]
     fn failed_instructor_entry_neither_changes_mode_nor_logs_a_success() {
@@ -1554,10 +1650,10 @@ mod tests {
         let mut draft = store
             .begin_lab_edit("wvu.bmeg420l.ecg.course.capture.v1")
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(draft.profile_version, "1.0.1");
+        assert_eq!(draft.profile_version, "1.0.0");
         draft.acquisition.channels[0].pin = "A2".into();
         let saved = store
-            .save_lab_draft(draft)
+            .save_lab_draft(draft, Some("1.0.0".into()), "save-ecg-0002".into())
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(saved.profile_version, "1.0.1");
         assert_eq!(saved.acquisition.analog_pins(), ["A2"]);
@@ -1592,12 +1688,16 @@ mod tests {
             .begin_lab_edit("wvu.bmeg420l.emg.force.course.capture.v1")
             .unwrap_or_else(|error| panic!("{error}"));
         emg.acquisition.channels[1].pin = "A0".into();
-        assert!(store.save_lab_draft(emg).is_err());
+        assert!(store
+            .save_lab_draft(emg, Some("1.0.0".into()), "invalid-emg-0001".into())
+            .is_err());
         let mut pulse = store
             .begin_lab_edit("wvu.bmeg420l.pulseox.txrx.raw.course.capture.v1")
             .unwrap_or_else(|error| panic!("{error}"));
         pulse.acquisition.digital_outputs[1].pin = "D5".into();
-        assert!(store.save_lab_draft(pulse).is_err());
+        assert!(store
+            .save_lab_draft(pulse, Some("1.0.0".into()), "invalid-pulse-001".into())
+            .is_err());
     }
 
     #[test]
@@ -1618,7 +1718,7 @@ mod tests {
         );
         assert_eq!(draft.acquisition.resolved_channels().len(), 1);
         let saved = store
-            .save_lab_draft(draft)
+            .save_lab_draft(draft, None, "save-blank-0001".into())
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(saved.status, ProfileStatus::Locked);
         assert!(store.get_locked("team.blank").is_ok());
@@ -1636,7 +1736,7 @@ mod tests {
             .duplicate_lab("wvu.bmeg420l.ecg.course.capture.v1", "team.ecg")
             .unwrap_or_else(|error| panic!("{error}"));
         let saved = store
-            .save_lab_draft(draft)
+            .save_lab_draft(draft, None, "save-team-ecg-01".into())
             .unwrap_or_else(|error| panic!("{error}"));
         store
             .retire(&saved.profile_id, &saved.profile_version)
@@ -1649,20 +1749,138 @@ mod tests {
         let restored = store
             .restore_course_default("wvu.bmeg420l.ecg.course.capture.v1")
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(restored.profile_version, "1.0.1");
-        assert_eq!(restored.source, ProfileSource::Instructor);
-
-        // A shipped definition is immutable, but the current offering can be
-        // retired/restored without deleting the package or its old snapshots.
-        store
+        assert_eq!(restored.profile_version, "1.0.0");
+        assert_eq!(restored.source, ProfileSource::BuiltIn);
+        assert!(store
             .retire("wvu.bmeg420l.blood_pressure.ppg.course.capture.v1", "1.0.0")
+            .is_err());
+    }
+
+    #[test]
+    fn selection_navigation_and_restart_never_create_a_ghost_revision() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = dir.path().join("profiles");
+        let store = ProfileStore::with_root(root.clone()).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut draft = store
+            .begin_lab_edit("wvu.bmeg420l.emg.force.course.capture.v1")
+            .unwrap_or_else(|error| panic!("{error}"));
+        draft.description.push_str(" instructor revision");
+        let saved = store
+            .save_lab_draft(draft, Some("1.0.0".into()), "save-emg-0001".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(saved.profile_version, "1.0.1");
+
+        for _ in 0..20 {
+            assert!(store.list().is_ok());
+            assert!(store
+                .get_locked("wvu.bmeg420l.emg.force.course.capture.v1")
+                .is_ok());
+            // Preview/edit initialization is a detached draft and must not
+            // become a historical catalog row until an explicit Save.
+            assert!(store
+                .begin_lab_edit("wvu.bmeg420l.emg.force.course.capture.v1")
+                .is_ok());
+        }
+        let versions: Vec<_> = store
+            .list_all()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .into_iter()
+            .filter(|entry| entry.profile.profile_id == "wvu.bmeg420l.emg.force.course.capture.v1")
+            .map(|entry| entry.profile.profile_version)
+            .collect();
+        assert_eq!(versions, vec!["1.0.0", "1.0.1"]);
+
+        let reopened = ProfileStore::with_root(root).unwrap_or_else(|error| panic!("{error}"));
+        reopened
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let reopened_versions: Vec<_> = reopened
+            .list_all()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .into_iter()
+            .filter(|entry| entry.profile.profile_id == "wvu.bmeg420l.emg.force.course.capture.v1")
+            .map(|entry| entry.profile.profile_version)
+            .collect();
+        assert_eq!(reopened_versions, vec!["1.0.0", "1.0.1"]);
+        assert_eq!(
+            reopened
+                .get_locked("wvu.bmeg420l.emg.force.course.capture.v1")
+                .unwrap_or_else(|error| panic!("{error}"))
+                .profile_version,
+            "1.0.1"
+        );
+    }
+
+    #[test]
+    fn stale_save_and_import_collisions_are_non_mutating() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = dir.path().join("profiles");
+        let store = ProfileStore::with_root(root.clone()).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut first = store
+            .begin_lab_edit("wvu.bmeg420l.ecg.course.capture.v1")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut stale = first.clone();
+        first.description.push_str(" first");
+        stale.description.push_str(" stale");
+        store
+            .save_lab_draft(first, Some("1.0.0".into()), "save-stale-001".into())
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(store
-            .get_locked("wvu.bmeg420l.blood_pressure.ppg.course.capture.v1")
+            .save_lab_draft(stale, Some("1.0.0".into()), "save-stale-002".into())
             .is_err());
-        let restored_builtin = store
-            .restore_retired("wvu.bmeg420l.blood_pressure.ppg.course.capture.v1", "1.0.0")
+
+        let exact = built_in_profiles()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_blood_pressure")
+            .unwrap_or_else(|| panic!("missing BP factory lab"));
+        let package = root.join("factory-bp.lab.json");
+        fs::create_dir_all(&root).unwrap_or_else(|error| panic!("{error}"));
+        fs::write(
+            &package,
+            serde_json::to_vec_pretty(&exact).unwrap_or_default(),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(store.import_profile(&package).is_err());
+        let entries = store.list_all().unwrap_or_default();
+        assert_eq!(entries.len(), 6);
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.profile.profile_version == "1.0.2"));
+    }
+
+    #[test]
+    fn reset_local_customizations_keeps_factory_labs_and_recording_history_separate() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = dir.path().join("profiles");
+        let store = ProfileStore::with_root(root).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(restored_builtin.source, ProfileSource::BuiltIn);
+        let mut draft = store
+            .begin_lab_edit("wvu.bmeg420l.ecg.course.capture.v1")
+            .unwrap_or_else(|error| panic!("{error}"));
+        draft.description.push_str(" local");
+        store
+            .save_lab_draft(draft, Some("1.0.0".into()), "save-reset-001".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        store
+            .reset_local_customizations()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let active = store.list().unwrap_or_default();
+        assert_eq!(active.len(), 5);
+        assert_eq!(
+            store
+                .get_locked("wvu.bmeg420l.ecg.course.capture.v1")
+                .unwrap_or_else(|error| panic!("{error}"))
+                .profile_version,
+            "1.0.0"
+        );
     }
 }
