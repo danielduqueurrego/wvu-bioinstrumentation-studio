@@ -17,3 +17,8 @@ node_modules
 !.env.example
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+/dist/
+/release/*.zip
+/src-tauri/resources/arduino-runtime/arduino-cli.exe
+/src-tauri/resources/arduino-runtime/data/
+/src-tauri/resources/arduino-runtime.zip

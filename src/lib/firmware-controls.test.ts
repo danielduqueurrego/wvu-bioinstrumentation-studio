@@ -37,7 +37,7 @@ describe('firmware workspace controls', () => {
   });
 
   it('makes the non-WVU consequence explicit rather than calling upload a hardware failure', () => {
-    expect(firmwareCompatibilityMessage('non_wvu_sketch')).toContain('upload succeeded');
-    expect(firmwareCompatibilityMessage('non_wvu_sketch')).toContain('Acquisition remains unavailable');
+    expect(firmwareCompatibilityMessage('non_wvu_sketch')).toContain('Upload complete');
+    expect(firmwareCompatibilityMessage('non_wvu_sketch')).toContain('Restore WVU Firmware');
   });
 });

@@ -1021,10 +1021,11 @@ fn verify_active_job(runtime: &WorkflowRuntime, job_id: u64) -> Result<(), Firmw
 
 fn required_cli(stage: FirmwareJobStage) -> Result<ArduinoCli, FirmwareFailure> {
     ArduinoCli::discover(None).map_err(|error| match error {
-        crate::arduino_cli::CliError::NotFound => FirmwareFailure::new(
+        crate::arduino_cli::CliError::NotFound
+        | crate::arduino_cli::CliError::RuntimeUnavailable => FirmwareFailure::new(
             FirmwareErrorCategory::ArduinoCliMissing,
             stage,
-            "Arduino CLI is not available. Editing and saving remain available.",
+            "Arduino tools are unavailable. Editing and saving remain available.",
             error.to_string(),
         ),
         _ => cli_failure(stage, FirmwareErrorCategory::InternalError, error),
@@ -1036,7 +1037,7 @@ fn require_core(cli: &ArduinoCli, stage: FirmwareJobStage) -> Result<(), Firmwar
         FirmwareFailure::new(
             FirmwareErrorCategory::CoreMissing,
             stage,
-            "Arduino UNO R4 core is not installed. Install `arduino:renesas_uno` before compiling.",
+            "The included Arduino UNO R4 tools are incomplete. Reinstall the application or contact your instructor.",
             error.to_string(),
         )
     })
@@ -1222,8 +1223,8 @@ fn combined_output(log: &CommandLog) -> String {
 
 fn failure_copy(category: FirmwareErrorCategory) -> (&'static str, &'static str) {
     match category {
-        FirmwareErrorCategory::ArduinoCliMissing => ("Arduino CLI unavailable", "Install Arduino CLI or configure an instructor-approved path, then refresh the environment."),
-        FirmwareErrorCategory::CoreMissing => ("UNO R4 core unavailable", "Install the Arduino UNO R4 core, then refresh the environment."),
+        FirmwareErrorCategory::ArduinoCliMissing => ("Arduino tools unavailable", "Restart the application. If the problem continues, reinstall WVU Bioinstrumentation Studio or contact your instructor."),
+        FirmwareErrorCategory::CoreMissing => ("Arduino tools incomplete", "Reinstall WVU Bioinstrumentation Studio or contact your instructor."),
         FirmwareErrorCategory::ProjectInvalid => ("Project needs attention", "Correct the project path/name or confirm the requested destructive action."),
         FirmwareErrorCategory::UnsavedChanges => ("Save required", "Save the editor contents, then compile or upload again."),
         FirmwareErrorCategory::CompileFailed => ("Compile failed", "Review the compiler output and navigate to the reported source line."),
@@ -1235,8 +1236,8 @@ fn failure_copy(category: FirmwareErrorCategory) -> (&'static str, &'static str)
         FirmwareErrorCategory::BootloaderNotFound => ("Bootloader not found", "Confirm the selected UNO R4 WiFi is connected, then retry upload."),
         FirmwareErrorCategory::UploadFailed => ("Upload failed", "Review Arduino CLI output and ensure no other program owns the selected COM port."),
         FirmwareErrorCategory::ApplicationPortNotFound => ("Application port did not return", "Refresh boards after upload. Do not assume the old COM number."),
-        FirmwareErrorCategory::ProtocolVerificationFailed => ("Protocol verification failed", "Restore the controlled WVU reference firmware before using Acquisition."),
-        FirmwareErrorCategory::WrongFirmwareIdentity => ("Firmware identity mismatch", "Restore the controlled WVU reference firmware before using Acquisition."),
+        FirmwareErrorCategory::ProtocolVerificationFailed => ("Firmware verification failed", "Use Restore WVU Firmware before using Acquisition."),
+        FirmwareErrorCategory::WrongFirmwareIdentity => ("Firmware update required", "Use Restore WVU Firmware before using Acquisition."),
         FirmwareErrorCategory::Canceled => ("Operation canceled", "Review the operation log and compile again before uploading."),
         FirmwareErrorCategory::InternalError => ("Firmware workflow error", "Copy diagnostics and contact the instructor/developer."),
     }

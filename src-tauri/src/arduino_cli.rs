@@ -9,6 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+/// Prevents command-prompt flashes when Arduino CLI and its helpers run from
+/// the packaged Windows application.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 pub const UNO_R4_WIFI_FQBN: &str = "arduino:renesas_uno:unor4wifi";
 
 #[derive(Clone, Debug, Serialize)]
@@ -54,8 +62,10 @@ pub struct CompileUsage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    #[error("ArduinoCliMissing: Arduino CLI was not found. Install it or set an instructor-approved path.")]
+    #[error("Arduino tools were not found. Reinstall WVU Bioinstrumentation Studio or contact your instructor.")]
     NotFound,
+    #[error("Arduino tools are not ready. Wait for setup to finish or reinstall WVU Bioinstrumentation Studio.")]
+    RuntimeUnavailable,
     #[error("Arduino CLI command failed (exit {exit_code:?})")]
     CommandFailed {
         log: Box<CommandLog>,
@@ -71,7 +81,7 @@ impl CliError {
     pub fn command_log(&self) -> Option<&CommandLog> {
         match self {
             Self::CommandFailed { log, .. } => Some(log),
-            Self::NotFound | Self::Json(_) | Self::Io(_) => None,
+            Self::NotFound | Self::RuntimeUnavailable | Self::Json(_) | Self::Io(_) => None,
         }
     }
 }
@@ -79,14 +89,27 @@ impl CliError {
 #[derive(Clone, Debug)]
 pub struct ArduinoCli {
     executable: PathBuf,
+    config_file: Option<PathBuf>,
 }
 
 impl ArduinoCli {
     pub fn discover(override_path: Option<&Path>) -> Result<Self, CliError> {
+        if let Some(runtime) = crate::arduino_runtime::active_runtime() {
+            return Ok(Self {
+                executable: runtime.executable.clone(),
+                config_file: Some(runtime.config_file.clone()),
+            });
+        }
+        // Production intentionally has no PATH/global-Arduino fallback. The
+        // bundled runtime is initialized before the startup board scan.
+        if !cfg!(debug_assertions) {
+            return Err(CliError::RuntimeUnavailable);
+        }
         if let Some(path) = override_path {
             if path.is_file() {
                 return Ok(Self {
                     executable: path.to_path_buf(),
+                    config_file: None,
                 });
             }
             return Err(CliError::NotFound);
@@ -94,23 +117,38 @@ impl ArduinoCli {
         if let Some(path) = std::env::var_os("BMEG_ARDUINO_CLI") {
             let path = PathBuf::from(path);
             if path.is_file() {
-                return Ok(Self { executable: path });
+                return Ok(Self {
+                    executable: path,
+                    config_file: None,
+                });
             }
         }
         let bundled = PathBuf::from("C:\\arduino-cli\\arduino-cli.exe");
         if bundled.is_file() {
             return Ok(Self {
                 executable: bundled,
+                config_file: None,
             });
         }
         if let Some(path) = executable_from_path() {
-            return Ok(Self { executable: path });
+            return Ok(Self {
+                executable: path,
+                config_file: None,
+            });
         }
         Err(CliError::NotFound)
     }
 
     pub fn executable(&self) -> &Path {
         &self.executable
+    }
+
+    fn configured_arguments(&self, args: &[String]) -> Vec<String> {
+        self.config_file
+            .iter()
+            .flat_map(|path| ["--config-file".to_owned(), path.display().to_string()])
+            .chain(args.iter().cloned())
+            .collect()
     }
 
     pub fn run(&self, args: &[&str]) -> Result<CommandLog, CliError> {
@@ -141,8 +179,9 @@ impl ArduinoCli {
         cancel: &AtomicBool,
     ) -> Result<CommandLog, CliError> {
         let started = Instant::now();
-        let mut child = Command::new(&self.executable)
-            .args(args)
+        let mut command = hidden_command(&self.executable);
+        let mut child = command
+            .args(self.configured_arguments(args))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -172,7 +211,7 @@ impl ArduinoCli {
         let stderr = join_pipe(stderr_reader)?;
         Ok(CommandLog {
             command: std::iter::once(self.executable.display().to_string())
-                .chain(args.iter().cloned())
+                .chain(self.configured_arguments(args))
                 .collect(),
             exit_code: status.code(),
             stdout,
@@ -232,6 +271,13 @@ impl ArduinoCli {
         ];
         self.run_cancellable(&args, cancel)
     }
+}
+
+fn hidden_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 fn executable_from_path() -> Option<PathBuf> {
@@ -442,5 +488,28 @@ mod tests {
             ArduinoCli::discover(Some(&missing)),
             Err(CliError::NotFound)
         ));
+    }
+
+    #[test]
+    fn bundled_runtime_commands_always_receive_the_app_config_file() {
+        let cli = ArduinoCli {
+            executable: PathBuf::from("C:\\runtime\\arduino-cli.exe"),
+            config_file: Some(PathBuf::from("C:\\runtime\\arduino-cli.yaml")),
+        };
+        assert_eq!(
+            cli.configured_arguments(&["board".into(), "list".into()]),
+            vec![
+                "--config-file".to_owned(),
+                "C:\\runtime\\arduino-cli.yaml".to_owned(),
+                "board".to_owned(),
+                "list".to_owned()
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_processes_use_the_no_window_creation_flag() {
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
     }
 }

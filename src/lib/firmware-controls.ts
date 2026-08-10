@@ -29,16 +29,16 @@ export function firmwareControls(input: FirmwareControlsInput) {
 export function firmwareCompatibilityMessage(value: FirmwareCompatibility) {
   switch (value) {
     case 'wvu_protocol_compatible':
-      return 'WVU protocol compatible — Acquisition may be used after a compatible handshake.';
+      return 'Firmware ready';
     case 'non_wvu_sketch':
-      return 'Non-WVU sketch uploaded — upload succeeded, but Acquisition remains unavailable until the reference firmware is restored.';
+      return 'Upload complete — Restore WVU Firmware before using Acquisition.';
     case 'wvu_protocol_incompatible':
-      return 'WVU protocol firmware responded but its identity is incompatible.';
+      return 'Firmware update required — restore WVU Firmware before using Acquisition.';
     case 'upload_in_progress':
       return 'Upload in progress — Acquisition is disabled until verification finishes.';
     case 'verification_failed':
-      return 'Upload completed but WVU protocol verification failed. Restore the controlled reference firmware.';
+      return 'Firmware needs attention — restore WVU Firmware before using Acquisition.';
     default:
-      return 'Firmware compatibility has not been verified. Editing and compiling remain available.';
+      return 'Firmware has not been checked yet.';
   }
 }

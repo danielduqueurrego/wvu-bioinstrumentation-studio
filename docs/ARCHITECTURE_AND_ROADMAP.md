@@ -92,7 +92,7 @@ src/
 
 ## 4. Arduino CLI integration
 
-Initial integration uses subprocesses:
+The packaged application invokes its included Arduino CLI directly with argument arrays:
 
 - `arduino-cli version`
 - `arduino-cli board list --format json`
@@ -100,7 +100,10 @@ Initial integration uses subprocesses:
 - `arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi --format json`
 - `arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port <COM>`
 
-Store exact command, exit code, stdout, and stderr in the diagnostic log. Do not assume a fixed Arduino CLI installation path; discover it and allow an instructor override.
+Store command arguments, exit code, stdout, and stderr in the diagnostic log. On Windows, the
+shared process helper applies `CREATE_NO_WINDOW`, captures output, and never launches a shell.
+The production CLI and UNO R4 core are pinned application resources copied on first run into an
+app-owned runtime. Development overrides are restricted to development builds.
 
 ## 5. Firmware organization
 

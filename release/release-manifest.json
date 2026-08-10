@@ -1,0 +1,8 @@
+{
+  "app_version": "1.0.0",
+  "platform": "windows-x64",
+  "arduino_cli_version": "1.5.2-rc.1",
+  "arduino_core": "1.6.0",
+  "firmware_protocol": "0.3",
+  "reference_firmware_build": "0x00010003"
+}

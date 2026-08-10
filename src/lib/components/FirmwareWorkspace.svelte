@@ -154,8 +154,8 @@
         selectedPort = project?.metadata.selected_com_port ?? boards[0]?.port ?? '';
       }
       statusMessage = environment.ready
-        ? `Arduino CLI ${environment.cli_version ?? ''}; Renesas UNO core ${environment.uno_r4_core_version ?? ''}.`
-        : environment.problem ?? 'Arduino CLI environment is not ready. Editing and saving remain available.';
+        ? 'Arduino tools are ready.'
+        : environment.problem ?? 'Arduino tools are not ready. Editing and saving remain available.';
     } catch (error) {
       statusMessage = `Could not inspect the Arduino environment: ${String(error)}`;
     }
@@ -310,14 +310,14 @@
   async function restoreReference() {
     if (!selectedPort || activeJob) return;
     const allowed = await confirm(
-      `Restore the controlled WVU reference firmware on ${selectedPort}? This replaces the current Arduino sketch and will only report success after HELLO, CAPABILITIES, PONG, version, and identity verification.`,
-      { title: 'Restore WVU reference firmware', kind: 'warning', okLabel: 'Restore firmware', cancelLabel: 'Cancel' }
+      `Restore WVU Firmware on ${selectedPort}? This replaces the current Arduino sketch.`,
+      { title: 'Restore WVU Firmware', kind: 'warning', okLabel: 'Restore firmware', cancelLabel: 'Cancel' }
     );
     if (!allowed) return;
     try {
       workflow.job = await invoke<Job>('restore_wvu_reference_firmware', { request: { port: selectedPort, confirmation: true } });
       reportFirmwareJob(workflow.job);
-      statusMessage = 'Restoring the controlled repository reference firmware. Acquisition remains disabled until identity verification passes.';
+      statusMessage = 'Restoring WVU Firmware. Acquisition will be available after the update is verified.';
     } catch (error) {
       statusMessage = `Reference restore could not start: ${friendlyFailure(error)}`;
     }
@@ -329,8 +329,8 @@
       const verification = await verifySelectedBoard(selectedPort);
       await refreshWorkflow();
       statusMessage = verification?.compatible
-        ? `Verified WVU protocol firmware on ${selectedPort}: ${verification.protocol_version ?? 'protocol version unavailable'}.`
-        : verification?.explanation ?? 'Firmware verification did not return a result.';
+        ? `Firmware ready on ${selectedPort}.`
+        : 'The Arduino firmware is not ready. Restore WVU Firmware if the problem continues.';
     } catch (error) {
       statusMessage = `Reference verification failed: ${friendlyFailure(error)}`;
       await refreshWorkflow();
@@ -340,7 +340,7 @@
   async function cancelJob() {
     try {
       workflow = await invoke<WorkflowStatus>('cancel_firmware_job');
-      statusMessage = 'Cancellation was requested for the active Arduino CLI child process.';
+      statusMessage = 'Cancellation was requested.';
     } catch (error) {
       statusMessage = `Cancel error: ${friendlyFailure(error)}`;
     }
@@ -426,7 +426,7 @@
   <div class="firmware-heading">
     <div>
       <h2 id="firmware-title">Firmware workspace</h2>
-      <p>One local Arduino <code>.ino</code> file per project. Editing and saving work offline; compiling and uploading require Arduino CLI and the installed UNO R4 core.</p>
+      <p>Create and edit one Arduino <code>.ino</code> file per project. Arduino tools are included with this application.</p>
     </div>
     <span class:compatible={workflow.compatibility === 'wvu_protocol_compatible'} class:incompatible={workflow.compatibility !== 'wvu_protocol_compatible'} class="compatibility" role="status">{compatibilityText}</span>
   </div>
@@ -448,7 +448,7 @@
       <div class="field-action"><span>Saved source</span><button type="button" onclick={saveProject} disabled={!project || !dirty}>Save</button></div>
       <div class="field-action"><span>Project location</span><button type="button" onclick={openProjectFolder} disabled={!project}>Open folder</button></div>
     </div>
-    {#if selectedTemplateInfo}<p class="help">{selectedTemplateInfo.description} {selectedTemplateInfo.verification_kind === 'non_wvu' ? 'It is not WVU protocol firmware; Acquisition remains unavailable after upload until the controlled reference is restored.' : 'It is copied byte-for-byte from the controlled repository firmware.'}</p>{/if}
+    {#if selectedTemplateInfo}<p class="help">{selectedTemplateInfo.description} {selectedTemplateInfo.verification_kind === 'non_wvu' ? 'Acquisition is unavailable after upload until WVU Firmware is restored.' : 'This template supports Acquisition after upload.'}</p>{/if}
     {#if project}<p class="project-path" title={project.project_folder}><strong>{project.metadata.source_filename}</strong> — {project.project_folder} {#if dirty}<span class="dirty" aria-label="Unsaved changes">Unsaved changes</span>{:else}<span class="saved">Saved</span>{/if}</p>{/if}
     {#if recents.length}
       <div class="recent"><span>Recent projects</span>{#each recents as recent}<button type="button" title={recent} onclick={() => openProject(recent)}>{recent}</button>{/each}</div>
@@ -475,11 +475,11 @@
     <aside class="environment-panel firmware-panel" aria-labelledby="environment-title">
       <div class="panel-heading"><h3 id="environment-title">Firmware environment</h3><button type="button" onclick={refreshEnvironment}>Refresh environment</button></div>
       <dl>
-        <dt>Arduino CLI</dt><dd title={environment.cli_path}>{environment.cli_path ?? 'Not found'} {environment.cli_version ? `(${environment.cli_version})` : ''}</dd>
-        <dt>UNO R4 core</dt><dd>{environment.uno_r4_core_version ?? 'Not installed'}</dd>
-        <dt>Expected FQBN</dt><dd>{environment.expected_fqbn}</dd>
-        <dt>Readiness</dt><dd>{environment.ready ? 'Ready' : environment.problem ?? 'Not ready'}</dd>
+        <dt>Arduino tools</dt><dd>{environment.ready ? 'Ready' : environment.problem ?? 'Needs attention'}</dd>
+        <dt>Board</dt><dd>{selectedPort ? `Arduino UNO R4 WiFi — ${selectedPort}` : 'Select a detected Arduino UNO R4 WiFi'}</dd>
+        <dt>Firmware</dt><dd>{workflow.compatibility === 'wvu_protocol_compatible' ? 'Ready' : 'Update required'}</dd>
       </dl>
+      <details class="advanced-details"><summary>Advanced details</summary><dl><dt>Arduino tools version</dt><dd>{environment.cli_version ?? '—'}</dd><dt>UNO R4 core version</dt><dd>{environment.uno_r4_core_version ?? '—'}</dd><dt>Expected board</dt><dd>{environment.expected_fqbn}</dd><dt>Tool location</dt><dd title={environment.cli_path}>{environment.cli_path ?? '—'}</dd></dl></details>
       <label>Selected UNO R4 WiFi
         <select bind:value={selectedPort} onchange={() => void verifyReference()} disabled={activeJob}>
           <option value="">Select a detected UNO R4 WiFi</option>
@@ -487,11 +487,11 @@
         </select>
       </label>
       <div class="action-stack">
-        <button type="button" onclick={refreshBoardCache} disabled={activeJob}>Refresh boards</button>
-        <button type="button" onclick={verifyReference} disabled={!selectedPort || activeJob}>Verify WVU firmware</button>
+        <button type="button" onclick={refreshBoardCache} disabled={activeJob}>Refresh Board</button>
+        <button type="button" onclick={verifyReference} disabled={!selectedPort || activeJob}>Verify Firmware</button>
         <button class="gold" type="button" onclick={compileProject} disabled={compileDisabled}>Compile saved project</button>
         <button type="button" onclick={uploadProject} disabled={uploadDisabled}>Upload selected project</button>
-        <button class="restore" type="button" onclick={restoreReference} disabled={!selectedPort || activeJob}>Restore WVU reference firmware</button>
+        <button class="restore" type="button" onclick={restoreReference} disabled={!selectedPort || activeJob}>Restore WVU Firmware</button>
         {#if activeJob}<button class="stop" type="button" onclick={cancelJob}>Cancel {workflow.job?.kind}</button>{/if}
       </div>
       <p class="teaching-warning">Teaching use only. Compilation does not establish electrical safety. Upload is blocked while acquisition or recording owns the session.</p>
@@ -530,6 +530,7 @@
   button { min-height: 2.45rem; border: 1px solid #002855; border-radius: .3rem; background: #fff; color: #002855; padding: .5rem .7rem; font: inherit; font-weight: 650; cursor: pointer; overflow-wrap: anywhere; } button:not(:disabled):hover { background: #002855; color: #fff; } button:disabled { cursor: not-allowed; opacity: .55; } button:focus-visible, input:focus-visible, select:focus-visible, pre:focus-visible { outline: 3px solid #EEAA00; outline-offset: 2px; }
   button.gold { background: #EEAA00; color: #17222e; } button.restore { border-color: #855a00; color: #684600; } button.stop { background: #9d2424; border-color: #761a1a; color: #fff; }
   .input-action { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .45rem; } .help { margin: .65rem 0 0; color: #4b5965; } .project-path, dd, .recent button { overflow-wrap: anywhere; word-break: break-word; }
+  .advanced-details { min-width: 0; margin: 0 0 1rem; } .advanced-details > summary { cursor: pointer; color: #002855; font-weight: 700; } .advanced-details[open] > summary { margin-bottom: .65rem; }
   .dirty { color: #8b1515; font-weight: 700; margin-left: .5rem; } .saved { color: #176c33; font-weight: 700; margin-left: .5rem; } .recent { margin-top: .8rem; display: grid; gap: .35rem; } .recent button { text-align: left; min-height: 2rem; }
   /* The environment panel remains a readable 304–400 px rail on wide desktops; the
      editor receives all remaining space instead of keeping both panels artificially narrow. */

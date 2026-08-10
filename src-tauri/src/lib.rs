@@ -1,5 +1,6 @@
 pub mod acquisition;
 pub mod arduino_cli;
+pub mod arduino_runtime;
 pub mod calibration;
 pub mod firmware_workflow;
 pub mod firmware_workspace;
@@ -47,6 +48,16 @@ async fn list_boards(cli_path: Option<String>) -> Result<Vec<arduino_cli::BoardI
     })
     .await
     .map_err(|error| format!("board discovery task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn prepare_arduino_runtime(
+    app: tauri::AppHandle,
+) -> Result<arduino_runtime::RuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || arduino_runtime::prepare_runtime(&app))
+        .await
+        .map_err(|error| format!("Arduino tool preparation task failed: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -721,6 +732,7 @@ pub fn run() {
             calibrations,
         })
         .invoke_handler(tauri::generate_handler![
+            prepare_arduino_runtime,
             list_boards,
             list_serial_ports,
             arduino_cli_version,

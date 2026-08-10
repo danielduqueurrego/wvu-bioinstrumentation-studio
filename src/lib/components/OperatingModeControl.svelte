@@ -28,13 +28,13 @@
 
 <fieldset disabled={disabled} aria-describedby="operating-mode-help">
   <legend>Operating mode</legend>
-  <p id="operating-mode-help" class="help">Student is the default. Confirm the acknowledgement, then select Instructor authoring to enable its local workflow tools.</p>
+  <p id="operating-mode-help" class="help">Student is the default. Confirm the acknowledgement, then select Instructor mode to edit lab settings.</p>
   <div class="choice-row">
     <label class="choice"><input type="radio" name="profile-operating-mode" value="student" bind:group={operatingMode} onchange={handleModeChange} /> Student</label>
-    <label class="choice"><input type="radio" name="profile-operating-mode" value="instructor_authoring" bind:group={operatingMode} onchange={handleModeChange} aria-describedby="instructor-mode-explanation" /> Instructor authoring</label>
+    <label class="choice"><input type="radio" name="profile-operating-mode" value="instructor_authoring" bind:group={operatingMode} onchange={handleModeChange} aria-describedby="instructor-mode-explanation" /> Instructor mode</label>
     <label class="choice instructor-confirm"><input type="checkbox" bind:checked={instructorAcknowledgement} onchange={handleAcknowledgementChange} aria-describedby="instructor-mode-explanation" /> I understand instructor mode can change acquisition settings.</label>
   </div>
-  <p id="instructor-mode-explanation" class="help">Instructor mode is a local workflow guard, not strong authentication. Without acknowledgement, Student remains selected and instructor tools remain unavailable.</p>
+  <p id="instructor-mode-explanation" class="help">Instructor mode changes lab settings on this computer. Without acknowledgement, Student remains selected and lab-management tools remain unavailable.</p>
 </fieldset>
 
 <style>

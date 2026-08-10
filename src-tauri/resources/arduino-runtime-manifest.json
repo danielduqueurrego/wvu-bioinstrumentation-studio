@@ -1,0 +1,6 @@
+{
+  "runtime_schema": 1,
+  "arduino_cli": "1.5.2-rc.1",
+  "renesas_uno_core": "1.6.0",
+  "bundle_revision": 3
+}

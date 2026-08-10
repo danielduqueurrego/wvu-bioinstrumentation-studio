@@ -84,6 +84,7 @@
   type FirmwareWorkflowStatus = { compatibility: string; job?: FirmwareJob };
   type FirmwareVerification = { declared_kind: string; compatible: boolean; protocol_version?: string; identity?: { protocol_version: string; firmware_build: number; device_id: number }; bytes_received?: number; valid_frames?: number; crc_failures?: number; explanation: string };
   type FirmwareEnvironment = { cli_path?: string; cli_version?: string; uno_r4_core_version?: string; expected_fqbn: string; boards: Board[]; ready: boolean; problem?: string };
+  type ArduinoRuntimeStatus = { ready: boolean; cli_version: string; core_version: string; message: string };
   type ActiveOperation = { title: string; stage: string; cancelable: boolean };
   type AcquisitionProfile = LabProfile;
   type ProfileSnapshot = { bench_notice_acknowledged: boolean; profile: AcquisitionProfile };
@@ -141,7 +142,8 @@
   let manualCalibrationUnits = 'mmHg';
   let calibrationFit: { slope: number; offset: number; r_squared: number; paired_samples: number } | undefined;
   let calibrationError = '';
-  let statusMessage = 'Ready. Simulator uses the same Rust session, parser, recording, and export path.';
+  let statusMessage = 'Ready.';
+  let arduinoToolsReady = false;
   let session: SessionStatus = {
     state: 'Disconnected', board: '', port: '', protocol_version: '0.1', simulator: false,
     samples: 0, packets: 0, measured_rate_hz: 0, integrity: emptyIntegrity,
@@ -163,9 +165,9 @@
   let markerLabel = '';
 
   $: if (source === 'hardware') {
-    note = 'A0 raw floating/uncalibrated engineering communication test; no human signal.';
+    note = 'Arduino data source — follow the assigned lab instructions.';
   } else {
-    note = 'Simulator waveform; no human signal.';
+    note = 'Simulator — no Arduino data are being recorded.';
   }
   $: timedSeconds = durationPreset === 'custom' ? Number(customSeconds) : Number(durationPreset);
   $: activeProfile = acquisitionProfiles.find((profile) => profile.profile_id === selectedProfileId);
@@ -298,11 +300,36 @@
   async function refreshEnvironmentSummary() {
     try {
       firmwareEnvironment = await invoke<FirmwareEnvironment>('firmware_environment');
+      arduinoToolsReady = firmwareEnvironment.ready;
     } catch (error) {
       firmwareEnvironment = {
         expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false,
-        problem: `Could not inspect Arduino CLI environment: ${String(error)}`
+        problem: 'Arduino tools could not be prepared. Reinstall the application or ask your instructor for help.'
       };
+      arduinoToolsReady = false;
+    }
+  }
+
+  async function prepareArduinoTools() {
+    try {
+      const runtime = await runOperation(
+        { title: 'Preparing Arduino tools…', stage: 'Setting up the included offline Arduino tools for this computer.', cancelable: false },
+        () => invoke<ArduinoRuntimeStatus>('prepare_arduino_runtime')
+      );
+      arduinoToolsReady = runtime.ready;
+      if (!runtime.ready) {
+        firmwareEnvironment = {
+          expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false,
+          problem: 'Arduino tools are not ready. Reinstall the application or ask your instructor for help.'
+        };
+      }
+    } catch (error) {
+      arduinoToolsReady = false;
+      firmwareEnvironment = {
+        expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false,
+        problem: 'Arduino tools could not be prepared. Reinstall the application or ask your instructor for help.'
+      };
+      statusMessage = `Arduino tools need attention. ${String(error)}`;
     }
   }
 
@@ -315,12 +342,12 @@
           const verification = await invoke<FirmwareVerification>('verify_wvu_reference_firmware', { port });
           await refreshFirmwareCompatibility();
           statusMessage = verification.compatible
-            ? `Verified WVU firmware on ${port}: ${verification.protocol_version ?? 'protocol version unavailable'}.`
-            : verification.explanation;
+            ? `Firmware ready on ${port}.`
+            : 'The Arduino was detected, but its WVU firmware is not ready. Open Firmware and use Restore WVU Firmware if needed.';
           return verification;
         } catch (error) {
           await refreshFirmwareCompatibility();
-          statusMessage = `Firmware verification failed on ${port}: ${String(error)}`;
+          statusMessage = 'The Arduino could not be verified. Refresh Board, then try Restore WVU Firmware if the problem continues.';
           return undefined;
         }
       }
@@ -334,7 +361,7 @@
     boardScanError = '';
     try {
       await runOperation(
-        { title: 'Detecting Arduino boards…', stage: reason === 'startup' ? 'Running the one startup supported-board scan. Navigation does not trigger additional scans.' : 'Refreshing the cached supported-board list. Navigation does not trigger additional scans.', cancelable: false },
+          { title: 'Detecting Arduino boards…', stage: reason === 'startup' ? 'Looking for a connected Arduino UNO R4 WiFi.' : 'Refreshing the list of connected Arduino boards.', cancelable: false },
         async () => {
           const scan = reconcileBoardCache(selectedPort, await invoke<Board[]>('list_boards'));
           boards = scan.boards;
@@ -343,14 +370,14 @@
           selectedPort = scan.selectedPort;
           if (scan.verificationPort) await verifySelectedFirmware(scan.verificationPort);
           statusMessage = boards.length
-            ? `${boards.length} supported UNO R4 WiFi board${boards.length === 1 ? '' : 's'} cached${selectedPort ? `; selected ${selectedPort}.` : '. Select one to verify firmware.'}`
-            : 'No supported UNO R4 WiFi detected. Simulator remains available.';
+            ? `${boards.length} Arduino UNO R4 WiFi board${boards.length === 1 ? '' : 's'} found${selectedPort ? `; ${selectedPort} is selected.` : '. Select a board to continue.'}`
+            : 'Arduino not detected. Check the USB connection, then select Refresh Board.';
         }
       );
     } catch (error) {
       boardScanStatus = 'error';
       boardScanError = String(error);
-      statusMessage = `Discovery error: ${boardScanError}`;
+      statusMessage = 'The board list could not be refreshed. Check the USB connection and try Refresh Board again.';
     } finally {
       boardScanInFlight = false;
     }
@@ -363,12 +390,12 @@
       session = await invoke<SessionStatus>('get_session_status');
       samples = await invoke<Point[]>('get_recent_display_data');
       displayRevision += 1;
-      if (session.last_error) statusMessage = session.last_error;
+      if (session.last_error) statusMessage = 'The recording stopped because the Arduino connection was lost. Reconnect the board and start a new recording.';
       if (session.last_summary) {
         statusMessage = `${session.last_summary.recording_status}: ${session.last_summary.samples} validated samples at ${session.last_summary.measured_rate_hz.toFixed(3)} Hz.`;
       }
     } catch (error) {
-      statusMessage = `Session status error: ${String(error)}`;
+      statusMessage = 'The recording status could not be updated. Try reconnecting the Arduino.';
     } finally {
       polling = false;
     }
@@ -632,8 +659,8 @@
     traceProfileKey = '';
     durationPreset = String(profileTimedPresets.includes(60) ? 60 : profileTimedPresets[0] ?? 10);
     statusMessage = activeProfile
-      ? `${activeProfile.display_name} selected. ${activeProfile.status === 'locked' ? 'Protected settings are locked by the approved profile.' : 'Draft profile selected.'}`
-      : 'Select a valid locked acquisition profile.';
+      ? `${activeProfile.display_name} is selected. Lab settings are ready.`
+      : 'Choose a course lab to continue.';
     void refreshCalibrations();
   }
 
@@ -685,8 +712,8 @@
         acknowledgement: mode === 'instructor_authoring' && instructorAcknowledgement
       });
       statusMessage = operatingMode === 'instructor_authoring'
-        ? 'Instructor authoring mode is enabled locally. It is a workflow guard, not authentication.'
-        : 'Student mode is enabled. Locked profile settings cannot be edited.';
+        ? 'Instructor mode is enabled. You can manage lab settings.'
+        : 'Student mode is enabled. Lab settings are protected.';
     } catch (error) {
       // The backend remains authoritative if a local command failure occurs.
       try {
@@ -706,7 +733,7 @@
   }
 
   function onInstructorBlocked() {
-    statusMessage = 'Confirm that instructor mode can change acquisition settings, then select Instructor authoring.';
+    statusMessage = 'Confirm that Instructor mode can change acquisition settings, then select Instructor mode.';
   }
 
   async function startRecording() {
@@ -714,23 +741,23 @@
       statusMessage = 'Choose a valid timed duration of at least 10 seconds, or select Until stopped.';
       return;
     }
-    statusMessage = 'Connecting through the Rust production session controller…';
+    statusMessage = 'Connecting to the Arduino…';
     try {
       session = source === 'simulator'
         ? await invoke<SessionStatus>('start_profile_simulator_recording', { outputDirectory, duration, profileId: selectedProfileId, benchNoticeAcknowledged, calibration: currentRecordingCalibration })
         : await invoke<SessionStatus>('start_profile_hardware_recording', { port: selectedPort, outputDirectory, duration, profileId: selectedProfileId, benchNoticeAcknowledged, calibration: currentRecordingCalibration });
       view = 'Acquisition';
     } catch (error) {
-      statusMessage = `Start error: ${String(error)}`;
+      statusMessage = 'Recording could not start. Confirm the Arduino is connected and Firmware is ready, then try again.';
     }
   }
 
   async function stopRecording() {
     try {
       session = await invoke<SessionStatus>('stop_recording');
-      statusMessage = 'Stop requested. The Rust worker is flushing validated data and metadata.';
+      statusMessage = 'Stopping and saving the recording…';
     } catch (error) {
-      statusMessage = `Stop error: ${String(error)}`;
+      statusMessage = 'The recording could not be stopped cleanly. Check Diagnostics for details.';
     }
   }
 
@@ -749,7 +776,7 @@
       session = await invoke<SessionStatus>('disconnect_session');
       statusMessage = 'Session disconnected. A future recording requires an explicit new start.';
     } catch (error) {
-      statusMessage = `Disconnect error: ${String(error)}`;
+      statusMessage = 'The Arduino connection could not be closed cleanly. Unplug and reconnect it before starting a new recording.';
     }
   }
 
@@ -804,8 +831,11 @@
     // The shell renders first. One application-level scan then populates the shared
     // cache; route changes consume that cache and never invoke Arduino CLI discovery.
     void (async () => {
-      await refreshEnvironmentSummary();
-      await refreshBoards('startup');
+      await prepareArduinoTools();
+      if (arduinoToolsReady) {
+        await refreshEnvironmentSummary();
+        await refreshBoards('startup');
+      }
     })();
     void pollSession();
     void refreshFirmwareCompatibility();
@@ -843,12 +873,22 @@
     </aside>
 
     <main class="content" class:wide-content={view === 'Firmware' || view === 'Acquisition'}>
-      <p class="device-cache-status" role="status">Board: {selectedPort ? `${boards.find((board) => board.port === selectedPort)?.name ?? 'UNO R4 WiFi'} — ${selectedPort}` : boards.length ? 'Select a supported UNO R4 WiFi' : 'No supported UNO R4 WiFi detected'} · Firmware: {firmwareCompatibility.replaceAll('_', ' ')} · Board refresh: {boardScanLastCompleted || (boardScanStatus === 'scanning' ? 'in progress' : 'not yet completed')}</p>
+      <p class="device-cache-status" role="status">Arduino: {selectedPort ? `Connected — ${boards.find((board) => board.port === selectedPort)?.name ?? 'UNO R4 WiFi'} (${selectedPort})` : 'Not connected'} · Firmware: {firmwareCompatibility === 'wvu_protocol_compatible' ? 'Ready' : selectedPort ? 'Update required' : '—'} · Arduino tools: {arduinoToolsReady ? 'Ready' : 'Preparing…'}</p>
       {#if view === 'Home'}
         <h2>Home</h2>
-        <p class="notice">Teaching and engineering equipment only — not a medical device. Phase 1 permits Arduino-alone, simulator, or safe bench-signal work only.</p>
+        <p class="notice">Teaching use only — not a medical device. Follow the BMEG 420L lab instructions and instructor safety procedures. Do not use this software for diagnosis or clinical decisions.</p>
+        <section class="panel quick-start" aria-labelledby="quick-start-title">
+          <h3 id="quick-start-title">BMEG 420L quick start</h3>
+          <ol>
+            <li>Connect the Arduino UNO R4 WiFi.</li>
+            <li>Confirm that Firmware is ready.</li>
+            <li>Open Acquisition and choose the assigned lab.</li>
+            <li>Choose the recording duration and start recording.</li>
+            <li>Stop and export your data when finished.</li>
+          </ol>
+        </section>
         <div class="action-row">
-          <button onclick={() => void refreshBoards()}>Refresh supported UNO R4 WiFi boards</button>
+          <button onclick={() => void refreshBoards()}>Refresh Board</button>
           <button class="gold" onclick={() => { source = 'simulator'; view = 'Acquisition'; }}>Open simulator acquisition</button>
         </div>
       {:else if view === 'Firmware'}
@@ -857,32 +897,43 @@
         <h2>Acquisition</h2>
         <p class="notice">Teaching use only — not a medical device. Follow BMEG 420L lab instructions and instructor safety procedures. Raw counts and Arduino-input volts are preserved; this app makes no diagnostic or clinical decision.</p>
         {#if source === 'hardware' && firmwareCompatibility !== 'wvu_protocol_compatible'}
-          <p class="warning" role="status">Hardware recording is disabled until the selected UNO R4 WiFi proves the controlled WVU firmware identity. Open <button class="inline-action" onclick={() => void selectView('Firmware')}>Firmware</button> and use Verify WVU firmware or Restore WVU reference firmware.</p>
+          <p class="warning" role="status">Hardware recording is unavailable until Firmware is ready. Open <button class="inline-action" onclick={() => void selectView('Firmware')}>Firmware</button> and use Verify Firmware or Restore WVU Firmware.</p>
         {/if}
 
         <section class="panel profile-panel" aria-labelledby="profile-title">
-          <div class="panel-heading"><div><h3 id="profile-title">Acquisition profile</h3><p class="help">Profiles bind protected acquisition settings, safety notices, firmware requirements, and export provenance.</p></div><span class:locked={!instructorModeActive} class="mode-badge">{instructorModeActive ? 'Instructor authoring' : 'Student mode'}</span></div>
+          <div class="panel-heading"><div><h3 id="profile-title">Lab</h3><p class="help">Choose the assigned course lab. Its required channels and recording settings are applied automatically.</p></div><span class:locked={!instructorModeActive} class="mode-badge">{instructorModeActive ? 'Instructor mode' : 'Student mode'}</span></div>
           <OperatingModeControl bind:operatingMode bind:instructorAcknowledgement disabled={session.state !== 'Disconnected' || modeChangeInFlight} {onModeConfirmed} {onInstructorBlocked} />
           {#if instructorModeActive}
             <LabManager selectedProfile={activeProfile} onSaved={labRevisionSaved} onStatus={(message) => statusMessage = message} openFirmware={openAssociatedFirmware} />
           {/if}
-          <label>Approved profile
+          <label>Selected lab
             <select bind:value={selectedProfileId} onchange={selectProfile} disabled={session.state !== 'Disconnected'}>
               {#each acquisitionProfiles as profile}<option value={profile.profile_id}>{profile.display_name} — {profile.profile_version}</option>{/each}
             </select>
           </label>
           {#if activeProfile}
             <div class="profile-details">
-              <span><strong>Profile</strong>{activeProfile.profile_id} / {activeProfile.profile_version}</span><span><strong>Category / source</strong>{activeProfile.category} / {activeProfile.source}</span><span><strong>Lock status</strong>{activeProfile.status}; protected pin, ADC, rate, firmware requirement, safety, and units cannot be changed in Student mode.</span>
-              <span><strong>Channels / units</strong>{activeChannels.map((channel) => `${channel.pin} = ${channel.label}`).join('; ')}; {activeProfile.display.raw_units_label} and Arduino input {activeProfile.display.voltage_units_label} only</span><span><strong>Protected acquisition</strong>{activeProfile.acquisition.acquisition_mode === 'pulseox_4state' ? `Fixed RED/DARK/IR/DARK; ${activeProfile.acquisition.state_dwell_us} µs/state` : `${activeChannels.length} synchronized channel${activeChannels.length === 1 ? '' : 's'}`}, {activeProfile.acquisition.adc_resolution_bits} bit, {activeProfile.acquisition.sample_rate_hz} {activeProfile.acquisition.acquisition_mode === 'pulseox_4state' ? 'cycles/s' : 'frames/s'}</span><span><strong>Firmware requirement</strong>Protocol {activeProfile.required_firmware.protocol_major}.{activeProfile.required_firmware.protocol_minor_min}+; build {activeProfile.required_firmware.build}; device {activeProfile.required_firmware.device}</span>
-              <span class="profile-hash"><strong>Integrity</strong>{activeProfile.integrity.canonical_hash_algorithm} {activeProfile.integrity.canonical_hash}</span>
+              <span><strong>Channels</strong>{activeChannels.map((channel) => channel.label).join('; ')}</span>
+              <span><strong>Rate</strong>{activeProfile.acquisition.sample_rate_hz} {activeProfile.acquisition.acquisition_mode === 'pulseox_4state' ? 'cycles/s' : 'frames/s'}</span>
+              <span><strong>ADC</strong>{activeProfile.acquisition.adc_resolution_bits} bit</span>
+              <span><strong>Units</strong>ADC counts and Arduino input volts</span>
             </div>
-            {#each activeProfile.safety.notices as notice}<p class="warning profile-notice">{notice}</p>{/each}
+            <details class="advanced-details" open={instructorModeActive}>
+              <summary>Lab details</summary>
+              <div class="profile-details">
+                <span><strong>Pin mapping</strong>{activeChannels.map((channel) => `${channel.pin} = ${channel.label}`).join('; ')}</span>
+                {#if activeProfile.acquisition.acquisition_mode === 'pulseox_4state'}<span><strong>Pulse-ox sequence</strong>RED → DARK → IR → DARK; {activeProfile.acquisition.state_dwell_us} µs per state</span>{/if}
+                {#if instructorModeActive}<span><strong>Instructor reference</strong>{activeProfile.profile_id} / {activeProfile.profile_version}</span>{/if}
+              </div>
+            </details>
+            {#if instructorModeActive && activeProfile.safety.notices.length}
+              <details class="advanced-details"><summary>Safety and lab notes</summary>{#each activeProfile.safety.notices as notice}<p class="help profile-notice">{notice}</p>{/each}</details>
+            {/if}
             {#if activeProfile.safety.bench_only && ['ecg', 'emg'].includes(activeProfile.category)}
               <label class="acknowledgement"><input type="checkbox" bind:checked={benchNoticeAcknowledged} disabled={session.state !== 'Disconnected'} /> I acknowledge this {activeProfile.category.toUpperCase()} profile is bench-validation only. No human-connected recording is authorized.</label>
             {/if}
           {:else}
-            <p class="error">No valid locked profile is available. Refresh the application or contact the instructor.</p>
+            <p class="error">No course lab is available. Restart the application or contact your instructor.</p>
           {/if}
         </section>
 
@@ -909,7 +960,7 @@
             <label>Frame / cycle rate <input value={activeProfile ? `${activeProfile.acquisition.sample_rate_hz} ${pulseoxProfile ? 'cycles/s' : 'frames/s'}` : '—'} readonly title="Protected by the selected profile" /></label>
             <label>Test note <input bind:value={note} readonly /></label>
           </div>
-          <p id="output-help" class="help">Files use a controlled timestamped Phase 1 name. Existing files are never overwritten.</p>
+          <p id="output-help" class="help">Files use a timestamped name. Existing files are never overwritten.</p>
         </section>
 
         <section class="panel" aria-labelledby="duration-title">
@@ -984,23 +1035,22 @@
           <button onclick={disconnect} disabled={session.state === 'Disconnected'}>Disconnect</button>
           {#if canRetryHandshake}<button onclick={retryHandshake}>Retry handshake</button>{/if}
           {#if canReset}<button onclick={resetBoardAndRetry}>Reset board and retry</button>{/if}
-          <button onclick={exportCsv} disabled={!session.last_summary}>Show CSV export</button>
+          <button onclick={exportCsv} disabled={!session.last_summary}>Export CSV</button>
         </div>
 
         <section class="metric-grid" aria-label="Acquisition metrics">
-          <span><strong>State</strong>{session.state}</span><span><strong>Device</strong>{session.board || 'not connected'} {session.port ? `(${session.port})` : ''}</span><span><strong>Protocol</strong>{session.protocol_version}</span>
+          <span><strong>Status</strong>{session.state === 'Acquiring' ? 'Recording…' : session.state === 'Disconnected' ? 'Ready' : session.state}</span><span><strong>Arduino</strong>{session.board || 'Not connected'} {session.port ? `(${session.port})` : ''}</span>
           <span><strong>Duration</strong>{session.duration?.mode === 'until_stopped' ? 'Until stopped' : session.duration?.seconds ? `${session.duration.seconds} s timed` : durationMode === 'until_stopped' ? 'Until stopped' : `${timedSeconds} s timed`}</span>
           <span><strong>Elapsed host</strong>{formatDuration(session.elapsed_seconds)}</span>
           {#if session.remaining_seconds !== undefined}<span><strong>Remaining</strong>{formatDuration(session.remaining_seconds)}</span>{/if}
-          <span><strong>Storage</strong>{formatStorage(session.available_disk_bytes)}</span><span><strong>Samples</strong>{session.samples}</span><span><strong>Measured</strong>{session.measured_rate_hz.toFixed(3)} Hz</span>
-          <span><strong>Valid packets</strong>{session.integrity.received_packets}</span><span><strong>CRC failures</strong>{session.integrity.crc_failures}</span><span><strong>Missing packets</strong>{session.integrity.missing_packet_sequences}</span><span><strong>Missing samples</strong>{session.integrity.missing_sample_sequences}</span>
-          <span><strong>Duplicate / out-of-order packets</strong>{session.integrity.duplicate_packets} / {session.integrity.out_of_order_packets}</span><span><strong>Firmware / host overflows</strong>{session.integrity.firmware_overflows} / {session.integrity.host_channel_overflows}</span><span><strong>Reconnects / disconnects</strong>{session.integrity.reconnects} / {session.integrity.disconnect_events}</span><span><strong>Lab digital outputs</strong>{activeDigitalOutputStatus()}</span>
+          <span><strong>Storage</strong>{formatStorage(session.available_disk_bytes)}</span><span><strong>Frames</strong>{session.samples}</span><span><strong>Measured rate</strong>{session.measured_rate_hz.toFixed(3)} Hz</span>
+          {#if activeProfile?.acquisition.digital_outputs?.length}<span><strong>Lab outputs</strong>{activeDigitalOutputStatus()}</span>{/if}
         </section>
         {#if session.storage_warning}<p class="warning" role="status">{session.storage_warning}</p>{/if}
-        {#if session.last_error}<p class="error" role="alert">Last error: {session.last_error}</p>{/if}
+        {#if session.last_error}<p class="error" role="alert">The Arduino connection was interrupted. Reconnect the board, refresh it, and start a new recording.</p>{/if}
         {#if session.connection_diagnostics}
-          <section class="panel diagnostics" aria-label="Connection diagnostics">
-            <h3>Connection diagnostics</h3>
+          <details class="panel diagnostics advanced-details" aria-label="Connection diagnostics">
+            <summary>Advanced connection details</summary>
             <div class="metric-grid">
               <span><strong>Original / final port</strong>{session.connection_diagnostics.original_port ?? session.connection_diagnostics.selected_port} / {session.connection_diagnostics.final_port ?? session.connection_diagnostics.selected_port}</span>
               <span><strong>Port opened / handshake</strong>{session.connection_diagnostics.port_opened ? 'yes' : 'no'} / {session.connection_diagnostics.handshake_elapsed_ms} ms</span>
@@ -1012,7 +1062,7 @@
               {#if session.connection_diagnostics.reset_attempted}<span><strong>Reset discovery</strong>bootloader: {session.connection_diagnostics.bootloader_observed ? 'yes' : 'no'}; disappeared: {session.connection_diagnostics.disappearance_observed ? 'yes' : 'no'}; returned: {session.connection_diagnostics.reappearance_observed ? 'yes' : 'no'}</span>{/if}
             </div>
             <p class="help">{session.connection_diagnostics.recommended_action}</p>
-          </section>
+          </details>
         {/if}
 
         <section class="panel plot-panel">
@@ -1045,25 +1095,25 @@
         {#if session.last_summary}
           <section class="panel paths">
             <h3>Finalized files</h3>
-            {#if session.last_summary.profile}<p><strong>Profile provenance:</strong> {session.last_summary.profile.profile.profile_id} {session.last_summary.profile.profile.profile_version}</p>{/if}
+            <p>{session.last_summary.completion_status === 'complete' ? 'Recording complete.' : 'Recording ended before completion.'}</p>
             <p title={session.last_summary.bmeg_path}>{session.last_summary.bmeg_path}</p>
             <p title={session.last_summary.metadata_path}>{session.last_summary.metadata_path}</p>
             <p title={session.last_summary.csv_path}>{session.last_summary.csv_path}</p>
-            <p>Finalization: {session.last_summary.completion_status}; reason: {session.last_summary.stop_reason}.</p>
+            <details class="advanced-details"><summary>Recording details</summary><p>Stop reason: {session.last_summary.stop_reason}.</p>{#if instructorModeActive && session.last_summary.profile}<p>Lab reference: {session.last_summary.profile.profile.profile_id} {session.last_summary.profile.profile.profile_version}</p>{/if}</details>
           </section>
         {/if}
       {:else}
         <h2>Diagnostics</h2>
         <section class="panel diagnostic-grid">
-          <p>Current state: <strong>{session.state}</strong></p>
-          <p>Last error: {session.last_error ?? 'none'}</p>
-          <p>Stop reason: {session.stop_reason ?? 'none'}</p>
-          <p>Available storage: {formatStorage(session.available_disk_bytes)}</p>
-          <p>ADC reference: {session.calibration?.adc_reference_v?.toFixed(3) ?? adcReferenceV.toFixed(3)} V</p>
-          <p>MPXV supply: {session.calibration?.mpxv_sensor_supply_v?.toFixed(3) ?? mpxvSensorSupplyV.toFixed(3)} V</p>
-          <p>Active calibrations: {session.calibration?.active_calibrations?.map((calibration) => calibration.calibration_id).join(', ') || 'none'}</p>
+          <p>Arduino: <strong>{selectedPort ? 'Connected' : 'Not connected'}</strong></p>
+          <p>Port: {selectedPort || '—'}</p>
+          <p>Firmware: {firmwareCompatibility === 'wvu_protocol_compatible' ? 'Ready' : 'Update required'}</p>
+          <p>Arduino tools: {arduinoToolsReady ? 'Ready' : 'Needs attention'}</p>
+          <p>Last recording: {session.last_summary ? `${session.last_summary.samples} frames` : 'None yet'}</p>
+          <p>Dropped data: {session.integrity.missing_sample_sequences}</p>
+          <p>Storage: {formatStorage(session.available_disk_bytes)}</p>
         </section>
-        <p>Serial ownership, packet validation, bounded display data, recording, and export run in Rust; the frontend only polls snapshots.</p>
+        <details class="panel advanced-details"><summary>Advanced details</summary><div class="diagnostic-grid"><p>Protocol: {session.protocol_version}</p><p>Received packets: {session.integrity.received_packets}</p><p>CRC failures: {session.integrity.crc_failures}</p><p>Missing frames: {session.integrity.missing_packet_sequences}</p><p>ADC reference: {session.calibration?.adc_reference_v?.toFixed(3) ?? adcReferenceV.toFixed(3)} V</p><p>MPXV supply: {session.calibration?.mpxv_sensor_supply_v?.toFixed(3) ?? mpxvSensorSupplyV.toFixed(3)} V</p><p>Active calibrations: {session.calibration?.active_calibrations?.map((calibration) => calibration.label).join(', ') || 'none'}</p>{#if session.last_error}<p>Last error: {session.last_error}</p>{/if}</div></details>
       {/if}
       <p class="status" aria-live="polite">{statusMessage}</p>
     </main>
@@ -1137,9 +1187,11 @@
   .device-cache-status { margin: 0 0 .8rem; padding: .55rem .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #fff; color: #42515d; overflow-wrap: anywhere; }
   h2 { margin-top: 0; } h3 { margin: 0 0 .8rem; } .notice, .warning { border-left: 5px solid #EEAA00; background: #fff8e8; padding: .75rem; } .warning { border-color: #9b6700; }
   .panel { min-width: 0; margin: 1rem 0; padding: clamp(.8rem, 2vw, 1rem); background: #fff; border: 1px solid #d7dde2; border-radius: .35rem; }
+  .quick-start ol { margin: .5rem 0 0; padding-left: 1.4rem; } .quick-start li + li { margin-top: .35rem; }
+  .advanced-details { min-width: 0; margin-top: .8rem; } .advanced-details > summary { cursor: pointer; color: #002855; font-weight: 700; } .advanced-details[open] > summary { margin-bottom: .75rem; }
   .panel-heading { display: flex; min-width: 0; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: start; } .panel-heading .help { max-width: 75ch; }
   .mode-badge { border: 1px solid #855a00; border-radius: 999px; padding: .35rem .6rem; background: #fff4dd; color: #684600; font-weight: 700; white-space: nowrap; } .mode-badge.locked { border-color: #176c33; background: #eaf6ee; color: #174f27; }
-  .profile-panel > label { margin-top: .8rem; } .profile-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: .55rem; margin-top: .8rem; } .profile-details span { min-width: 0; padding: .6rem .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; overflow-wrap: anywhere; } .profile-details strong { display: block; color: #42515d; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; } .profile-hash { font-family: Consolas, "Cascadia Code", monospace; font-size: .82rem; } .profile-notice { margin: .6rem 0 0; }
+  .profile-panel > label { margin-top: .8rem; } .profile-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: .55rem; margin-top: .8rem; } .profile-details span { min-width: 0; padding: .6rem .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; overflow-wrap: anywhere; } .profile-details strong { display: block; color: #42515d; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; } .profile-notice { margin: .6rem 0 0; }
   .acknowledgement { display: flex; gap: .55rem; align-items: flex-start; margin-top: .75rem; padding: .7rem; background: #fff4dd; border: 1px solid #9b6700; font-weight: 700; } .acknowledgement input { width: auto; min-height: auto; margin-top: .2rem; }
   .button-pair { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .8rem; } .button-pair button { flex: 0 1 18rem; }
   .control-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .8rem; align-items: end; }

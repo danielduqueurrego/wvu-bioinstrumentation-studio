@@ -4,19 +4,18 @@ Windows teaching software for BMEG 420L. It is **not a medical device** and neve
 diagnostic or treatment advice. The app records raw engineering signals and preserves the timing,
 channel map, firmware identity, profile snapshot, and integrity counters needed for course work.
 
-## Current Phase 6 capabilities
+## Capabilities
 
-- One UNO R4 WiFi at a time, with controlled protocol v0.3 firmware:
-  build `0x00010003`, device `0x554E4F34`, USB CDC configured at 921600 baud.
+- One Arduino UNO R4 WiFi at a time, with WVU firmware that supports synchronized course capture.
 - Synchronized logical analog frames with one to six unique A0–A5 inputs; ADC reads are sequential
   within a frame, not electrically simultaneous.
-- Locked course captures: ECG (A0); EMG + force (A0–A3); blood pressure + PPG (A0–A2, D4 green);
+- Course captures: ECG (A0); EMG + force (A0–A3); blood pressure + PPG (A0–A2, D4 green);
   and pulse-ox TX/RX raw capture (A0/A1, D5 red, D6 IR). All shipped course profiles default to
   14-bit ADC acquisition; instructors may explicitly select a firmware-supported alternative in a
   new lab revision.
 - Timed and **Until stopped** recording, bounded uPlot display updates, markers, continuous BMEG,
   profile-aware CSV, metadata, storage guards, disconnect finalization, and simulator support.
-- A firmware workspace for one-file UNO projects plus locked, profile-aware course capture and
+- A firmware workspace for one-file UNO projects plus course capture and
   display-only plot groups. Formal analog-module characterization is outside the runtime app
   scope and does not gate ordinary course capture.
 - A lightweight **Calibration & Units** card: raw counts, stored-reference volts, MPXV kPa/mmHg,
@@ -29,11 +28,11 @@ channel map, firmware identity, profile snapshot, and integrity counters needed 
   activation. Reading, selecting, acquiring, plotting, calibrating, or navigating never creates
   a lab version. Earlier recording snapshots never change.
 
-See [course profile mapping](docs/COURSE_ACQUISITION_PROFILES.md),
-[protocol v0.3](docs/USB_PROTOCOL_SPECIFICATION_v0.3.md),
-[profile schema](docs/ACQUISITION_PROFILE_SCHEMA_v1.md), and
-[calibration and units](docs/CALIBRATION_AND_UNITS.md), and
-[instructor lab authoring](docs/INSTRUCTOR_LAB_AUTHORING.md).
+For students, start with [Student Quick Start](docs/STUDENT_QUICK_START.md) and
+[Installation](docs/INSTALLATION.md). Course details are in
+[course profile mapping](docs/COURSE_ACQUISITION_PROFILES.md) and
+[calibration and units](docs/CALIBRATION_AND_UNITS.md). Instructor configuration is documented
+in [instructor lab authoring](docs/INSTRUCTOR_LAB_AUTHORING.md).
 
 ## Safety boundary
 
@@ -46,7 +45,7 @@ The reference firmware makes D4/D5/D6 LOW at startup, idle, Stop, protocol/confi
 and watchdog faults. D4 may be HIGH only during the configured BP/PPG capture; D5/D6 are active
 HIGH only during the fixed pulse-ox RED/DARK/IR/DARK sequence and are never HIGH together.
 
-## Build and checks
+## Maintainer build and checks
 
 ```powershell
 $env:Path = 'C:\Users\dd00055\.cargo\bin;' + $env:Path
@@ -64,7 +63,7 @@ npm run tauri build
 Run the desktop app with `npm run tauri dev`. The frontend only polls bounded snapshots at about
 25 Hz; it does not receive one UI event per raw ADC record.
 
-## Controlled firmware
+## Maintainer firmware verification
 
 Close Arduino IDE, Serial Monitor, Serial Plotter, and other serial tools before using the app.
 Rediscover the port; do not assume `COM12`.
@@ -88,11 +87,11 @@ never held in RAM. Metadata includes start/stop time, duration mode, profile sna
 board/port, active analog pins, digital mapping, ADC/rate, markers, free space, completion/stop
 reason, and integrity counters. CSV streams from BMEG after finalization.
 
-For Phase 5 BMEG/CSV, leading columns are `record_sequence,t_us` (or `cycle_index,t_us` for
+For current BMEG/CSV recordings, leading columns are `record_sequence,t_us` (or `cycle_index,t_us` for
 pulse ox), followed by profile-defined raw count fields and direct voltage/selected engineering
 columns. Existing Phase 1–4 BMEG files remain readable and are never relabelled as course profiles.
 
-## Controlled acceptance harnesses
+## Maintainer acceptance harnesses
 
 The harnesses call the same Rust session/controller path as Tauri and write temporary ignored
 outputs. They never authorize human measurement.
