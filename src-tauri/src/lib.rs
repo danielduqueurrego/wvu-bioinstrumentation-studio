@@ -221,6 +221,81 @@ fn list_acquisition_profiles(
 }
 
 #[tauri::command]
+fn list_instructor_labs(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<profiles::LabListEntry>, String> {
+    state.profiles.list_all().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn begin_lab_edit(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .begin_lab_edit(&profile_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn duplicate_lab(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    lab_id: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .duplicate_lab(&profile_id, &lab_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn create_blank_simultaneous_lab(
+    state: tauri::State<'_, AppState>,
+    lab_id: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .create_blank_simultaneous_lab(&lab_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_lab_draft(
+    state: tauri::State<'_, AppState>,
+    draft: profiles::AcquisitionProfile,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .save_lab_draft(draft)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn restore_retired_lab(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    profile_version: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .restore_retired(&profile_id, &profile_version)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn restore_course_default_lab(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .restore_course_default(&profile_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn get_profile_mode(state: tauri::State<'_, AppState>) -> Result<profiles::ProfileMode, String> {
     state.profiles.mode().map_err(|error| error.to_string())
 }
@@ -693,6 +768,13 @@ pub fn run() {
             get_firmware_workflow_status,
             verify_wvu_reference_firmware,
             list_acquisition_profiles,
+            list_instructor_labs,
+            begin_lab_edit,
+            duplicate_lab,
+            create_blank_simultaneous_lab,
+            save_lab_draft,
+            restore_retired_lab,
+            restore_course_default_lab,
             get_profile_mode,
             set_profile_mode,
             duplicate_profile_to_draft,

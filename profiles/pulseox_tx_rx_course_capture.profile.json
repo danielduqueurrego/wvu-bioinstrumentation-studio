@@ -9,17 +9,20 @@
   "description": "Fixed RED/DARK/IR/DARK raw transmission and reflectance capture for later offline processing.",
   "target_board": "Arduino UNO R4 WiFi",
   "fqbn": "arduino:renesas_uno:unor4wifi",
-  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 2, "build": "0x00010002", "device": "0x554E4F34" },
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 3, "build": "0x00010003", "device": "0x554E4F34" },
   "acquisition": {
     "analog_pin": "A0", "adc_resolution_bits": 14, "sample_rate_hz": 250,
     "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
     "acquisition_mode": "pulseox_4state",
     "analog_inputs": { "tx": "A0", "rx": "A1" },
     "led_outputs": { "green": null, "red": "D5", "ir": "D6" },
+    "digital_outputs": [{ "pin": "D5", "label": "Red LED", "behavior": "acquisition_sequenced" }, { "pin": "D6", "label": "IR LED", "behavior": "acquisition_sequenced" }],
     "state_dwell_us": 1000
   },
   "display": { "primary_quantity": "arduino_input_volts", "channel_label": "Raw TX + RX photodetector states", "raw_units_label": "ADC counts", "voltage_units_label": "V", "voltage_reference_v": 5.0, "plot_min_v": 0.0, "plot_max_v": 5.0 },
   "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "Raw RED/DARK/IR/DARK variables are preserved; no SpO2, perfusion index, or heart rate is calculated."] },
   "export": { "signal_name": "pulseox_tx_rx_raw_course_capture", "include_profile_snapshot": true },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "2ada45d1e96dbd2747c0a6e897fff234e9441e599dc7077df529196cc62d021e" }
+  "plot_defaults": { "groups": [{ "channel_ids": ["red_tx", "ir_tx"] }, { "channel_ids": ["red_rx", "ir_rx"] }] },
+  "associated_sketch": { "name": "WVU Reference Firmware", "is_wvu_reference": true },
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "6386f36f85f9522335d63a8d63ed12663ab5802968bb4c13b6d5d26d64cf1cb1" }
 }

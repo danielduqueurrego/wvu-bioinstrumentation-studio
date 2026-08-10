@@ -288,7 +288,7 @@ The project shall use:
 
 Phase 4 supersedes the earlier one-channel course-capture assumptions without changing the
 medical-device boundary. The controlled application shall support the UNO R4 WiFi with protocol
-v0.2 for one to six sequentially sampled analog inputs in a synchronized logical frame and one
+v0.2 (extended by v0.3 resource capability advertisement) for one to six sequentially sampled analog inputs in a synchronized logical frame and one
 fixed pulse-ox four-state cycle mode. Course profiles shall capture the following raw variables:
 
 - ECG: A0 at 12 bit / 1000 frames/s.
@@ -312,6 +312,24 @@ linear `MPXV_mmHg = slope × XGZP_volts + offset` calibration from a selected sy
 or two or more manual points, reporting slope, offset, R², and paired sample count without an
 automatic accept/reject threshold. It shall not calculate SBP, DBP, SpO2, heart rate, EMG force,
 fatigue, or any physiological conclusion.
+
+## Phase 6 instructor-lab-authoring amendment
+
+The application shall let a locally acknowledged Instructor create a draft from an active lab,
+edit supported course-capture settings, and save it as a new immutable active revision without
+changing historical recording snapshots. Supported simultaneous-lab settings are one through six
+unique A0–A5 channels, machine-safe IDs/CSV names, labels, supported rate/ADC choices, allowed
+engineering-conversion types, default visibility/plot groups, and safe D4–D6 behavior. Conflicts,
+unsupported pins, duplicate resources, unsupported rate/ADC/channel combinations, and unsafe
+output behavior shall be rejected before capture.
+
+The app shall retain exactly two acquisition modes: simultaneous analog and fixed pulse-ox
+RED/DARK/IR/DARK. The pulse template shall automatically select the latter, preserve its fixed
+phase order and eight raw values, and allow only TX/RX pin, RED/IR pin, ADC, labels, plot defaults,
+and supported dwell changes. It shall never offer a generic waveform sequencer or drive RED and
+IR together. Lab changes shall not automatically compile, upload, reset, or otherwise modify the
+Arduino. Existing Firmware-workspace explicit compile/upload/verification controls remain the
+only firmware mutation path.
 
 ## 7. Deferred requirements
 

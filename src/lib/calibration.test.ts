@@ -37,6 +37,12 @@ describe('course calibration display helpers', () => {
     expect(supportedDisplayUnits('course_blood_pressure', 'xgzp', true)).toEqual(['counts', 'volts', 'mmhg']);
   });
 
+  it('keeps an instructor-declared generic linear channel in its named engineering units', () => {
+    expect(
+      supportedDisplayUnits('development', 'load_cell', true, ['linear_calibration'], 'grams')
+    ).toEqual(['counts', 'volts', 'calibrated']);
+  });
+
   it('finds the explicitly selected persisted calibration by its stable ID', () => {
     const preset = { schema_version: 1, calibration_id: 'team.xgzp.1', profile_id: 'bp', channel_id: 'xgzp', calibration_type: 'linear' as const,
       input_quantity: 'volts', output_quantity: 'pressure', output_units: 'mmHg', parameters: { slope: 120, offset: -10 }, created_at: '2026-08-10T00:00:00Z', label: 'Team XGZP' };

@@ -4,7 +4,7 @@
 //! transport read and disk write. Status and the bounded display history are copied
 //! under a short mutex so polling the UI never waits for serial I/O.
 use crate::{
-    acquisition::{AcquisitionController, AcquisitionSnapshot},
+    acquisition::{AcquisitionController, AcquisitionSnapshot, FirmwareCapabilities},
     calibration::RecordingCalibration,
     profiles::{built_in_profiles, ProfileSnapshot, ProfileStatus},
     protocol::{
@@ -93,6 +93,7 @@ pub struct ConnectionDiagnostics {
     pub capabilities_received: bool,
     pub pong_received: bool,
     pub protocol_version: Option<String>,
+    pub firmware_capabilities: Option<FirmwareCapabilities>,
     pub firmware_build: Option<u32>,
     pub firmware_board_id: Option<u32>,
     pub raw_byte_classification: String,
@@ -124,6 +125,7 @@ impl ConnectionDiagnostics {
             capabilities_received: false,
             pong_received: false,
             protocol_version: None,
+            firmware_capabilities: None,
             firmware_build: None,
             firmware_board_id: None,
             raw_byte_classification: "no bytes received".into(),
@@ -299,7 +301,7 @@ impl SessionController {
                 board: String::new(),
                 port: String::new(),
                 simulator: false,
-                protocol_version: "0.2".into(),
+                protocol_version: "0.3".into(),
                 recent: VecDeque::with_capacity(DISPLAY_CAPACITY),
                 samples: 0,
                 packets: 0,
@@ -864,7 +866,7 @@ impl SessionController {
         runtime.board = board.to_owned();
         runtime.port = port.to_owned();
         runtime.simulator = simulator;
-        runtime.protocol_version = "0.2".into();
+        runtime.protocol_version = "0.3".into();
         runtime.recent.clear();
         runtime.samples = 0;
         runtime.packets = 0;
@@ -1007,11 +1009,15 @@ impl SessionController {
         let (tx, rx) = sync_channel(4_096);
         let mut acquisition = AcquisitionController::new(tx);
         self.wait_for_handshake(io, &mut acquisition)?;
+        let negotiated_capabilities = acquisition.snapshot().firmware_capabilities;
         self.send_command(
             io,
             MessageType::Configure,
             1,
-            configure_payload(&profile.profile.acquisition)?,
+            configure_payload(
+                &profile.profile.acquisition,
+                negotiated_capabilities.as_ref(),
+            )?,
         )?;
         self.wait_until(io, &mut acquisition, |s| s.config_ack_seen, "CONFIG_ACK")?;
         acquisition.configure().map_err(SessionError::State)?;
@@ -1274,7 +1280,9 @@ impl SessionController {
                         Some(category.clone()),
                     )?;
                     return Err(SessionError::Protocol(format!(
-                        "handshake reached protocol v0.1 on {} but firmware identity was not accepted: build={:?}, device={:?}. {}",
+                        "handshake reached protocol v{}.{} on {} but firmware identity was not accepted: build={:?}, device={:?}. {}",
+                        crate::protocol::PROTOCOL_MAJOR,
+                        crate::protocol::PROTOCOL_MINOR,
                         self.status()?.port,
                         snapshot.firmware_build,
                         snapshot.firmware_board_id,
@@ -1420,16 +1428,14 @@ impl SessionController {
             (version, core, serial)
         };
         let mut digital_output_mapping = std::collections::BTreeMap::new();
-        if let Some(outputs) = profile.profile.acquisition.led_outputs.as_ref() {
-            if let Some(pin) = outputs.green.as_ref() {
-                digital_output_mapping.insert("green".into(), pin.clone());
-            }
-            if let Some(pin) = outputs.red.as_ref() {
-                digital_output_mapping.insert("red".into(), pin.clone());
-            }
-            if let Some(pin) = outputs.ir.as_ref() {
-                digital_output_mapping.insert("ir".into(), pin.clone());
-            }
+        for output in profile.profile.acquisition.resolved_digital_outputs() {
+            let key = match output.label.to_ascii_lowercase().as_str() {
+                "green led" => "green".into(),
+                "red led" => "red".into(),
+                "ir led" => "ir".into(),
+                _ => output.label,
+            };
+            digital_output_mapping.insert(key, output.pin);
         }
         Ok(RecordingMetadata {
             utc_start: Utc::now(),
@@ -1449,7 +1455,7 @@ impl SessionController {
             arduino_cli_version,
             uno_r4_core_version,
             firmware_build: REFERENCE_FIRMWARE_BUILD,
-            protocol_version: "0.2".into(),
+            protocol_version: "0.3".into(),
             analog_pin: profile.profile.acquisition.analog_pins().join(","),
             active_analog_pins: profile.profile.acquisition.analog_pins(),
             digital_output_mapping,
@@ -1628,12 +1634,17 @@ impl SessionController {
         diagnostics.capabilities_received = snapshot.capabilities_seen;
         diagnostics.pong_received = snapshot.pong_seen;
         diagnostics.protocol_version = if snapshot.integrity.received_packets > 0 {
-            Some("0.1".into())
+            Some(format!(
+                "{}.{}",
+                crate::protocol::PROTOCOL_MAJOR,
+                crate::protocol::PROTOCOL_MINOR
+            ))
         } else {
             None
         };
         diagnostics.firmware_build = snapshot.firmware_build;
         diagnostics.firmware_board_id = snapshot.firmware_board_id;
+        diagnostics.firmware_capabilities = snapshot.firmware_capabilities.clone();
         diagnostics.raw_byte_classification =
             raw_byte_classification(snapshot, bytes_received).into();
         diagnostics.ping_attempts = ping_attempts;
@@ -1804,6 +1815,7 @@ fn validate_profile_snapshot(snapshot: &ProfileSnapshot) -> Result<(), SessionEr
 
 fn configure_payload(
     settings: &crate::profiles::AcquisitionSettings,
+    capabilities: Option<&FirmwareCapabilities>,
 ) -> Result<Vec<u8>, SessionError> {
     let pin_id = |pin: &str| match pin {
         "A0" => Ok(0),
@@ -1832,32 +1844,149 @@ fn configure_payload(
                     "profile requests an unsupported simultaneous acquisition configuration",
                 ));
             }
-            let green_enabled = settings
-                .led_outputs
-                .as_ref()
-                .and_then(|outputs| outputs.green.as_deref())
-                == Some("D4");
+            let output_mask = settings
+                .resolved_digital_outputs()
+                .into_iter()
+                .filter(|output| {
+                    output.behavior == crate::profiles::DigitalOutputBehavior::HighWhileRecording
+                })
+                .try_fold(0u8, |mask, output| match output.pin.as_str() {
+                    "D4" => Ok(mask | 0x01),
+                    "D5" => Ok(mask | 0x02),
+                    "D6" => Ok(mask | 0x04),
+                    _ => Err(SessionError::State("profile digital output is unsupported")),
+                })?;
+            validate_firmware_capabilities(
+                capabilities,
+                0x01,
+                pins.len(),
+                settings.adc_resolution_bits,
+                Some(settings.sample_rate_hz),
+                output_mask,
+            )?;
             payload.extend_from_slice(&[0, settings.adc_resolution_bits]);
             payload.extend_from_slice(&settings.sample_rate_hz.to_le_bytes());
             payload.push(pins.len() as u8);
             payload.extend_from_slice(&pins);
-            payload.push(u8::from(green_enabled));
+            payload.push(output_mask);
         }
         crate::profiles::AcquisitionMode::Pulseox4State => {
-            if settings.adc_resolution_bits != 14
-                || settings.state_dwell_us != Some(1_000)
-                || settings.analog_pins() != ["A0".to_string(), "A1".to_string()]
+            let inputs = settings.analog_inputs.as_ref().ok_or(SessionError::State(
+                "pulse-ox profile is missing its TX/RX analog inputs",
+            ))?;
+            let outputs = settings.resolved_digital_outputs();
+            let red = outputs
+                .iter()
+                .find(|output| output.label.eq_ignore_ascii_case("red led"))
+                .ok_or(SessionError::State(
+                    "pulse-ox profile is missing a RED output",
+                ))?;
+            let ir = outputs
+                .iter()
+                .find(|output| output.label.eq_ignore_ascii_case("ir led"))
+                .ok_or(SessionError::State(
+                    "pulse-ox profile is missing an IR output",
+                ))?;
+            if red.pin == ir.pin
+                || red.behavior != crate::profiles::DigitalOutputBehavior::AcquisitionSequenced
+                || ir.behavior != crate::profiles::DigitalOutputBehavior::AcquisitionSequenced
+            {
+                return Err(SessionError::State(
+                    "pulse-ox RED and IR must use distinct acquisition-sequenced outputs",
+                ));
+            }
+            let output_pin = |pin: &str| match pin {
+                "D4" => Ok(4),
+                "D5" => Ok(5),
+                "D6" => Ok(6),
+                _ => Err(SessionError::State(
+                    "pulse-ox profile digital output is unsupported",
+                )),
+            };
+            let dwell = settings.state_dwell_us.ok_or(SessionError::State(
+                "pulse-ox profile is missing state dwell time",
+            ))?;
+            if !matches!(settings.adc_resolution_bits, 12 | 14)
+                || !(250..=5_000).contains(&dwell)
+                || settings.analog_pins().len() != 2
+                || red.pin == ir.pin
             {
                 return Err(SessionError::State(
                     "profile requests an unsupported fixed pulse-ox configuration",
                 ));
             }
-            payload.extend_from_slice(&[1, 14]);
-            payload.extend_from_slice(&1_000u32.to_le_bytes());
-            payload.extend_from_slice(&[2, 0, 1, 0]);
+            let output_mask = match (red.pin.as_str(), ir.pin.as_str()) {
+                ("D4", "D5") | ("D5", "D4") => 0x03,
+                ("D4", "D6") | ("D6", "D4") => 0x05,
+                ("D5", "D6") | ("D6", "D5") => 0x06,
+                _ => {
+                    return Err(SessionError::State(
+                        "pulse-ox profile digital output is unsupported",
+                    ))
+                }
+            };
+            validate_firmware_capabilities(
+                capabilities,
+                0x02,
+                2,
+                settings.adc_resolution_bits,
+                None,
+                output_mask,
+            )?;
+            payload.extend_from_slice(&[1, settings.adc_resolution_bits]);
+            payload.extend_from_slice(&dwell.to_le_bytes());
+            payload.extend_from_slice(&[
+                2,
+                pin_id(&inputs.tx)?,
+                pin_id(&inputs.rx)?,
+                output_pin(&red.pin)?,
+                output_pin(&ir.pin)?,
+            ]);
         }
     }
     Ok(payload)
+}
+
+fn validate_firmware_capabilities(
+    capabilities: Option<&FirmwareCapabilities>,
+    required_mode: u8,
+    channel_count: usize,
+    adc_bits: u8,
+    rate_hz: Option<u32>,
+    output_mask: u8,
+) -> Result<(), SessionError> {
+    let Some(capabilities) = capabilities else {
+        // Legacy CAPABILITIES packets did not carry enough detail to make a
+        // Phase 6 resource claim. Their existing conservative configuration
+        // checks above remain in effect for backward reader compatibility.
+        return Ok(());
+    };
+    if !capabilities.supports_mode(required_mode) {
+        return Err(SessionError::State(
+            "connected firmware does not support this acquisition mode",
+        ));
+    }
+    if channel_count > usize::from(capabilities.max_analog_channels) {
+        return Err(SessionError::State(
+            "connected firmware does not support this many analog channels",
+        ));
+    }
+    if !capabilities.supports_adc_resolution(adc_bits) {
+        return Err(SessionError::State(
+            "connected firmware does not support this ADC resolution",
+        ));
+    }
+    if rate_hz.is_some_and(|rate| !capabilities.supports_rate(rate)) {
+        return Err(SessionError::State(
+            "connected firmware does not support this frame/cycle rate",
+        ));
+    }
+    if output_mask & !capabilities.supported_digital_output_mask != 0 {
+        return Err(SessionError::State(
+            "connected firmware does not support this controlled output mapping",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2083,11 +2212,13 @@ impl SimulatorIo {
         };
         simulator.queue(
             MessageType::Hello,
-            vec![2, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
+            vec![3, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
         )?;
         simulator.queue(
             MessageType::Capabilities,
-            vec![12, 14, 6, 0x03, 0x07, 3, 200, 0, 250, 0, 232, 3],
+            vec![
+                12, 14, 6, 0x03, 0x07, 5, 100, 0, 200, 0, 250, 0, 244, 1, 232, 3,
+            ],
         )?;
         Ok(simulator)
     }
@@ -2289,15 +2420,10 @@ impl Write for SimulatorIo {
                                     payload[2], payload[3], payload[4], payload[5],
                                 ]);
                             self.channel_count = channel_count;
-                            self.output_mask =
-                                if payload[7 + usize::from(self.channel_count)] & 0x01 != 0 {
-                                    0x01
-                                } else {
-                                    0
-                                };
+                            self.output_mask = payload[7 + usize::from(self.channel_count)] & 0x07;
                         }
                         1 => {
-                            if payload.len() != 10 {
+                            if payload.len() != 11 {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidInput,
                                     "invalid simulator pulse-ox layout",
@@ -2474,7 +2600,7 @@ mod tests {
                 commands: FrameParser::default(),
                 answer_on_ping,
                 pings: 0,
-                hello_payload: vec![2, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
+                hello_payload: vec![3, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
             }
         }
 
@@ -2609,7 +2735,7 @@ mod tests {
     fn handshake_rejects_an_incompatible_firmware_identity() {
         let (session, mut acquisition) = handshake_session();
         let mut io = HandshakeMock::new(Some(1));
-        io.hello_payload[0] = 3;
+        io.hello_payload[0] = 4;
         assert!(session
             .wait_for_handshake_with_policy(
                 &mut io,
@@ -3140,15 +3266,124 @@ mod tests {
                 .find(|profile| profile.category == category)
                 .unwrap_or_else(|| panic!("missing {category}"))
         };
-        let emg = configure_payload(&lookup("course_emg_force").acquisition)
+        let emg = configure_payload(&lookup("course_emg_force").acquisition, None)
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(emg, vec![0, 12, 232, 3, 0, 0, 4, 0, 1, 2, 3, 0]);
-        let bp = configure_payload(&lookup("course_blood_pressure").acquisition)
+        let bp = configure_payload(&lookup("course_blood_pressure").acquisition, None)
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(bp, vec![0, 12, 200, 0, 0, 0, 3, 0, 1, 2, 1]);
-        let pulseox = configure_payload(&lookup("course_pulseox").acquisition)
+        let pulseox = configure_payload(&lookup("course_pulseox").acquisition, None)
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(pulseox, vec![1, 14, 232, 3, 0, 0, 2, 0, 1, 0]);
+        assert_eq!(pulseox, vec![1, 14, 232, 3, 0, 0, 2, 0, 1, 5, 6]);
+    }
+
+    #[test]
+    fn phase6_configuration_uses_advertised_firmware_capabilities() {
+        let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
+        let emg = profiles
+            .iter()
+            .find(|profile| profile.category == "course_emg_force")
+            .unwrap_or_else(|| panic!("missing EMG profile"));
+        let capabilities = FirmwareCapabilities {
+            supported_adc_resolutions: vec![12, 14],
+            max_analog_channels: 6,
+            supported_modes: 0x03,
+            supported_digital_output_mask: 0x07,
+            supported_rates_hz: vec![100, 200, 250, 500, 1_000],
+        };
+        assert!(configure_payload(&emg.acquisition, Some(&capabilities)).is_ok());
+
+        let rate_limited = FirmwareCapabilities {
+            supported_rates_hz: vec![100, 200, 250, 500],
+            ..capabilities.clone()
+        };
+        assert!(configure_payload(&emg.acquisition, Some(&rate_limited)).is_err());
+
+        let channel_limited = FirmwareCapabilities {
+            max_analog_channels: 3,
+            ..capabilities
+        };
+        assert!(configure_payload(&emg.acquisition, Some(&channel_limited)).is_err());
+    }
+
+    #[test]
+    fn instructor_authored_course_maps_encode_without_changing_the_fixed_protocol_modes() {
+        let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
+        let lookup = |category: &str| {
+            profiles
+                .iter()
+                .find(|profile| profile.category == category)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {category}"))
+        };
+        let capabilities = FirmwareCapabilities {
+            supported_adc_resolutions: vec![12, 14],
+            max_analog_channels: 6,
+            supported_modes: 0x03,
+            supported_digital_output_mask: 0x07,
+            supported_rates_hz: vec![100, 200, 250, 500, 1_000],
+        };
+
+        let mut ecg = lookup("course_ecg");
+        ecg.acquisition.channels[0].pin = "A2".into();
+        ecg.acquisition.sample_rate_hz = 500;
+        assert_eq!(
+            configure_payload(&ecg.acquisition, Some(&capabilities))
+                .unwrap_or_else(|error| panic!("{error}")),
+            vec![0, 12, 244, 1, 0, 0, 1, 2, 0]
+        );
+
+        let mut emg = lookup("course_emg_force");
+        for (channel, pin) in emg
+            .acquisition
+            .channels
+            .iter_mut()
+            .zip(["A1", "A2", "A4", "A5"])
+        {
+            channel.pin = pin.into();
+        }
+        emg.acquisition.sample_rate_hz = 500;
+        emg.acquisition.adc_resolution_bits = 14;
+        assert_eq!(
+            configure_payload(&emg.acquisition, Some(&capabilities))
+                .unwrap_or_else(|error| panic!("{error}")),
+            vec![0, 14, 244, 1, 0, 0, 4, 1, 2, 4, 5, 0]
+        );
+
+        let mut bp = lookup("course_blood_pressure");
+        for (channel, pin) in bp.acquisition.channels.iter_mut().zip(["A3", "A4", "A5"]) {
+            channel.pin = pin.into();
+        }
+        bp.acquisition.sample_rate_hz = 250;
+        assert_eq!(
+            configure_payload(&bp.acquisition, Some(&capabilities))
+                .unwrap_or_else(|error| panic!("{error}")),
+            vec![0, 12, 250, 0, 0, 0, 3, 3, 4, 5, 1]
+        );
+
+        let mut pulse = lookup("course_pulseox");
+        pulse.acquisition.analog_inputs = Some(crate::profiles::PulseOxInputs {
+            tx: "A2".into(),
+            rx: "A3".into(),
+        });
+        pulse.acquisition.digital_outputs = vec![
+            crate::profiles::DigitalOutput {
+                pin: "D4".into(),
+                label: "Red LED".into(),
+                behavior: crate::profiles::DigitalOutputBehavior::AcquisitionSequenced,
+            },
+            crate::profiles::DigitalOutput {
+                pin: "D6".into(),
+                label: "IR LED".into(),
+                behavior: crate::profiles::DigitalOutputBehavior::AcquisitionSequenced,
+            },
+        ];
+        pulse.acquisition.state_dwell_us = Some(2_000);
+        assert_eq!(
+            configure_payload(&pulse.acquisition, Some(&capabilities))
+                .unwrap_or_else(|error| panic!("{error}")),
+            vec![1, 14, 208, 7, 0, 0, 2, 2, 3, 4, 6]
+        );
     }
 
     #[test]
@@ -3166,7 +3401,7 @@ mod tests {
             let mut simulator =
                 SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
                     .unwrap_or_else(|error| panic!("{error}"));
-            let configure = configure_payload(&profile.profile.acquisition)
+            let configure = configure_payload(&profile.profile.acquisition, None)
                 .unwrap_or_else(|error| panic!("{error}"));
             simulator
                 .write_all(

@@ -15,8 +15,16 @@ UNO R4 WiFi/FQBN target, firmware requirement, acquisition, display, safety, exp
 integrity blocks. Unknown optional fields are retained in deterministic key order when practical.
 
 `profile_id` is stable and uses lowercase ASCII letters, digits, `.`, `_`, and `-`.
-`profile_version` is `MAJOR.MINOR.PATCH`. A finalized locked profile/version is immutable; edits
-begin with a separate instructor draft and finalization creates a new version.
+`profile_version` is `MAJOR.MINOR.PATCH`. A finalized locked profile/version is immutable. The
+Instructor Lab Editor creates the next patch revision automatically when it saves an edit; users
+do not need to choose a semantic version manually.
+
+Phase 6 additions remain optional for older snapshots: `acquisition.digital_outputs` describes
+the allowed controlled output pins and safe behavior; `plot_defaults.groups` maps signal IDs to
+their default display-only plot groups; channel entries may declare allowed conversion types,
+default unit, and default visibility; and `associated_sketch` records a named controlled or local
+Arduino sketch reference. These fields are frozen into a recording snapshot but never replace raw
+ADC data or embed arbitrary source code.
 
 ## Integrity
 
@@ -29,14 +37,14 @@ lowercase 64-character `canonical_hash`. This detects accidental/tampered profil
 
 | ID | Name | Mapping / ADC / logical rate | Signal label | SHA-256 |
 | --- | --- | --- | --- | --- |
-| `wvu.bmeg420l.general.analog.development.v2` | General Analog — Development | A0 default; instructor draft supports 1–6 unique A0–A5 / 12 or 14 bit / ≤1000 Hz | profile-defined | `d5ee6a65cbeb8c4b950586ad591cc7ac566718f38afeda74f5fb1a45ee71ef2d` |
-| `wvu.bmeg420l.ecg.course.capture.v1` | ECG — Course Capture | A0 / 12 bit / 1000 frames/s | `ecg_counts` | `cd04267743fd38066aa8daf91b6eafa9550e4406e2ef3d0d59ceae04051b782d` |
-| `wvu.bmeg420l.emg.force.course.capture.v1` | EMG + Force — Course Capture | A0–A3 / 12 bit / 1000 frames/s | four synchronized raw fields | `ddad92c2805f04b5af546bcd5bf9dc05b74b6e92163e99a279c3e7fbf13ddcd9` |
-| `wvu.bmeg420l.blood_pressure.ppg.course.capture.v1` | Blood Pressure + PPG — Course Capture | A0–A2, D4 green / 12 bit / 200 frames/s | three synchronized raw fields | `14cf52a6b4c097474efd1303e872dcad5d54532518b6c0b8bb36d4a68166be7a` |
-| `wvu.bmeg420l.pulseox.txrx.raw.course.capture.v1` | Pulse Oximetry — TX + RX Raw Capture | A0/A1, D5 red, D6 IR / 14 bit / 250 cycles/s | eight state-preserved raw fields | `2ada45d1e96dbd2747c0a6e897fff234e9441e599dc7077df529196cc62d021e` |
+| `wvu.bmeg420l.general.analog.development.v2` | General Analog — Development | A0 default; instructor lab supports 1–6 unique A0–A5 / 12 or 14 bit / supported rate | profile-defined | `32de72f4eff444694a33d44c56e5c6931191a6a46414d8010fef6303db3428fe` |
+| `wvu.bmeg420l.ecg.course.capture.v1` | ECG — Course Capture | A0 / 12 bit / 1000 frames/s | `ecg_counts` | `c55aff5dc395aaca24dfbeae944034731ef2a7c0701d3de27fa1885ed87d44ce` |
+| `wvu.bmeg420l.emg.force.course.capture.v1` | EMG + Force — Course Capture | A0–A3 / 12 bit / 1000 frames/s | four synchronized raw fields | `d121920e5bd38a531ee5ab29ab8b784b83bd524a029a83b4041d759529164630` |
+| `wvu.bmeg420l.blood_pressure.ppg.course.capture.v1` | Blood Pressure + PPG — Course Capture | A0–A2, D4 green / 12 bit / 200 frames/s | three synchronized raw fields | `06cca7fd5717ca960ce2af75607af4479ed69d5be4e1d5e429127a5d372a31e5` |
+| `wvu.bmeg420l.pulseox.txrx.raw.course.capture.v1` | Pulse Oximetry — TX + RX Raw Capture | A0/A1, D5 red, D6 IR / 14 bit / 250 cycles/s | eight state-preserved raw fields | `6386f36f85f9522335d63a8d63ed12663ab5802968bb4c13b6d5d26d64cf1cb1` |
 
-All require UNO R4 WiFi FQBN `arduino:renesas_uno:unor4wifi`, protocol 0.2, build
-`0x00010002`, and device `0x554E4F34`. All allow timed (10/30/60/300/600 s plus custom ≥10 s)
+All require UNO R4 WiFi FQBN `arduino:renesas_uno:unor4wifi`, protocol 0.3, build
+`0x00010003`, and device `0x554E4F34`. All allow timed (10/30/60/300/600 s plus custom ≥10 s)
 and Until-stopped runs. Values are raw ADC counts; direct Arduino-input volts use the explicitly
 recorded reference-voltage assumption. See `COURSE_ACQUISITION_PROFILES.md` for field order and
 the teaching-use boundary.
@@ -57,11 +65,13 @@ remains readable under its documented 5.0 V conversion assumption.
 
 ## Local authoring workflow
 
-Student mode is the default and exposes valid active locked profiles only. Instructor authoring
+Student mode is the default and exposes only active locked lab revisions. Instructor authoring
 requires an explicit local acknowledgement, logs the mode change locally, and is not strong
-authentication. It can duplicate a locked profile to a draft, edit allowed draft content,
-validate/finalize a new locked version, import/export a validated locked package, and retire an
-instructor-created version without deleting recordings that contain its snapshot.
+authentication. Instructors can edit a current lab, duplicate it, save an automatic new locked
+revision, import/export, retire/restore a revision, and restore a shipped course default as a new
+revision. The backend validates all pins, output behavior, sample rate, ADC resolution, pulse-ox
+resource conflicts, and the canonical hash before it activates a revision. Old recordings retain
+their original snapshot even if the active lab changes later.
 
 The operating-mode UI has one native radio-group value: `student` or `instructor_authoring`.
 Acknowledgement is a separate checkbox. Selecting Instructor without acknowledgement leaves

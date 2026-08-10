@@ -28,9 +28,13 @@
   authorizes human use.
 - Rust exists at `C:\Users\dd00055\.cargo\bin` but is not on the persistent PowerShell PATH.
   Prepend it for the session or repair the user PATH entry.
-- The explicit 1200-bps Reset board and retry limitation is unchanged. Normal protocol v0.2
+- The explicit 1200-bps Reset board and retry limitation is unchanged. Normal protocol v0.3
   acquisition and controlled firmware upload/restore work; recovery should not silently upload
   firmware.
 - Phase 5 deliberately has no physiological interpretation, clinical SpO2, heart-rate analysis,
   SBP/DBP estimation, EMG activation/fatigue analysis, force conversion, or automatic filtering.
   Its MPXV and student-generated XGZP conversions are engineering-unit tools only.
+- Phase 6 requires an explicit controlled-reference firmware update to protocol 0.3 / build
+  `0x00010003` before an instructor-authored resource mapping can be captured on hardware. The
+  application never performs that upload automatically; use the Firmware workspace’s explicit
+  Restore WVU reference firmware action after reviewing the selected lab.

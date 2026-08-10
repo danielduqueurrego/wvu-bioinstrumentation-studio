@@ -4,10 +4,10 @@ Windows teaching software for BMEG 420L. It is **not a medical device** and neve
 diagnostic or treatment advice. The app records raw engineering signals and preserves the timing,
 channel map, firmware identity, profile snapshot, and integrity counters needed for course work.
 
-## Current Phase 5 capabilities
+## Current Phase 6 capabilities
 
-- One UNO R4 WiFi at a time, with controlled protocol v0.2 firmware:
-  build `0x00010002`, device `0x554E4F34`, USB CDC configured at 921600 baud.
+- One UNO R4 WiFi at a time, with controlled protocol v0.3 firmware:
+  build `0x00010003`, device `0x554E4F34`, USB CDC configured at 921600 baud.
 - Synchronized logical analog frames with one to six unique A0–A5 inputs; ADC reads are sequential
   within a frame, not electrically simultaneous.
 - Locked course captures: ECG (A0); EMG + force (A0–A3); blood pressure + PPG (A0–A2, D4 green);
@@ -20,11 +20,16 @@ channel map, firmware identity, profile snapshot, and integrity counters needed 
 - A lightweight **Calibration & Units** card: raw counts, stored-reference volts, MPXV kPa/mmHg,
   and a student-created XGZP linear mmHg conversion. These are derived display/export values;
   raw BMEG values remain authoritative.
+- An Instructor-only **Manage Labs** workflow that creates immutable active revisions of course
+  labs. It supports pin/channel/rate/ADC/output/plot-default changes, fixed pulse-ox phase
+  configuration, export/import, retirement/restore, and restoration of shipped course defaults.
+  Editing a lab never changes the snapshot stored in an earlier recording.
 
 See [course profile mapping](docs/COURSE_ACQUISITION_PROFILES.md),
-[protocol v0.2](docs/USB_PROTOCOL_SPECIFICATION_v0.2.md), and
+[protocol v0.3](docs/USB_PROTOCOL_SPECIFICATION_v0.3.md),
 [profile schema](docs/ACQUISITION_PROFILE_SCHEMA_v1.md), and
-[calibration and units](docs/CALIBRATION_AND_UNITS.md).
+[calibration and units](docs/CALIBRATION_AND_UNITS.md), and
+[instructor lab authoring](docs/INSTRUCTOR_LAB_AUTHORING.md).
 
 ## Safety boundary
 
@@ -67,8 +72,8 @@ arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port <CURRENT_UNO_PORT
 cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase1_capture -- probe
 ```
 
-The probe must show HELLO, CAPABILITIES, PONG, zero CRC failures, protocol 0.2, build
-`0x00010002`, and device `0x554E4F34`. A successful upload alone is not identity proof. The
+The probe must show HELLO, CAPABILITIES, PONG, zero CRC failures, protocol 0.3, build
+`0x00010003`, and device `0x554E4F34`. A successful upload alone is not identity proof. The
 Firmware workspace’s **Restore WVU reference firmware** action uses the same controlled source and
 requires a verified protocol handshake before Acquisition is re-enabled.
 

@@ -1,10 +1,10 @@
 /*
- * WVU Bioinstrumentation Studio controlled UNO R4 WiFi firmware, Phase 4.
+ * WVU Bioinstrumentation Studio controlled UNO R4 WiFi firmware, Phase 6.
  * Teaching use only; not a medical device. This sketch performs no physiological
  * interpretation. Analog channels are read in deterministic sequential order
  * within one logical timestamped frame; they are not literally simultaneous.
  *
- * Protocol 0.2 supports only two acquisition modes:
+ * Protocol 0.3 supports only two acquisition modes:
  *   0 simultaneous analog frame: 1..6 A0..A5 channels
  *   1 fixed pulse-ox cycle: A0 TX/A1 RX, RED/DARK/IR/DARK at 1000 us/state
  *
@@ -15,10 +15,10 @@
 #include <Arduino.h>
 
 static const uint8_t MAGIC[] = {'B','M','E','G'};
-static const uint8_t PROTOCOL_MAJOR = 0, PROTOCOL_MINOR = 2;
+static const uint8_t PROTOCOL_MAJOR = 0, PROTOCOL_MINOR = 3;
 static const uint16_t MAX_PAYLOAD = 1024;
 static const uint32_t CONTROLLED_SERIAL_BAUD = 921600UL;
-static const uint32_t FIRMWARE_BUILD = 0x00010002UL;
+static const uint32_t FIRMWARE_BUILD = 0x00010003UL;
 static const uint32_t DEVICE_ID = 0x554E4F34UL;
 static const uint32_t COMMAND_TIMEOUT_US = 5000000UL;
 static const uint8_t D4_GREEN = 4, D5_RED = 5, D6_IR = 6;
@@ -30,9 +30,10 @@ enum AcquisitionMode : uint8_t { SIMULTANEOUS=0, PULSEOX_4STATE=1 };
 uint32_t packetSequence = 0, recordSequence = 0, nextTickMicros = 0, lastCommandMicros = 0;
 uint32_t microsLast = 0; uint64_t microsHigh = 0;
 uint64_t batchFirstTimestamp = 0; uint32_t batchFirstSequence = 0;
-bool configured = false, acquiring = false, greenEnabled = false, overflowObserved = false;
+bool configured = false, acquiring = false, overflowObserved = false;
 uint8_t acquisitionMode = SIMULTANEOUS, adcBits = 12, channelCount = 1, analogPins[6] = {A0};
 uint32_t frameRateHz = 1000, stateDwellUs = 1000; uint8_t pulseState = 0, batchCount = 0;
+uint8_t activeOutputMask = 0, redOutputPin = D5_RED, irOutputPin = D6_IR;
 uint16_t batch[BATCH_RECORDS][MAX_FIELDS];
 
 uint16_t crc16(const uint8_t* bytes, size_t length) { uint16_t crc=0xFFFF; while (length--) { crc ^= (uint16_t)(*bytes++) << 8; for(uint8_t i=0;i<8;i++) crc=(crc&0x8000)?(uint16_t)((crc<<1)^0x1021):(uint16_t)(crc<<1); } return crc; }
@@ -41,10 +42,17 @@ uint64_t extendedMicros(){uint32_t now=micros();if(now<microsLast)microsHigh+=(1
 
 void forceSafeOutputs(){ digitalWrite(D4_GREEN,LOW); digitalWrite(D5_RED,LOW); digitalWrite(D6_IR,LOW); }
 uint8_t outputMask(){ return (digitalRead(D4_GREEN)==HIGH?0x01:0) | (digitalRead(D5_RED)==HIGH?0x02:0) | (digitalRead(D6_IR)==HIGH?0x04:0); }
+void writeControlledOutput(uint8_t pin, uint8_t value){ if(pin==D4_GREEN||pin==D5_RED||pin==D6_IR)digitalWrite(pin,value); }
+void applyActiveOutputs(){
+  forceSafeOutputs();
+  if(activeOutputMask&0x01)digitalWrite(D4_GREEN,HIGH);
+  if(activeOutputMask&0x02)digitalWrite(D5_RED,HIGH);
+  if(activeOutputMask&0x04)digitalWrite(D6_IR,HIGH);
+}
 void applyPulseState(uint8_t state){
-  digitalWrite(D4_GREEN,LOW);
-  digitalWrite(D5_RED, state==0 ? HIGH : LOW);
-  digitalWrite(D6_IR, state==2 ? HIGH : LOW);
+  forceSafeOutputs();
+  writeControlledOutput(redOutputPin, state==0 ? HIGH : LOW);
+  writeControlledOutput(irOutputPin, state==2 ? HIGH : LOW);
 }
 
 void sendFrame(uint8_t type,const uint8_t* payload,uint16_t length){
@@ -58,9 +66,11 @@ void sendFrame(uint8_t type,const uint8_t* payload,uint16_t length){
   if(type!=SAMPLE_BATCH) Serial.flush();
 }
 void sendHello(){uint8_t p[12];writeU32(p,FIRMWARE_BUILD);writeU32(p+4,DEVICE_ID);p[8]=1;p[9]=14;p[10]=6;p[11]=0x03;sendFrame(HELLO,p,sizeof(p));}
-void sendCapabilities(){uint8_t p[]={12,14,6,0x03,0x07,3,200,0,250,0,232,3};sendFrame(CAPABILITIES,p,sizeof(p));}
+// bits: 12/14-bit ADC, six analog inputs, simultaneous + four-state modes,
+// D4/D5/D6 controlled outputs, and 100/200/250/500/1000 Hz recommended rates.
+void sendCapabilities(){uint8_t p[]={12,14,6,0x03,0x07,5,100,0,200,0,250,0,244,1,232,3};sendFrame(CAPABILITIES,p,sizeof(p));}
 void sendError(uint8_t code){uint8_t p[]={code};sendFrame(ERROR_MESSAGE,p,1);}
-// STATUS v0.2 payload: acquiring (0/1), output mask (bit 0 D4, bit 1 D5, bit 2 D6).
+// STATUS v0.3 payload: acquiring (0/1), output mask (bit 0 D4, bit 1 D5, bit 2 D6).
 void sendStatus(){uint8_t p[]={acquiring?1:0,outputMask()};sendFrame(STATUS,p,sizeof(p));}
 
 void sendBatch(){
@@ -78,19 +88,22 @@ void sendBatch(){
 
 void rejectConfiguration(uint8_t code){acquiring=false;configured=false;batchCount=0;forceSafeOutputs();sendError(code);}
 bool uniquePins(const uint8_t* pins,uint8_t count){for(uint8_t i=0;i<count;i++)for(uint8_t j=i+1;j<count;j++)if(pins[i]==pins[j])return false;return true;}
+bool supportedFrameRate(uint32_t rate){return rate==100||rate==200||rate==250||rate==500||rate==1000;}
 bool configureSimultaneous(const uint8_t* p,uint16_t length){
   if(length<9)return false;
   uint8_t bits=p[1], count=p[6]; uint32_t rate=(uint32_t)p[2]|((uint32_t)p[3]<<8)|((uint32_t)p[4]<<16)|((uint32_t)p[5]<<24);
-  if(count<1||count>6||length!=(uint16_t)(8+count)||!(bits==12||bits==14)||rate==0||rate>1000)return false;
+  if(count<1||count>6||length!=(uint16_t)(8+count)||!(bits==12||bits==14)||!supportedFrameRate(rate))return false;
   uint8_t pins[6]; for(uint8_t i=0;i<count;i++){if(p[7+i]>5)return false;pins[i]=p[7+i];}
-  if(!uniquePins(pins,count) || (p[7+count]&~0x01))return false;
-  acquisitionMode=SIMULTANEOUS; adcBits=bits; channelCount=count; frameRateHz=rate; greenEnabled=(p[7+count]&0x01)!=0;
+  if(!uniquePins(pins,count) || (p[7+count]&~0x07))return false;
+  // Red and IR are never both HIGH in simultaneous mode.
+  if((p[7+count]&0x06)==0x06)return false;
+  acquisitionMode=SIMULTANEOUS; adcBits=bits; channelCount=count; frameRateHz=rate; activeOutputMask=p[7+count];
   for(uint8_t i=0;i<count;i++)analogPins[i]=A0+pins[i]; analogReadResolution(adcBits); return true;
 }
 bool configurePulseox(const uint8_t* p,uint16_t length){
   uint32_t dwell=(uint32_t)p[2]|((uint32_t)p[3]<<8)|((uint32_t)p[4]<<16)|((uint32_t)p[5]<<24);
-  if(length!=10||p[1]!=14||dwell!=1000||p[6]!=2||p[7]!=0||p[8]!=1||p[9]!=0)return false;
-  acquisitionMode=PULSEOX_4STATE;adcBits=14;channelCount=2;analogPins[0]=A0;analogPins[1]=A1;stateDwellUs=dwell;greenEnabled=false;analogReadResolution(14);return true;
+  if(length!=11||!(p[1]==12||p[1]==14)||dwell<250||dwell>5000||p[6]!=2||p[7]>5||p[8]>5||p[7]==p[8]||p[9]<4||p[9]>6||p[10]<4||p[10]>6||p[9]==p[10])return false;
+  acquisitionMode=PULSEOX_4STATE;adcBits=p[1];channelCount=2;analogPins[0]=A0+p[7];analogPins[1]=A0+p[8];stateDwellUs=dwell;activeOutputMask=0;redOutputPin=p[9];irOutputPin=p[10];analogReadResolution(adcBits);return true;
 }
 
 void handleFrame(const uint8_t* frame,uint16_t length){
@@ -104,7 +117,7 @@ void handleFrame(const uint8_t* frame,uint16_t length){
     bool ok=payloadLength>=1 && ((p[0]==SIMULTANEOUS&&configureSimultaneous(p,payloadLength)) || (p[0]==PULSEOX_4STATE&&configurePulseox(p,payloadLength)));
     if(!ok){rejectConfiguration(3);return;} forceSafeOutputs();configured=true;sendFrame(CONFIG_ACK,nullptr,0);
   }else if(frame[6]==START){
-    if(!configured||payloadLength){sendError(4);return;} forceSafeOutputs();if(greenEnabled)digitalWrite(D4_GREEN,HIGH);acquiring=true;batchCount=0;pulseState=0;recordSequence=0;nextTickMicros=micros();lastCommandMicros=micros();sendStatus();
+    if(!configured||payloadLength){sendError(4);return;} forceSafeOutputs();if(acquisitionMode==SIMULTANEOUS)applyActiveOutputs();acquiring=true;batchCount=0;pulseState=0;recordSequence=0;nextTickMicros=micros();lastCommandMicros=micros();sendStatus();
   }else if(frame[6]==STOP){acquiring=false;batchCount=0;forceSafeOutputs();sendStatus();
   }else if(frame[6]==PING){sendHello();sendCapabilities();sendFrame(PONG,nullptr,0);}
 }

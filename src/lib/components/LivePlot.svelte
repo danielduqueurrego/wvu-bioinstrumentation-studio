@@ -67,7 +67,11 @@
           {},
           ...active.map((channel, index) => ({ label: channel.label, stroke: colors[index % colors.length], width: 2 }))
         ],
-        axes: [{}, { label: new Set(active.map((channel) => displayUnitLabel(channelUnits[channel.id] ?? 'counts'))).size === 1 ? displayUnitLabel(channelUnits[active[0]?.id] ?? 'counts') : 'Mixed units' }],
+        axes: [{}, {
+          label: new Set(active.map((channel) => displayUnitLabel(channelUnits[channel.id] ?? 'counts', calibration, channel.id))).size === 1
+            ? displayUnitLabel(channelUnits[active[0]?.id] ?? 'counts', calibration, active[0]?.id)
+            : 'Mixed units'
+        }],
         legend: { show: true }
       },
       chartData(),

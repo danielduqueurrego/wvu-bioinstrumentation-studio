@@ -4,10 +4,11 @@ use std::collections::VecDeque;
 
 pub const MAGIC: [u8; 4] = *b"BMEG";
 pub const PROTOCOL_MAJOR: u8 = 0;
-/// Protocol v0.2 adds synchronized multi-channel records and the fixed pulse-ox cycle mode.
-pub const PROTOCOL_MINOR: u8 = 2;
+/// Protocol v0.3 adds instructor-configurable controlled output masks and remappable
+/// pulse-ox TX/RX and RED/IR resources while keeping the fixed four-state order.
+pub const PROTOCOL_MINOR: u8 = 3;
 pub const LEGACY_PROTOCOL_MINOR: u8 = 1;
-/// USB CDC configuration used by the controlled v0.2 firmware. This leaves
+/// USB CDC configuration used by the controlled v0.3 firmware. This leaves
 /// headroom for a six-channel 1 kHz logical-frame stream.
 pub const CONTROLLED_SERIAL_BAUD: u32 = 921_600;
 pub const HEADER_LEN: usize = 14;
@@ -16,7 +17,7 @@ pub const MAX_PAYLOAD_LEN: usize = 1024;
 
 /// Immutable identity expected from the controlled Phase 1 UNO R4 WiFi sketch.
 /// The matching values are encoded in `firmware/reference_unor4wifi`'s HELLO frame.
-pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0002;
+pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0003;
 pub const REFERENCE_DEVICE_ID: u32 = 0x554e_4f34;
 
 #[repr(u8)]

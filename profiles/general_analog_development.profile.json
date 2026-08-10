@@ -9,15 +9,17 @@
   "description": "Flexible synchronized raw Arduino analog acquisition for teaching and debugging.",
   "target_board": "Arduino UNO R4 WiFi",
   "fqbn": "arduino:renesas_uno:unor4wifi",
-  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 2, "build": "0x00010002", "device": "0x554E4F34" },
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 3, "build": "0x00010003", "device": "0x554E4F34" },
   "acquisition": {
     "analog_pin": "A0", "adc_resolution_bits": 12, "sample_rate_hz": 1000,
     "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
     "acquisition_mode": "simultaneous",
-    "channels": [{ "pin": "A0", "id": "general_a0", "label": "General A0", "csv_name": "general_a0_counts", "units": "ADC counts" }]
+    "channels": [{ "pin": "A0", "id": "general_a0", "label": "General A0", "csv_name": "general_a0_counts", "units": "ADC counts", "allowed_conversions": ["counts_volts", "linear_calibration"], "default_display_unit": "counts" }]
   },
   "display": { "primary_quantity": "arduino_input_volts", "channel_label": "General analog input", "raw_units_label": "ADC counts", "voltage_units_label": "V", "voltage_reference_v": 5.0, "plot_min_v": 0.0, "plot_max_v": 5.0 },
   "safety": { "bench_only": true, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Use simulator, UNO alone, or a safe 0–5 V bench signal for development."] },
   "export": { "signal_name": "general_analog_raw", "include_profile_snapshot": true },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "d5ee6a65cbeb8c4b950586ad591cc7ac566718f38afeda74f5fb1a45ee71ef2d" }
+  "plot_defaults": { "groups": [{ "channel_ids": ["general_a0"] }] },
+  "associated_sketch": { "name": "WVU Reference Firmware", "is_wvu_reference": true },
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "32de72f4eff444694a33d44c56e5c6931191a6a46414d8010fef6303db3428fe" }
 }

@@ -46,6 +46,15 @@ does not decide that a calibration is good enough. Students may also enter two o
 under the application user-data directory, filtered by profile and channel, and can be loaded or
 deleted. They are not stored inside immutable course profiles.
 
+## Instructor-declared generic linear channels
+
+An Instructor Lab revision may permit a channel to use a generic linear calibration. Students can
+enter two or more `volts, reference value` points, review slope/intercept/R², name the preset,
+and choose its engineering quantity and unit text. This is the same lightweight derived-value
+path as XGZP; it is not a validation state, does not alter raw BMEG records, and does not make a
+physiological claim. The CSV preserves raw and voltage columns and appends the named derived
+column only when that calibration is frozen into the recording.
+
 ## Recording and export provenance
 
 At recording start the controller freezes:

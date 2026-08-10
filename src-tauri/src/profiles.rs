@@ -15,6 +15,9 @@ use std::{
 
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const UNO_R4_WIFI_FQBN: &str = "arduino:renesas_uno:unor4wifi";
+pub const SUPPORTED_ANALOG_PINS: [&str; 6] = ["A0", "A1", "A2", "A3", "A4", "A5"];
+pub const SUPPORTED_DIGITAL_OUTPUT_PINS: [&str; 3] = ["D4", "D5", "D6"];
+pub const RECOMMENDED_SAMPLE_RATES_HZ: [u32; 5] = [100, 200, 250, 500, 1_000];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +69,61 @@ pub struct ProfileChannel {
     pub label: String,
     pub csv_name: String,
     pub units: String,
+    /// Display/conversion capabilities are a lab-level allowance. Student calibration
+    /// coefficients remain local and are never written into a locked lab definition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_conversions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_display_unit: Option<String>,
+    #[serde(
+        default = "default_visible",
+        skip_serializing_if = "is_default_visible"
+    )]
+    pub default_visible: bool,
+}
+
+fn default_visible() -> bool {
+    true
+}
+fn is_default_visible(value: &bool) -> bool {
+    *value
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigitalOutputBehavior {
+    AlwaysLow,
+    HighWhileRecording,
+    AcquisitionSequenced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DigitalOutput {
+    pub pin: String,
+    pub label: String,
+    pub behavior: DigitalOutputBehavior,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlotDefaultGroup {
+    pub channel_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlotDefaults {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<PlotDefaultGroup>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssociatedSketch {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
+    #[serde(default)]
+    pub is_wvu_reference: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -104,6 +162,10 @@ pub struct AcquisitionSettings {
     pub led_outputs: Option<LedOutputs>,
     #[serde(default)]
     pub state_dwell_us: Option<u32>,
+    /// Phase 6 uses this explicit description. `led_outputs` remains readable for
+    /// Phase 1–5 recordings and is treated as a legacy shorthand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub digital_outputs: Vec<DigitalOutput>,
 }
 
 fn default_analog_pin() -> String {
@@ -121,6 +183,9 @@ impl AcquisitionSettings {
             label: "Raw analog input".into(),
             csv_name: "adc_counts".into(),
             units: "ADC counts".into(),
+            allowed_conversions: Vec::new(),
+            default_display_unit: None,
+            default_visible: true,
         }]
     }
 
@@ -154,6 +219,38 @@ impl AcquisitionSettings {
                 .map(|inputs| vec![inputs.tx.clone(), inputs.rx.clone()])
                 .unwrap_or_default(),
         }
+    }
+
+    pub fn resolved_digital_outputs(&self) -> Vec<DigitalOutput> {
+        if !self.digital_outputs.is_empty() {
+            return self.digital_outputs.clone();
+        }
+        let Some(legacy) = &self.led_outputs else {
+            return Vec::new();
+        };
+        let mut outputs = Vec::new();
+        if let Some(pin) = &legacy.green {
+            outputs.push(DigitalOutput {
+                pin: pin.clone(),
+                label: "Green LED".into(),
+                behavior: DigitalOutputBehavior::HighWhileRecording,
+            });
+        }
+        if let Some(pin) = &legacy.red {
+            outputs.push(DigitalOutput {
+                pin: pin.clone(),
+                label: "Red LED".into(),
+                behavior: DigitalOutputBehavior::AcquisitionSequenced,
+            });
+        }
+        if let Some(pin) = &legacy.ir {
+            outputs.push(DigitalOutput {
+                pin: pin.clone(),
+                label: "IR LED".into(),
+                behavior: DigitalOutputBehavior::AcquisitionSequenced,
+            });
+        }
+        outputs
     }
 }
 
@@ -206,9 +303,19 @@ pub struct AcquisitionProfile {
     pub safety: SafetySettings,
     pub export: ExportSettings,
     pub integrity: ProfileIntegrity,
+    #[serde(default, skip_serializing_if = "PlotDefaults::is_empty")]
+    pub plot_defaults: PlotDefaults,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub associated_sketch: Option<AssociatedSketch>,
     /// Retain optional future fields in deterministic key order on import/export.
     #[serde(flatten, default)]
     pub additional: BTreeMap<String, serde_json::Value>,
+}
+
+impl PlotDefaults {
+    fn is_empty(value: &Self) -> bool {
+        value.groups.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -300,7 +407,7 @@ impl AcquisitionProfile {
             ));
         }
         let analog_pins = self.acquisition.analog_pins();
-        let supported_pin = |pin: &str| matches!(pin, "A0" | "A1" | "A2" | "A3" | "A4" | "A5");
+        let supported_pin = |pin: &str| SUPPORTED_ANALOG_PINS.contains(&pin);
         if analog_pins.is_empty()
             || analog_pins.len() > 6
             || !analog_pins.iter().all(|pin| supported_pin(pin))
@@ -328,35 +435,115 @@ impl AcquisitionProfile {
         }
         match self.acquisition.acquisition_mode {
             AcquisitionMode::Simultaneous => {
-                if self.acquisition.resolved_channels().len() != analog_pins.len()
-                    || self.acquisition.resolved_channels().iter().any(|channel| {
+                let channels = self.acquisition.resolved_channels();
+                let mut ids = BTreeSet::new();
+                let mut csv_names = BTreeSet::new();
+                if channels.len() != analog_pins.len()
+                    || channels.iter().any(|channel| {
                         channel.id.trim().is_empty()
                             || channel.label.trim().is_empty()
                             || channel.csv_name.trim().is_empty()
                             || channel.units != "ADC counts"
                     })
+                    || !channels
+                        .iter()
+                        .all(|channel| ids.insert(channel.id.clone()))
+                    || !channels
+                        .iter()
+                        .all(|channel| csv_names.insert(channel.csv_name.clone()))
                 {
                     return Err(ProfileError::Validation(
-                        "simultaneous profiles require named raw-count channels".into(),
+                        "simultaneous profiles require uniquely named raw-count channels and CSV fields".into(),
                     ));
                 }
+                validate_plot_defaults(
+                    &self.plot_defaults,
+                    &channels
+                        .iter()
+                        .map(|channel| channel.id.clone())
+                        .collect::<Vec<_>>(),
+                )?;
             }
             AcquisitionMode::Pulseox4State => {
-                if self.acquisition.adc_resolution_bits != 14
-                    || self.acquisition.sample_rate_hz != 250
-                    || self.acquisition.state_dwell_us != Some(1_000)
-                    || analog_pins != ["A0".to_string(), "A1".to_string()]
+                let outputs = self.acquisition.resolved_digital_outputs();
+                let red = outputs
+                    .iter()
+                    .find(|output| output.label.eq_ignore_ascii_case("red led"));
+                let ir = outputs
+                    .iter()
+                    .find(|output| output.label.eq_ignore_ascii_case("ir led"));
+                if !matches!(self.acquisition.adc_resolution_bits, 12 | 14)
+                    || !(50..=1_000).contains(&self.acquisition.sample_rate_hz)
+                    || !matches!(self.acquisition.state_dwell_us, Some(250..=5_000))
+                    || analog_pins.len() != 2
                     || self.acquisition.analog_inputs.is_none()
-                    || self.acquisition.led_outputs.as_ref().is_none_or(|leds| {
-                        leds.red.as_deref() != Some("D5") || leds.ir.as_deref() != Some("D6")
+                    || red.is_none_or(|output| {
+                        output.behavior != DigitalOutputBehavior::AcquisitionSequenced
                     })
+                    || ir.is_none_or(|output| {
+                        output.behavior != DigitalOutputBehavior::AcquisitionSequenced
+                    })
+                    || red.zip(ir).is_some_and(|(red, ir)| red.pin == ir.pin)
                 {
                     return Err(ProfileError::Validation(
-                        "pulse-ox profiles require A0/A1, 14 bit, 250 cycles/s, 1000 us states, D5 red, and D6 IR"
+                        "pulse-ox profiles require unique TX/RX analog pins, 12- or 14-bit ADC, a supported dwell, and distinct sequenced Red/IR outputs"
                             .into(),
                     ));
                 }
+                validate_plot_defaults(
+                    &self.plot_defaults,
+                    &[
+                        "red_tx".into(),
+                        "ir_tx".into(),
+                        "red_rx".into(),
+                        "ir_rx".into(),
+                    ],
+                )?;
             }
+        }
+        let outputs = self.acquisition.resolved_digital_outputs();
+        let mut output_pins = BTreeSet::new();
+        if outputs.iter().any(|output| {
+            !SUPPORTED_DIGITAL_OUTPUT_PINS.contains(&output.pin.as_str())
+                || output.label.trim().is_empty()
+                || !output_pins.insert(output.pin.clone())
+        }) {
+            return Err(ProfileError::Validation(
+                "digital outputs must use each supported D4, D5, or D6 pin at most once".into(),
+            ));
+        }
+        if self.acquisition.resolved_channels().iter().any(|channel| {
+            channel.allowed_conversions.iter().any(|conversion| {
+                !matches!(
+                    conversion.as_str(),
+                    "counts_volts" | "mpxv_pressure" | "linear_calibration"
+                )
+            }) || channel
+                .default_display_unit
+                .as_ref()
+                .is_some_and(|unit| !matches!(unit.as_str(), "counts" | "volts" | "kpa" | "mmhg"))
+        }) {
+            return Err(ProfileError::Validation(
+                "channel conversion capabilities must be Counts/Volts, MPXV pressure, or generic linear calibration".into(),
+            ));
+        }
+        if outputs.iter().any(|output| {
+            output.behavior == DigitalOutputBehavior::HighWhileRecording
+                && (output.pin == "D5" || output.pin == "D6")
+        }) {
+            return Err(ProfileError::Validation(
+                "D5 and D6 are reserved for the fixed mutually-exclusive pulse-ox sequence; use Always LOW outside that mode".into(),
+            ));
+        }
+        if self.acquisition.acquisition_mode == AcquisitionMode::Simultaneous
+            && outputs
+                .iter()
+                .any(|output| output.behavior == DigitalOutputBehavior::AcquisitionSequenced)
+        {
+            return Err(ProfileError::Validation(
+                "acquisition-sequenced outputs are available only to the fixed pulse-ox mode"
+                    .into(),
+            ));
         }
         if self.acquisition.allowed_duration_modes.is_empty()
             || !self
@@ -403,15 +590,29 @@ impl AcquisitionProfile {
         }
         if self.required_firmware.protocol_major != PROTOCOL_MAJOR
             || self.required_firmware.protocol_minor_min > PROTOCOL_MINOR
-            || !matches!(
-                parse_hex(&self.required_firmware.build)?,
-                REFERENCE_FIRMWARE_BUILD | 0x0001_0001
-            )
+            || ![REFERENCE_FIRMWARE_BUILD, 0x0001_0002, 0x0001_0001]
+                .contains(&parse_hex(&self.required_firmware.build)?)
             || parse_hex(&self.required_firmware.device)? != REFERENCE_DEVICE_ID
         {
             return Err(ProfileError::Validation(
                 "profile requires an incompatible controlled firmware identity".into(),
             ));
+        }
+        if let Some(sketch) = &self.associated_sketch {
+            if sketch.name.trim().is_empty()
+                || sketch.relative_path.as_ref().is_some_and(|path| {
+                    path.trim().is_empty()
+                        || Path::new(path).is_absolute()
+                        || Path::new(path)
+                            .components()
+                            .any(|component| matches!(component, std::path::Component::ParentDir))
+                        || !path.to_ascii_lowercase().ends_with(".ino")
+                })
+            {
+                return Err(ProfileError::Validation(
+                    "associated sketch must have a name and an optional relative .ino path without traversal".into(),
+                ));
+            }
         }
         if self.status == ProfileStatus::Locked {
             self.verify_integrity()?;
@@ -466,6 +667,23 @@ struct ProfileRuntime {
     mode: ProfileMode,
     profiles: BTreeMap<(String, String), AcquisitionProfile>,
     retired: BTreeSet<(String, String)>,
+    active_versions: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LabListEntry {
+    pub profile: AcquisitionProfile,
+    pub active: bool,
+    pub retired: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedLabState {
+    profiles: Vec<AcquisitionProfile>,
+    #[serde(default)]
+    retired: Vec<(String, String)>,
+    #[serde(default)]
+    active_versions: BTreeMap<String, String>,
 }
 
 impl Default for ProfileStore {
@@ -481,6 +699,7 @@ impl Default for ProfileStore {
                 mode: ProfileMode::Student,
                 profiles: BTreeMap::new(),
                 retired: BTreeSet::new(),
+                active_versions: BTreeMap::new(),
             })),
         })
     }
@@ -489,17 +708,65 @@ impl ProfileStore {
     pub fn with_root(root: PathBuf) -> Result<Self, ProfileError> {
         let mut profiles = BTreeMap::new();
         for profile in built_in_profiles()? {
-            profiles.insert(
-                (profile.profile_id.clone(), profile.profile_version.clone()),
-                profile,
-            );
+            let key = pkey(&profile);
+            profiles.insert(key, profile);
+        }
+        let mut active_versions: BTreeMap<String, String> = profiles
+            .values()
+            .map(|profile| (profile.profile_id.clone(), profile.profile_version.clone()))
+            .collect();
+        let mut retired = BTreeSet::new();
+        let state_path = root.join("lab_state.json");
+        if state_path.exists() {
+            let text = fs::read_to_string(&state_path).map_err(|source| ProfileError::Read {
+                path: state_path.display().to_string(),
+                source,
+            })?;
+            let persisted: PersistedLabState = serde_json::from_str(&text)?;
+            for profile in persisted.profiles {
+                profile.validate()?;
+                profiles.insert(pkey(&profile), profile);
+            }
+            retired.extend(persisted.retired);
+            for (id, version) in persisted.active_versions {
+                if profiles.contains_key(&(id.clone(), version.clone())) {
+                    active_versions.insert(id, version);
+                }
+            }
+        }
+        // Phase 3A–5 stored individual finalized instructor profiles under
+        // `locked/`. Import them once into the new version-history runtime so
+        // an application upgrade does not hide a student's/instructor's existing
+        // local labs merely because Phase 6 introduced `lab_state.json`.
+        let legacy_dir = root.join("locked");
+        if legacy_dir.is_dir() {
+            for entry in fs::read_dir(&legacy_dir).map_err(|source| ProfileError::Read {
+                path: legacy_dir.display().to_string(),
+                source,
+            })? {
+                let entry = entry.map_err(|source| ProfileError::Read {
+                    path: legacy_dir.display().to_string(),
+                    source,
+                })?;
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let profile = load_profile(&path)?;
+                let key = pkey(&profile);
+                active_versions
+                    .entry(profile.profile_id.clone())
+                    .or_insert_with(|| profile.profile_version.clone());
+                profiles.entry(key).or_insert(profile);
+            }
         }
         Ok(Self {
             root,
             runtime: Arc::new(Mutex::new(ProfileRuntime {
                 mode: ProfileMode::Student,
                 profiles,
-                retired: BTreeSet::new(),
+                retired,
+                active_versions,
             })),
         })
     }
@@ -528,23 +795,174 @@ impl ProfileStore {
             .profiles
             .iter()
             .filter(|(key, profile)| {
-                profile.status == ProfileStatus::Locked && !runtime.retired.contains(*key)
+                profile.status == ProfileStatus::Locked
+                    && !runtime.retired.contains(*key)
+                    && runtime.active_versions.get(&profile.profile_id)
+                        == Some(&profile.profile_version)
             })
             .map(|(_, profile)| profile.clone())
             .collect())
     }
-    pub fn get_locked(&self, profile_id: &str) -> Result<AcquisitionProfile, ProfileError> {
+
+    /// Instructor-only Lab Manager inventory. It includes historical and retired revisions,
+    /// while Student mode receives only `list()` active locked labs.
+    pub fn list_all(&self) -> Result<Vec<LabListEntry>, ProfileError> {
+        self.require_instructor()?;
         let runtime = self.lock()?;
-        runtime
+        Ok(runtime
             .profiles
             .iter()
-            .find(|((id, _), p)| {
-                id == profile_id
-                    && p.status == ProfileStatus::Locked
-                    && !runtime.retired.contains(&pkey(p))
+            .map(|(key, profile)| LabListEntry {
+                profile: profile.clone(),
+                active: runtime.active_versions.get(&profile.profile_id)
+                    == Some(&profile.profile_version)
+                    && !runtime.retired.contains(key),
+                retired: runtime.retired.contains(key),
             })
-            .map(|(_, p)| p.clone())
+            .collect())
+    }
+    pub fn get_locked(&self, profile_id: &str) -> Result<AcquisitionProfile, ProfileError> {
+        let runtime = self.lock()?;
+        let version = runtime.active_versions.get(profile_id).ok_or_else(|| {
+            ProfileError::Validation("select a valid active locked profile".into())
+        })?;
+        let key = (profile_id.to_string(), version.clone());
+        runtime
+            .profiles
+            .get(&key)
+            .filter(|profile| {
+                profile.status == ProfileStatus::Locked && !runtime.retired.contains(&key)
+            })
+            .cloned()
             .ok_or_else(|| ProfileError::Validation("select a valid active locked profile".into()))
+    }
+
+    /// Begins a new editable revision of the selected active lab. The immutable active
+    /// revision stays available to existing recordings and Student mode until Save changes.
+    pub fn begin_lab_edit(&self, profile_id: &str) -> Result<AcquisitionProfile, ProfileError> {
+        self.require_instructor()?;
+        let current = self.get_locked(profile_id)?;
+        let mut draft = current;
+        draft.profile_version = next_patch_version(&draft.profile_version)?;
+        draft.status = ProfileStatus::Draft;
+        draft.source = ProfileSource::Instructor;
+        draft.integrity.canonical_hash.clear();
+        let mut runtime = self.lock()?;
+        if runtime.profiles.contains_key(&pkey(&draft)) {
+            return Err(ProfileError::Validation(
+                "the next lab revision already exists; choose another active revision".into(),
+            ));
+        }
+        runtime.profiles.insert(pkey(&draft), draft.clone());
+        Ok(draft)
+    }
+
+    /// Creates a new lab identity from the selected lab. This is the non-destructive
+    /// Duplicate action; the caller supplies a machine-safe ID, not a version string.
+    pub fn duplicate_lab(
+        &self,
+        profile_id: &str,
+        lab_id: &str,
+    ) -> Result<AcquisitionProfile, ProfileError> {
+        self.require_instructor()?;
+        if !valid_profile_id(lab_id) {
+            return Err(ProfileError::Validation(
+                "lab ID must use lowercase letters, numbers, dots, dashes, or underscores".into(),
+            ));
+        }
+        let current = self.get_locked(profile_id)?;
+        let mut draft = current;
+        draft.profile_id = lab_id.into();
+        draft.profile_version = "1.0.0".into();
+        draft.status = ProfileStatus::Draft;
+        draft.source = ProfileSource::Instructor;
+        draft.integrity.canonical_hash.clear();
+        let mut runtime = self.lock()?;
+        if runtime.profiles.keys().any(|(id, _)| id == lab_id) {
+            return Err(ProfileError::Validation("lab ID already exists".into()));
+        }
+        runtime.profiles.insert(pkey(&draft), draft.clone());
+        Ok(draft)
+    }
+
+    /// Creates the Phase 6 Blank Simultaneous Analog template. It intentionally
+    /// starts as an instructor draft; only an explicitly saved/hashed revision
+    /// becomes visible to Student mode.
+    pub fn create_blank_simultaneous_lab(
+        &self,
+        lab_id: &str,
+    ) -> Result<AcquisitionProfile, ProfileError> {
+        self.require_instructor()?;
+        if !valid_profile_id(lab_id) {
+            return Err(ProfileError::Validation(
+                "lab ID must use lowercase letters, numbers, dots, dashes, or underscores".into(),
+            ));
+        }
+        let mut draft = built_in_profiles()?
+            .into_iter()
+            .find(|profile| profile.category == "development")
+            .ok_or_else(|| {
+                ProfileError::Validation("General Analog template is unavailable".into())
+            })?;
+        draft.profile_id = lab_id.into();
+        draft.profile_version = "1.0.0".into();
+        draft.display_name = "Blank Simultaneous Analog".into();
+        draft.description = "Instructor-authored simultaneous analog course lab.".into();
+        draft.source = ProfileSource::Instructor;
+        draft.status = ProfileStatus::Draft;
+        draft.integrity.canonical_hash.clear();
+        let mut runtime = self.lock()?;
+        if runtime.profiles.contains_key(&pkey(&draft)) {
+            return Err(ProfileError::Validation(
+                "lab ID/version already exists".into(),
+            ));
+        }
+        runtime.profiles.insert(pkey(&draft), draft.clone());
+        Ok(draft)
+    }
+
+    /// Saves the complete editable lab draft as the next active locked revision. The
+    /// backend preserves its ID/version/status/source so a stale UI cannot elevate a
+    /// different locked profile or replace history.
+    pub fn save_lab_draft(
+        &self,
+        edited: AcquisitionProfile,
+    ) -> Result<AcquisitionProfile, ProfileError> {
+        self.require_instructor()?;
+        let key = pkey(&edited);
+        let mut runtime = self.lock()?;
+        let existing = runtime
+            .profiles
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| ProfileError::Validation("lab draft not found".into()))?;
+        if existing.status != ProfileStatus::Draft {
+            return Err(ProfileError::Validation(
+                "only a lab draft may be saved".into(),
+            ));
+        }
+        let mut finalized = edited;
+        finalized.profile_id = existing.profile_id;
+        finalized.profile_version = existing.profile_version;
+        // Validate editable fields before the immutable hash exists, then lock and
+        // validate the final canonical document.
+        finalized.status = ProfileStatus::Draft;
+        finalized.source = ProfileSource::Instructor;
+        finalized.integrity.canonical_hash.clear();
+        finalized.validate()?;
+        finalized.status = ProfileStatus::Locked;
+        finalized.refresh_hash()?;
+        finalized.validate()?;
+        runtime.profiles.insert(pkey(&finalized), finalized.clone());
+        runtime.active_versions.insert(
+            finalized.profile_id.clone(),
+            finalized.profile_version.clone(),
+        );
+        runtime.retired.remove(&pkey(&finalized));
+        let persisted = self.persisted_state(&runtime);
+        drop(runtime);
+        self.persist_state(&persisted)?;
+        Ok(finalized)
     }
     pub fn duplicate_to_draft(
         &self,
@@ -617,6 +1035,15 @@ impl ProfileStore {
                 "only a General Analog development draft may remap runtime channels".into(),
             ));
         }
+        draft.plot_defaults = PlotDefaults {
+            groups: acquisition
+                .resolved_channels()
+                .into_iter()
+                .map(|channel| PlotDefaultGroup {
+                    channel_ids: vec![channel.id],
+                })
+                .collect(),
+        };
         draft.acquisition = acquisition;
         draft.validate()?;
         Ok(draft.clone())
@@ -656,25 +1083,96 @@ impl ProfileStore {
             ));
         }
         runtime.profiles.insert(key, final_profile.clone());
+        runtime.active_versions.insert(
+            final_profile.profile_id.clone(),
+            final_profile.profile_version.clone(),
+        );
+        let persisted = self.persisted_state(&runtime);
         drop(runtime);
-        self.persist(&final_profile)?;
+        self.persist_state(&persisted)?;
         Ok(final_profile)
     }
     pub fn retire(&self, profile_id: &str, profile_version: &str) -> Result<(), ProfileError> {
         self.require_instructor()?;
         let mut runtime = self.lock()?;
         let key = (profile_id.into(), profile_version.into());
-        let profile = runtime
+        runtime
             .profiles
             .get(&key)
             .ok_or_else(|| ProfileError::Validation("profile not found".into()))?;
-        if profile.source == ProfileSource::BuiltIn {
+        runtime.retired.insert(key);
+        if runtime.active_versions.get(profile_id) == Some(&profile_version.to_string()) {
+            runtime.active_versions.remove(profile_id);
+        }
+        let persisted = self.persisted_state(&runtime);
+        drop(runtime);
+        self.persist_state(&persisted)?;
+        Ok(())
+    }
+    pub fn restore_retired(
+        &self,
+        profile_id: &str,
+        profile_version: &str,
+    ) -> Result<AcquisitionProfile, ProfileError> {
+        self.require_instructor()?;
+        let key = (profile_id.to_string(), profile_version.to_string());
+        let mut runtime = self.lock()?;
+        let profile = runtime
+            .profiles
+            .get(&key)
+            .filter(|profile| profile.status == ProfileStatus::Locked)
+            .cloned()
+            .ok_or_else(|| ProfileError::Validation("retired lab revision not found".into()))?;
+        if !runtime.retired.remove(&key) {
             return Err(ProfileError::Validation(
-                "built-in profiles cannot be retired".into(),
+                "lab revision is not retired".into(),
             ));
         }
-        runtime.retired.insert(key);
-        Ok(())
+        runtime
+            .active_versions
+            .insert(profile.profile_id.clone(), profile.profile_version.clone());
+        let persisted = self.persisted_state(&runtime);
+        drop(runtime);
+        self.persist_state(&persisted)?;
+        Ok(profile)
+    }
+    pub fn restore_course_default(
+        &self,
+        profile_id: &str,
+    ) -> Result<AcquisitionProfile, ProfileError> {
+        self.require_instructor()?;
+        let mut restored = built_in_profiles()?
+            .into_iter()
+            .find(|profile| profile.profile_id == profile_id)
+            .ok_or_else(|| {
+                ProfileError::Validation("no shipped course default exists for this lab".into())
+            })?;
+        let runtime = self.lock()?;
+        let highest = runtime
+            .profiles
+            .keys()
+            .filter(|(id, _)| id == profile_id)
+            .map(|(_, version)| version.clone())
+            .max_by(|left, right| version_key(left).cmp(&version_key(right)));
+        drop(runtime);
+        restored.profile_version =
+            next_patch_version(highest.as_deref().unwrap_or(&restored.profile_version))?;
+        restored.status = ProfileStatus::Locked;
+        restored.source = ProfileSource::Instructor;
+        restored.integrity.canonical_hash.clear();
+        restored.refresh_hash()?;
+        restored.validate()?;
+        let mut runtime = self.lock()?;
+        runtime.profiles.insert(pkey(&restored), restored.clone());
+        runtime.active_versions.insert(
+            restored.profile_id.clone(),
+            restored.profile_version.clone(),
+        );
+        runtime.retired.remove(&pkey(&restored));
+        let persisted = self.persisted_state(&runtime);
+        drop(runtime);
+        self.persist_state(&persisted)?;
+        Ok(restored)
     }
     pub fn import_profile(&self, path: &Path) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
@@ -692,8 +1190,13 @@ impl ProfileStore {
             ));
         }
         runtime.profiles.insert(key, profile.clone());
+        runtime
+            .active_versions
+            .entry(profile.profile_id.clone())
+            .or_insert_with(|| profile.profile_version.clone());
+        let persisted = self.persisted_state(&runtime);
         drop(runtime);
-        self.persist(&profile)?;
+        self.persist_state(&persisted)?;
         Ok(profile)
     }
     pub fn export_profile(
@@ -731,22 +1234,34 @@ impl ProfileStore {
             Err(ProfileError::StudentMode)
         }
     }
-    fn persist(&self, profile: &AcquisitionProfile) -> Result<(), ProfileError> {
-        let dir = self.root.join("locked");
-        fs::create_dir_all(&dir).map_err(|source| ProfileError::Write {
-            path: dir.display().to_string(),
+    fn persisted_state(&self, runtime: &ProfileRuntime) -> PersistedLabState {
+        PersistedLabState {
+            profiles: runtime
+                .profiles
+                .values()
+                .filter(|profile| profile.source == ProfileSource::Instructor)
+                .cloned()
+                .collect(),
+            retired: runtime.retired.iter().cloned().collect(),
+            active_versions: runtime.active_versions.clone(),
+        }
+    }
+    fn persist_state(&self, state: &PersistedLabState) -> Result<(), ProfileError> {
+        fs::create_dir_all(&self.root).map_err(|source| ProfileError::Write {
+            path: self.root.display().to_string(),
             source,
         })?;
-        let path = dir.join(format!(
-            "{}_{}.profile.json",
-            safe_filename_component(&profile.profile_id),
-            profile.profile_version
-        ));
-        fs::write(&path, serde_json::to_vec_pretty(profile)?).map_err(|source| {
+        let path = self.root.join("lab_state.json");
+        let temporary = self.root.join("lab_state.json.tmp");
+        fs::write(&temporary, serde_json::to_vec_pretty(state)?).map_err(|source| {
             ProfileError::Write {
-                path: path.display().to_string(),
+                path: temporary.display().to_string(),
                 source,
             }
+        })?;
+        fs::rename(&temporary, &path).map_err(|source| ProfileError::Write {
+            path: path.display().to_string(),
+            source,
         })
     }
     fn append_mode_log(&self, mode: &ProfileMode) -> Result<(), ProfileError> {
@@ -797,6 +1312,50 @@ fn valid_semver(value: &str) -> bool {
         && fields
             .iter()
             .all(|field| !field.is_empty() && field.chars().all(|c| c.is_ascii_digit()))
+}
+fn version_key(value: &str) -> (u64, u64, u64) {
+    let parts: Vec<u64> = value
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect();
+    (
+        parts.first().copied().unwrap_or(0),
+        parts.get(1).copied().unwrap_or(0),
+        parts.get(2).copied().unwrap_or(0),
+    )
+}
+fn next_patch_version(value: &str) -> Result<String, ProfileError> {
+    if !valid_semver(value) {
+        return Err(ProfileError::Validation(
+            "lab version must be MAJOR.MINOR.PATCH".into(),
+        ));
+    }
+    let (major, minor, patch) = version_key(value);
+    Ok(format!("{major}.{minor}.{}", patch.saturating_add(1)))
+}
+fn validate_plot_defaults(
+    defaults: &PlotDefaults,
+    channel_ids: &[String],
+) -> Result<(), ProfileError> {
+    if defaults.groups.is_empty() {
+        return Ok(());
+    }
+    let known: BTreeSet<_> = channel_ids.iter().cloned().collect();
+    let mut assigned = BTreeSet::new();
+    if defaults.groups.iter().any(|group| {
+        group.channel_ids.is_empty()
+            || group
+                .channel_ids
+                .iter()
+                .any(|id| !known.contains(id) || !assigned.insert(id.clone()))
+    }) || assigned != known
+    {
+        return Err(ProfileError::Validation(
+            "plot defaults must assign every display signal to exactly one non-empty plot group"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 pub fn safe_filename_component(value: &str) -> String {
     let clean: String = value
@@ -945,6 +1504,9 @@ mod tests {
                 label: format!("Channel {index}"),
                 csv_name: format!("channel_{index}_counts"),
                 units: "ADC counts".into(),
+                allowed_conversions: vec!["counts_volts".into()],
+                default_display_unit: Some("counts".into()),
+                default_visible: true,
             })
             .collect();
         let remapped = store
@@ -979,5 +1541,128 @@ mod tests {
             fs::read_to_string(root.join("mode_changes.log")).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(log.lines().count(), 1);
         assert!(log.contains("InstructorAuthoring"));
+    }
+
+    #[test]
+    fn lab_edit_creates_next_active_revision_and_persists_history() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = dir.path().join("labs");
+        let store = ProfileStore::with_root(root.clone()).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut draft = store
+            .begin_lab_edit("wvu.bmeg420l.ecg.course.capture.v1")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(draft.profile_version, "1.0.1");
+        draft.acquisition.channels[0].pin = "A2".into();
+        let saved = store
+            .save_lab_draft(draft)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(saved.profile_version, "1.0.1");
+        assert_eq!(saved.acquisition.analog_pins(), ["A2"]);
+        assert!(saved.verify_integrity().is_ok());
+        assert_eq!(
+            store
+                .get_locked("wvu.bmeg420l.ecg.course.capture.v1")
+                .unwrap_or_else(|error| panic!("{error}"))
+                .profile_version,
+            "1.0.1"
+        );
+        let reopened = ProfileStore::with_root(root).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            reopened
+                .get_locked("wvu.bmeg420l.ecg.course.capture.v1")
+                .unwrap_or_else(|error| panic!("{error}"))
+                .acquisition
+                .analog_pins(),
+            ["A2"]
+        );
+    }
+
+    #[test]
+    fn lab_editor_rejects_pin_conflicts_and_invalid_pulseox_resources() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let store =
+            ProfileStore::with_root(dir.path().into()).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut emg = store
+            .begin_lab_edit("wvu.bmeg420l.emg.force.course.capture.v1")
+            .unwrap_or_else(|error| panic!("{error}"));
+        emg.acquisition.channels[1].pin = "A0".into();
+        assert!(store.save_lab_draft(emg).is_err());
+        let mut pulse = store
+            .begin_lab_edit("wvu.bmeg420l.pulseox.txrx.raw.course.capture.v1")
+            .unwrap_or_else(|error| panic!("{error}"));
+        pulse.acquisition.digital_outputs[1].pin = "D5".into();
+        assert!(store.save_lab_draft(pulse).is_err());
+    }
+
+    #[test]
+    fn blank_simultaneous_template_starts_as_a_saveable_instructor_draft() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let store =
+            ProfileStore::with_root(dir.path().into()).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let draft = store
+            .create_blank_simultaneous_lab("team.blank")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(draft.status, ProfileStatus::Draft);
+        assert_eq!(
+            draft.acquisition.acquisition_mode,
+            AcquisitionMode::Simultaneous
+        );
+        assert_eq!(draft.acquisition.resolved_channels().len(), 1);
+        let saved = store
+            .save_lab_draft(draft)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(saved.status, ProfileStatus::Locked);
+        assert!(store.get_locked("team.blank").is_ok());
+    }
+
+    #[test]
+    fn retired_lab_can_be_restored_and_course_default_creates_new_revision() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let store =
+            ProfileStore::with_root(dir.path().into()).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let draft = store
+            .duplicate_lab("wvu.bmeg420l.ecg.course.capture.v1", "team.ecg")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let saved = store
+            .save_lab_draft(draft)
+            .unwrap_or_else(|error| panic!("{error}"));
+        store
+            .retire(&saved.profile_id, &saved.profile_version)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(store.get_locked("team.ecg").is_err());
+        store
+            .restore_retired(&saved.profile_id, &saved.profile_version)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(store.get_locked("team.ecg").is_ok());
+        let restored = store
+            .restore_course_default("wvu.bmeg420l.ecg.course.capture.v1")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(restored.profile_version, "1.0.1");
+        assert_eq!(restored.source, ProfileSource::Instructor);
+
+        // A shipped definition is immutable, but the current offering can be
+        // retired/restored without deleting the package or its old snapshots.
+        store
+            .retire("wvu.bmeg420l.blood_pressure.ppg.course.capture.v1", "1.0.0")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(store
+            .get_locked("wvu.bmeg420l.blood_pressure.ppg.course.capture.v1")
+            .is_err());
+        let restored_builtin = store
+            .restore_retired("wvu.bmeg420l.blood_pressure.ppg.course.capture.v1", "1.0.0")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(restored_builtin.source, ProfileSource::BuiltIn);
     }
 }

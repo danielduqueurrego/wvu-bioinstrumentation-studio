@@ -1,5 +1,5 @@
 /** Display/export calibration helpers. Raw BMEG values remain ADC counts. */
-export type DisplayUnit = 'counts' | 'volts' | 'kpa' | 'mmhg';
+export type DisplayUnit = 'counts' | 'volts' | 'kpa' | 'mmhg' | 'calibrated';
 
 export type CalibrationPreset = {
   schema_version: number;
@@ -68,15 +68,36 @@ export function mergeCalibrationPresets(
   );
 }
 
-export function supportedDisplayUnits(category: string | undefined, channelId: string, hasLinearCalibration: boolean): DisplayUnit[] {
+export function supportedDisplayUnits(
+  category: string | undefined,
+  channelId: string,
+  hasLinearCalibration: boolean,
+  allowedConversions: string[] = [],
+  linearOutputUnits = 'mmHg'
+): DisplayUnit[] {
   if (category === 'course_pulseox') return ['counts', 'volts'];
-  if (channelId === 'mpxv') return ['counts', 'volts', 'kpa', 'mmhg'];
   if (channelId === 'pressure' && category === 'course_emg_force') return ['counts', 'volts', 'kpa'];
+  if (allowedConversions.includes('mpxv_pressure')) return ['counts', 'volts', 'kpa', 'mmhg'];
+  if (allowedConversions.includes('linear_calibration')) {
+    const calibratedUnit: DisplayUnit = linearOutputUnits.trim().toLowerCase() === 'mmhg'
+      ? 'mmhg'
+      : 'calibrated';
+    return hasLinearCalibration ? ['counts', 'volts', calibratedUnit] : ['counts', 'volts'];
+  }
+  if (channelId === 'mpxv') return ['counts', 'volts', 'kpa', 'mmhg'];
   if (channelId === 'xgzp') return hasLinearCalibration ? ['counts', 'volts', 'mmhg'] : ['counts', 'volts'];
   return ['counts', 'volts'];
 }
 
-export function displayUnitLabel(unit: DisplayUnit): string {
+export function displayUnitLabel(
+  unit: DisplayUnit,
+  calibration?: RecordingCalibration,
+  channelId?: string
+): string {
+  if (unit === 'calibrated') {
+    return calibrationForChannel(calibration?.active_calibrations ?? [], channelId ?? '')?.output_units
+      || 'Calibrated units';
+  }
   return ({ counts: 'ADC counts', volts: 'V', kpa: 'Pressure (kPa)', mmhg: 'Pressure (mmHg)' })[unit];
 }
 
@@ -92,14 +113,20 @@ export function displayedValue(
   if (unit === 'volts') return volts;
   if (unit === 'kpa') return mpxvKpa(volts, calibration.mpxv_sensor_supply_v);
   const preset = calibrationForChannel(calibration.active_calibrations, channelId);
-  if (channelId === 'xgzp' && preset?.calibration_type === 'linear') {
+  if (preset?.calibration_type === 'linear') {
     return (preset.parameters.slope ?? Number.NaN) * volts + (preset.parameters.offset ?? Number.NaN);
   }
   return mpxvMmhg(volts, calibration.mpxv_sensor_supply_v);
 }
 
-export function unitsForGroup(channelIds: string[], units: Record<string, DisplayUnit>): string {
-  const labels = new Set(channelIds.map((channelId) => displayUnitLabel(units[channelId] ?? 'counts')));
+export function unitsForGroup(
+  channelIds: string[],
+  units: Record<string, DisplayUnit>,
+  calibration?: RecordingCalibration
+): string {
+  const labels = new Set(channelIds.map((channelId) =>
+    displayUnitLabel(units[channelId] ?? 'counts', calibration, channelId)
+  ));
   return labels.size === 1 ? [...labels][0] : 'Mixed units';
 }
 

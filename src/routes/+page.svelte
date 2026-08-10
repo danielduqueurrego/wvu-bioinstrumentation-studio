@@ -3,6 +3,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import { open, save } from '@tauri-apps/plugin-dialog';
   import LivePlot from '$lib/components/LivePlot.svelte';
+  import LabManager from '$lib/components/LabManager.svelte';
+  import type { LabProfile } from '$lib/labs';
   import OperatingModeControl from '$lib/components/OperatingModeControl.svelte';
   import type FirmwareWorkspaceComponent from '$lib/components/FirmwareWorkspace.svelte';
   import { connectionActions } from '$lib/connection-actions';
@@ -25,6 +27,7 @@
     assignChannelToPlot,
     defaultPlotGroups,
     initialTraceVisibility,
+    normalizePlotGroups,
     onePlotPerSignal,
     overlayAll,
     setPlotGroupCount,
@@ -83,17 +86,7 @@
   type FirmwareVerification = { declared_kind: string; compatible: boolean; protocol_version?: string; identity?: { protocol_version: string; firmware_build: number; device_id: number }; bytes_received?: number; valid_frames?: number; crc_failures?: number; explanation: string };
   type FirmwareEnvironment = { cli_path?: string; cli_version?: string; uno_r4_core_version?: string; expected_fqbn: string; boards: Board[]; ready: boolean; problem?: string };
   type ActiveOperation = { title: string; stage: string; cancelable: boolean };
-  type AcquisitionProfile = {
-    schema_version: number; profile_id: string; profile_version: string; display_name: string;
-    category: string; status: 'locked' | 'draft' | 'retired'; source: 'built_in' | 'instructor';
-    description: string; target_board: string; fqbn: string;
-    required_firmware: { protocol_major: number; protocol_minor_min: number; build: string; device: string };
-    acquisition: { analog_pin: string; adc_resolution_bits: number; sample_rate_hz: number; allowed_duration_modes: string[]; timed_presets_seconds: number[]; minimum_custom_duration_seconds: number; acquisition_mode?: 'simultaneous' | 'pulseox_4state'; channels?: Array<{ pin: string; id: string; label: string; csv_name: string; units: string }>; analog_inputs?: { tx: string; rx: string }; led_outputs?: { green?: string; red?: string; ir?: string }; state_dwell_us?: number };
-    display: { primary_quantity: string; channel_label: string; raw_units_label: string; voltage_units_label: string; voltage_reference_v: number; plot_min_v: number; plot_max_v: number };
-    safety: { bench_only: boolean; human_connection_authorized: boolean; not_medical_device: boolean; notices: string[] };
-    export: { signal_name: string; include_profile_snapshot: boolean };
-    integrity: { canonical_hash_algorithm: string; canonical_hash: string };
-  };
+  type AcquisitionProfile = LabProfile;
   type ProfileSnapshot = { bench_notice_acknowledged: boolean; profile: AcquisitionProfile };
 
   const emptyIntegrity: Integrity = {
@@ -133,6 +126,7 @@
     active_calibrations: []
   };
   let savedCalibrations: CalibrationPreset[] = [];
+  let calibrationChannelId = '';
   let selectedXgzpCalibrationId = '';
   // This is the calibration actually applied to live display/future recording.
   // It is deliberately an object, not only an ID-derived reactive value, so a
@@ -144,6 +138,7 @@
   let calibrationEndSeconds = 10;
   let calibrationLabel = 'XGZP calibration';
   let manualCalibrationPoints = '0.80, 20\n1.20, 60\n1.60, 100';
+  let manualCalibrationQuantity = 'pressure';
   let manualCalibrationUnits = 'mmHg';
   let calibrationFit: { slope: number; offset: number; r_squared: number; paired_samples: number } | undefined;
   let calibrationError = '';
@@ -188,20 +183,33 @@
   $: pulseoxProfile = activeProfile?.acquisition.acquisition_mode === 'pulseox_4state';
   $: plotChannels = pulseoxProfile
     ? [
-      { id: 'red_tx', label: 'RED TX − DARK 1', csv_name: 'red_TX_minus_dark1_TX' },
-      { id: 'ir_tx', label: 'IR TX − DARK 2', csv_name: 'ir_TX_minus_dark2_TX' },
-      { id: 'red_rx', label: 'RED RX − DARK 1', csv_name: 'red_RX_minus_dark1_RX' },
-      { id: 'ir_rx', label: 'IR RX − DARK 2', csv_name: 'ir_RX_minus_dark2_RX' }
+      { id: 'red_tx', label: 'RED TX − DARK 1', csv_name: 'red_TX_minus_dark1_TX', allowed_conversions: ['counts_volts'] },
+      { id: 'ir_tx', label: 'IR TX − DARK 2', csv_name: 'ir_TX_minus_dark2_TX', allowed_conversions: ['counts_volts'] },
+      { id: 'red_rx', label: 'RED RX − DARK 1', csv_name: 'red_RX_minus_dark1_RX', allowed_conversions: ['counts_volts'] },
+      { id: 'ir_rx', label: 'IR RX − DARK 2', csv_name: 'ir_RX_minus_dark2_RX', allowed_conversions: ['counts_volts'] }
     ]
     : activeChannels;
+  $: linearCalibrationChannels = activeChannels.filter((channel) =>
+    channel.allowed_conversions?.includes('linear_calibration') || channel.id === 'xgzp'
+  );
+  $: hasMpxvChannel = activeChannels.some((channel) =>
+    channel.allowed_conversions?.includes('mpxv_pressure')
+      || channel.id === 'mpxv'
+      || (activeProfile?.category === 'course_emg_force' && channel.id === 'pressure')
+  );
+  $: if (!linearCalibrationChannels.some((channel) => channel.id === calibrationChannelId)) {
+    calibrationChannelId = linearCalibrationChannels[0]?.id ?? '';
+  }
   $: plotProfileKey = `${activeProfile?.profile_id ?? ''}:${pulseoxProfile ? 'pulseox-preview' : 'analog'}:${plotChannels.map((channel) => channel.id).join('|')}`;
   // Visibility is reset only when the selected profile's display fields change.  It is
   // never reconciled during a live checkbox toggle, which keeps checkbox DOM state and
   // uPlot series derived from one authoritative map.
   $: if (plotProfileKey !== traceProfileKey) {
     traceProfileKey = plotProfileKey;
-    traceVisibility = initialTraceVisibility(plotChannels);
-    plotGroups = defaultPlotGroups(activeProfile?.category, plotChannels);
+    traceVisibility = Object.fromEntries(plotChannels.map((channel) => [channel.id, !('default_visible' in channel) || channel.default_visible !== false]));
+    plotGroups = activeProfile?.plot_defaults?.groups?.length
+      ? normalizePlotGroups(plotChannels, activeProfile.plot_defaults.groups.map((group, index) => ({ id: `profile-${index + 1}`, channelIds: group.channel_ids })))
+      : defaultPlotGroups(activeProfile?.category, plotChannels);
     channelUnits = initialChannelUnits(plotChannels.map((channel) => channel.id));
     savedCalibrations = [];
     selectedXgzpCalibrationId = '';
@@ -217,7 +225,9 @@
     supportedDisplayUnits(
       activeProfile?.category,
       channel.id,
-      Boolean(activeXgzpCalibration && selectedXgzpCalibrationId)
+      Boolean(activeXgzpCalibration && selectedXgzpCalibrationId && activeXgzpCalibration.channel_id === channel.id),
+      channel.allowed_conversions ?? [],
+      activeXgzpCalibration?.channel_id === channel.id ? activeXgzpCalibration.output_units : 'mmHg'
     )
   ]));
   // This is intentionally a direct reactive expression rather than a markup
@@ -412,16 +422,28 @@
     }
   }
 
+  async function labRevisionSaved(profile: AcquisitionProfile) {
+    await refreshProfiles();
+    selectedProfileId = profile.profile_id;
+    traceProfileKey = '';
+    selectProfile();
+  }
+
+  function openAssociatedFirmware() {
+    view = 'Firmware';
+  }
+
   async function refreshCalibrations() {
-    if (!activeProfile || !activeChannels.some((channel) => channel.id === 'xgzp')) {
+    if (!activeProfile || !calibrationChannelId) {
       savedCalibrations = [];
       selectedXgzpCalibrationId = '';
+      activeXgzpCalibration = undefined;
       return;
     }
     try {
       const stored = await invoke<CalibrationPreset[]>('list_calibrations', {
         profileId: activeProfile.profile_id,
-        channelId: 'xgzp'
+        channelId: calibrationChannelId
       });
       // Keep a calibration that Rust has just accepted active in this session,
       // even if a file-system list refresh temporarily arrives before it.
@@ -447,11 +469,15 @@
     displayUnits: Record<string, DisplayUnit>
   ): RecordingCalibration {
     const activeCalibrations: CalibrationPreset[] = [];
-    if (profile && channels.some((channel) => channel.id === 'mpxv')) {
-      activeCalibrations.push(fixedMpxvCalibration(profile.profile_id, 'mpxv', mpxvSupply, adcReference));
-    }
-    if (profile && profile.category === 'course_emg_force' && channels.some((channel) => channel.id === 'pressure')) {
-      activeCalibrations.push(fixedMpxvCalibration(profile.profile_id, 'pressure', mpxvSupply, adcReference));
+    if (profile) {
+      for (const channel of profile.acquisition.channels ?? []) {
+        const fixedMpxv = channel.allowed_conversions?.includes('mpxv_pressure')
+          || channel.id === 'mpxv'
+          || (profile.category === 'course_emg_force' && channel.id === 'pressure');
+        if (fixedMpxv) {
+          activeCalibrations.push(fixedMpxvCalibration(profile.profile_id, channel.id, mpxvSupply, adcReference));
+        }
+      }
     }
     if (xgzpCalibration) activeCalibrations.push(xgzpCalibration);
     return {
@@ -480,10 +506,23 @@
     if (activeXgzpCalibration) {
       // Selecting a calibration explicitly opts into its engineering-unit
       // display and freezes the same preset into the next recording.
-      channelUnits = { ...channelUnits, xgzp: 'mmhg' };
-    } else if (channelUnits.xgzp === 'mmhg') {
-      channelUnits = { ...channelUnits, xgzp: 'volts' };
+      channelUnits = {
+        ...channelUnits,
+        [calibrationChannelId]: activeXgzpCalibration.output_units.trim().toLowerCase() === 'mmhg'
+          ? 'mmhg'
+          : 'calibrated'
+      };
+    } else if (channelUnits[calibrationChannelId] === 'mmhg') {
+      channelUnits = { ...channelUnits, [calibrationChannelId]: 'volts' };
     }
+    await refreshCalibrations();
+  }
+
+  async function selectCalibrationChannel(channelId: string) {
+    calibrationChannelId = channelId;
+    selectedXgzpCalibrationId = '';
+    activeXgzpCalibration = undefined;
+    savedCalibrations = [];
     await refreshCalibrations();
   }
 
@@ -503,7 +542,7 @@
     try {
       if (calibrationMethod === 'xgzp_recording') {
         const bmegPath = session.last_summary?.bmeg_path;
-        if (!bmegPath || activeProfile?.category !== 'course_blood_pressure') {
+        if (!bmegPath || activeProfile?.category !== 'course_blood_pressure' || calibrationChannelId !== 'xgzp') {
           throw new Error('Finish a Blood Pressure + PPG recording before fitting XGZP against its synchronized MPXV channel.');
         }
         const fit = await invoke<{ slope: number; offset: number; r_squared: number; paired_samples: number }>('fit_xgzp_calibration', {
@@ -537,12 +576,15 @@
       calibrationStartSeconds = 0;
       calibrationEndSeconds = Math.max(0.1, recordingDuration);
     }
+    if (calibrationChannelId !== 'xgzp' || activeProfile?.category !== 'course_blood_pressure') {
+      calibrationMethod = 'manual_points';
+    }
     calibrationDialogOpen = true;
   }
 
   async function saveCurrentCalibration() {
     if (!activeProfile || !calibrationFit) return;
-    const channelId = activeProfile.category === 'course_blood_pressure' ? 'xgzp' : activeChannels[0]?.id;
+    const channelId = calibrationChannelId;
     if (!channelId) return;
     try {
       const calibration: CalibrationPreset = {
@@ -552,7 +594,7 @@
           channel_id: channelId,
           calibration_type: 'linear',
           input_quantity: 'volts',
-          output_quantity: 'pressure',
+          output_quantity: manualCalibrationQuantity.trim() || 'engineering value',
           output_units: manualCalibrationUnits || 'mmHg',
           parameters: { slope: calibrationFit.slope, offset: calibrationFit.offset },
           created_at: new Date().toISOString(),
@@ -564,7 +606,10 @@
       selectedXgzpCalibrationId = calibration.calibration_id;
       activeXgzpCalibration = calibration;
       savedCalibrations = mergeCalibrationPresets(savedCalibrations, [calibration]);
-      channelUnits = { ...channelUnits, [channelId]: 'mmhg' };
+      channelUnits = {
+        ...channelUnits,
+        [channelId]: calibration.output_units.trim().toLowerCase() === 'mmhg' ? 'mmhg' : 'calibrated'
+      };
       await refreshCalibrations();
       calibrationDialogOpen = false;
       statusMessage = `Saved local calibration “${calibration.label}”. Raw BMEG samples remain unchanged; the calibration will be snapshotted only in future recordings.`;
@@ -577,7 +622,12 @@
       await invoke('delete_calibration', { calibrationId: activeXgzpCalibration.calibration_id });
       selectedXgzpCalibrationId = '';
       activeXgzpCalibration = undefined;
-      channelUnits = { ...channelUnits, xgzp: channelUnits.xgzp === 'mmhg' ? 'volts' : channelUnits.xgzp };
+      channelUnits = {
+        ...channelUnits,
+        [calibrationChannelId]: ['mmhg', 'calibrated'].includes(channelUnits[calibrationChannelId] ?? '')
+          ? 'volts'
+          : channelUnits[calibrationChannelId]
+      };
       await refreshCalibrations();
       statusMessage = 'Deleted the local calibration preset. Existing recording snapshots are unchanged.';
     } catch (error) { statusMessage = `Could not delete calibration: ${String(error)}`; }
@@ -623,6 +673,16 @@
       const value = sample.values[channelIndex];
       return count + (value === 0 || value === fullScale ? 1 : 0);
     }, 0);
+  }
+
+  function activeDigitalOutputStatus(): string {
+    const outputs = activeProfile?.acquisition.digital_outputs ?? [];
+    if (!outputs.length) return 'No active digital outputs for this lab';
+    const mask = session.digital_output_mask ?? 0;
+    const bitForPin: Record<string, number> = { D4: 1, D5: 2, D6: 4 };
+    return outputs
+      .map((output) => `${output.pin} ${output.label} — ${output.behavior === 'acquisition_sequenced' ? 'Sequenced' : mask & bitForPin[output.pin] ? 'HIGH' : 'LOW'}`)
+      .join('; ');
   }
 
   async function commitProfileMode(mode: OperatingMode) {
@@ -893,12 +953,7 @@
           <div class="panel-heading"><div><h3 id="profile-title">Acquisition profile</h3><p class="help">Profiles bind protected acquisition settings, safety notices, firmware requirements, and export provenance.</p></div><span class:locked={!instructorModeActive} class="mode-badge">{instructorModeActive ? 'Instructor authoring' : 'Student mode'}</span></div>
           <OperatingModeControl bind:operatingMode bind:instructorAcknowledgement disabled={session.state !== 'Disconnected' || modeChangeInFlight} {onModeConfirmed} {onInstructorBlocked} />
           {#if instructorModeActive}
-            <section class="authoring" aria-label="Instructor draft profile workflow">
-              <p class="warning">Instructor mode is a local workflow guard, not strong authentication. Finalizing creates a new locked version; it does not alter built-in profiles.</p>
-              <div class="control-grid"><label>New draft profile ID <input bind:value={draftId} /></label><div class="field-action"><span>Draft from selected locked profile</span><button onclick={duplicateDraft}>Duplicate to draft</button></div></div>
-              {#if authoringDraft}<div class="control-grid"><label>Draft description <input bind:value={draftDescription} /></label><label>Final version <input bind:value={finalDraftVersion} placeholder="1.0.1" /></label><div class="field-action"><span>Finalize immutable package</span><button class="gold" onclick={finalizeDraft}>Validate and finalize</button></div></div>{#if authoringDraft.category === 'development'}<div class="control-grid"><label>Draft analog pins (A0–A5, comma separated) <input bind:value={draftPins} /></label><label>Draft frame rate <select bind:value={draftSampleRate}><option value={200}>200 frames/s</option><option value={250}>250 frames/s</option><option value={1000}>1000 frames/s</option></select></label><label>Draft ADC <select bind:value={draftAdcBits}><option value={12}>12 bit</option><option value={14}>14 bit</option></select></label><div class="field-action"><span>General Analog draft only</span><button onclick={updateDraftChannels}>Validate channel map</button></div></div>{/if}{/if}
-              <div class="button-pair"><button onclick={importProfilePackage}>Import locked profile package</button><button onclick={exportProfilePackage} disabled={!activeProfile}>Export selected profile</button>{#if activeProfile?.source === 'instructor'}<button onclick={retireSelectedProfile}>Retire selected instructor profile</button>{/if}</div>
-            </section>
+            <LabManager selectedProfile={activeProfile} onSaved={labRevisionSaved} onStatus={(message) => statusMessage = message} openFirmware={openAssociatedFirmware} />
           {/if}
           <label>Approved profile
             <select bind:value={selectedProfileId} onchange={selectProfile} disabled={session.state !== 'Disconnected'}>
@@ -979,30 +1034,35 @@
           <div class="plot-heading"><div><h3 id="calibration-title">Calibration &amp; Units</h3><p class="help">Raw ADC counts remain authoritative in BMEG. These settings control only live display and derived CSV columns, and are frozen into each new recording’s metadata.</p></div></div>
           <div class="control-grid">
             <label>ADC reference voltage (V)<input type="number" min="0.1" max="10" step="0.001" bind:value={adcReferenceV} disabled={session.state !== 'Disconnected'} /></label>
-            {#if activeChannels.some((channel) => channel.id === 'mpxv' || channel.id === 'pressure')}
+            {#if hasMpxvChannel}
               <label>MPXV sensor supply (Vs, V)<input type="number" min="0.1" max="10" step="0.001" bind:value={mpxvSensorSupplyV} disabled={session.state !== 'Disconnected'} /></label>
             {/if}
-            {#if activeProfile?.category === 'course_blood_pressure'}
-              <label>XGZP calibration
+            {#if linearCalibrationChannels.length}
+              <label>Linear calibration channel
+                <select value={calibrationChannelId} onchange={(event) => void selectCalibrationChannel(event.currentTarget.value)} disabled={session.state !== 'Disconnected'}>
+                  {#each linearCalibrationChannels as channel}<option value={channel.id}>{channel.label}</option>{/each}
+                </select>
+              </label>
+              <label>{calibrationChannelId === 'xgzp' ? 'XGZP calibration' : 'Channel calibration'}
                 <select value={selectedXgzpCalibrationId} onchange={(event) => void selectXgzpCalibration(event.currentTarget.value)} disabled={session.state !== 'Disconnected'}>
                   <option value="">None — counts/volts only</option>
                   {#each savedCalibrations as calibration}<option value={calibration.calibration_id}>{calibration.label} ({calibration.output_units})</option>{/each}
                 </select>
               </label>
-              <p class="help">Active XGZP calibration: {activeXgzpCalibration?.label ?? 'none — counts/volts only'}.</p>
-              <div class="button-pair calibration-actions"><button onclick={openXgzpCalibration} disabled={session.state !== 'Disconnected' || !session.last_summary}>Calibrate XGZP</button><button onclick={deleteSelectedCalibration} disabled={session.state !== 'Disconnected' || !activeXgzpCalibration}>Delete calibration</button></div>
+              <p class="help">Active {calibrationChannelId === 'xgzp' ? 'XGZP' : 'channel'} calibration: {activeXgzpCalibration?.label ?? 'none — counts/volts only'}.</p>
+              <div class="button-pair calibration-actions"><button onclick={openXgzpCalibration} disabled={session.state !== 'Disconnected'}>Calibrate {calibrationChannelId === 'xgzp' ? 'XGZP' : 'channel'}</button><button onclick={deleteSelectedCalibration} disabled={session.state !== 'Disconnected' || !activeXgzpCalibration}>Delete calibration</button></div>
             {/if}
           </div>
           <div class="unit-grid" aria-label="Per-channel display units">
             {#each plotChannels as channel}
               <label>{channel.label}
                 <select value={channelUnits[channel.id] ?? 'counts'} onchange={(event) => setChannelUnit(channel.id, event.currentTarget.value)}>
-                  {#each channelUnitOptions[channel.id] ?? ['counts', 'volts'] as unit}<option value={unit}>{displayUnitLabel(unit)}</option>{/each}
+                  {#each channelUnitOptions[channel.id] ?? ['counts', 'volts'] as unit}<option value={unit}>{displayUnitLabel(unit, currentRecordingCalibration, channel.id)}</option>{/each}
                 </select>
               </label>
             {/each}
           </div>
-          {#if activeProfile?.category === 'course_blood_pressure'}<p class="help">MPXV uses P<sub>kPa</sub> = (Vout / Vs − 0.04) / 0.009 and P<sub>mmHg</sub> = 7.5006 × P<sub>kPa</sub>. XGZP mmHg is available only after you save a local linear calibration against MPXV.</p>{/if}
+          {#if hasMpxvChannel}<p class="help">MPXV uses P<sub>kPa</sub> = (Vout / Vs − 0.04) / 0.009 and P<sub>mmHg</sub> = 7.5006 × P<sub>kPa</sub>. A channel configured for generic linear calibration offers mmHg only after you save its local fit.</p>{/if}
           {#if activeProfile?.category === 'course_emg_force'}<p class="help">The A3 conversion is labeled <strong>Pressure (kPa)</strong>; it does not infer muscular force.</p>{/if}
           {#if pulseoxProfile}<p class="help">Pulse-ox units apply only to the ambient-subtracted live preview. The eight raw LED-state count values remain unchanged.</p>{/if}
         </section>
@@ -1023,7 +1083,7 @@
           {#if session.remaining_seconds !== undefined}<span><strong>Remaining</strong>{formatDuration(session.remaining_seconds)}</span>{/if}
           <span><strong>Storage</strong>{formatStorage(session.available_disk_bytes)}</span><span><strong>Samples</strong>{session.samples}</span><span><strong>Measured</strong>{session.measured_rate_hz.toFixed(3)} Hz</span>
           <span><strong>Valid packets</strong>{session.integrity.received_packets}</span><span><strong>CRC failures</strong>{session.integrity.crc_failures}</span><span><strong>Missing packets</strong>{session.integrity.missing_packet_sequences}</span><span><strong>Missing samples</strong>{session.integrity.missing_sample_sequences}</span>
-          <span><strong>Duplicate / out-of-order packets</strong>{session.integrity.duplicate_packets} / {session.integrity.out_of_order_packets}</span><span><strong>Firmware / host overflows</strong>{session.integrity.firmware_overflows} / {session.integrity.host_channel_overflows}</span><span><strong>Reconnects / disconnects</strong>{session.integrity.reconnects} / {session.integrity.disconnect_events}</span><span><strong>D4 / D5 / D6 outputs</strong>{session.digital_output_mask === undefined ? 'not reported' : `${session.digital_output_mask & 1 ? 'HIGH' : 'LOW'} / ${session.digital_output_mask & 2 ? 'HIGH' : 'LOW'} / ${session.digital_output_mask & 4 ? 'HIGH' : 'LOW'}`}</span>
+          <span><strong>Duplicate / out-of-order packets</strong>{session.integrity.duplicate_packets} / {session.integrity.out_of_order_packets}</span><span><strong>Firmware / host overflows</strong>{session.integrity.firmware_overflows} / {session.integrity.host_channel_overflows}</span><span><strong>Reconnects / disconnects</strong>{session.integrity.reconnects} / {session.integrity.disconnect_events}</span><span><strong>Lab digital outputs</strong>{activeDigitalOutputStatus()}</span>
         </section>
         {#if session.storage_warning}<p class="warning" role="status">{session.storage_warning}</p>{/if}
         {#if session.last_error}<p class="error" role="alert">Last error: {session.last_error}</p>{/if}
@@ -1063,7 +1123,7 @@
             <div class="stacked-plots" aria-label="Synchronized plot groups">
               {#each renderedPlotGroups as group, index (group.id)}
                 <section class="stacked-plot" aria-label={`Plot ${index + 1}: ${group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(', ')}`}>
-                  <div class="stacked-plot-heading"><strong>Plot {index + 1}: {group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(' + ')}</strong><span>{unitsForGroup(group.channelIds, channelUnits)}{!pulseoxProfile && group.channelIds.some((id) => bufferedRailCount(id)) ? `; ${group.channelIds.reduce((count, id) => count + bufferedRailCount(id), 0)} buffered rail samples` : ''}</span></div>
+                  <div class="stacked-plot-heading"><strong>Plot {index + 1}: {group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(' + ')}</strong><span>{unitsForGroup(group.channelIds, channelUnits, currentRecordingCalibration)}{!pulseoxProfile && group.channelIds.some((id) => bufferedRailCount(id)) ? `; ${group.channelIds.reduce((count, id) => count + bufferedRailCount(id), 0)} buffered rail samples` : ''}</span></div>
                   <LivePlot {samples} channels={plotChannels} visibleChannelIds={group.channelIds} {channelUnits} calibration={currentRecordingCalibration} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} pulseoxPreview={pulseoxProfile} {displayRevision} />
                 </section>
               {/each}
@@ -1102,17 +1162,18 @@
 {#if calibrationDialogOpen}
   <div class="operation-backdrop">
     <dialog open class="calibration-dialog" aria-modal="true" aria-labelledby="calibration-dialog-title">
-      <div class="plot-heading"><h2 id="calibration-dialog-title">Calibrate XGZP</h2><button onclick={() => { calibrationDialogOpen = false; calibrationFit = undefined; calibrationError = ''; }}>Close</button></div>
+      <div class="plot-heading"><h2 id="calibration-dialog-title">Calibrate {activeChannels.find((channel) => channel.id === calibrationChannelId)?.label ?? 'channel'}</h2><button onclick={() => { calibrationDialogOpen = false; calibrationFit = undefined; calibrationError = ''; }}>Close</button></div>
       <p class="warning">Course calibration only. This fits engineering pressure units from your selected data; it does not make a blood-pressure determination or clinical conclusion.</p>
       <fieldset disabled={session.state !== 'Disconnected'}>
         <legend>Calibration method</legend>
-        <div class="choice-row"><label class="choice"><input type="radio" bind:group={calibrationMethod} value="xgzp_recording" /> Use completed synchronized BP recording</label><label class="choice"><input type="radio" bind:group={calibrationMethod} value="manual_points" /> Enter manual linear points</label></div>
+        <div class="choice-row">{#if calibrationChannelId === 'xgzp' && activeProfile?.category === 'course_blood_pressure'}<label class="choice"><input type="radio" bind:group={calibrationMethod} value="xgzp_recording" /> Use completed synchronized BP recording</label>{/if}<label class="choice"><input type="radio" bind:group={calibrationMethod} value="manual_points" /> Enter manual linear points</label></div>
       </fieldset>
       {#if calibrationMethod === 'xgzp_recording'}
         <p class="help">The completed recording provides A1 MPXV as the reference and A2 XGZP as the fitted input. Select a stable interval in seconds.</p>
         <div class="control-grid"><label>Start (seconds)<input type="number" min="0" step="0.1" bind:value={calibrationStartSeconds} /></label><label>End (seconds)<input type="number" min="0.1" step="0.1" bind:value={calibrationEndSeconds} /></label></div>
       {:else}
-        <label>Manual points: channel volts, reference mmHg<textarea rows="5" bind:value={manualCalibrationPoints} spellcheck="false"></textarea></label>
+        <label>Manual points: channel volts, reference engineering value<textarea rows="5" bind:value={manualCalibrationPoints} spellcheck="false"></textarea></label>
+        <label>Output quantity<input bind:value={manualCalibrationQuantity} placeholder="pressure" /></label>
         <label>Output units<input bind:value={manualCalibrationUnits} placeholder="mmHg" /></label>
       {/if}
       <div class="action-row"><button class="gold" onclick={calculateCalibrationFit}>Calculate linear fit</button></div>
@@ -1168,7 +1229,7 @@
   .panel-heading { display: flex; min-width: 0; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: start; } .panel-heading .help { max-width: 75ch; }
   .mode-badge { border: 1px solid #855a00; border-radius: 999px; padding: .35rem .6rem; background: #fff4dd; color: #684600; font-weight: 700; white-space: nowrap; } .mode-badge.locked { border-color: #176c33; background: #eaf6ee; color: #174f27; }
   .profile-panel > label { margin-top: .8rem; } .profile-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: .55rem; margin-top: .8rem; } .profile-details span { min-width: 0; padding: .6rem .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; overflow-wrap: anywhere; } .profile-details strong { display: block; color: #42515d; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; } .profile-hash { font-family: Consolas, "Cascadia Code", monospace; font-size: .82rem; } .profile-notice { margin: .6rem 0 0; }
-  .acknowledgement { display: flex; gap: .55rem; align-items: flex-start; margin-top: .75rem; padding: .7rem; background: #fff4dd; border: 1px solid #9b6700; font-weight: 700; } .acknowledgement input { width: auto; min-height: auto; margin-top: .2rem; } .authoring { margin-top: .8rem; padding-top: .8rem; border-top: 1px solid #d7dde2; }
+  .acknowledgement { display: flex; gap: .55rem; align-items: flex-start; margin-top: .75rem; padding: .7rem; background: #fff4dd; border: 1px solid #9b6700; font-weight: 700; } .acknowledgement input { width: auto; min-height: auto; margin-top: .2rem; }
   .button-pair { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .8rem; } .button-pair button { flex: 0 1 18rem; }
   .control-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .8rem; align-items: end; }
   label, .field-action { min-width: 0; display: grid; gap: .3rem; font-weight: 600; } .field-action > span { font-size: .9rem; }

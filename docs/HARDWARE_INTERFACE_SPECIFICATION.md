@@ -11,7 +11,10 @@
 
 ## 2. Configurable pin philosophy
 
-The biomedical board exposes signals through headers. The application therefore uses profile-constrained configurable mappings rather than hard-coded pins.
+The biomedical board exposes signals through headers. The application therefore uses
+lab-constrained configurable mappings rather than hard-coded pins. Shipped course defaults remain
+locked; an Instructor-created revision may select only the controlled resources advertised by the
+connected firmware.
 
 ### Analog inputs
 
@@ -71,7 +74,10 @@ counts and Arduino-input volts only; it performs no physiological analysis.
 - XGZP/instrumented pressure: A2
 - Green LED: D4, active HIGH only while this profile is acquiring
 
-Defaults are editable within profile rules.
+Defaults are editable through an Instructor Lab Manager revision. The current controlled firmware
+supports unique A0–A5 simultaneous inputs, D4–D6 controlled outputs, 12/14-bit resolution, and
+the documented frame-rate capability set. An offline edit may be saved, but capture verifies its
+requirements against the firmware capabilities before CONFIGURE.
 
 ## 4. Pulse-oximetry electrical facts
 
@@ -91,7 +97,9 @@ Defaults are editable within profile rules.
 
 ## 5. Initial pulse-ox timing
 
-Phase 4 fixed raw cycle rate: approximately 250 cycles/s (1 ms per state, 4 ms per cycle).
+The fixed raw phase order remains RED, DARK 1, IR, DARK 2. Instructor revisions may remap distinct
+TX/RX and RED/IR pins and choose a controlled 250–5000 µs dwell. The nominal cycle estimate is
+`1 / (4 × dwell)`; raw timestamps report actual timing. The state order is not editable.
 
 ```text
 RED on:  sample TX/RX

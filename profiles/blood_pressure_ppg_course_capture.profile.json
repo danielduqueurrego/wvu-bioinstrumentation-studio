@@ -9,20 +9,23 @@
   "description": "Three synchronized raw PPG and pressure-interface variables with an active-HIGH green LED during capture.",
   "target_board": "Arduino UNO R4 WiFi",
   "fqbn": "arduino:renesas_uno:unor4wifi",
-  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 2, "build": "0x00010002", "device": "0x554E4F34" },
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 3, "build": "0x00010003", "device": "0x554E4F34" },
   "acquisition": {
     "analog_pin": "A0", "adc_resolution_bits": 12, "sample_rate_hz": 200,
     "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
     "acquisition_mode": "simultaneous",
     "channels": [
-      { "pin": "A0", "id": "ppg", "label": "PPG", "csv_name": "ppg_counts", "units": "ADC counts" },
-      { "pin": "A1", "id": "mpxv", "label": "Pressure Reference / MPXV", "csv_name": "mpxv_counts", "units": "ADC counts" },
-      { "pin": "A2", "id": "xgzp", "label": "Pressure Sensor / XGZP", "csv_name": "xgzp_counts", "units": "ADC counts" }
+      { "pin": "A0", "id": "ppg", "label": "PPG", "csv_name": "ppg_counts", "units": "ADC counts", "allowed_conversions": ["counts_volts"], "default_display_unit": "counts" },
+      { "pin": "A1", "id": "mpxv", "label": "Pressure Reference / MPXV", "csv_name": "mpxv_counts", "units": "ADC counts", "allowed_conversions": ["counts_volts", "mpxv_pressure"], "default_display_unit": "counts" },
+      { "pin": "A2", "id": "xgzp", "label": "Pressure Sensor / XGZP", "csv_name": "xgzp_counts", "units": "ADC counts", "allowed_conversions": ["counts_volts", "linear_calibration"], "default_display_unit": "counts" }
     ],
-    "led_outputs": { "green": "D4", "red": null, "ir": null }
+    "led_outputs": { "green": "D4", "red": null, "ir": null },
+    "digital_outputs": [{ "pin": "D4", "label": "Green LED", "behavior": "high_while_recording" }]
   },
   "display": { "primary_quantity": "arduino_input_volts", "channel_label": "PPG and pressure channels", "raw_units_label": "ADC counts", "voltage_units_label": "V", "voltage_reference_v": 5.0, "plot_min_v": 0.0, "plot_max_v": 5.0 },
   "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "No blood-pressure, heart-rate, or calibration result is calculated by this application."] },
   "export": { "signal_name": "blood_pressure_ppg_course_capture", "include_profile_snapshot": true },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "14cf52a6b4c097474efd1303e872dcad5d54532518b6c0b8bb36d4a68166be7a" }
+  "plot_defaults": { "groups": [{ "channel_ids": ["ppg"] }, { "channel_ids": ["mpxv"] }, { "channel_ids": ["xgzp"] }] },
+  "associated_sketch": { "name": "WVU Reference Firmware", "is_wvu_reference": true },
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "06cca7fd5717ca960ce2af75607af4479ed69d5be4e1d5e429127a5d372a31e5" }
 }

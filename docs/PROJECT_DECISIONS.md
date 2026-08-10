@@ -132,6 +132,23 @@ Profile files are versioned JSON, validated against a schema, and cannot be sile
   as display/CSV layers. No SpO2, heart rate, SBP/DBP estimate, EMG activation/fatigue, force
   conversion, or automatic filter is added.
 
+## Phase 6 instructor lab-authoring decisions
+
+- Lab editing is revisioned: a saved Instructor edit creates the next immutable patch version and
+  activates it for new recordings. Historic snapshots are never mutated.
+- The authoring surface remains inside Acquisition rather than adding a new app tab. Student mode
+  sees active labs only; Instructor mode is a local workflow guard, not strong authentication.
+- Controlled protocol v0.3 advertises the current firmware’s ADC, channel-count, mode,
+  D4–D6-output, and recommended-rate capabilities. A lab can be authored offline, but capture
+  refuses configurations the connected firmware cannot advertise or configure.
+- Simultaneous analog labs support one to six unique A0–A5 channels. D4 may be HIGH while
+  recording; D5/D6 remain LOW in that mode. This prevents accidental optical LED activation.
+- Pulse oximetry remains one fixed RED/DARK/IR/DARK state machine. TX/RX, RED/IR pin mappings and
+  supported dwell are editable; phase order is not. RED and IR must use distinct outputs and are
+  never HIGH together.
+- Plot defaults are lab-revision configuration only. Later live visibility, grouping, and unit
+  choices change the display, never the active raw recording schema.
+
 ## Branding
 
 - Use the approved WVU/college lockup without redrawing or recoloring it.

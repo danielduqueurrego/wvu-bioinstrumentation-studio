@@ -30,9 +30,67 @@ pub struct AcquisitionSnapshot {
     pub status_seen: bool,
     pub firmware_build: Option<u32>,
     pub firmware_board_id: Option<u32>,
+    pub firmware_capabilities: Option<FirmwareCapabilities>,
     pub digital_output_mask: Option<u8>,
     pub skipped_noise_bytes: u64,
 }
+
+/// Capability information advertised by the controlled firmware.  The host
+/// deliberately keeps this separate from a lab definition: a lab may be
+/// authored offline, but a capture is configured only when the connected
+/// firmware has advertised support for its requested resources.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct FirmwareCapabilities {
+    pub supported_adc_resolutions: Vec<u8>,
+    pub max_analog_channels: u8,
+    pub supported_modes: u8,
+    pub supported_digital_output_mask: u8,
+    pub supported_rates_hz: Vec<u32>,
+}
+
+impl FirmwareCapabilities {
+    /// v0.3 CAPABILITIES is:
+    /// min ADC bits, max ADC bits, max analog channels, mode bits, output
+    /// mask, rate count, then little-endian u16 rates.  Earlier capability
+    /// payloads remain readable but cannot prove the richer Phase 6 limits.
+    fn from_payload(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 6 {
+            return None;
+        }
+        let rate_count = usize::from(payload[5]);
+        if payload.len() != 6 + rate_count * 2 || payload[0] > payload[1] {
+            return None;
+        }
+        let supported_rates_hz = payload[6..]
+            .chunks_exact(2)
+            .map(|bytes| u32::from(u16::from_le_bytes([bytes[0], bytes[1]])))
+            .collect();
+        Some(Self {
+            supported_adc_resolutions: if payload[0] == payload[1] {
+                vec![payload[0]]
+            } else {
+                vec![payload[0], payload[1]]
+            },
+            max_analog_channels: payload[2],
+            supported_modes: payload[3],
+            supported_digital_output_mask: payload[4] & 0x07,
+            supported_rates_hz,
+        })
+    }
+
+    pub fn supports_adc_resolution(&self, bits: u8) -> bool {
+        self.supported_adc_resolutions.contains(&bits)
+    }
+
+    pub fn supports_rate(&self, rate_hz: u32) -> bool {
+        self.supported_rates_hz.contains(&rate_hz)
+    }
+
+    pub fn supports_mode(&self, mode_bit: u8) -> bool {
+        self.supported_modes & mode_bit != 0
+    }
+}
+
 pub struct AcquisitionController {
     pub state: AcquisitionState,
     parser: FrameParser,
@@ -49,6 +107,7 @@ pub struct AcquisitionController {
     status_seen: bool,
     firmware_build: Option<u32>,
     firmware_board_id: Option<u32>,
+    firmware_capabilities: Option<FirmwareCapabilities>,
     digital_output_mask: Option<u8>,
 }
 impl AcquisitionController {
@@ -69,6 +128,7 @@ impl AcquisitionController {
             status_seen: false,
             firmware_build: None,
             firmware_board_id: None,
+            firmware_capabilities: None,
             digital_output_mask: None,
         }
     }
@@ -122,7 +182,10 @@ impl AcquisitionController {
                     ]));
                 }
             }
-            MessageType::Capabilities => self.capabilities_seen = true,
+            MessageType::Capabilities => {
+                self.capabilities_seen = true;
+                self.firmware_capabilities = FirmwareCapabilities::from_payload(&frame.payload);
+            }
             MessageType::ConfigAck => self.config_ack_seen = true,
             MessageType::Pong => self.pong_seen = true,
             MessageType::Status => {
@@ -193,6 +256,7 @@ impl AcquisitionController {
             status_seen: self.status_seen,
             firmware_build: self.firmware_build,
             firmware_board_id: self.firmware_board_id,
+            firmware_capabilities: self.firmware_capabilities.clone(),
             digital_output_mask: self.digital_output_mask,
             skipped_noise_bytes: self.parser.stats.skipped_noise_bytes,
         }
@@ -323,6 +387,47 @@ mod tests {
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.firmware_build, Some(0x0001_0001));
         assert_eq!(snapshot.firmware_board_id, Some(0x554e_4f34));
+    }
+
+    #[test]
+    fn phase6_capabilities_are_parsed_for_configuration_checks() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        let capabilities = Frame {
+            message_type: MessageType::Capabilities,
+            flags: 0,
+            sequence: 0,
+            payload: vec![
+                12, 14, 6, 0x03, 0x07, 5, 100, 0, 200, 0, 250, 0, 244, 1, 232, 3,
+            ],
+        };
+        controller.ingest_bytes(&crate::protocol::encode_frame(&capabilities).unwrap_or_default());
+        let parsed = controller
+            .snapshot()
+            .firmware_capabilities
+            .expect("capabilities");
+        assert_eq!(parsed.supported_adc_resolutions, vec![12, 14]);
+        assert_eq!(parsed.max_analog_channels, 6);
+        assert!(parsed.supports_mode(0x01));
+        assert!(parsed.supports_mode(0x02));
+        assert!(parsed.supports_rate(1_000));
+        assert_eq!(parsed.supported_digital_output_mask, 0x07);
+    }
+
+    #[test]
+    fn legacy_capabilities_are_seen_but_do_not_claim_phase6_limits() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        let legacy = Frame {
+            message_type: MessageType::Capabilities,
+            flags: 0,
+            sequence: 0,
+            payload: vec![12, 1, 6, 0],
+        };
+        controller.ingest_bytes(&crate::protocol::encode_frame(&legacy).unwrap_or_default());
+        let snapshot = controller.snapshot();
+        assert!(snapshot.capabilities_seen);
+        assert!(snapshot.firmware_capabilities.is_none());
     }
 
     #[test]

@@ -160,7 +160,8 @@ Formal characterization is an external instructor engineering activity and never
 
 ### Phase 4 — multi-channel course acquisition
 
-- Protocol v0.2 and controlled UNO R4 WiFi firmware for one-to-six synchronized logical analog
+- Protocol v0.2, later extended to v0.3 for instructor-configurable resources, and controlled UNO
+  R4 WiFi firmware for one-to-six synchronized logical analog
   fields, plus a fixed four-state pulse-ox raw cycle
 - Locked course capture profiles: ECG; EMG + force; Blood Pressure + PPG; and pulse-ox TX/RX
 - Record-major raw BMEG/CSV fields, profile/pin/output/marker provenance, and legacy v0.1 reader
@@ -223,7 +224,19 @@ Formal characterization is an external instructor engineering activity and never
 - CSV adds volts and selected engineering columns beside raw counts; no physiological analysis is
   added.
 
-### Phase 6 — packaging and classroom hardening
+### Phase 6 — instructor lab authoring and configurable workflows
+
+- Instructor-only Lab Manager with immutable active revisions, history, duplicate, retire/restore,
+  import/export, and course-default restore
+- One-to-six configurable simultaneous analog channels with unique A0–A5, labels, CSV fields,
+  rate/ADC selection, calibration allowance, default visibility, and default plot groups
+- Safe D4–D6 output declarations and capability-checked configuration
+- Fixed-order pulse-ox template with remappable TX/RX and RED/IR, editable supported dwell, and
+  authoritative raw eight-state records
+- Firmware association provenance, while compile/upload remain explicit Firmware-workspace actions
+- Protocol v0.3 capability advertisement and no automatic upload/reset when a lab changes
+
+### Phase 7 — packaging and classroom hardening
 
 - Offline dependency bundle
 - Windows installer and portable build

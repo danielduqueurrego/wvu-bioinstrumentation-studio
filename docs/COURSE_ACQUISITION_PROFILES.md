@@ -17,9 +17,11 @@ student-saved XGZP linear mmHg conversion. It does not calculate heart rate, SpO
 activation, fatigue, force, or any clinical result. Follow BMEG
 420L lab safety procedures; do not use the application for diagnosis or clinical decisions.
 
-Built-in profiles are locked and include a SHA-256 integrity check. This detects accidental or
-tampered content, not authorship or authorization. Instructor mode can create a separate general
-development draft with a custom unique A0–A5 map; it cannot alter a built-in profile in place.
+Built-in labs are locked and include a SHA-256 integrity check. This detects accidental or
+tampered content, not authorship or authorization. Instructor mode can use **Manage Labs** to
+create a new immutable active revision with a unique A0–A5 map, supported rate/ADC selection,
+safe D4–D6 behavior, channel labels/CSV fields, allowed engineering conversions, and plot
+defaults. It never edits a shipped definition or an already recorded snapshot in place.
 
 Each recording freezes the selected profile snapshot, firmware identity, analog/digital mapping,
 logical rate, ADC resolution, ADC reference voltage, active calibration snapshots, markers, stop
@@ -28,7 +30,7 @@ and profile-specific raw field order while adding derived columns beside raw cou
 
 ## Live plot groups
 
-Plot groups are a current-session display preference, not profile content. Each visible signal is
+Each lab revision provides display-only default plot groups. In a session, every visible signal is
 assigned to exactly one plot group, and each group has an independent y-axis autoscale while all
 plots share the same time domain. **Overlay all** places every signal in one group; **One plot per
 signal** creates one group for each signal. Hiding, regrouping, or re-showing a signal never

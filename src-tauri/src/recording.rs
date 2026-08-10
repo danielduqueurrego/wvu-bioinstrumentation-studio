@@ -4,7 +4,7 @@
 //! `u32 sequence, u64 timestamp_us, u16 status_flags, u16[field_count] counts`.
 use crate::{
     calibration::{
-        apply_linear, counts_to_volts, mpxv_kpa, mpxv_mmhg, RecordingCalibration,
+        apply_linear, counts_to_volts, mpxv_kpa, mpxv_mmhg, CalibrationType, RecordingCalibration,
         DEFAULT_ADC_REFERENCE_V, DEFAULT_MPXV_SUPPLY_V,
     },
     profiles::ProfileSnapshot,
@@ -515,22 +515,23 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
         for channel in &channels {
             columns.push(channel.csv_name.clone());
             columns.push(voltage_column_name(&channel.csv_name));
-            match channel.id.as_str() {
-                "mpxv" if calibration.for_channel("mpxv").is_some() => {
-                    columns.push("mpxv_kPa".into());
-                    columns.push("mpxv_mmHg".into());
+            if let Some(preset) = calibration.for_channel(&channel.id) {
+                match preset.calibration_type {
+                    CalibrationType::FixedFormula => {
+                        columns.push(derived_column_name(&channel.csv_name, "kPa"));
+                        if channel.id == "mpxv"
+                            || calibration
+                                .channel_units
+                                .get(&channel.id)
+                                .is_some_and(|unit| unit == "mmhg")
+                        {
+                            columns.push(derived_column_name(&channel.csv_name, "mmHg"));
+                        }
+                    }
+                    CalibrationType::Linear => {
+                        columns.push(derived_column_name(&channel.csv_name, &preset.output_units));
+                    }
                 }
-                "pressure" if calibration.for_channel("pressure").is_some() => {
-                    columns.push("pressure_kPa".into())
-                }
-                "xgzp"
-                    if calibration
-                        .for_channel("xgzp")
-                        .is_some_and(|preset| preset.output_units.eq_ignore_ascii_case("mmHg")) =>
-                {
-                    columns.push("xgzp_mmHg".into())
-                }
-                _ => {}
             }
         }
         writeln!(writer, "record_sequence,t_us,{}", columns.join(","))?;
@@ -554,34 +555,29 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
                 let volts = counts_to_volts(counts, input.metadata.adc_bits, adc_reference_v)
                     .map_err(|error| RecordingError::Csv(error.to_string()))?;
                 write!(writer, ",{counts},{volts:.6}")?;
-                match channel.id.as_str() {
-                    "mpxv" if calibration.for_channel("mpxv").is_some() => {
-                        let kpa = mpxv_kpa(volts, sensor_supply_v)
-                            .map_err(|error| RecordingError::Csv(error.to_string()))?;
-                        let mmhg = mpxv_mmhg(volts, sensor_supply_v)
-                            .map_err(|error| RecordingError::Csv(error.to_string()))?;
-                        write!(writer, ",{kpa:.6},{mmhg:.6}")?;
+                if let Some(preset) = calibration.for_channel(&channel.id) {
+                    match preset.calibration_type {
+                        CalibrationType::FixedFormula => {
+                            let kpa = mpxv_kpa(volts, sensor_supply_v)
+                                .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                            write!(writer, ",{kpa:.6}")?;
+                            if channel.id == "mpxv"
+                                || calibration
+                                    .channel_units
+                                    .get(&channel.id)
+                                    .is_some_and(|unit| unit == "mmhg")
+                            {
+                                let mmhg = mpxv_mmhg(volts, sensor_supply_v)
+                                    .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                                write!(writer, ",{mmhg:.6}")?;
+                            }
+                        }
+                        CalibrationType::Linear => {
+                            let value = apply_linear(volts, preset)
+                                .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                            write!(writer, ",{value:.6}")?;
+                        }
                     }
-                    "pressure" if calibration.for_channel("pressure").is_some() => {
-                        let kpa = mpxv_kpa(volts, sensor_supply_v)
-                            .map_err(|error| RecordingError::Csv(error.to_string()))?;
-                        write!(writer, ",{kpa:.6}")?;
-                    }
-                    "xgzp"
-                        if calibration.for_channel("xgzp").is_some_and(|preset| {
-                            preset.output_units.eq_ignore_ascii_case("mmHg")
-                        }) =>
-                    {
-                        let value = apply_linear(
-                            volts,
-                            calibration
-                                .for_channel("xgzp")
-                                .ok_or(RecordingError::InvalidRecordShape)?,
-                        )
-                        .map_err(|error| RecordingError::Csv(error.to_string()))?;
-                        write!(writer, ",{value:.6}")?;
-                    }
-                    _ => {}
                 }
             }
         }
@@ -597,6 +593,22 @@ fn voltage_column_name(raw_column: &str) -> String {
         .strip_suffix("_counts")
         .map(|base| format!("{base}_V"))
         .unwrap_or_else(|| format!("{raw_column}_V"))
+}
+
+fn derived_column_name(raw_column: &str, units: &str) -> String {
+    let base = raw_column.strip_suffix("_counts").unwrap_or(raw_column);
+    let units = units
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    format!(
+        "{base}_{}",
+        if units.is_empty() {
+            "calibrated"
+        } else {
+            &units
+        }
+    )
 }
 
 fn csv_field(value: &str) -> String {
