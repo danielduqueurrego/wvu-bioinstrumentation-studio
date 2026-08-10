@@ -23,11 +23,9 @@
   3440 × 1392 / 100% scaling. Separate 900 × 650, 1024 × 768, 1366 × 768, 1920 × 1080,
   maximized, 125%, and 150% viewport/scaling observations remain pending documentation follow-up;
   they are not claimed as tested. See `logs/phase3a_manual_ui_verification_2026-08-06.md`.
-- Physical ECG and EMG module/interface characterization in the optional Phase 3B Validation
-  workflow remains deferred until safe bench sources, module identifiers, and instructor-entered
-  criteria are available. It is not required for ordinary Phase 4 course capture and must never
-  use a person or electrode system. The Validation-page viewport matrix passed at 100%; 125% and
-  150% scaling remain pending manual inspection.
+- Formal ECG/EMG analog-module characterization is outside the runtime class application scope.
+  Historical Phase 3B evidence remains in Git history; it neither gates course capture nor
+  authorizes human use.
 - Rust exists at `C:\Users\dd00055\.cargo\bin` but is not on the persistent PowerShell PATH.
   Prepend it for the session or repair the user PATH entry.
 - The explicit 1200-bps Reset board and retry limitation is unchanged. Normal protocol v0.2

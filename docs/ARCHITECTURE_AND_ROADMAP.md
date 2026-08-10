@@ -55,7 +55,6 @@ src-tauri/src/
     metadata.rs
   profiles/
     mod.rs
-    validation.rs
   simulator/
     mod.rs
     device.rs
@@ -153,13 +152,11 @@ the frontend and keeps a job visible until its terminal result and diagnostic lo
 - No human authorization, module characterization, physiological interpretation, leads-off,
   optional notch channel, or EMG 2000 Hz work
 
-### Phase 3B — analog-interface bench validation
+### Formal analog characterization — outside the runtime app scope
 
-- Instructor-only draft/finalized validation evidence tied to locked profile and firmware identity
-- Raw-data-preserving baseline, DC, sine, saturation-margin, and repeatability run evidence
-- Transparent engineering metrics and local instructor-defined criteria
-- Manifest-hashed validation package export/import and explicit legacy recording compatibility
-- Bench sources or simulator only; no human/electrode system, physiological analysis, or medical claim
+Historical Phase 3B evidence is retained in Git history and old recordings remain readable, but
+the class application does not manage validation drafts, packages, status badges, or criteria.
+Formal characterization is an external instructor engineering activity and never gates capture.
 
 ### Phase 4 — multi-channel course acquisition
 
@@ -170,7 +167,7 @@ the frontend and keeps a job visible until its terminal result and diagnostic lo
 - Bounded multitrace uPlot and 20–30 Hz frontend polling while full-rate raw writes remain in Rust
 - Active-HIGH D4 green only for BP capture; D5 RED/D6 IR only in the fixed pulse cycle; low on
   every safe transition
-- No physiological analysis or clinical claim; optional Phase 3B characterization remains separate
+- No physiological analysis or clinical claim; formal characterization remains external to the app
 
 ### Phase 1 — tested vertical slice
 
@@ -196,14 +193,14 @@ the frontend and keeps a job visible until its terminal result and diagnostic lo
 - Compile/upload UX
 - Error navigation
 - Restore/compare template
-- Profile validation and pin mapper
+- Profile integrity checks and pin mapper
 
 ### Phase 3 — ECG & EMG
 
 - ECG/EMG locked profile
 - Optional notch channel
 - Leads-off status
-- 1000/2000 samples/s validation
+- 1000/2000 samples/s timing verification
 - Ten-minute recording
 - One-hour stress test
 

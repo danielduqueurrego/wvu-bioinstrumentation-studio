@@ -30,7 +30,7 @@ An instructor must additionally be able to:
 - Inspect and modify profile JSON.
 - Unlock advanced diagnostics.
 - Select allowable sample-rate ranges and pins.
-- Run calibration and validation workflows.
+- Inspect profile integrity, firmware, timing, and packet-loss diagnostics.
 - View build, upload, protocol, timing, and packet-loss logs.
 - Package approved firmware templates and offline dependencies.
 
@@ -63,7 +63,7 @@ Before acquisition, the application shall verify:
 - Configured pin validity
 - Available output directory
 - Required session metadata
-- Locked profile schema/integrity and explicit bench-only acknowledgement when required
+- Locked profile schema/integrity and any profile-required course acknowledgement
 
 ### FR-004 Sketch editing
 
@@ -112,7 +112,8 @@ The application shall:
 - Plot live signals at approximately 20–30 display updates per second.
 - Keep acquisition rate independent of display rate.
 - Use a bounded display history.
-- Support visibility, color, scale, zoom, and time-window controls.
+- Support visibility, deterministic color, configurable plot groups with independent y axes,
+  zoom, and time-window controls.
 - Mark clipping and data-loss events.
 
 ### FR-009 Recording
@@ -206,13 +207,9 @@ On firmware startup, acquisition stop, command timeout, communication failure, o
 - Default ADC resolution: 12 bits
 - Display/export: counts and volts
 - No derived heart rate or EMG envelope
-- Phase 3A locks raw ECG/EMG A0 acquisition to 12-bit / 1000 samples/s for bench-only validation.
-  No person, electrode, or module-to-person connection is authorized; no clinical or physiological
-  interpretation is available.
-- Phase 3B may associate versioned instructor-authored analog-interface bench-validation evidence
-  with the locked ECG/EMG profile only when profile ID/version/hash and controlled firmware
-  identity match. It shall preserve separate raw recordings, transparent metrics, criteria, and
-  manifest-verified evidence packages. Bench validation never authorizes human-connected use.
+- Current course profiles preserve raw ECG/EMG capture variables at their locked profile settings.
+  They are teaching tools, not medical devices; no clinical or physiological interpretation is
+  available. Formal analog-module characterization is outside this application's runtime scope.
 
 ### Pulse Oximetry
 

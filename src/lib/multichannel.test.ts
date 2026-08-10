@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
-  defaultPlotLayout,
+  assignChannelToPlot,
+  defaultPlotGroups,
   hasUniqueAnalogPins,
   initialTraceVisibility,
+  onePlotPerSignal,
+  overlayAll,
+  setPlotGroupCount,
   pulseoxAmbientSubtractedPreview,
   setTraceVisibility,
+  visiblePlotGroups,
   visibleChannelIds,
   visibleChannels
 } from './multichannel';
@@ -33,9 +38,49 @@ describe('Phase 4 multi-channel UI helpers', () => {
     expect(visibleChannelIds(channels, visibility)).toEqual(channels.map((channel) => channel.id));
   });
 
-  it('defaults multi-signal capture to stacked plots while preserving single-signal overlay', () => {
-    expect(defaultPlotLayout(1)).toBe('overlay');
-    expect(defaultPlotLayout(4)).toBe('stacked');
+  it('uses course-specific display-only plot-group defaults', () => {
+    expect(defaultPlotGroups('course_ecg', channels.slice(0, 1))).toHaveLength(1);
+    expect(defaultPlotGroups('course_emg_force', channels)).toHaveLength(4);
+    expect(defaultPlotGroups('development', channels)).toHaveLength(4);
+    expect(defaultPlotGroups('course_blood_pressure', channels.slice(0, 3))).toHaveLength(3);
+    expect(defaultPlotGroups('course_pulseox', [
+      { id: 'red_tx', label: 'RED TX', csv_name: 'red_tx' },
+      { id: 'ir_tx', label: 'IR TX', csv_name: 'ir_tx' },
+      { id: 'red_rx', label: 'RED RX', csv_name: 'red_rx' },
+      { id: 'ir_rx', label: 'IR RX', csv_name: 'ir_rx' }
+    ]).map((group) => group.channelIds)).toEqual([['red_tx', 'ir_tx'], ['red_rx', 'ir_rx']]);
+  });
+
+  it('merges removed plots deterministically and preserves assignments while hidden', () => {
+    let groups = onePlotPerSignal(channels);
+    groups = setPlotGroupCount(channels, groups, 2);
+    expect(groups.map((group) => group.channelIds)).toEqual([
+      ['raw_emg'],
+      ['rectified_emg', 'envelope', 'pressure']
+    ]);
+    groups = assignChannelToPlot(channels, groups, 'rectified_emg', 0);
+    expect(groups.map((group) => group.channelIds)).toEqual([
+      ['raw_emg', 'rectified_emg'],
+      ['envelope', 'pressure']
+    ]);
+    const visibility = setTraceVisibility(initialTraceVisibility(channels), 'pressure', false);
+    expect(visiblePlotGroups(channels, groups, visibility).map((group) => group.channelIds))
+      .toEqual([['raw_emg', 'rectified_emg'], ['envelope']]);
+  });
+
+  it('keeps empty slots available for assignment but never asks the UI to render an empty plot', () => {
+    const groups = setPlotGroupCount(channels, overlayAll(channels), 4);
+    expect(groups).toHaveLength(4);
+    expect(visiblePlotGroups(channels, groups, initialTraceVisibility(channels))).toEqual([
+      { id: 'plot-1', channelIds: channels.map((channel) => channel.id) }
+    ]);
+  });
+
+  it('applies overlay and one-per-signal convenience presets without changing capture fields', () => {
+    expect(overlayAll(channels)).toEqual([{ id: 'plot-1', channelIds: channels.map((channel) => channel.id) }]);
+    expect(onePlotPerSignal(channels).map((group) => group.channelIds)).toEqual([
+      ['raw_emg'], ['rectified_emg'], ['envelope'], ['pressure']
+    ]);
   });
 
   it('preserves the raw pulse layout and derives preview subtraction explicitly', () => {

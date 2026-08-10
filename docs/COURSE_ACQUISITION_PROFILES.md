@@ -22,3 +22,14 @@ development draft with a custom unique A0–A5 map; it cannot alter a built-in p
 Each recording freezes the selected profile snapshot, firmware identity, analog/digital mapping,
 logical rate, ADC resolution, markers, stop reason, and integrity counters. BMEG is authoritative;
 CSV preserves the raw record/cycle sequence and profile-specific field order.
+
+## Live plot groups
+
+Plot groups are a current-session display preference, not profile content. Each visible signal is
+assigned to exactly one plot group, and each group has an independent y-axis autoscale while all
+plots share the same time domain. **Overlay all** places every signal in one group; **One plot per
+signal** creates one group for each signal. Hiding, regrouping, or re-showing a signal never
+stops acquisition and never changes BMEG, CSV, metadata, or the captured channel list.
+
+Default arrangements are ECG: one plot; EMG + force: four plots; blood pressure + PPG: three
+plots; pulse oximetry: two TX/RX preview plots; and General Analog: one plot per selected channel.

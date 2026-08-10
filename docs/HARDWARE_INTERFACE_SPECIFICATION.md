@@ -112,7 +112,8 @@ For 12-bit ADC data:
 - Preliminary hard clipping warning: <= 41 or >= 4054 counts (approximately 1% from rails)
 - Preliminary caution zone: <= 205 or >= 3890 counts (approximately 5% from rails)
 
-Thresholds are configurable until multi-board validation is complete.
+Thresholds are configurable according to the current course exercise; the runtime application
+does not manage formal hardware-characterization evidence.
 
 ## 7. Pressure channels
 

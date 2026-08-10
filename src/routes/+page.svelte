@@ -9,14 +9,19 @@
   import { durationRequest, isTimedDurationValid, type RecordingDurationRequest } from '$lib/duration';
   import type { OperatingMode } from '$lib/operating-mode';
   import {
-    defaultPlotLayout,
+    assignChannelToPlot,
+    defaultPlotGroups,
     initialTraceVisibility,
+    onePlotPerSignal,
+    overlayAll,
+    setPlotGroupCount,
     setTraceVisibility,
+    visiblePlotGroups,
     visibleChannelIds,
-    type PlotLayout,
+    type PlotGroup,
     type VisibleChannelMap
   } from '$lib/multichannel';
-  import { validationControls } from '$lib/validation-controls';
+  import { PRIMARY_NAVIGATION, type PrimaryView } from '$lib/navigation';
   import { reconcileBoardCache } from '$lib/board-cache';
   import logoUrl from '../../assets/branding/WVU-CBE Logo.svg';
 
@@ -34,7 +39,7 @@
     board_elapsed_seconds: number; host_elapsed_seconds: number; bmeg_path: string; csv_path: string;
     metadata_path: string; recording_status: string; duration: Duration; stop_reason: string;
     completion_status: string; initial_free_disk_bytes?: number; final_free_disk_bytes?: number;
-    integrity: Integrity; error?: string; profile?: ProfileSnapshot; validation_context?: { validation_id: string; test_type: string; run_number: number };
+    integrity: Integrity; error?: string; profile?: ProfileSnapshot;
     active_digital_output_mask?: number; final_digital_output_mask?: number;
   };
   type SessionStatus = {
@@ -43,7 +48,7 @@
     duration?: Duration; elapsed_seconds: number; remaining_seconds?: number;
     available_disk_bytes?: number; storage_warning?: string; stop_reason?: string;
     connection_diagnostics?: ConnectionDiagnostics;
-    last_error?: string; last_summary?: Summary; validation_context?: { validation_id: string; test_type: string; run_number: number };
+    last_error?: string; last_summary?: Summary;
     digital_output_mask?: number;
   };
   type ConnectionDiagnostics = {
@@ -77,14 +82,6 @@
     integrity: { canonical_hash_algorithm: string; canonical_hash: string };
   };
   type ProfileSnapshot = { bench_notice_acknowledged: boolean; profile: AcquisitionProfile };
-  type ValidationStatus = {
-    profile_id: string; profile_version: string; status: 'unvalidated' | 'draft_validation' | 'bench_validated' | 'validation_expired' | 'validation_does_not_match_profile' | 'validation_does_not_match_firmware';
-    validation_id?: string; explanation: string;
-  };
-  type Criterion = { metric: string; operator: 'less_than_or_equal' | 'greater_than_or_equal'; threshold: number; units: string };
-  type CriterionResult = { criterion: Criterion; observed_value?: number; passed: boolean; explanation: string };
-  type ValidationRun = { run_number: number; test_type: string; source_description: string; raw_sample_count: number; metrics: Array<{ name: string; value: number; units: string }>; criteria: CriterionResult[] };
-  type ValidationEvidence = { validation_id: string; profile_id: string; profile_version: string; profile_hash: string; status: string; hardware: { module_name: string; module_identifier: string; module_revision: string; module_serial: string; board: string; board_serial: string; com_port: string; firmware_build: string; firmware_device: string }; tests: ValidationRun[]; acceptance_summary: CriterionResult[]; accepted: boolean; integrity: { canonical_hash_algorithm: string; canonical_hash: string } };
 
   const emptyIntegrity: Integrity = {
     received_packets: 0, crc_failures: 0, invalid_frames: 0, unsupported_versions: 0,
@@ -94,7 +91,7 @@
   };
   const activeStates = ['Connecting', 'Connected', 'Configured', 'Acquiring', 'Stopping'];
 
-  let view = 'Home';
+  let view: PrimaryView = 'Home';
   let samples: Point[] = [];
   let displayRevision = 0;
   let boards: Board[] = [];
@@ -136,29 +133,9 @@
   let draftPins = 'A0';
   let draftSampleRate = 1000;
   let draftAdcBits = 12;
-  let profileValidation: ValidationStatus | undefined;
-  let validationEvidence: ValidationEvidence[] = [];
-  let validationAcknowledged = false;
-  let validationId = 'wvu.bmeg420l.ecg.interface.validation.2026-08-06.001';
-  let validationModuleName = 'ECG module';
-  let validationModuleIdentifier = '';
-  let validationModuleRevision = '';
-  let validationModuleSerial = '';
-  let selectedValidationId = '';
-  let validationTestType = 'baseline';
-  let validationRunNumber = 1;
-  let validationSourceDescription = 'Deterministic simulator bench signal';
-  let validationSetpoint = 2.5;
-  let validationOffset = 2.5;
-  let validationFrequency = 50;
-  let validationPeakToPeak = 1;
-  let validationCriterionMetric = 'clipping_percentage';
-  let validationCriterionOperator: Criterion['operator'] = 'less_than_or_equal';
-  let validationCriterionThreshold = 0;
-  let validationCriterionUnits = '%';
   let traceVisibility: VisibleChannelMap = {};
   let traceProfileKey = '';
-  let plotLayout: PlotLayout | undefined;
+  let plotGroups: PlotGroup[] = [];
   let markerLabel = '';
 
   $: if (source === 'hardware') {
@@ -187,9 +164,10 @@
   $: if (plotProfileKey !== traceProfileKey) {
     traceProfileKey = plotProfileKey;
     traceVisibility = initialTraceVisibility(plotChannels);
-    if (plotLayout === undefined && plotChannels.length) plotLayout = defaultPlotLayout(plotChannels.length);
+    plotGroups = defaultPlotGroups(activeProfile?.category, plotChannels);
   }
   $: visibleTraceIds = visibleChannelIds(plotChannels, traceVisibility);
+  $: renderedPlotGroups = visiblePlotGroups(plotChannels, plotGroups, traceVisibility);
   $: instructorModeActive = operatingMode === 'instructor_authoring';
   $: profileTimedPresets = activeProfile?.acquisition.timed_presets_seconds ?? [10, 30, 60, 300, 600];
   $: timedDurationValid = isTimedDurationValid(timedSeconds);
@@ -220,9 +198,6 @@
       * 2.5
       / (1024 * 1024)
     : 0;
-  $: selectedValidation = validationEvidence.find((evidence) => evidence.validation_id === selectedValidationId);
-  $: validationProfiles = acquisitionProfiles.filter((profile) => ['ecg', 'emg', 'course_ecg', 'course_emg_force'].includes(profile.category));
-  $: validationActions = validationControls({ instructor: instructorModeActive, profileCategory: activeProfile?.category, safetyAcknowledged: validationAcknowledged, validationDraftSelected: Boolean(selectedValidationId), sessionDisconnected: session.state === 'Disconnected', evidenceStatus: selectedValidation?.status });
 
   function formatDuration(seconds: number | undefined) {
     if (seconds === undefined || !Number.isFinite(seconds)) return '—';
@@ -369,25 +344,8 @@
       }
       const confirmedMode = await invoke<OperatingMode>('get_profile_mode');
       if (!modeChangeInFlight) operatingMode = confirmedMode;
-      await refreshValidation();
     } catch (error) {
       statusMessage = `Profile error: ${String(error)}`;
-    }
-  }
-
-  async function refreshValidation() {
-    try {
-      validationEvidence = await invoke<ValidationEvidence[]>('list_validation_evidence');
-      if (!validationEvidence.some((evidence) => evidence.validation_id === selectedValidationId)) {
-        selectedValidationId = validationEvidence[0]?.validation_id ?? '';
-      }
-      if (activeProfile) {
-        profileValidation = await invoke<ValidationStatus>('get_profile_validation_status', { profileId: activeProfile.profile_id });
-      } else {
-        profileValidation = undefined;
-      }
-    } catch (error) {
-      statusMessage = `Validation evidence error: ${String(error)}`;
     }
   }
 
@@ -400,11 +358,26 @@
     statusMessage = activeProfile
       ? `${activeProfile.display_name} selected. ${activeProfile.status === 'locked' ? 'Protected settings are locked by the approved profile.' : 'Draft profile selected.'}`
       : 'Select a valid locked acquisition profile.';
-    void refreshValidation();
   }
 
   function setChannelVisible(channelId: string, isVisible: boolean) {
     traceVisibility = setTraceVisibility(traceVisibility, channelId, isVisible);
+  }
+
+  function changePlotCount(delta: number) {
+    plotGroups = setPlotGroupCount(plotChannels, plotGroups, plotGroups.length + delta);
+  }
+
+  function assignChannelToGroup(channelId: string, plotNumber: string) {
+    plotGroups = assignChannelToPlot(plotChannels, plotGroups, channelId, Number(plotNumber) - 1);
+  }
+
+  function useOverlayAll() {
+    plotGroups = overlayAll(plotChannels);
+  }
+
+  function useOnePlotPerSignal() {
+    plotGroups = onePlotPerSignal(plotChannels);
   }
 
   function bufferedRailCount(channelId: string): number {
@@ -415,119 +388,6 @@
       const value = sample.values[channelIndex];
       return count + (value === 0 || value === fullScale ? 1 : 0);
     }, 0);
-  }
-
-  function selectedValidationCriterion(): Criterion {
-    return { metric: validationCriterionMetric, operator: validationCriterionOperator, threshold: Number(validationCriterionThreshold), units: validationCriterionUnits };
-  }
-
-  async function createValidationDraft() {
-    if (!instructorModeActive || !activeProfile || !['ecg', 'emg', 'course_ecg', 'course_emg_force'].includes(activeProfile.category)) {
-      statusMessage = 'Enter Instructor authoring mode and select the ECG or EMG locked profile before creating bench-validation evidence.';
-      return;
-    }
-    try {
-      const evidence = await invoke<ValidationEvidence>('create_validation_draft', {
-        request: {
-          profileId: activeProfile.profile_id,
-          validationId,
-          hardware: {
-            board: 'Arduino UNO R4 WiFi', boardSerial: boards.find((board) => board.port === selectedPort)?.serial_number ?? '',
-            comPort: source === 'hardware' ? selectedPort : 'SIM', firmwareBuild: activeProfile.required_firmware.build,
-            firmwareDevice: activeProfile.required_firmware.device, moduleName: validationModuleName,
-            moduleIdentifier: validationModuleIdentifier, moduleRevision: validationModuleRevision, moduleSerial: validationModuleSerial
-          },
-          equipment: [], testConditions: { safety: 'Bench-only; no person or electrode system connected.' },
-          notes: 'Bench-validation use only. Not a medical device. No human-connected recording is authorized.'
-        }
-      });
-      selectedValidationId = evidence.validation_id;
-      statusMessage = `Created validation draft ${evidence.validation_id}. Add separate raw-data runs before finalization.`;
-      await refreshValidation();
-    } catch (error) { statusMessage = `Create validation draft error: ${String(error)}`; }
-  }
-
-  async function startValidationRecording() {
-    if (!activeProfile || !selectedValidationId || !validationAcknowledged) {
-      statusMessage = 'Select an ECG or EMG profile, a draft validation, and acknowledge the bench-only safety notice.';
-      return;
-    }
-    const request = {
-      port: source === 'hardware' ? selectedPort : null, outputDirectory, duration,
-      profileId: activeProfile.profile_id, validationId: selectedValidationId,
-      testType: validationTestType, runNumber: Number(validationRunNumber),
-      benchValidationAcknowledged: validationAcknowledged, sourceDescription: validationSourceDescription,
-      sourceSetpointV: validationTestType === 'dc_sweep' ? Number(validationSetpoint) : null,
-      sourceOffsetV: Number(validationOffset),
-      sourceFrequencyHz: validationTestType === 'sine_wave' ? Number(validationFrequency) : null,
-      sourcePeakToPeakV: validationTestType === 'sine_wave' ? Number(validationPeakToPeak) : null,
-      equipmentMetadata: { source: validationSourceDescription }
-    };
-    try {
-      session = source === 'simulator'
-        ? await invoke<SessionStatus>('start_validation_simulator_recording', { request })
-        : await invoke<SessionStatus>('start_validation_hardware_recording', { request });
-      statusMessage = `Validation run ${validationRunNumber} is recording through the production acquisition path.`;
-      view = 'Validation';
-    } catch (error) { statusMessage = `Start validation run error: ${String(error)}`; }
-  }
-
-  async function completeValidationRun() {
-    if (!selectedValidationId) return;
-    try {
-      const evidence = await invoke<ValidationEvidence>('complete_validation_run', {
-        request: {
-          validationId: selectedValidationId, testType: validationTestType, runNumber: Number(validationRunNumber),
-          sourceDescription: validationSourceDescription,
-          sourceSetpointV: validationTestType === 'dc_sweep' ? Number(validationSetpoint) : null,
-          sourceFrequencyHz: validationTestType === 'sine_wave' ? Number(validationFrequency) : null,
-          sourcePeakToPeakV: validationTestType === 'sine_wave' ? Number(validationPeakToPeak) : null,
-          criteria: [selectedValidationCriterion()], notes: 'Raw BMEG, CSV, and metadata are retained; metrics use phase3b.raw_metrics.v1.'
-        }
-      });
-      validationRunNumber += 1;
-      statusMessage = `Captured transparent metrics for validation run ${evidence.tests.length}. Review criteria before finalization.`;
-      await refreshValidation();
-    } catch (error) { statusMessage = `Complete validation run error: ${String(error)}`; }
-  }
-
-  async function finalizeValidation() {
-    if (!selectedValidation || !activeProfile) return;
-    const summary = selectedValidation.tests.flatMap((test) => test.criteria);
-    try {
-      await invoke<ValidationEvidence>('set_validation_acceptance_summary', { validationId: selectedValidation.validation_id, summary, accepted: summary.length > 0 && summary.every((result) => result.passed) });
-      const finalized = await invoke<ValidationEvidence>('finalize_validation_evidence', { validationId: selectedValidation.validation_id, profileId: activeProfile.profile_id });
-      statusMessage = `Finalized ${finalized.validation_id}; SHA-256 evidence integrity is ${finalized.integrity.canonical_hash}.`;
-      await refreshValidation();
-    } catch (error) { statusMessage = `Finalize validation error: ${String(error)}`; }
-  }
-
-  async function exportValidationPackage() {
-    if (!selectedValidationId) return;
-    try {
-      const destination = await open({ directory: true, multiple: false });
-      if (typeof destination !== 'string') return;
-      const packagePath = await invoke<string>('export_validation_package', { validationId: selectedValidationId, destination });
-      statusMessage = `Exported validation package: ${packagePath}`;
-    } catch (error) { statusMessage = `Validation package export error: ${String(error)}`; }
-  }
-
-  async function importValidationPackage() {
-    if (!activeProfile) return;
-    try {
-      const sourcePath = await open({ directory: true, multiple: false });
-      if (typeof sourcePath !== 'string') return;
-      const evidence = await invoke<ValidationEvidence>('import_validation_package', { source: sourcePath, profileId: activeProfile.profile_id });
-      selectedValidationId = evidence.validation_id;
-      await refreshValidation();
-      statusMessage = `Imported and verified validation evidence ${evidence.validation_id}.`;
-    } catch (error) { statusMessage = `Validation package import error: ${String(error)}`; }
-  }
-
-  async function retireValidation() {
-    if (!selectedValidationId) return;
-    try { await invoke('retire_validation_evidence', { validationId: selectedValidationId }); await refreshValidation(); statusMessage = 'Retired validation evidence from the active review list; existing recording provenance remains unchanged.'; }
-    catch (error) { statusMessage = `Retire validation error: ${String(error)}`; }
   }
 
   async function commitProfileMode(mode: OperatingMode) {
@@ -726,14 +586,10 @@
     }
   }
 
-  async function selectView(nextView: string) {
+  async function selectView(nextView: PrimaryView) {
     if (nextView === 'Firmware' && !FirmwareWorkspace) {
       const module = await import('$lib/components/FirmwareWorkspace.svelte');
       FirmwareWorkspace = module.default;
-    }
-    if (nextView === 'Validation' && !['ecg', 'emg', 'course_ecg', 'course_emg_force'].includes(activeProfile?.category ?? '')) {
-      selectedProfileId = validationProfiles[0]?.profile_id ?? selectedProfileId;
-      selectProfile();
     }
     view = nextView;
   }
@@ -764,20 +620,20 @@
     <img src={logoUrl} alt="Approved WVU College of Business and Economics logo" />
     <div>
       <h1>WVU Bioinstrumentation Studio</h1>
-      <p>Firmware, Acquisition, and Calibration for BMEG 420L</p>
+      <p>Firmware, Acquisition, Visualization, Calibration, and Data Export for BMEG 420L</p>
     </div>
   </header>
 
   <div class="workspace">
     <aside class="navigation">
       <nav aria-label="Primary">
-        {#each ['Home', 'Firmware', 'Acquisition', 'Validation', 'Diagnostics'] as item}
+        {#each PRIMARY_NAVIGATION as item}
           <button class:active={view === item} aria-current={view === item ? 'page' : undefined} onclick={() => void selectView(item)}>{item}</button>
         {/each}
       </nav>
     </aside>
 
-    <main class="content" class:wide-content={view === 'Firmware' || view === 'Acquisition' || view === 'Validation'}>
+    <main class="content" class:wide-content={view === 'Firmware' || view === 'Acquisition'}>
       <p class="device-cache-status" role="status">Board: {selectedPort ? `${boards.find((board) => board.port === selectedPort)?.name ?? 'UNO R4 WiFi'} — ${selectedPort}` : boards.length ? 'Select a supported UNO R4 WiFi' : 'No supported UNO R4 WiFi detected'} · Firmware: {firmwareCompatibility.replaceAll('_', ' ')} · Board refresh: {boardScanLastCompleted || (boardScanStatus === 'scanning' ? 'in progress' : 'not yet completed')}</p>
       {#if view === 'Home'}
         <h2>Home</h2>
@@ -816,7 +672,6 @@
               <span><strong>Profile</strong>{activeProfile.profile_id} / {activeProfile.profile_version}</span><span><strong>Category / source</strong>{activeProfile.category} / {activeProfile.source}</span><span><strong>Lock status</strong>{activeProfile.status}; protected pin, ADC, rate, firmware requirement, safety, and units cannot be changed in Student mode.</span>
               <span><strong>Channels / units</strong>{activeChannels.map((channel) => `${channel.pin} = ${channel.label}`).join('; ')}; {activeProfile.display.raw_units_label} and Arduino input {activeProfile.display.voltage_units_label} only</span><span><strong>Protected acquisition</strong>{activeProfile.acquisition.acquisition_mode === 'pulseox_4state' ? `Fixed RED/DARK/IR/DARK; ${activeProfile.acquisition.state_dwell_us} µs/state` : `${activeChannels.length} synchronized channel${activeChannels.length === 1 ? '' : 's'}`}, {activeProfile.acquisition.adc_resolution_bits} bit, {activeProfile.acquisition.sample_rate_hz} {activeProfile.acquisition.acquisition_mode === 'pulseox_4state' ? 'cycles/s' : 'frames/s'}</span><span><strong>Firmware requirement</strong>Protocol {activeProfile.required_firmware.protocol_major}.{activeProfile.required_firmware.protocol_minor_min}+; build {activeProfile.required_firmware.build}; device {activeProfile.required_firmware.device}</span>
               <span class="profile-hash"><strong>Integrity</strong>{activeProfile.integrity.canonical_hash_algorithm} {activeProfile.integrity.canonical_hash}</span>
-              <span><strong>Bench validation</strong>{profileValidation?.status?.replaceAll('_', ' ') ?? 'unvalidated'} — {profileValidation?.explanation ?? 'No validation evidence loaded.'}</span>
             </div>
             {#each activeProfile.safety.notices as notice}<p class="warning profile-notice">{notice}</p>{/each}
             {#if activeProfile.safety.bench_only && ['ecg', 'emg'].includes(activeProfile.category)}
@@ -921,22 +776,28 @@
 
         <section class="panel plot-panel">
           <div class="plot-heading"><h3>{pulseoxProfile ? 'Bounded live ambient-subtracted preview' : 'Bounded live synchronized raw plot'}</h3><label class="toggle"><input type="checkbox" bind:checked={volts} /> Display volts (counts × 5.0 / {Math.pow(2, activeProfile?.acquisition.adc_resolution_bits ?? 12) - 1})</label></div>
-          <fieldset class="plot-layout" aria-label="Plot layout"><legend>Plot layout</legend><div class="choice-row"><label class="choice"><input type="radio" name="plot-layout" value="stacked" bind:group={plotLayout} /> Stacked</label><label class="choice"><input type="radio" name="plot-layout" value="overlay" bind:group={plotLayout} /> Overlay</label></div></fieldset>
+          <section class="plot-arrangement" aria-labelledby="plot-arrangement-title">
+            <div class="plot-arrangement-heading"><div><h4 id="plot-arrangement-title">Plot arrangement</h4><p class="help">Display-only grouping. Every captured signal remains in the raw BMEG, CSV, and metadata even when hidden.</p></div><div class="plot-count-control" aria-label="Number of plots"><span>Number of plots</span><button aria-label="Use one fewer plot" onclick={() => changePlotCount(-1)} disabled={plotGroups.length <= 1 || !plotChannels.length}>−</button><strong>{plotGroups.length}</strong><button aria-label="Use one more plot" onclick={() => changePlotCount(1)} disabled={plotGroups.length >= plotChannels.length || !plotChannels.length}>+</button></div></div>
+            <div class="button-pair"><button onclick={useOverlayAll} disabled={!plotChannels.length}>Overlay all</button><button onclick={useOnePlotPerSignal} disabled={!plotChannels.length}>One plot per signal</button></div>
+            <div class="plot-assignment-grid" aria-label="Signal plot assignments">
+              {#each plotChannels as channel}
+                <label>{channel.label}<select value={String(Math.max(0, plotGroups.findIndex((group) => group.channelIds.includes(channel.id))) + 1)} onchange={(event) => assignChannelToGroup(channel.id, event.currentTarget.value)} disabled={!plotGroups.length}>{#each plotGroups as _group, index}<option value={String(index + 1)}>Plot {index + 1}</option>{/each}</select></label>
+              {/each}
+            </div>
+          </section>
           <div class="trace-controls" aria-label="Visible traces">{#each plotChannels as channel}<label class="choice"><input type="checkbox" checked={traceVisibility[channel.id] !== false} onchange={(event) => setChannelVisible(channel.id, event.currentTarget.checked)} /> {channel.label}</label>{/each}</div>
           {#if pulseoxProfile}<p class="help">Preview subtraction is display-only. The raw RED, DARK 1, IR, DARK 2 TX/RX values are recorded unchanged.</p>{/if}
           {#if !visibleTraceIds.length}
             <p class="help">No traces are selected for display. Recording and export continue for every profile field.</p>
-          {:else if plotLayout === 'stacked'}
-            <div class="stacked-plots" aria-label="Stacked synchronized plots">
-              {#each plotChannels.filter((channel) => traceVisibility[channel.id] !== false) as channel}
-                <section class="stacked-plot" aria-label={`${channel.label} plot`}>
-                  <div class="stacked-plot-heading"><strong>{channel.label}</strong><span>{volts ? 'Arduino input volts' : 'ADC counts'}{!pulseoxProfile && bufferedRailCount(channel.id) ? `; ${bufferedRailCount(channel.id)} buffered rail sample${bufferedRailCount(channel.id) === 1 ? '' : 's'}` : ''}</span></div>
-                  <LivePlot {samples} channels={plotChannels} visibleChannelIds={[channel.id]} {volts} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} pulseoxPreview={pulseoxProfile} {displayRevision} />
+          {:else}
+            <div class="stacked-plots" aria-label="Synchronized plot groups">
+              {#each renderedPlotGroups as group, index (group.id)}
+                <section class="stacked-plot" aria-label={`Plot ${index + 1}: ${group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(', ')}`}>
+                  <div class="stacked-plot-heading"><strong>Plot {index + 1}: {group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(' + ')}</strong><span>{volts ? 'Arduino input volts' : 'ADC counts'}{!pulseoxProfile && group.channelIds.some((id) => bufferedRailCount(id)) ? `; ${group.channelIds.reduce((count, id) => count + bufferedRailCount(id), 0)} buffered rail samples` : ''}</span></div>
+                  <LivePlot {samples} channels={plotChannels} visibleChannelIds={group.channelIds} {volts} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} pulseoxPreview={pulseoxProfile} {displayRevision} />
                 </section>
               {/each}
             </div>
-          {:else}
-            <LivePlot {samples} channels={plotChannels} visibleChannelIds={visibleTraceIds} {volts} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} pulseoxPreview={pulseoxProfile} {displayRevision} />
           {/if}
           <div class="action-row marker-row"><label>Marker label <input bind:value={markerLabel} maxlength="80" placeholder="baseline, rest, start inflation…" disabled={session.state !== 'Acquiring'} /></label><button onclick={addMarker} disabled={session.state !== 'Acquiring'}>Add marker</button></div>
         </section>
@@ -950,66 +811,6 @@
             <p>Finalization: {session.last_summary.completion_status}; reason: {session.last_summary.stop_reason}.</p>
           </section>
         {/if}
-      {:else if view === 'Validation'}
-        <h2>Bench validation</h2>
-        <p class="notice"><strong>Bench-validation use only.</strong> No person or electrode system may be connected. Not a medical device. Validation records analog-interface evidence only; they do not authorize human-connected recording or clinical interpretation.</p>
-        <section class="panel" aria-labelledby="validation-profile-title">
-          <div class="panel-heading"><div><h3 id="validation-profile-title">Profile validation status</h3><p class="help">Evidence is separate from locked-profile integrity. A SHA-256 hash detects changes, but is not authentication.</p></div><span class="mode-badge">{profileValidation?.status?.replaceAll('_', ' ') ?? 'unvalidated'}</span></div>
-          <div class="control-grid">
-            <label>Locked module profile
-              <select bind:value={selectedProfileId} onchange={selectProfile} disabled={session.state !== 'Disconnected'}>
-                {#each validationProfiles as profile}<option value={profile.profile_id}>{profile.display_name} — {profile.profile_version}</option>{/each}
-              </select>
-            </label>
-            <span class="field-action"><span>Current evidence</span><strong>{profileValidation?.validation_id ?? 'No matching finalized evidence'}</strong></span>
-            <span class="field-action"><span>Status explanation</span><strong>{profileValidation?.explanation ?? 'Select an ECG or EMG profile.'}</strong></span>
-          </div>
-          <p class="warning">A Bench validated badge means only that finalized local bench evidence matches the locked profile and controlled firmware identity. Human use remains prohibited.</p>
-        </section>
-        {#if !instructorModeActive}
-          <section class="panel"><h3>Instructor workflow required</h3><p class="help">Student mode may review profile validation status but cannot create, capture, finalize, import, export, or retire validation evidence. Enter Instructor authoring from Acquisition after its explicit local acknowledgement.</p></section>
-        {:else}
-          <section class="panel" aria-labelledby="validation-draft-title">
-            <h3 id="validation-draft-title">1. Create or resume a validation draft</h3>
-            <div class="control-grid">
-              <label>Validation ID <input bind:value={validationId} placeholder="wvu.bmeg420l.ecg.interface.validation.2026-08-06.001" /></label>
-              <label>Module name <input bind:value={validationModuleName} /></label>
-              <label>Module identifier <input bind:value={validationModuleIdentifier} placeholder="Required for module characterization; use documented interface-only condition if absent" /></label>
-              <label>Module revision <input bind:value={validationModuleRevision} /></label>
-              <label>Module serial <input bind:value={validationModuleSerial} /></label>
-              <div class="field-action"><span>New draft</span><button onclick={createValidationDraft} disabled={!validationActions.canCreateDraft}>Create validation draft</button></div>
-            </div>
-            <p class="help">Record function generator, DMM, oscilloscope, and module details in the validation evidence before finalizing. The app never drives external equipment.</p>
-          </section>
-          <section class="panel" aria-labelledby="validation-run-title">
-            <h3 id="validation-run-title">2. Capture a separate raw validation run</h3>
-            <label class="acknowledgement"><input type="checkbox" bind:checked={validationAcknowledged} disabled={session.state !== 'Disconnected'} /> I confirm this is bench validation only: no person or electrode system is connected.</label>
-            <div class="control-grid">
-              <label>Draft validation <select bind:value={selectedValidationId} disabled={session.state !== 'Disconnected'}><option value="">Select a draft validation</option>{#each validationEvidence.filter((evidence) => evidence.status === 'draft') as evidence}<option value={evidence.validation_id}>{evidence.validation_id}</option>{/each}</select></label>
-              <label>Source <select bind:value={source} disabled={session.state !== 'Disconnected'}><option value="simulator">Simulator</option><option value="hardware">UNO R4 WiFi / safe bench source</option></select></label>
-              {#if source === 'hardware'}<label>UNO R4 WiFi port <select bind:value={selectedPort} disabled={session.state !== 'Disconnected'}>{#each boards as board}<option value={board.port}>{board.name} — {board.port}</option>{/each}</select></label>{/if}
-              <label>Test type <select bind:value={validationTestType} disabled={session.state !== 'Disconnected'}><option value="baseline">Zero-input / baseline</option><option value="dc_sweep">DC operating-range sweep</option><option value="sine_wave">Known sine-wave acquisition</option><option value="saturation_margin">Saturation-margin check</option><option value="repeatability">Repeatability</option></select></label>
-              <label>Run number <input type="number" min="1" step="1" bind:value={validationRunNumber} disabled={session.state !== 'Disconnected'} /></label>
-              <label>Source / safe condition <input bind:value={validationSourceDescription} disabled={session.state !== 'Disconnected'} /></label>
-              {#if validationTestType === 'dc_sweep'}<label>Entered setpoint (V) <input type="number" min="0" max="5" step="0.001" bind:value={validationSetpoint} /></label>{/if}
-              {#if validationTestType === 'sine_wave'}<label>Entered offset (V) <input type="number" min="0" max="5" step="0.001" bind:value={validationOffset} /></label><label>Entered frequency (Hz) <input type="number" min="0.001" step="0.001" bind:value={validationFrequency} /></label><label>Entered peak-to-peak (V) <input type="number" min="0" max="5" step="0.001" bind:value={validationPeakToPeak} /></label>{/if}
-              <label>Criterion metric <select bind:value={validationCriterionMetric}><option value="clipping_percentage">Clipping percentage</option><option value="absolute_voltage_error">Absolute voltage error</option><option value="absolute_frequency_error_hz">Absolute frequency error</option><option value="measured_frequency_hz">Measured frequency</option><option value="measured_sample_rate_hz">Measured sample rate</option><option value="peak_to_peak_volts">Peak-to-peak volts</option><option value="rail_margin_percentage">Rail-margin percentage</option></select></label>
-              <label>Operator <select bind:value={validationCriterionOperator}><option value="less_than_or_equal">≤ threshold</option><option value="greater_than_or_equal">≥ threshold</option></select></label>
-              <label>Threshold <input type="number" step="any" bind:value={validationCriterionThreshold} /></label>
-              <label>Units <input bind:value={validationCriterionUnits} /></label>
-            </div>
-            <div class="button-pair"><button class="gold" onclick={startValidationRecording} disabled={!validationActions.canStartRun}>Start bench-validation recording</button><button class="stop" onclick={stopRecording} disabled={!isActive}>Stop recording</button><button onclick={completeValidationRun} disabled={!validationActions.canCompleteRun || !session.last_summary || session.last_summary.validation_context?.validation_id !== selectedValidationId}>Compute transparent run metrics</button></div>
-            <p class="help">Metrics use the retained raw BMEG stream. The frequency estimate, when requested, is a documented arithmetic-mean rising-crossing timing check; it does not filter or modify recorded data.</p>
-          </section>
-          <section class="panel" aria-labelledby="validation-review-title">
-            <h3 id="validation-review-title">3. Review, finalize, and package evidence</h3>
-            {#if selectedValidation}
-              <p class="profile-hash"><strong>{selectedValidation.validation_id}</strong> — {selectedValidation.status}; SHA-256: {selectedValidation.integrity.canonical_hash || 'assigned only at finalization'}</p>
-              <div class="validation-table-wrap"><table><thead><tr><th>Run</th><th>Test</th><th>Samples</th><th>Metrics</th><th>Criteria</th></tr></thead><tbody>{#each selectedValidation.tests as run}<tr><td>{run.run_number}</td><td>{run.test_type}</td><td>{run.raw_sample_count}</td><td>{run.metrics.map((metric) => `${metric.name}: ${metric.value.toFixed(4)} ${metric.units}`).join('; ')}</td><td>{run.criteria.length ? run.criteria.map((result) => result.passed ? 'pass' : 'fail').join(', ') : 'No criterion entered'}</td></tr>{/each}</tbody></table></div>
-              <div class="button-pair"><button class="gold" onclick={finalizeValidation} disabled={!validationActions.canFinalize}>Finalize complete passing evidence</button><button onclick={exportValidationPackage} disabled={!validationActions.canExportOrRetire}>Export validation package</button><button onclick={importValidationPackage}>Import validation package</button><button onclick={retireValidation} disabled={!validationActions.canExportOrRetire}>Retire validation record</button></div>
-            {:else}<p class="help">Create or select a validation draft to review its run table.</p>{/if}
-          </section>
-        {/if}
       {:else}
         <h2>Diagnostics</h2>
         <section class="panel diagnostic-grid">
@@ -1017,8 +818,6 @@
           <p>Last error: {session.last_error ?? 'none'}</p>
           <p>Stop reason: {session.stop_reason ?? 'none'}</p>
           <p>Available storage: {formatStorage(session.available_disk_bytes)}</p>
-          <p>Active validation: {session.validation_context ? `${session.validation_context.validation_id}; ${session.validation_context.test_type}; run ${session.validation_context.run_number}` : 'none'}</p>
-          <p>Profile validation: {profileValidation?.status?.replaceAll('_', ' ') ?? 'unvalidated'}</p>
         </section>
         <p>Serial ownership, packet validation, bounded display data, recording, and export run in Rust; the frontend only polls snapshots.</p>
       {/if}
@@ -1074,9 +873,8 @@
   fieldset { min-width: 0; border: 0; padding: 0; margin: 0; } legend { font-weight: 650; margin-bottom: .3rem; } .choice-row, .duration-controls, .action-row, .plot-heading { display: flex; min-width: 0; flex-wrap: wrap; gap: .7rem; align-items: end; } .choice { display: flex; align-items: center; gap: .4rem; } .choice input, .toggle input { width: auto; min-height: auto; }
   .duration-controls { margin-top: .75rem; } .action-row { margin: 1rem 0; } .recording-actions button { flex: 0 1 20rem; } .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: .55rem; margin: 1rem 0; } .metric-grid span { min-width: 0; padding: .6rem .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #fff; overflow-wrap: anywhere; } .metric-grid strong { display: block; color: #42515d; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; }
   .plot-panel { min-width: 0; } .plot-heading { justify-content: space-between; align-items: center; } .toggle { display: flex; align-items: center; gap: .45rem; font-size: .9rem; }
-  .plot-layout { margin-top: .7rem; } .trace-controls { display: flex; flex-wrap: wrap; gap: .45rem .8rem; margin: .75rem 0; } .trace-controls .choice { font-size: .9rem; } .stacked-plots { display: grid; gap: .85rem; min-width: 0; } .stacked-plot { min-width: 0; min-height: 0; padding: .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .stacked-plot-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; margin-bottom: .5rem; color: #42515d; } .marker-row { align-items: end; } .marker-row label { flex: 1 1 18rem; }
+  .plot-arrangement { min-width: 0; margin-top: .75rem; padding: .75rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .plot-arrangement-heading { display: flex; min-width: 0; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: start; } .plot-arrangement h4 { margin: 0; } .plot-arrangement .help { max-width: 72ch; } .plot-count-control { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; font-weight: 700; } .plot-count-control button { min-height: 2.1rem; min-width: 2.1rem; padding: .2rem .55rem; text-align: center; } .plot-count-control strong { min-width: 1.5rem; text-align: center; } .plot-assignment-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .65rem; margin-top: .8rem; } .trace-controls { display: flex; flex-wrap: wrap; gap: .45rem .8rem; margin: .75rem 0; } .trace-controls .choice { font-size: .9rem; } .stacked-plots { display: grid; gap: .85rem; min-width: 0; } .stacked-plot { min-width: 0; min-height: 0; padding: .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .stacked-plot-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; margin-bottom: .5rem; color: #42515d; } .marker-row { align-items: end; } .marker-row label { flex: 1 1 18rem; }
   .paths p, .status { overflow-wrap: anywhere; word-break: break-word; } .paths p { margin: .35rem 0; } .status { margin: 1rem 0 0; padding: .7rem; border: 1px solid #d7dde2; background: #fff; border-radius: .3rem; } .diagnostic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: .75rem; }
-  .validation-table-wrap { min-width: 0; max-width: 100%; overflow-x: auto; border: 1px solid #d7dde2; border-radius: .3rem; } table { width: 100%; min-width: 44rem; border-collapse: collapse; } th, td { min-width: 0; padding: .55rem; text-align: left; vertical-align: top; border-bottom: 1px solid #d7dde2; overflow-wrap: anywhere; } th { background: #eef3f6; } td { font-size: .9rem; }
   .operation-backdrop { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 1rem; background: rgb(12 27 42 / 52%); } .operation-modal { width: min(100%, 35rem); display: flex; gap: 1rem; align-items: flex-start; padding: 1.2rem; border: 2px solid #002855; border-radius: .45rem; background: #fff; box-shadow: 0 1rem 3rem rgb(0 0 0 / 25%); } .operation-modal h2 { margin: 0; } .operation-modal p { margin: .4rem 0; overflow-wrap: anywhere; } .spinner { flex: 0 0 2rem; width: 2rem; height: 2rem; border: .3rem solid #d7dde2; border-top-color: #002855; border-radius: 50%; animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
   @media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .navigation { padding: .65rem; } nav { grid-template-columns: repeat(4, minmax(0, 1fr)); } nav button { text-align: center; padding-inline: .35rem; } }
   @media (max-width: 650px) { .app-header { align-items: flex-start; } .app-header img { max-width: 130px; } nav { grid-template-columns: repeat(2, minmax(0, 1fr)); } .content { padding: 1rem; } .recording-actions button { flex-basis: 100%; } .plot-heading { align-items: flex-start; } }

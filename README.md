@@ -14,9 +14,9 @@ channel map, firmware identity, profile snapshot, and integrity counters needed 
   and pulse-ox TX/RX raw capture (A0/A1, D5 red, D6 IR).
 - Timed and **Until stopped** recording, bounded uPlot display updates, markers, continuous BMEG,
   profile-aware CSV, metadata, storage guards, disconnect finalization, and simulator support.
-- A firmware workspace for one-file UNO projects and an optional instructor-only bench-validation
-  evidence workflow. Formal physical module characterization is not required for ordinary course
-  capture and remains a separate future activity.
+- A firmware workspace for one-file UNO projects plus locked, profile-aware course capture and
+  display-only plot groups. Formal analog-module characterization is outside the runtime app
+  scope and does not gate ordinary course capture.
 
 See [course profile mapping](docs/COURSE_ACQUISITION_PROFILES.md),
 [protocol v0.2](docs/USB_PROTOCOL_SPECIFICATION_v0.2.md), and
@@ -25,10 +25,9 @@ See [course profile mapping](docs/COURSE_ACQUISITION_PROFILES.md),
 ## Safety boundary
 
 Follow BMEG 420L lab instructions and instructor safety procedures. Do not use this app for
-diagnosis or clinical decisions. The optional Validation page is explicitly bench-only. Phase 4
-does not calculate heart rate, SpO2, blood pressure, EMG activation/fatigue, or any physiological
-interpretation. Raw ADC counts remain authoritative; volts are direct Arduino-input conversion
-only, never calibrated physiological units.
+diagnosis or clinical decisions. The app does not calculate heart rate, SpO2, blood pressure, EMG
+activation/fatigue, or any physiological interpretation. Raw ADC counts remain authoritative;
+volts are direct Arduino-input conversion only, never calibrated physiological units.
 
 The reference firmware makes D4/D5/D6 LOW at startup, idle, Stop, protocol/configuration errors,
 and watchdog faults. D4 may be HIGH only during the configured BP/PPG capture; D5/D6 are active

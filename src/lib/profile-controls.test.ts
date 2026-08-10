@@ -14,7 +14,7 @@ describe('profile acquisition controls', () => {
     expect(profileControls({ category: 'development', locked: true, benchAcknowledged: false, firmwareCompatible: false, source: 'simulator' }).canStart).toBe(true);
   });
 
-  it('does not make optional bench-validation evidence a course-capture gate', () => {
+  it('does not make a retired validation feature a course-capture gate', () => {
     expect(profileControls({ category: 'course_ecg', locked: true, benchAcknowledged: false, firmwareCompatible: true, source: 'hardware' }).canStart).toBe(true);
     expect(profileControls({ category: 'course_emg_force', locked: true, benchAcknowledged: false, firmwareCompatible: true, source: 'simulator' }).canStart).toBe(true);
   });

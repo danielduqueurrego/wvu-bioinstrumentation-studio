@@ -97,19 +97,13 @@ Profile files are versioned JSON, validated against a schema, and cannot be sile
   device/no human-connected recording authorized. No physiological quantity or interpretation is
   created by Phase 3A.
 
-## Phase 3B bench-validation evidence decisions
+## Formal analog-characterization decision
 
-- Validation evidence is a separate versioned JSON model, linked to a locked profile ID/version/
-  canonical hash and exact controlled firmware build/device identity. It never mutates the
-  profile snapshot embedded in a recording.
-- Draft/finalized/retired evidence states are instructor-only workflow operations. Finalized
-  evidence is immutable and SHA-256 integrity protected; the hash detects changes but is not an
-  authorship signature, authentication mechanism, or authorization for human use.
-- Every validation run uses the production session controller and is recorded as a separate raw
-  BMEG/metadata/CSV session with a compact validation context. Metrics are computed from retained
-  raw samples without hidden filtering.
-- Bench validation remains strictly no-person/no-electrode/not-medical-device work even when an
-  evidence record matches a profile. No physical module result is inferred from simulator evidence.
+- The former Phase 3B evidence workflow is historical and removed from the runtime class
+  application. Formal analog characterization is an external instructor activity; it neither
+  changes profile integrity nor gates normal course acquisition.
+- Current readers tolerate historical validation metadata in old recordings, but the app does not
+  create validation evidence, expose validation status, or manage validation packages.
 
 ## Measurement policy
 
@@ -122,9 +116,8 @@ Profile files are versioned JSON, validated against a schema, and cannot be sile
 
 ## Phase 4 multi-channel course-capture decisions
 
-- Course development prioritizes synchronized raw variables, pin mapping, timing, and provenance;
-  formal Phase 3B physical analog characterization remains optional and does not block normal lab
-  capture. It remains a separate no-person engineering workflow.
+- Course development prioritizes synchronized raw variables, pin mapping, timing, provenance, and
+  flexible display-only plot groups; formal analog characterization is external to this app.
 - Protocol v0.2 retains major zero and moves controlled USB CDC configuration to 921600 baud to
   leave headroom for six 16-bit fields at 1000 logical frames/s. v0.1 recordings remain readable.
 - Two firmware acquisition modes are deliberately fixed: simultaneous 1–6 channel frames and the

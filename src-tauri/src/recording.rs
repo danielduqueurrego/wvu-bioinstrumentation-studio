@@ -134,18 +134,17 @@ pub struct RecordingMetadata {
     /// metadata sidecar. Files made before this field existed remain legacy/general recordings.
     #[serde(default)]
     pub profile_snapshot: Option<ProfileSnapshot>,
-    /// Optional Phase 3B provenance for a single bench-validation run. The full
-    /// immutable validation evidence remains a separate JSON document/package so
-    /// the BMEG header stays compact and legacy BMEG readers remain compatible.
+    /// Historical Phase 3B metadata retained only so previously recorded BMEG
+    /// files deserialize safely after the class application removed Validation.
     #[serde(default)]
-    pub validation_context: Option<ValidationRunContext>,
+    pub validation_context: Option<LegacyValidationContext>,
     /// Manual, non-protocol experiment annotations. Markers never alter or remove raw samples.
     #[serde(default)]
     pub markers: Vec<RecordingMarker>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ValidationRunContext {
+pub struct LegacyValidationContext {
     pub validation_id: String,
     pub test_type: String,
     pub run_number: u32,
@@ -776,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_context_round_trips_and_extends_only_validation_csv() {
+    fn legacy_validation_context_deserializes_without_changing_course_csv() {
         let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
         let profile = crate::profiles::built_in_profiles()
             .unwrap_or_else(|e| panic!("{e}"))
@@ -820,7 +819,7 @@ mod tests {
             final_free_disk_bytes: None,
             completion_status: "complete".into(),
             profile_snapshot: Some(profile),
-            validation_context: Some(ValidationRunContext {
+            validation_context: Some(LegacyValidationContext {
                 validation_id: "wvu.validation.001".into(),
                 test_type: "dc_operating_range_sweep".into(),
                 run_number: 1,

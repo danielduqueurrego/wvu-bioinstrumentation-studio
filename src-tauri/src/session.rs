@@ -12,7 +12,7 @@ use crate::{
     },
     recording::{
         export_bmeg_csv, BmegWriter, RecordingDuration, RecordingMarker, RecordingMetadata,
-        StopReason, SynchronizedRecord, ValidationRunContext,
+        StopReason, SynchronizedRecord,
     },
 };
 use chrono::{Local, Utc};
@@ -46,23 +46,6 @@ const DISK_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
 const DISK_CRITICAL_BYTES: u64 = 250 * 1024 * 1024;
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const RECORDING_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Deterministic signal choices used only by the Phase 3B simulator transport.
-/// They become normal `SAMPLE_BATCH` frames and are parsed by the same host path
-/// as hardware; they do not alter stored raw samples after acquisition.
-#[derive(Clone, Debug)]
-enum SimulatorSignal {
-    General,
-    Dc {
-        volts: f64,
-    },
-    Sine {
-        offset_v: f64,
-        peak_to_peak_v: f64,
-        frequency_hz: f64,
-    },
-    IntentionalClipping,
-}
 
 /// Kept behind a small interface so storage guard behavior is deterministic in
 /// tests and the production implementation remains Windows-compatible.
@@ -208,7 +191,6 @@ pub struct SessionSummary {
     pub integrity: IntegrityCounters,
     pub error: Option<String>,
     pub profile: ProfileSnapshot,
-    pub validation_context: Option<ValidationRunContext>,
     pub active_digital_output_mask: Option<u8>,
     pub final_digital_output_mask: Option<u8>,
 }
@@ -234,7 +216,6 @@ pub struct SessionStatus {
     pub last_error: Option<String>,
     pub last_summary: Option<SessionSummary>,
     pub profile: Option<ProfileSnapshot>,
-    pub validation_context: Option<ValidationRunContext>,
     pub digital_output_mask: Option<u8>,
 }
 
@@ -283,7 +264,6 @@ struct SessionRuntime {
     stop_reason: Option<StopReason>,
     connection_diagnostics: Option<ConnectionDiagnostics>,
     profile: Option<ProfileSnapshot>,
-    validation_context: Option<ValidationRunContext>,
     markers: Vec<RecordingMarker>,
     digital_output_mask: Option<u8>,
 }
@@ -317,7 +297,6 @@ impl SessionController {
                 stop_reason: None,
                 connection_diagnostics: None,
                 profile: None,
-                validation_context: None,
                 markers: Vec::new(),
                 digital_output_mask: None,
             })),
@@ -399,28 +378,6 @@ impl SessionController {
         self.status()
     }
 
-    /// Starts a bench-validation simulator run through the ordinary parser,
-    /// bounded display buffer, BMEG writer, and CSV exporter. The context is
-    /// frozen into the recording header before acquisition starts.
-    pub fn start_simulator_validation(
-        &self,
-        profile: ProfileSnapshot,
-        duration: RecordingDuration,
-        output_dir: PathBuf,
-        validation_context: ValidationRunContext,
-    ) -> Result<SessionStatus, SessionError> {
-        self.validate_duration(&duration)?;
-        validate_validation_context(&validation_context)?;
-        let signal = validation_simulator_signal(&validation_context)?;
-        self.begin_session(true, "Simulator", "SIM", duration.clone(), profile.clone())?;
-        self.set_validation_context(Some(validation_context))?;
-        let controller = self.clone();
-        self.spawn_worker(move || {
-            controller.capture_simulator_worker_with_signal(profile, duration, output_dir, signal)
-        })?;
-        self.status()
-    }
-
     /// Starts the common production path with a serial transport on a worker.
     pub fn start_serial(
         &self,
@@ -453,33 +410,6 @@ impl SessionController {
         self.status()
     }
 
-    /// Starts a bench-validation hardware run through the production serial
-    /// worker. It intentionally does not open a second validation transport.
-    pub fn start_serial_validation(
-        &self,
-        profile: ProfileSnapshot,
-        port_name: String,
-        duration: RecordingDuration,
-        output_dir: PathBuf,
-        validation_context: ValidationRunContext,
-    ) -> Result<SessionStatus, SessionError> {
-        self.validate_duration(&duration)?;
-        validate_validation_context(&validation_context)?;
-        self.begin_session(
-            false,
-            "Arduino UNO R4 WiFi",
-            &port_name,
-            duration.clone(),
-            profile.clone(),
-        )?;
-        self.set_validation_context(Some(validation_context))?;
-        let controller = self.clone();
-        self.spawn_worker(move || {
-            controller.capture_serial_worker(profile, port_name, duration, output_dir)
-        })?;
-        self.status()
-    }
-
     /// Synchronous entry point used by the controlled acceptance harness and tests.
     pub fn capture_simulator(
         &self,
@@ -500,32 +430,6 @@ impl SessionController {
         self.capture_simulator_worker(profile, duration, output_dir.to_path_buf())?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "simulator session did not produce a summary",
-        ))
-    }
-
-    /// Synchronous production-path entry point for deterministic validation
-    /// acceptance harnesses. It is deliberately the same worker implementation
-    /// used by the Tauri validation command, not an alternate sample generator.
-    pub fn capture_simulator_validation(
-        &self,
-        profile: ProfileSnapshot,
-        duration: RecordingDuration,
-        output_dir: &Path,
-        validation_context: ValidationRunContext,
-    ) -> Result<SessionSummary, SessionError> {
-        self.validate_duration(&duration)?;
-        validate_validation_context(&validation_context)?;
-        let signal = validation_simulator_signal(&validation_context)?;
-        self.begin_session(true, "Simulator", "SIM", duration.clone(), profile.clone())?;
-        self.set_validation_context(Some(validation_context))?;
-        self.capture_simulator_worker_with_signal(
-            profile,
-            duration,
-            output_dir.to_path_buf(),
-            signal,
-        )?;
-        self.status()?.last_summary.ok_or(SessionError::State(
-            "simulator validation session did not produce a summary",
         ))
     }
 
@@ -894,7 +798,6 @@ impl SessionController {
             Some(ConnectionDiagnostics::new(port))
         };
         runtime.profile = Some(profile);
-        runtime.validation_context = None;
         runtime.markers.clear();
         self.cancel.store(false, Ordering::Release);
         let mut stop_reason = self
@@ -902,14 +805,6 @@ impl SessionController {
             .lock()
             .map_err(|_| SessionError::State("stop reason lock poisoned"))?;
         *stop_reason = None;
-        Ok(())
-    }
-
-    fn set_validation_context(
-        &self,
-        context: Option<ValidationRunContext>,
-    ) -> Result<(), SessionError> {
-        self.lock_runtime()?.validation_context = context;
         Ok(())
     }
 
@@ -939,23 +834,8 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: PathBuf,
     ) -> Result<(), SessionError> {
-        self.capture_simulator_worker_with_signal(
-            profile,
-            duration,
-            output_dir,
-            SimulatorSignal::General,
-        )
-    }
-
-    fn capture_simulator_worker_with_signal(
-        &self,
-        profile: ProfileSnapshot,
-        duration: RecordingDuration,
-        output_dir: PathBuf,
-        signal: SimulatorSignal,
-    ) -> Result<(), SessionError> {
         let result = (|| {
-            let mut simulator = SimulatorIo::new_with_signal(&profile, duration.clone(), signal)?;
+            let mut simulator = SimulatorIo::new(&profile, duration.clone())?;
             self.set_state(SessionState::Connected)?;
             self.capture_transport(&mut simulator, true, "SIM", profile, duration, &output_dir)
         })();
@@ -1180,7 +1060,6 @@ impl SessionController {
                 .as_ref()
                 .map(std::string::ToString::to_string),
             profile,
-            validation_context: final_meta.validation_context.clone(),
             active_digital_output_mask,
             final_digital_output_mask,
         };
@@ -1476,8 +1355,14 @@ impl SessionController {
             csv_filename: None,
             notes: if simulator {
                 match profile.profile.category.as_str() {
-                    "ecg" => "Synthetic ECG-like teaching waveform; nonphysiological and not a physical module validation.".into(),
-                    "emg" => "Synthetic EMG-like teaching waveform; nonphysiological and not a physical module validation.".into(),
+                    "ecg" => {
+                        "Synthetic ECG-like teaching waveform; nonphysiological teaching data only."
+                            .into()
+                    }
+                    "emg" => {
+                        "Synthetic EMG-like teaching waveform; nonphysiological teaching data only."
+                            .into()
+                    }
                     _ => "Deterministic simulator waveform; no human signal.".into(),
                 }
             } else {
@@ -1491,7 +1376,9 @@ impl SessionController {
             final_free_disk_bytes: None,
             completion_status: "active".into(),
             profile_snapshot: Some(profile.clone()),
-            validation_context: self.lock_runtime()?.validation_context.clone(),
+            // Retained as an optional legacy metadata field. New course recordings
+            // never create the retired Phase 3B context.
+            validation_context: None,
             markers: Vec::new(),
         })
     }
@@ -1503,33 +1390,20 @@ impl SessionController {
     ) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), SessionError> {
         fs::create_dir_all(output_dir)?;
         let stamp = Local::now().format("%Y%m%d_%H%M%S");
-        let validation_name = self
-            .lock_runtime()?
-            .validation_context
-            .as_ref()
-            .map(|context| {
-                format!(
-                    "Phase3B_{}_{}",
-                    crate::profiles::safe_filename_component(&profile.profile.category),
-                    crate::profiles::safe_filename_component(&context.test_type)
-                )
-            });
         for run in 1..=99 {
-            let name = validation_name.clone().unwrap_or_else(|| {
-                match profile.profile.category.as_str() {
-                    "development" => "Phase1_A0".to_string(),
-                    category if category.starts_with("course_") => format!(
-                        "Phase4_{}",
-                        crate::profiles::safe_filename_component(
-                            category.trim_start_matches("course_")
-                        )
-                    ),
-                    category => format!(
-                        "Phase3A_{}",
-                        crate::profiles::safe_filename_component(category)
-                    ),
-                }
-            });
+            let name = match profile.profile.category.as_str() {
+                "development" => "Phase1_A0".to_string(),
+                category if category.starts_with("course_") => format!(
+                    "Phase4_{}",
+                    crate::profiles::safe_filename_component(
+                        category.trim_start_matches("course_")
+                    )
+                ),
+                category => format!(
+                    "Phase3A_{}",
+                    crate::profiles::safe_filename_component(category)
+                ),
+            };
             let base = output_dir.join(format!("{stamp}_{name}_Run{run:02}"));
             let bmeg = base.with_extension("bmeg");
             let csv = base.with_extension("csv");
@@ -1717,7 +1591,6 @@ impl SessionController {
             last_error: runtime.last_error.clone(),
             last_summary: runtime.last_summary.clone(),
             profile: runtime.profile.clone(),
-            validation_context: runtime.validation_context.clone(),
             digital_output_mask: runtime.digital_output_mask,
         }
     }
@@ -1811,67 +1684,6 @@ fn validate_profile_snapshot(snapshot: &ProfileSnapshot) -> Result<(), SessionEr
         ));
     }
     Ok(())
-}
-
-fn validate_validation_context(context: &ValidationRunContext) -> Result<(), SessionError> {
-    if !context.bench_only
-        || context.validation_id.trim().is_empty()
-        || context.test_type.trim().is_empty()
-        || context.run_number == 0
-        || context.source_description.trim().is_empty()
-    {
-        return Err(SessionError::State(
-            "bench-validation recordings require a validation ID, test type, run number, source description, and bench-only acknowledgement",
-        ));
-    }
-    for value in [
-        context.source_setpoint_v,
-        context.source_offset_v,
-        context.source_peak_to_peak_v,
-    ] {
-        if value.is_some_and(|value| !(0.0..=5.0).contains(&value)) {
-            return Err(SessionError::State(
-                "bench-validation source voltage values must be within 0 to 5 V",
-            ));
-        }
-    }
-    if context
-        .source_frequency_hz
-        .is_some_and(|value| value <= 0.0)
-    {
-        return Err(SessionError::State(
-            "bench-validation source frequency must be positive",
-        ));
-    }
-    Ok(())
-}
-
-fn validation_simulator_signal(
-    context: &ValidationRunContext,
-) -> Result<SimulatorSignal, SessionError> {
-    match context.test_type.as_str() {
-        "dc_operating_range_sweep" => Ok(SimulatorSignal::Dc {
-            volts: context.source_setpoint_v.ok_or(SessionError::State(
-                "a DC simulator validation run requires an entered 0 to 5 V setpoint",
-            ))?,
-        }),
-        "known_sine_wave_acquisition" => Ok(SimulatorSignal::Sine {
-            offset_v: context.source_offset_v.unwrap_or(2.5),
-            peak_to_peak_v: context.source_peak_to_peak_v.ok_or(SessionError::State(
-                "a sine simulator validation run requires an entered peak-to-peak amplitude",
-            ))?,
-            frequency_hz: context.source_frequency_hz.ok_or(SessionError::State(
-                "a sine simulator validation run requires an entered frequency",
-            ))?,
-        }),
-        "saturation_margin" => Ok(SimulatorSignal::IntentionalClipping),
-        "zero_input_baseline" | "repeatability" => Ok(SimulatorSignal::Dc {
-            volts: context.source_offset_v.unwrap_or(2.5),
-        }),
-        _ => Err(SessionError::State(
-            "unsupported Phase 3B validation test type",
-        )),
-    }
 }
 
 fn configure_payload(
@@ -2126,7 +1938,6 @@ struct SimulatorIo {
     next_batch_at: Instant,
     batch_interval: Option<Duration>,
     max_fragment: usize,
-    signal: SimulatorSignal,
     profile_category: String,
     requested_duration_seconds: Option<u64>,
     sample_period_us: u32,
@@ -2136,11 +1947,7 @@ struct SimulatorIo {
 }
 
 impl SimulatorIo {
-    fn new_with_signal(
-        profile: &ProfileSnapshot,
-        duration: RecordingDuration,
-        signal: SimulatorSignal,
-    ) -> Result<Self, SessionError> {
+    fn new(profile: &ProfileSnapshot, duration: RecordingDuration) -> Result<Self, SessionError> {
         let mut simulator = Self {
             bytes: VecDeque::new(),
             commands: FrameParser::default(),
@@ -2151,7 +1958,6 @@ impl SimulatorIo {
             next_batch_at: Instant::now(),
             batch_interval: Some(Duration::from_millis(10)),
             max_fragment: 7,
-            signal,
             profile_category: profile.profile.category.clone(),
             requested_duration_seconds: duration.requested_seconds(),
             sample_period_us: 1_000,
@@ -2184,7 +1990,7 @@ impl SimulatorIo {
         logical_rate_hz: u32,
         pulseox: bool,
     ) -> Result<Self, SessionError> {
-        let mut simulator = Self::new_with_signal(profile, duration, SimulatorSignal::General)?;
+        let mut simulator = Self::new(profile, duration)?;
         simulator.batch_interval = None;
         simulator.max_fragment = 128;
         simulator.channel_count = field_count;
@@ -2242,54 +2048,33 @@ impl SimulatorIo {
     }
 
     fn signal_counts(&self, sequence: u32, field: usize) -> u16 {
-        let volts = match self.signal {
-            SimulatorSignal::General => {
-                let rate = 1_000_000.0 / f64::from(self.sample_period_us);
-                let phase = sequence as f64 * std::f64::consts::TAU / rate;
-                match self.profile_category.as_str() {
-                    "course_emg_force" => match field {
-                        0 => 2.5 + (phase * 70.0).sin() * 0.7,
-                        1 => 2.5 + (phase * 70.0).sin().abs() * 0.7,
-                        2 => 2.5 + (phase * 1.5).sin() * 0.35,
-                        _ => 2.5 + (phase * 0.2).sin() * 0.8,
-                    },
-                    "course_blood_pressure" => match field {
-                        0 => 2.4 + (phase * 1.2).sin() * 0.35,
-                        1 => 2.5 + (phase * 0.08).sin() * 0.9,
-                        _ => 2.45 + (phase * 0.08 + 0.2).sin() * 0.75,
-                    },
-                    "course_pulseox" => {
-                        let state = field % 4;
-                        let dark = matches!(state, 1 | 3);
-                        let base = if field < 4 { 2.1 } else { 2.8 };
-                        if dark {
-                            0.15
-                        } else if state == 0 {
-                            base + 0.25
-                        } else {
-                            base + 0.4
-                        }
-                    }
-                    _ => 2.5 + (phase * 2.0).sin() * 1.1,
-                }
-            }
-            SimulatorSignal::Dc { volts } => volts,
-            SimulatorSignal::Sine {
-                offset_v,
-                peak_to_peak_v,
-                frequency_hz,
-            } => {
-                offset_v
-                    + peak_to_peak_v / 2.0
-                        * (sequence as f64 * std::f64::consts::TAU * frequency_hz / 1_000.0).sin()
-            }
-            SimulatorSignal::IntentionalClipping => {
-                if sequence % 20 < 10 {
-                    0.0
+        let rate = 1_000_000.0 / f64::from(self.sample_period_us);
+        let phase = sequence as f64 * std::f64::consts::TAU / rate;
+        let volts = match self.profile_category.as_str() {
+            "course_emg_force" => match field {
+                0 => 2.5 + (phase * 70.0).sin() * 0.7,
+                1 => 2.5 + (phase * 70.0).sin().abs() * 0.7,
+                2 => 2.5 + (phase * 1.5).sin() * 0.35,
+                _ => 2.5 + (phase * 0.2).sin() * 0.8,
+            },
+            "course_blood_pressure" => match field {
+                0 => 2.4 + (phase * 1.2).sin() * 0.35,
+                1 => 2.5 + (phase * 0.08).sin() * 0.9,
+                _ => 2.45 + (phase * 0.08 + 0.2).sin() * 0.75,
+            },
+            "course_pulseox" => {
+                let state = field % 4;
+                let dark = matches!(state, 1 | 3);
+                let base = if field < 4 { 2.1 } else { 2.8 };
+                if dark {
+                    0.15
+                } else if state == 0 {
+                    base + 0.25
                 } else {
-                    5.0
+                    base + 0.4
                 }
             }
+            _ => 2.5 + (phase * 2.0).sin() * 1.1,
         };
         let full_scale = if self.pulseox { 16_383.0 } else { 4_095.0 };
         (volts * full_scale / 5.0).round().clamp(0.0, full_scale) as u16
@@ -3049,10 +2834,9 @@ mod tests {
             .set_state(SessionState::Connected)
             .unwrap_or_else(|e| panic!("{e}"));
         let mut transport = DisconnectingSimulator {
-            inner: SimulatorIo::new_with_signal(
+            inner: SimulatorIo::new(
                 &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
                 RecordingDuration::Timed { seconds: 2 },
-                SimulatorSignal::General,
             )
             .unwrap_or_else(|e| panic!("{e}")),
             reads: 0,
@@ -3115,45 +2899,6 @@ mod tests {
     }
 
     #[test]
-    fn validation_simulator_signals_are_bounded_and_explicit() {
-        let sine = ValidationRunContext {
-            validation_id: "wvu.validation.001".into(),
-            test_type: "known_sine_wave_acquisition".into(),
-            run_number: 1,
-            bench_only: true,
-            source_description: "synthetic sine".into(),
-            source_setpoint_v: None,
-            source_offset_v: Some(2.5),
-            source_frequency_hz: Some(50.0),
-            source_peak_to_peak_v: Some(1.0),
-            equipment_metadata: std::collections::BTreeMap::new(),
-            simulator_parameters: std::collections::BTreeMap::new(),
-        };
-        let signal = validation_simulator_signal(&sine).unwrap_or_else(|error| panic!("{error}"));
-        let simulator = SimulatorIo::new_with_signal(
-            &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
-            RecordingDuration::Timed { seconds: 10 },
-            signal,
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
-        assert!(simulator.signal_counts(0, 0) >= 1_638 && simulator.signal_counts(0, 0) <= 2_458);
-        let clipping = ValidationRunContext {
-            test_type: "saturation_margin".into(),
-            ..sine
-        };
-        let signal =
-            validation_simulator_signal(&clipping).unwrap_or_else(|error| panic!("{error}"));
-        let simulator = SimulatorIo::new_with_signal(
-            &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
-            RecordingDuration::Timed { seconds: 10 },
-            signal,
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(simulator.signal_counts(0, 0), 0);
-        assert_eq!(simulator.signal_counts(10, 0), 4_095);
-    }
-
-    #[test]
     fn phase4_configuration_payloads_bind_course_channel_maps_and_leds() {
         let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
         let lookup = |category: &str| {
@@ -3185,12 +2930,9 @@ mod tests {
                 .find(|profile| profile.category == category)
                 .unwrap_or_else(|| panic!("missing {category}"))
                 .snapshot(false);
-            let mut simulator = SimulatorIo::new_with_signal(
-                &profile,
-                RecordingDuration::Timed { seconds: 10 },
-                SimulatorSignal::General,
-            )
-            .unwrap_or_else(|error| panic!("{error}"));
+            let mut simulator =
+                SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
+                    .unwrap_or_else(|error| panic!("{error}"));
             let configure = configure_payload(&profile.profile.acquisition)
                 .unwrap_or_else(|error| panic!("{error}"));
             simulator

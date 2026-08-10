@@ -4,8 +4,8 @@
 
 Profiles are teaching/engineering configuration packages, not medical-device configurations.
 Locked course profiles require their controlled UNO firmware identity and preserve raw ADC
-counts/Arduino-input volts. They do not authorize diagnosis or clinical use. The optional
-Validation workflow remains bench-only; normal course capture does not require Validation evidence.
+counts/Arduino-input volts. They do not authorize diagnosis or clinical use. Formal hardware
+characterization is outside the runtime class application scope and never gates course capture.
 
 ## Package shape
 
@@ -66,10 +66,9 @@ Student selected; selecting Student does not require clearing acknowledgement; a
 acknowledgement during Instructor authoring immediately returns the UI and local workflow mode to
 Student. The local mode-change log records only completed backend transitions.
 
-## Bench-validation association
+## Historical evidence compatibility
 
-Phase 3B evidence is deliberately not embedded into or used to change a profile package. The
-Validation view reports a profile as unvalidated, draft, bench validated, expired, or mismatched
-only after comparing a separate finalized validation document's profile ID/version/hash and
-firmware build/device. The recording snapshot remains immutable. See
-`docs/VALIDATION_EVIDENCE_SCHEMA_v1.md`; validation does not authorize human-connected use.
+Older recordings may contain optional Phase 3B validation metadata. Current readers preserve that
+metadata for backward-compatible deserialization but the class application does not create,
+display, or use validation evidence. Acquisition profile integrity remains independent of any
+historical evidence.
