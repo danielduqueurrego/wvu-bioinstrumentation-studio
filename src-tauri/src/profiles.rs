@@ -48,13 +48,113 @@ pub struct FirmwareRequirement {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionMode {
+    Simultaneous,
+    #[serde(rename = "pulseox_4state")]
+    Pulseox4State,
+}
+
+fn default_acquisition_mode() -> AcquisitionMode {
+    AcquisitionMode::Simultaneous
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProfileChannel {
+    pub pin: String,
+    pub id: String,
+    pub label: String,
+    pub csv_name: String,
+    pub units: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PulseOxInputs {
+    pub tx: String,
+    pub rx: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LedOutputs {
+    #[serde(default)]
+    pub green: Option<String>,
+    #[serde(default)]
+    pub red: Option<String>,
+    #[serde(default)]
+    pub ir: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AcquisitionSettings {
+    /// Retained for Phase 1–3 profile snapshots. New profiles use `channels`.
+    #[serde(default = "default_analog_pin")]
     pub analog_pin: String,
     pub adc_resolution_bits: u8,
     pub sample_rate_hz: u32,
     pub allowed_duration_modes: Vec<String>,
     pub timed_presets_seconds: Vec<u64>,
     pub minimum_custom_duration_seconds: u64,
+    #[serde(default = "default_acquisition_mode")]
+    pub acquisition_mode: AcquisitionMode,
+    #[serde(default)]
+    pub channels: Vec<ProfileChannel>,
+    #[serde(default)]
+    pub analog_inputs: Option<PulseOxInputs>,
+    #[serde(default)]
+    pub led_outputs: Option<LedOutputs>,
+    #[serde(default)]
+    pub state_dwell_us: Option<u32>,
+}
+
+fn default_analog_pin() -> String {
+    "A0".into()
+}
+
+impl AcquisitionSettings {
+    pub fn resolved_channels(&self) -> Vec<ProfileChannel> {
+        if !self.channels.is_empty() {
+            return self.channels.clone();
+        }
+        vec![ProfileChannel {
+            pin: self.analog_pin.clone(),
+            id: "raw".into(),
+            label: "Raw analog input".into(),
+            csv_name: "adc_counts".into(),
+            units: "ADC counts".into(),
+        }]
+    }
+
+    pub fn record_field_names(&self) -> Vec<String> {
+        match self.acquisition_mode {
+            AcquisitionMode::Simultaneous => self
+                .resolved_channels()
+                .into_iter()
+                .map(|channel| channel.csv_name)
+                .collect(),
+            AcquisitionMode::Pulseox4State => [
+                "red_TX", "dark1_TX", "ir_TX", "dark2_TX", "red_RX", "dark1_RX", "ir_RX",
+                "dark2_RX",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        }
+    }
+
+    pub fn analog_pins(&self) -> Vec<String> {
+        match self.acquisition_mode {
+            AcquisitionMode::Simultaneous => self
+                .resolved_channels()
+                .into_iter()
+                .map(|channel| channel.pin)
+                .collect(),
+            AcquisitionMode::Pulseox4State => self
+                .analog_inputs
+                .as_ref()
+                .map(|inputs| vec![inputs.tx.clone(), inputs.rx.clone()])
+                .unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -199,19 +299,64 @@ impl AcquisitionProfile {
                 "profile targets an unsupported board or FQBN".into(),
             ));
         }
-        if !matches!(
-            self.acquisition.analog_pin.as_str(),
-            "A0" | "A1" | "A2" | "A3" | "A4" | "A5"
-        ) {
+        let analog_pins = self.acquisition.analog_pins();
+        let supported_pin = |pin: &str| matches!(pin, "A0" | "A1" | "A2" | "A3" | "A4" | "A5");
+        if analog_pins.is_empty()
+            || analog_pins.len() > 6
+            || !analog_pins.iter().all(|pin| supported_pin(pin))
+            || {
+                let mut unique = analog_pins.clone();
+                unique.sort();
+                unique.dedup();
+                unique.len() != analog_pins.len()
+            }
+        {
             return Err(ProfileError::Validation(
-                "analog pin must be A0 through A5".into(),
+                "analog channels must be unique pins A0 through A5".into(),
             ));
         }
-        if self.acquisition.adc_resolution_bits != 12 || self.acquisition.sample_rate_hz != 1_000 {
+        if !matches!(self.acquisition.adc_resolution_bits, 12 | 14) {
             return Err(ProfileError::Validation(
-                "the controlled Phase 3A firmware supports one 12-bit channel at 1000 samples/s"
+                "the controlled Phase 4 firmware supports 12-bit or 14-bit ADC acquisition".into(),
+            ));
+        }
+        if self.acquisition.sample_rate_hz == 0 || self.acquisition.sample_rate_hz > 1_000 {
+            return Err(ProfileError::Validation(
+                "sample rate must be a supported positive rate no greater than 1000 frames/s"
                     .into(),
             ));
+        }
+        match self.acquisition.acquisition_mode {
+            AcquisitionMode::Simultaneous => {
+                if self.acquisition.resolved_channels().len() != analog_pins.len()
+                    || self.acquisition.resolved_channels().iter().any(|channel| {
+                        channel.id.trim().is_empty()
+                            || channel.label.trim().is_empty()
+                            || channel.csv_name.trim().is_empty()
+                            || channel.units != "ADC counts"
+                    })
+                {
+                    return Err(ProfileError::Validation(
+                        "simultaneous profiles require named raw-count channels".into(),
+                    ));
+                }
+            }
+            AcquisitionMode::Pulseox4State => {
+                if self.acquisition.adc_resolution_bits != 14
+                    || self.acquisition.sample_rate_hz != 250
+                    || self.acquisition.state_dwell_us != Some(1_000)
+                    || analog_pins != ["A0".to_string(), "A1".to_string()]
+                    || self.acquisition.analog_inputs.is_none()
+                    || self.acquisition.led_outputs.as_ref().is_none_or(|leds| {
+                        leds.red.as_deref() != Some("D5") || leds.ir.as_deref() != Some("D6")
+                    })
+                {
+                    return Err(ProfileError::Validation(
+                        "pulse-ox profiles require A0/A1, 14 bit, 250 cycles/s, 1000 us states, D5 red, and D6 IR"
+                            .into(),
+                    ));
+                }
+            }
         }
         if self.acquisition.allowed_duration_modes.is_empty()
             || !self
@@ -246,12 +391,10 @@ impl AcquisitionProfile {
                     .into(),
             ));
         }
-        if !self.safety.bench_only
-            || self.safety.human_connection_authorized
-            || !self.safety.not_medical_device
-            || self.safety.notices.is_empty()
-        {
-            return Err(ProfileError::Validation("Phase 3A profiles must be explicitly bench-only, non-medical, and forbid human connection".into()));
+        if !self.safety.not_medical_device || self.safety.notices.is_empty() {
+            return Err(ProfileError::Validation(
+                "profiles must be non-medical and include visible safety notices".into(),
+            ));
         }
         if self.export.signal_name.trim().is_empty() || !self.export.include_profile_snapshot {
             return Err(ProfileError::Validation(
@@ -260,7 +403,10 @@ impl AcquisitionProfile {
         }
         if self.required_firmware.protocol_major != PROTOCOL_MAJOR
             || self.required_firmware.protocol_minor_min > PROTOCOL_MINOR
-            || parse_hex(&self.required_firmware.build)? != REFERENCE_FIRMWARE_BUILD
+            || !matches!(
+                parse_hex(&self.required_firmware.build)?,
+                REFERENCE_FIRMWARE_BUILD | 0x0001_0001
+            )
             || parse_hex(&self.required_firmware.device)? != REFERENCE_DEVICE_ID
         {
             return Err(ProfileError::Validation(
@@ -280,7 +426,7 @@ impl AcquisitionProfile {
         }
     }
     pub fn requires_bench_acknowledgement(&self) -> bool {
-        matches!(self.category.as_str(), "ecg" | "emg")
+        self.safety.bench_only && matches!(self.category.as_str(), "ecg" | "emg")
     }
 }
 
@@ -296,9 +442,11 @@ pub fn load_profile(path: &Path) -> Result<AcquisitionProfile, ProfileError> {
 
 pub fn built_in_profiles() -> Result<Vec<AcquisitionProfile>, ProfileError> {
     [
-        include_str!("../../profiles/general_a0_development.profile.json"),
-        include_str!("../../profiles/ecg_module_raw.profile.json"),
-        include_str!("../../profiles/emg_module_raw.profile.json"),
+        include_str!("../../profiles/general_analog_development.profile.json"),
+        include_str!("../../profiles/ecg_course_capture.profile.json"),
+        include_str!("../../profiles/emg_force_course_capture.profile.json"),
+        include_str!("../../profiles/blood_pressure_ppg_course_capture.profile.json"),
+        include_str!("../../profiles/pulseox_tx_rx_course_capture.profile.json"),
     ]
     .into_iter()
     .map(|text| {
@@ -441,6 +589,36 @@ impl ProfileStore {
             return Err(ProfileError::Validation("description is required".into()));
         }
         draft.description = description;
+        Ok(draft.clone())
+    }
+
+    /// Instructor-authored drafts may remap the general analog channel list. The draft remains
+    /// unusable in Student mode until it is validated, finalized, and hash-locked as a new
+    /// profile version.
+    pub fn update_draft_acquisition(
+        &self,
+        profile_id: &str,
+        profile_version: &str,
+        acquisition: AcquisitionSettings,
+    ) -> Result<AcquisitionProfile, ProfileError> {
+        self.require_instructor()?;
+        let mut runtime = self.lock()?;
+        let draft = runtime
+            .profiles
+            .get_mut(&(profile_id.into(), profile_version.into()))
+            .ok_or_else(|| ProfileError::Validation("draft not found".into()))?;
+        if draft.status != ProfileStatus::Draft {
+            return Err(ProfileError::Validation(
+                "only a draft may be edited".into(),
+            ));
+        }
+        if draft.category != "development" {
+            return Err(ProfileError::Validation(
+                "only a General Analog development draft may remap runtime channels".into(),
+            ));
+        }
+        draft.acquisition = acquisition;
+        draft.validate()?;
         Ok(draft.clone())
     }
     pub fn finalize_draft(
@@ -644,9 +822,70 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     #[test]
+    fn phase4_builtin_hashes_are_deterministic() {
+        let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(profiles.len(), 5);
+        assert!(profiles
+            .iter()
+            .all(|profile| profile.verify_integrity().is_ok()));
+    }
+
+    #[test]
+    fn course_profile_maps_preserve_required_synchronized_variables() {
+        let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
+        let lookup = |category: &str| {
+            profiles
+                .iter()
+                .find(|profile| profile.category == category)
+                .unwrap_or_else(|| panic!("missing {category}"))
+        };
+        let ecg = lookup("course_ecg");
+        assert_eq!(ecg.acquisition.record_field_names(), ["ecg_counts"]);
+        let emg = lookup("course_emg_force");
+        assert_eq!(emg.acquisition.analog_pins(), ["A0", "A1", "A2", "A3"]);
+        assert_eq!(
+            emg.acquisition.record_field_names(),
+            [
+                "raw_emg_counts",
+                "rectified_emg_counts",
+                "emg_envelope_counts",
+                "pressure_counts"
+            ]
+        );
+        let bp = lookup("course_blood_pressure");
+        assert_eq!(bp.acquisition.analog_pins(), ["A0", "A1", "A2"]);
+        assert_eq!(
+            bp.acquisition
+                .led_outputs
+                .as_ref()
+                .and_then(|outputs| outputs.green.as_deref()),
+            Some("D4")
+        );
+        let pulseox = lookup("course_pulseox");
+        assert_eq!(
+            pulseox.acquisition.acquisition_mode,
+            AcquisitionMode::Pulseox4State
+        );
+        assert_eq!(pulseox.acquisition.analog_pins(), ["A0", "A1"]);
+        assert_eq!(pulseox.acquisition.record_field_names().len(), 8);
+        assert_eq!(pulseox.acquisition.state_dwell_us, Some(1_000));
+    }
+
+    #[test]
+    fn profile_validation_rejects_duplicate_pins_and_bad_pulseox_mapping() {
+        let mut profile = built_in_profiles().unwrap_or_else(|error| panic!("{error}"))[2].clone();
+        profile.acquisition.channels[1].pin = "A0".into();
+        profile.integrity.canonical_hash.clear();
+        assert!(profile.validate().is_err());
+        let mut pulseox = built_in_profiles().unwrap_or_else(|error| panic!("{error}"))[4].clone();
+        pulseox.acquisition.state_dwell_us = Some(900);
+        pulseox.integrity.canonical_hash.clear();
+        assert!(pulseox.validate().is_err());
+    }
+    #[test]
     fn builtin_profiles_are_valid_and_hashed() {
         let profiles = built_in_profiles().unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(profiles.len(), 3);
+        assert_eq!(profiles.len(), 5);
         assert!(profiles
             .iter()
             .all(|p| p.status == ProfileStatus::Locked && p.verify_integrity().is_ok()));
@@ -662,13 +901,13 @@ mod tests {
         let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
         let store = ProfileStore::with_root(dir.path().into()).unwrap_or_else(|e| panic!("{e}"));
         assert!(store
-            .duplicate_to_draft("wvu.bmeg420l.ecg.raw.v1", "example.ecg.draft")
+            .duplicate_to_draft("wvu.bmeg420l.ecg.course.capture.v1", "example.ecg.draft")
             .is_err());
         store
             .set_mode(ProfileMode::InstructorAuthoring, true)
             .unwrap_or_else(|e| panic!("{e}"));
         let draft = store
-            .duplicate_to_draft("wvu.bmeg420l.ecg.raw.v1", "example.ecg.draft")
+            .duplicate_to_draft("wvu.bmeg420l.ecg.course.capture.v1", "example.ecg.draft")
             .unwrap_or_else(|e| panic!("{e}"));
         let final_profile = store
             .finalize_draft(&draft.profile_id, &draft.profile_version, "1.0.1".into())
@@ -682,6 +921,43 @@ mod tests {
             .unwrap_or_default()
             .iter()
             .any(|p| p.profile_id == final_profile.profile_id));
+    }
+
+    #[test]
+    fn instructor_can_remap_only_a_general_analog_draft() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let store =
+            ProfileStore::with_root(dir.path().into()).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let draft = store
+            .duplicate_to_draft(
+                "wvu.bmeg420l.general.analog.development.v2",
+                "example.general.draft",
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut settings = draft.acquisition.clone();
+        settings.channels = (0..6)
+            .map(|index| ProfileChannel {
+                pin: format!("A{index}"),
+                id: format!("channel_{index}"),
+                label: format!("Channel {index}"),
+                csv_name: format!("channel_{index}_counts"),
+                units: "ADC counts".into(),
+            })
+            .collect();
+        let remapped = store
+            .update_draft_acquisition(&draft.profile_id, &draft.profile_version, settings)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(remapped.acquisition.analog_pins().len(), 6);
+        assert!(store
+            .update_draft_acquisition(
+                "wvu.bmeg420l.ecg.course.capture.v1",
+                "1.0.0",
+                remapped.acquisition,
+            )
+            .is_err());
     }
     #[test]
     fn failed_instructor_entry_neither_changes_mode_nor_logs_a_success() {

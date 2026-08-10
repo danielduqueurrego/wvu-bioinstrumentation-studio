@@ -46,17 +46,24 @@
   type Compatibility = FirmwareCompatibility;
   type Environment = { cli_path?: string; cli_version?: string; uno_r4_core_version?: string; expected_fqbn: string; boards: Board[]; ready: boolean; problem?: string };
 
+  // Board discovery is owned by the root application cache. This component may refresh
+  // static CLI/core information, but mounting the Firmware view never enumerates boards.
+  export let environment: Environment = { expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false };
+  export let boards: Board[] = [];
+  export let selectedPort = '';
+  export let refreshBoardCache: () => Promise<void> = async () => {};
+  export let verifySelectedBoard: (port: string) => Promise<Verification | undefined> = async () => undefined;
+  export let reportFirmwareJob: (job: Job) => void = () => {};
+
   let editorHost: HTMLDivElement;
   let editor: EditorView | undefined;
   let editorSource = '';
   let project: Project | undefined;
   let templates: Template[] = [];
-  let environment: Environment = { expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false };
   let workflow: WorkflowStatus = { compatibility: 'unknown' };
   let parentFolder = '';
   let projectName = 'MyUnoR4Project';
   let selectedTemplate: TemplateKind = 'blank_uno_r4_wifi';
-  let selectedPort = '';
   let notes = '';
   let saveAsParent = '';
   let saveAsName = '';
@@ -143,8 +150,8 @@
   async function refreshEnvironment() {
     try {
       environment = await invoke<Environment>('firmware_environment');
-      if (!selectedPort || !environment.boards.some((board) => board.port === selectedPort)) {
-        selectedPort = project?.metadata.selected_com_port ?? environment.boards[0]?.port ?? '';
+      if (!selectedPort || !boards.some((board) => board.port === selectedPort)) {
+        selectedPort = project?.metadata.selected_com_port ?? boards[0]?.port ?? '';
       }
       statusMessage = environment.ready
         ? `Arduino CLI ${environment.cli_version ?? ''}; Renesas UNO core ${environment.uno_r4_core_version ?? ''}.`
@@ -277,6 +284,7 @@
     if (!project || dirty || activeJob) return;
     try {
       workflow.job = await invoke<Job>('start_firmware_compile', { request: { projectFolder: project.project_folder, unsavedChanges: false } });
+      reportFirmwareJob(workflow.job);
       statusMessage = `Compiling saved project ${project.metadata.source_filename} for ${environment.expected_fqbn}.`;
     } catch (error) {
       statusMessage = `Compile could not start: ${friendlyFailure(error)}`;
@@ -292,6 +300,7 @@
     if (!allowed) return;
     try {
       workflow.job = await invoke<Job>('start_firmware_upload', { request: { projectFolder: project.project_folder, port: selectedPort, unsavedChanges: false, confirmation: true } });
+      reportFirmwareJob(workflow.job);
       statusMessage = 'Closing the production serial session and starting the selected-board upload workflow.';
     } catch (error) {
       statusMessage = `Upload could not start: ${friendlyFailure(error)}`;
@@ -307,6 +316,7 @@
     if (!allowed) return;
     try {
       workflow.job = await invoke<Job>('restore_wvu_reference_firmware', { request: { port: selectedPort, confirmation: true } });
+      reportFirmwareJob(workflow.job);
       statusMessage = 'Restoring the controlled repository reference firmware. Acquisition remains disabled until identity verification passes.';
     } catch (error) {
       statusMessage = `Reference restore could not start: ${friendlyFailure(error)}`;
@@ -316,11 +326,11 @@
   async function verifyReference() {
     if (!selectedPort || activeJob) return;
     try {
-      const verification = await invoke<Verification>('verify_wvu_reference_firmware', { port: selectedPort });
+      const verification = await verifySelectedBoard(selectedPort);
       await refreshWorkflow();
-      statusMessage = verification.compatible
+      statusMessage = verification?.compatible
         ? `Verified WVU protocol firmware on ${selectedPort}: ${verification.protocol_version ?? 'protocol version unavailable'}.`
-        : verification.explanation;
+        : verification?.explanation ?? 'Firmware verification did not return a result.';
     } catch (error) {
       statusMessage = `Reference verification failed: ${friendlyFailure(error)}`;
       await refreshWorkflow();
@@ -393,12 +403,10 @@
       } catch (error) {
         statusMessage = `Could not load firmware workspace: ${String(error)}`;
       }
-      await refreshEnvironment();
       await refreshWorkflow();
     })();
     const timer = window.setInterval(() => {
       void refreshWorkflow();
-      if (workflow.job?.active) void refreshEnvironment();
     }, 500);
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (!dirty) return;
@@ -473,13 +481,13 @@
         <dt>Readiness</dt><dd>{environment.ready ? 'Ready' : environment.problem ?? 'Not ready'}</dd>
       </dl>
       <label>Selected UNO R4 WiFi
-        <select bind:value={selectedPort} disabled={activeJob}>
+        <select bind:value={selectedPort} onchange={() => void verifyReference()} disabled={activeJob}>
           <option value="">Select a detected UNO R4 WiFi</option>
-          {#each environment.boards as board}<option value={board.port}>{board.name} — {board.port}{board.serial_number ? ` (${board.serial_number})` : ''}</option>{/each}
+          {#each boards as board}<option value={board.port}>{board.name} — {board.port}{board.serial_number ? ` (${board.serial_number})` : ''}</option>{/each}
         </select>
       </label>
       <div class="action-stack">
-        <button type="button" onclick={refreshEnvironment} disabled={activeJob}>Refresh boards</button>
+        <button type="button" onclick={refreshBoardCache} disabled={activeJob}>Refresh boards</button>
         <button type="button" onclick={verifyReference} disabled={!selectedPort || activeJob}>Verify WVU firmware</button>
         <button class="gold" type="button" onclick={compileProject} disabled={compileDisabled}>Compile saved project</button>
         <button type="button" onclick={uploadProject} disabled={uploadDisabled}>Upload selected project</button>

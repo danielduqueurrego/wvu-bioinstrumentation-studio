@@ -1,5 +1,7 @@
-//! Phase 1 `.bmeg`: `BMEGREC1` + u16 JSON-header length + UTF-8 header + fixed records.
-//! Each record is little-endian: u32 sample sequence, u64 timestamp_us, u16 ADC counts.
+//! `.bmeg`: `BMEGREC1` + u16 JSON-header length + UTF-8 header + streamed records.
+//! Legacy Phase 1–3 records are `u32 sequence, u64 timestamp_us, u16 ADC counts`.
+//! Phase 4 profile-aware records preserve a synchronized frame as
+//! `u32 sequence, u64 timestamp_us, u16 status_flags, u16[field_count] counts`.
 use crate::{profiles::ProfileSnapshot, protocol::IntegrityCounters};
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
@@ -87,6 +89,8 @@ pub struct RecordingMetadata {
     pub utc_start: DateTime<Utc>,
     pub local_start: DateTime<Local>,
     pub board: String,
+    #[serde(default)]
+    pub board_serial: Option<String>,
     pub com_port: String,
     pub fqbn: String,
     pub arduino_cli_version: String,
@@ -94,6 +98,10 @@ pub struct RecordingMetadata {
     pub firmware_build: u32,
     pub protocol_version: String,
     pub analog_pin: String,
+    #[serde(default)]
+    pub active_analog_pins: Vec<String>,
+    #[serde(default)]
+    pub digital_output_mapping: BTreeMap<String, String>,
     pub adc_bits: u8,
     pub requested_sample_rate_hz: u32,
     pub measured_sample_rate_hz: f64,
@@ -131,6 +139,9 @@ pub struct RecordingMetadata {
     /// the BMEG header stays compact and legacy BMEG readers remain compatible.
     #[serde(default)]
     pub validation_context: Option<ValidationRunContext>,
+    /// Manual, non-protocol experiment annotations. Markers never alter or remove raw samples.
+    #[serde(default)]
+    pub markers: Vec<RecordingMarker>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -149,15 +160,39 @@ pub struct ValidationRunContext {
     #[serde(default)]
     pub simulator_parameters: BTreeMap<String, String>,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecordingMarker {
+    pub timestamp_us: u64,
+    pub label: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RawSample {
     pub sequence: u32,
     pub timestamp_us: u64,
     pub counts: u16,
 }
+
+/// One synchronized logical acquisition record. The UNO reads configured analog pins in a
+/// deterministic sequential order; this shared timestamp/sequence preserves the logical frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SynchronizedRecord {
+    pub sequence: u32,
+    pub timestamp_us: u64,
+    pub status_flags: u16,
+    pub counts: Vec<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordLayout {
+    Legacy,
+    Synchronized { field_count: usize },
+}
 pub struct BmegWriter {
     writer: BufWriter<File>,
     pub records: u64,
+    layout: RecordLayout,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum RecordingError {
@@ -171,21 +206,66 @@ pub enum RecordingError {
     BadMagic,
     #[error("recording is truncated")]
     Truncated,
+    #[error("recording record shape does not match the profile field layout")]
+    InvalidRecordShape,
 }
 impl BmegWriter {
     pub fn create(path: &Path, metadata: &RecordingMetadata) -> Result<Self, RecordingError> {
+        Self::create_with_layout(path, metadata, RecordLayout::Legacy)
+    }
+
+    pub fn create_synchronized(
+        path: &Path,
+        metadata: &RecordingMetadata,
+        field_count: usize,
+    ) -> Result<Self, RecordingError> {
+        if field_count == 0 || field_count > 8 {
+            return Err(RecordingError::InvalidRecordShape);
+        }
+        Self::create_with_layout(path, metadata, RecordLayout::Synchronized { field_count })
+    }
+
+    fn create_with_layout(
+        path: &Path,
+        metadata: &RecordingMetadata,
+        layout: RecordLayout,
+    ) -> Result<Self, RecordingError> {
         let header = serde_json::to_vec(metadata)?;
         let header_len = u16::try_from(header.len()).map_err(|_| RecordingError::HeaderTooLarge)?;
         let mut writer = BufWriter::new(File::create(path)?);
         writer.write_all(BMEG_MAGIC)?;
         writer.write_all(&header_len.to_le_bytes())?;
         writer.write_all(&header)?;
-        Ok(Self { writer, records: 0 })
+        Ok(Self {
+            writer,
+            records: 0,
+            layout,
+        })
     }
     pub fn write(&mut self, sample: RawSample) -> Result<(), RecordingError> {
+        if self.layout != RecordLayout::Legacy {
+            return Err(RecordingError::InvalidRecordShape);
+        }
         self.writer.write_all(&sample.sequence.to_le_bytes())?;
         self.writer.write_all(&sample.timestamp_us.to_le_bytes())?;
         self.writer.write_all(&sample.counts.to_le_bytes())?;
+        self.records += 1;
+        Ok(())
+    }
+
+    pub fn write_record(&mut self, record: &SynchronizedRecord) -> Result<(), RecordingError> {
+        let RecordLayout::Synchronized { field_count } = self.layout else {
+            return Err(RecordingError::InvalidRecordShape);
+        };
+        if record.counts.len() != field_count {
+            return Err(RecordingError::InvalidRecordShape);
+        }
+        self.writer.write_all(&record.sequence.to_le_bytes())?;
+        self.writer.write_all(&record.timestamp_us.to_le_bytes())?;
+        self.writer.write_all(&record.status_flags.to_le_bytes())?;
+        for counts in &record.counts {
+            self.writer.write_all(&counts.to_le_bytes())?;
+        }
         self.records += 1;
         Ok(())
     }
@@ -207,6 +287,7 @@ impl BmegWriter {
 pub struct BmegReader {
     reader: BufReader<File>,
     pub metadata: RecordingMetadata,
+    layout: RecordLayout,
 }
 impl BmegReader {
     pub fn open(path: &Path) -> Result<Self, RecordingError> {
@@ -220,12 +301,68 @@ impl BmegReader {
         reader.read_exact(&mut length).map_err(map_eof)?;
         let mut header = vec![0u8; usize::from(u16::from_le_bytes(length))];
         reader.read_exact(&mut header).map_err(map_eof)?;
+        let metadata: RecordingMetadata = serde_json::from_slice(&header)?;
+        let layout = metadata
+            .profile_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.profile.required_firmware.protocol_minor_min >= 2)
+            .map(|snapshot| RecordLayout::Synchronized {
+                field_count: snapshot.profile.acquisition.record_field_names().len(),
+            })
+            .unwrap_or(RecordLayout::Legacy);
         Ok(Self {
             reader,
-            metadata: serde_json::from_slice(&header)?,
+            metadata,
+            layout,
         })
     }
     pub fn next_sample(&mut self) -> Result<Option<RawSample>, RecordingError> {
+        Ok(self.next_record()?.map(|record| RawSample {
+            sequence: record.sequence,
+            timestamp_us: record.timestamp_us,
+            counts: record.counts[0],
+        }))
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<SynchronizedRecord>, RecordingError> {
+        match self.layout {
+            RecordLayout::Legacy => self.next_legacy_record(),
+            RecordLayout::Synchronized { field_count } => {
+                let mut prefix = [0u8; 14];
+                match self.reader.read(&mut prefix[..1]) {
+                    Ok(0) => return Ok(None),
+                    Ok(_) => {}
+                    Err(error) => return Err(RecordingError::Io(error)),
+                }
+                self.reader.read_exact(&mut prefix[1..]).map_err(map_eof)?;
+                let mut values = vec![0u8; field_count * 2];
+                self.reader.read_exact(&mut values).map_err(map_eof)?;
+                Ok(Some(SynchronizedRecord {
+                    sequence: u32::from_le_bytes(
+                        prefix[0..4]
+                            .try_into()
+                            .map_err(|_| RecordingError::Truncated)?,
+                    ),
+                    timestamp_us: u64::from_le_bytes(
+                        prefix[4..12]
+                            .try_into()
+                            .map_err(|_| RecordingError::Truncated)?,
+                    ),
+                    status_flags: u16::from_le_bytes(
+                        prefix[12..14]
+                            .try_into()
+                            .map_err(|_| RecordingError::Truncated)?,
+                    ),
+                    counts: values
+                        .chunks_exact(2)
+                        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                        .collect(),
+                }))
+            }
+        }
+    }
+
+    fn next_legacy_record(&mut self) -> Result<Option<SynchronizedRecord>, RecordingError> {
         let mut bytes = [0u8; BMEG_RECORD_BYTES];
         match self.reader.read(&mut bytes[..1]) {
             Ok(0) => return Ok(None),
@@ -233,7 +370,7 @@ impl BmegReader {
             Err(error) => return Err(RecordingError::Io(error)),
         }
         self.reader.read_exact(&mut bytes[1..]).map_err(map_eof)?;
-        Ok(Some(RawSample {
+        Ok(Some(SynchronizedRecord {
             sequence: u32::from_le_bytes(
                 bytes[0..4]
                     .try_into()
@@ -244,11 +381,12 @@ impl BmegReader {
                     .try_into()
                     .map_err(|_| RecordingError::Truncated)?,
             ),
-            counts: u16::from_le_bytes(
+            counts: vec![u16::from_le_bytes(
                 bytes[12..14]
                     .try_into()
                     .map_err(|_| RecordingError::Truncated)?,
-            ),
+            )],
+            status_flags: 1,
         }))
     }
 }
@@ -264,6 +402,9 @@ fn map_eof(error: std::io::Error) -> RecordingError {
 /// Writes a CSV by streaming a BMEG file. No complete recording is kept in RAM.
 pub fn export_bmeg_csv(bmeg: &Path, csv: &Path) -> Result<u64, RecordingError> {
     let mut input = BmegReader::open(bmeg)?;
+    if input.layout != RecordLayout::Legacy {
+        return export_multichannel_csv(&mut input, csv);
+    }
     let first_timestamp = input.metadata.utc_start.timestamp_micros();
     let mut writer = BufWriter::new(File::create(csv)?);
     let profile = input.metadata.profile_snapshot.clone();
@@ -328,6 +469,39 @@ pub fn export_bmeg_csv(bmeg: &Path, csv: &Path) -> Result<u64, RecordingError> {
     Ok(count)
 }
 
+fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, RecordingError> {
+    let snapshot = input
+        .metadata
+        .profile_snapshot
+        .as_ref()
+        .ok_or(RecordingError::InvalidRecordShape)?;
+    let fields = snapshot.profile.acquisition.record_field_names();
+    let pulseox = matches!(
+        snapshot.profile.acquisition.acquisition_mode,
+        crate::profiles::AcquisitionMode::Pulseox4State
+    );
+    let mut writer = BufWriter::new(File::create(csv)?);
+    if pulseox {
+        writeln!(writer, "cycle_index,t_us,{}", fields.join(","))?;
+    } else {
+        writeln!(writer, "record_sequence,t_us,{}", fields.join(","))?;
+    }
+    let mut count = 0u64;
+    while let Some(record) = input.next_record()? {
+        if record.counts.len() != fields.len() {
+            return Err(RecordingError::InvalidRecordShape);
+        }
+        write!(writer, "{},{}", record.sequence, record.timestamp_us)?;
+        for counts in record.counts {
+            write!(writer, ",{counts}")?;
+        }
+        writer.write_all(b"\n")?;
+        count += 1;
+    }
+    writer.flush()?;
+    Ok(count)
+}
+
 fn csv_field(value: &str) -> String {
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -362,6 +536,7 @@ mod tests {
             utc_start: Utc::now(),
             local_start: Local::now(),
             board: "simulator".into(),
+            board_serial: None,
             com_port: "SIM".into(),
             fqbn: "simulator".into(),
             arduino_cli_version: "n/a".into(),
@@ -369,6 +544,8 @@ mod tests {
             firmware_build: 1,
             protocol_version: "0.1".into(),
             analog_pin: "A0".into(),
+            active_analog_pins: vec!["A0".into()],
+            digital_output_mapping: BTreeMap::new(),
             adc_bits: 12,
             requested_sample_rate_hz: 1000,
             measured_sample_rate_hz: 1000.0,
@@ -392,6 +569,7 @@ mod tests {
             completion_status: "complete".into(),
             profile_snapshot: None,
             validation_context: None,
+            markers: Vec::new(),
         };
         let bmeg = dir.path().join("r.bmeg");
         let mut w = BmegWriter::create(&bmeg, &meta).unwrap_or_else(|e| panic!("{e}"));
@@ -464,6 +642,7 @@ mod tests {
             utc_start: Utc::now(),
             local_start: Local::now(),
             board: "simulator".into(),
+            board_serial: None,
             com_port: "SIM".into(),
             fqbn: "simulator".into(),
             arduino_cli_version: "n/a".into(),
@@ -471,6 +650,8 @@ mod tests {
             firmware_build: 1,
             protocol_version: "0.1".into(),
             analog_pin: "A0".into(),
+            active_analog_pins: vec!["A0".into()],
+            digital_output_mapping: BTreeMap::new(),
             adc_bits: 12,
             requested_sample_rate_hz: 1000,
             measured_sample_rate_hz: 1000.0,
@@ -494,6 +675,7 @@ mod tests {
             completion_status: "complete".into(),
             profile_snapshot: None,
             validation_context: None,
+            markers: Vec::new(),
         };
         let mut old = serde_json::to_value(metadata).unwrap_or_else(|e| panic!("{e}"));
         let object = old
@@ -521,13 +703,14 @@ mod tests {
         let profile = crate::profiles::built_in_profiles()
             .unwrap_or_else(|e| panic!("{e}"))
             .into_iter()
-            .find(|profile| profile.category == "ecg")
+            .find(|profile| profile.category == "course_ecg")
             .unwrap_or_else(|| panic!("missing ECG profile"))
             .snapshot(true);
         let mut metadata = RecordingMetadata {
             utc_start: Utc::now(),
             local_start: Local::now(),
             board: "Simulator".into(),
+            board_serial: None,
             com_port: "SIM".into(),
             fqbn: "simulator".into(),
             arduino_cli_version: "n/a".into(),
@@ -535,6 +718,8 @@ mod tests {
             firmware_build: 0x0001_0001,
             protocol_version: "0.1".into(),
             analog_pin: "A0".into(),
+            active_analog_pins: vec!["A0".into()],
+            digital_output_mapping: BTreeMap::new(),
             adc_bits: 12,
             requested_sample_rate_hz: 1000,
             measured_sample_rate_hz: 0.0,
@@ -558,19 +743,26 @@ mod tests {
             completion_status: "complete".into(),
             profile_snapshot: Some(profile.clone()),
             validation_context: None,
+            markers: vec![RecordingMarker {
+                timestamp_us: 0,
+                label: "baseline".into(),
+            }],
         };
         let bmeg = dir.path().join("profile.bmeg");
-        let mut writer = BmegWriter::create(&bmeg, &metadata).unwrap_or_else(|e| panic!("{e}"));
+        let mut writer =
+            BmegWriter::create_synchronized(&bmeg, &metadata, 1).unwrap_or_else(|e| panic!("{e}"));
         writer
-            .write(RawSample {
+            .write_record(&SynchronizedRecord {
                 sequence: 0,
                 timestamp_us: 0,
-                counts: 2048,
+                status_flags: 1,
+                counts: vec![2048],
             })
             .unwrap_or_else(|e| panic!("{e}"));
         writer.finish().unwrap_or_else(|e| panic!("{e}"));
         let read_back = BmegReader::open(&bmeg).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(read_back.metadata.profile_snapshot, Some(profile));
+        assert_eq!(read_back.metadata.markers[0].label, "baseline");
         let csv = dir.path().join("profile.csv");
         assert_eq!(
             export_bmeg_csv(&bmeg, &csv).unwrap_or_else(|e| panic!("{e}")),
@@ -578,7 +770,7 @@ mod tests {
         );
         assert!(std::fs::read_to_string(csv)
             .unwrap_or_default()
-            .contains("profile_id"));
+            .starts_with("record_sequence,t_us,ecg_counts"));
         metadata.profile_snapshot = None;
         assert!(metadata.profile_snapshot.is_none());
     }
@@ -589,13 +781,14 @@ mod tests {
         let profile = crate::profiles::built_in_profiles()
             .unwrap_or_else(|e| panic!("{e}"))
             .into_iter()
-            .find(|profile| profile.category == "ecg")
+            .find(|profile| profile.category == "course_ecg")
             .unwrap_or_else(|| panic!("missing ECG profile"))
             .snapshot(true);
         let metadata = RecordingMetadata {
             utc_start: Utc::now(),
             local_start: Local::now(),
             board: "Simulator".into(),
+            board_serial: None,
             com_port: "SIM".into(),
             fqbn: "simulator".into(),
             arduino_cli_version: "n/a".into(),
@@ -603,6 +796,8 @@ mod tests {
             firmware_build: 0x0001_0001,
             protocol_version: "0.1".into(),
             analog_pin: "A0".into(),
+            active_analog_pins: vec!["A0".into()],
+            digital_output_mapping: BTreeMap::new(),
             adc_bits: 12,
             requested_sample_rate_hz: 1_000,
             measured_sample_rate_hz: 1_000.0,
@@ -638,22 +833,26 @@ mod tests {
                 equipment_metadata: BTreeMap::new(),
                 simulator_parameters: BTreeMap::from([("seed".into(), "test".into())]),
             }),
+            markers: Vec::new(),
         };
         let bmeg = dir.path().join("validation.bmeg");
         let csv = dir.path().join("validation.csv");
-        let mut writer = BmegWriter::create(&bmeg, &metadata).unwrap_or_else(|e| panic!("{e}"));
+        let mut writer =
+            BmegWriter::create_synchronized(&bmeg, &metadata, 1).unwrap_or_else(|e| panic!("{e}"));
         writer
-            .write(RawSample {
+            .write_record(&SynchronizedRecord {
                 sequence: 0,
                 timestamp_us: 0,
-                counts: 2048,
+                status_flags: 1,
+                counts: vec![2048],
             })
             .unwrap_or_else(|e| panic!("{e}"));
         writer
-            .write(RawSample {
+            .write_record(&SynchronizedRecord {
                 sequence: 1,
                 timestamp_us: 1_000,
-                counts: 2048,
+                status_flags: 1,
+                counts: vec![2048],
             })
             .unwrap_or_else(|e| panic!("{e}"));
         writer.finish().unwrap_or_else(|e| panic!("{e}"));
@@ -667,10 +866,9 @@ mod tests {
             metadata.validation_context
         );
         let header = std::fs::read_to_string(csv).unwrap_or_else(|e| panic!("{e}"));
-        assert!(header
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .contains("validation_run_number"));
+        assert_eq!(
+            header.lines().next(),
+            Some("record_sequence,t_us,ecg_counts")
+        );
     }
 }

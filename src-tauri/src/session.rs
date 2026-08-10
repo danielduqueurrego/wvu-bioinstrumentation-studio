@@ -8,11 +8,11 @@ use crate::{
     profiles::{built_in_profiles, ProfileSnapshot, ProfileStatus},
     protocol::{
         encode_frame, Frame, FrameParser, IntegrityCounters, MessageType, SampleBatch,
-        REFERENCE_DEVICE_ID, REFERENCE_FIRMWARE_BUILD,
+        CONTROLLED_SERIAL_BAUD, REFERENCE_DEVICE_ID, REFERENCE_FIRMWARE_BUILD,
     },
     recording::{
-        export_bmeg_csv, BmegWriter, RawSample, RecordingDuration, RecordingMetadata, StopReason,
-        ValidationRunContext,
+        export_bmeg_csv, BmegWriter, RecordingDuration, RecordingMarker, RecordingMetadata,
+        StopReason, SynchronizedRecord, ValidationRunContext,
     },
 };
 use chrono::{Local, Utc};
@@ -209,6 +209,8 @@ pub struct SessionSummary {
     pub error: Option<String>,
     pub profile: ProfileSnapshot,
     pub validation_context: Option<ValidationRunContext>,
+    pub active_digital_output_mask: Option<u8>,
+    pub final_digital_output_mask: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -233,6 +235,7 @@ pub struct SessionStatus {
     pub last_summary: Option<SessionSummary>,
     pub profile: Option<ProfileSnapshot>,
     pub validation_context: Option<ValidationRunContext>,
+    pub digital_output_mask: Option<u8>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -266,7 +269,7 @@ struct SessionRuntime {
     port: String,
     simulator: bool,
     protocol_version: String,
-    recent: VecDeque<RawSample>,
+    recent: VecDeque<SynchronizedRecord>,
     samples: u64,
     packets: u64,
     measured_rate_hz: f64,
@@ -281,6 +284,8 @@ struct SessionRuntime {
     connection_diagnostics: Option<ConnectionDiagnostics>,
     profile: Option<ProfileSnapshot>,
     validation_context: Option<ValidationRunContext>,
+    markers: Vec<RecordingMarker>,
+    digital_output_mask: Option<u8>,
 }
 
 impl Default for SessionController {
@@ -297,7 +302,7 @@ impl SessionController {
                 board: String::new(),
                 port: String::new(),
                 simulator: false,
-                protocol_version: "0.1".into(),
+                protocol_version: "0.2".into(),
                 recent: VecDeque::with_capacity(DISPLAY_CAPACITY),
                 samples: 0,
                 packets: 0,
@@ -313,6 +318,8 @@ impl SessionController {
                 connection_diagnostics: None,
                 profile: None,
                 validation_context: None,
+                markers: Vec::new(),
+                digital_output_mask: None,
             })),
             cancel: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
@@ -325,8 +332,8 @@ impl SessionController {
         Ok(Self::status_from_runtime(&runtime))
     }
 
-    pub fn recent_samples(&self) -> Result<Vec<RawSample>, SessionError> {
-        Ok(self.lock_runtime()?.recent.iter().copied().collect())
+    pub fn recent_samples(&self) -> Result<Vec<SynchronizedRecord>, SessionError> {
+        Ok(self.lock_runtime()?.recent.iter().cloned().collect())
     }
 
     pub fn is_recording(&self) -> Result<bool, SessionError> {
@@ -338,6 +345,34 @@ impl SessionController {
                 | SessionState::Acquiring
                 | SessionState::Stopping
         ))
+    }
+
+    /// Adds a bounded user annotation to the active logical-record stream. It is recorded in the
+    /// finalized metadata sidecar/header and never changes the raw BMEG samples.
+    pub fn add_marker(&self, label: String) -> Result<RecordingMarker, SessionError> {
+        let label = label.trim();
+        if label.len() > 80 || label.contains('\0') {
+            return Err(SessionError::State(
+                "marker label must be at most 80 non-NUL characters",
+            ));
+        }
+        let mut runtime = self.lock_runtime()?;
+        if runtime.state != SessionState::Acquiring {
+            return Err(SessionError::State(
+                "markers can be added only while recording",
+            ));
+        }
+        let timestamp_us = runtime
+            .recent
+            .back()
+            .map(|record| record.timestamp_us)
+            .unwrap_or(0);
+        let marker = RecordingMarker {
+            timestamp_us,
+            label: label.into(),
+        };
+        runtime.markers.push(marker.clone());
+        Ok(marker)
     }
 
     /// Starts the common production path on a worker. This returns quickly; callers poll status.
@@ -629,7 +664,7 @@ impl SessionController {
         self.set_reset_diagnostics(ConnectionDiagnostics::new(&target.port))?;
 
         let result = (|| {
-            let mut port = serialport::new(&target.port, 115_200)
+            let mut port = serialport::new(&target.port, CONTROLLED_SERIAL_BAUD)
                 .timeout(Duration::from_millis(25))
                 .open()?;
             self.mark_port_opened(&target.port)?;
@@ -774,7 +809,7 @@ impl SessionController {
             // unchanged. Give its application firmware a bounded settling period
             // even when no disappearance was observable.
             thread::sleep(RESET_APPLICATION_GRACE);
-            let mut port = serialport::new(&final_port, 115_200)
+            let mut port = serialport::new(&final_port, CONTROLLED_SERIAL_BAUD)
                 .timeout(Duration::from_millis(25))
                 .open()?;
             self.mark_port_opened(&final_port)?;
@@ -840,6 +875,7 @@ impl SessionController {
         runtime.board = board.to_owned();
         runtime.port = port.to_owned();
         runtime.simulator = simulator;
+        runtime.protocol_version = "0.2".into();
         runtime.recent.clear();
         runtime.samples = 0;
         runtime.packets = 0;
@@ -859,6 +895,7 @@ impl SessionController {
         };
         runtime.profile = Some(profile);
         runtime.validation_context = None;
+        runtime.markers.clear();
         self.cancel.store(false, Ordering::Release);
         let mut stop_reason = self
             .stop_reason
@@ -918,7 +955,7 @@ impl SessionController {
         signal: SimulatorSignal,
     ) -> Result<(), SessionError> {
         let result = (|| {
-            let mut simulator = SimulatorIo::new_with_signal(duration.clone(), signal)?;
+            let mut simulator = SimulatorIo::new_with_signal(&profile, duration.clone(), signal)?;
             self.set_state(SessionState::Connected)?;
             self.capture_transport(&mut simulator, true, "SIM", profile, duration, &output_dir)
         })();
@@ -934,7 +971,7 @@ impl SessionController {
         output_dir: PathBuf,
     ) -> Result<(), SessionError> {
         let result = (|| {
-            let mut port = serialport::new(&port_name, 115_200)
+            let mut port = serialport::new(&port_name, CONTROLLED_SERIAL_BAUD)
                 .timeout(Duration::from_millis(25))
                 .open()?;
             self.mark_port_opened(&port_name)?;
@@ -988,11 +1025,16 @@ impl SessionController {
         acquisition.configure().map_err(SessionError::State)?;
         self.set_state(SessionState::Configured)?;
         // The recording is open before START, so every validated post-start sample has a sink.
-        let mut raw = BmegWriter::create(&temporary_bmeg, &initial_meta)?;
+        let mut raw = BmegWriter::create_synchronized(
+            &temporary_bmeg,
+            &initial_meta,
+            profile.profile.acquisition.record_field_names().len(),
+        )?;
         acquisition.start().map_err(SessionError::State)?;
         self.send_command(io, MessageType::Start, 2, vec![])?;
         self.wait_until(io, &mut acquisition, |s| s.status_seen, "START status")?;
         self.set_state(SessionState::Acquiring)?;
+        let active_digital_output_mask = acquisition.snapshot().digital_output_mask;
 
         let started = Instant::now();
         let mut last_ping = Instant::now();
@@ -1047,11 +1089,29 @@ impl SessionController {
         }
 
         let _ = self.send_command(io, MessageType::Stop, 4, vec![]);
+        // Give the controlled firmware a bounded opportunity to confirm that all
+        // course LED outputs are low before the serial handle is released.
+        let stop_status_deadline = Instant::now() + Duration::from_millis(300);
+        while terminal_error.is_none() && Instant::now() < stop_status_deadline {
+            match io.read(&mut buffer) {
+                Ok(n) if n > 0 => acquisition.ingest_bytes(&buffer[..n]),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(error) => {
+                    terminal_error = Some(error);
+                    break;
+                }
+            }
+            if acquisition.snapshot().digital_output_mask == Some(0) {
+                break;
+            }
+        }
         self.drain_samples(&rx, &mut raw)?;
         raw.finish()?;
         fs::rename(&temporary_bmeg, &bmeg)?;
         let csv_rows = export_bmeg_csv(&bmeg, &csv)?;
         let mut snapshot = acquisition.snapshot();
+        let final_digital_output_mask = snapshot.digital_output_mask;
         if terminal_error.is_some() {
             snapshot.integrity.disconnect_events += 1;
         }
@@ -1089,6 +1149,7 @@ impl SessionController {
             "incomplete"
         }
         .into();
+        final_meta.markers = self.lock_runtime()?.markers.clone();
         fs::write(
             &metadata,
             serde_json::to_vec_pretty(&final_meta)
@@ -1120,6 +1181,8 @@ impl SessionController {
                 .map(std::string::ToString::to_string),
             profile,
             validation_context: final_meta.validation_context.clone(),
+            active_digital_output_mask,
+            final_digital_output_mask,
         };
         self.set_summary(summary.clone())?;
         self.set_runtime_stop_reason(reason)?;
@@ -1318,11 +1381,11 @@ impl SessionController {
 
     fn drain_samples(
         &self,
-        receiver: &Receiver<RawSample>,
+        receiver: &Receiver<SynchronizedRecord>,
         raw: &mut BmegWriter,
     ) -> Result<(), SessionError> {
         for sample in receiver.try_iter() {
-            raw.write(sample)?;
+            raw.write_record(&sample)?;
             let mut runtime = self.lock_runtime()?;
             if runtime.recent.len() == DISPLAY_CAPACITY {
                 runtime.recent.pop_front();
@@ -1340,8 +1403,8 @@ impl SessionController {
         duration: &RecordingDuration,
         profile: &ProfileSnapshot,
     ) -> Result<RecordingMetadata, SessionError> {
-        let (arduino_cli_version, uno_r4_core_version) = if simulator {
-            ("not applicable".into(), "not applicable".into())
+        let (arduino_cli_version, uno_r4_core_version, board_serial) = if simulator {
+            ("not applicable".into(), "not applicable".into(), None)
         } else {
             let cli = crate::arduino_cli::ArduinoCli::discover(None)
                 .map_err(|error| SessionError::Protocol(error.to_string()))?;
@@ -1354,8 +1417,27 @@ impl SessionController {
             let core = cli
                 .uno_r4_core_version()
                 .map_err(|error| SessionError::Protocol(error.to_string()))?;
-            (version, core)
+            let serial = cli
+                .boards()
+                .ok()
+                .into_iter()
+                .flatten()
+                .find(|board| board.port.eq_ignore_ascii_case(source))
+                .and_then(|board| board.serial_number);
+            (version, core, serial)
         };
+        let mut digital_output_mapping = std::collections::BTreeMap::new();
+        if let Some(outputs) = profile.profile.acquisition.led_outputs.as_ref() {
+            if let Some(pin) = outputs.green.as_ref() {
+                digital_output_mapping.insert("green".into(), pin.clone());
+            }
+            if let Some(pin) = outputs.red.as_ref() {
+                digital_output_mapping.insert("red".into(), pin.clone());
+            }
+            if let Some(pin) = outputs.ir.as_ref() {
+                digital_output_mapping.insert("ir".into(), pin.clone());
+            }
+        }
         Ok(RecordingMetadata {
             utc_start: Utc::now(),
             local_start: Local::now(),
@@ -1364,6 +1446,7 @@ impl SessionController {
             } else {
                 "Arduino UNO R4 WiFi".into()
             },
+            board_serial,
             com_port: source.into(),
             fqbn: if simulator {
                 "simulator".into()
@@ -1373,8 +1456,10 @@ impl SessionController {
             arduino_cli_version,
             uno_r4_core_version,
             firmware_build: REFERENCE_FIRMWARE_BUILD,
-            protocol_version: "0.1".into(),
-            analog_pin: profile.profile.acquisition.analog_pin.clone(),
+            protocol_version: "0.2".into(),
+            analog_pin: profile.profile.acquisition.analog_pins().join(","),
+            active_analog_pins: profile.profile.acquisition.analog_pins(),
+            digital_output_mapping,
             adc_bits: profile.profile.acquisition.adc_resolution_bits,
             requested_sample_rate_hz: profile.profile.acquisition.sample_rate_hz,
             measured_sample_rate_hz: 0.0,
@@ -1407,6 +1492,7 @@ impl SessionController {
             completion_status: "active".into(),
             profile_snapshot: Some(profile.clone()),
             validation_context: self.lock_runtime()?.validation_context.clone(),
+            markers: Vec::new(),
         })
     }
 
@@ -1432,6 +1518,12 @@ impl SessionController {
             let name = validation_name.clone().unwrap_or_else(|| {
                 match profile.profile.category.as_str() {
                     "development" => "Phase1_A0".to_string(),
+                    category if category.starts_with("course_") => format!(
+                        "Phase4_{}",
+                        crate::profiles::safe_filename_component(
+                            category.trim_start_matches("course_")
+                        )
+                    ),
                     category => format!(
                         "Phase3A_{}",
                         crate::profiles::safe_filename_component(category)
@@ -1512,6 +1604,7 @@ impl SessionController {
         runtime.packets = snapshot.integrity.received_packets;
         runtime.measured_rate_hz = snapshot.measured_rate_hz;
         runtime.integrity = snapshot.integrity.clone();
+        runtime.digital_output_mask = snapshot.digital_output_mask;
         Ok(())
     }
 
@@ -1625,6 +1718,7 @@ impl SessionController {
             last_summary: runtime.last_summary.clone(),
             profile: runtime.profile.clone(),
             validation_context: runtime.validation_context.clone(),
+            digital_output_mask: runtime.digital_output_mask,
         }
     }
 
@@ -1783,23 +1877,58 @@ fn validation_simulator_signal(
 fn configure_payload(
     settings: &crate::profiles::AcquisitionSettings,
 ) -> Result<Vec<u8>, SessionError> {
-    let pin = match settings.analog_pin.as_str() {
-        "A0" => 0,
-        "A1" => 1,
-        "A2" => 2,
-        "A3" => 3,
-        "A4" => 4,
-        "A5" => 5,
-        _ => return Err(SessionError::State("profile analog pin is unsupported")),
+    let pin_id = |pin: &str| match pin {
+        "A0" => Ok(0),
+        "A1" => Ok(1),
+        "A2" => Ok(2),
+        "A3" => Ok(3),
+        "A4" => Ok(4),
+        "A5" => Ok(5),
+        _ => Err(SessionError::State("profile analog pin is unsupported")),
     };
-    if settings.adc_resolution_bits != 12 || settings.sample_rate_hz != 1_000 {
-        return Err(SessionError::State(
-            "profile requests an unsupported firmware configuration",
-        ));
+    let mut payload = Vec::with_capacity(16);
+    match settings.acquisition_mode {
+        crate::profiles::AcquisitionMode::Simultaneous => {
+            let pins: Result<Vec<_>, _> = settings
+                .analog_pins()
+                .iter()
+                .map(|pin| pin_id(pin))
+                .collect();
+            let pins = pins?;
+            if !(1..=6).contains(&pins.len())
+                || !matches!(settings.adc_resolution_bits, 12 | 14)
+                || settings.sample_rate_hz == 0
+                || settings.sample_rate_hz > 1_000
+            {
+                return Err(SessionError::State(
+                    "profile requests an unsupported simultaneous acquisition configuration",
+                ));
+            }
+            let green_enabled = settings
+                .led_outputs
+                .as_ref()
+                .and_then(|outputs| outputs.green.as_deref())
+                == Some("D4");
+            payload.extend_from_slice(&[0, settings.adc_resolution_bits]);
+            payload.extend_from_slice(&settings.sample_rate_hz.to_le_bytes());
+            payload.push(pins.len() as u8);
+            payload.extend_from_slice(&pins);
+            payload.push(u8::from(green_enabled));
+        }
+        crate::profiles::AcquisitionMode::Pulseox4State => {
+            if settings.adc_resolution_bits != 14
+                || settings.state_dwell_us != Some(1_000)
+                || settings.analog_pins() != ["A0".to_string(), "A1".to_string()]
+            {
+                return Err(SessionError::State(
+                    "profile requests an unsupported fixed pulse-ox configuration",
+                ));
+            }
+            payload.extend_from_slice(&[1, 14]);
+            payload.extend_from_slice(&1_000u32.to_le_bytes());
+            payload.extend_from_slice(&[2, 0, 1, 0]);
+        }
     }
-    let mut payload = Vec::with_capacity(8);
-    payload.extend_from_slice(&settings.sample_rate_hz.to_le_bytes());
-    payload.extend_from_slice(&[settings.adc_resolution_bits, 1, pin, 0]);
     Ok(payload)
 }
 
@@ -1998,10 +2127,17 @@ struct SimulatorIo {
     batch_interval: Option<Duration>,
     max_fragment: usize,
     signal: SimulatorSignal,
+    profile_category: String,
+    requested_duration_seconds: Option<u64>,
+    sample_period_us: u32,
+    channel_count: u8,
+    pulseox: bool,
+    output_mask: u8,
 }
 
 impl SimulatorIo {
     fn new_with_signal(
+        profile: &ProfileSnapshot,
         duration: RecordingDuration,
         signal: SimulatorSignal,
     ) -> Result<Self, SessionError> {
@@ -2010,28 +2146,50 @@ impl SimulatorIo {
             commands: FrameParser::default(),
             packet_sequence: 0,
             sample_sequence: 0,
-            sample_limit: duration
-                .requested_seconds()
-                .map(|seconds| seconds.saturating_mul(1_000)),
+            sample_limit: None,
             active: false,
             next_batch_at: Instant::now(),
             batch_interval: Some(Duration::from_millis(10)),
             max_fragment: 7,
             signal,
+            profile_category: profile.profile.category.clone(),
+            requested_duration_seconds: duration.requested_seconds(),
+            sample_period_us: 1_000,
+            channel_count: 1,
+            pulseox: false,
+            output_mask: 0,
         };
         simulator.queue(
             MessageType::Hello,
-            vec![1, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 12, 1, 0],
+            vec![2, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
         )?;
-        simulator.queue(MessageType::Capabilities, vec![12, 1, 6, 0])?;
+        simulator.queue(
+            MessageType::Capabilities,
+            vec![12, 14, 6, 0x03, 0x07, 3, 200, 0, 250, 0, 232, 3],
+        )?;
         Ok(simulator)
     }
 
     #[cfg(test)]
     fn new_accelerated(duration: RecordingDuration) -> Result<Self, SessionError> {
-        let mut simulator = Self::new_with_signal(duration, SimulatorSignal::General)?;
+        let profile = default_general_profile()?;
+        Self::new_accelerated_with_layout(&profile, duration, 1, 1_000, false)
+    }
+
+    #[cfg(test)]
+    fn new_accelerated_with_layout(
+        profile: &ProfileSnapshot,
+        duration: RecordingDuration,
+        field_count: u8,
+        logical_rate_hz: u32,
+        pulseox: bool,
+    ) -> Result<Self, SessionError> {
+        let mut simulator = Self::new_with_signal(profile, duration, SimulatorSignal::General)?;
         simulator.batch_interval = None;
         simulator.max_fragment = 128;
+        simulator.channel_count = field_count;
+        simulator.pulseox = pulseox;
+        simulator.sample_period_us = 1_000_000 / logical_rate_hz;
         Ok(simulator)
     }
 
@@ -2063,14 +2221,17 @@ impl SimulatorIo {
                     .min(10) as u32
             })
             .unwrap_or(10);
-        let samples = (0..count)
-            .map(|index| self.signal_counts(self.sample_sequence + index))
-            .collect();
+        let mut samples = Vec::with_capacity(count as usize * usize::from(self.channel_count));
+        for index in 0..count {
+            for field in 0..self.channel_count {
+                samples.push(self.signal_counts(self.sample_sequence + index, usize::from(field)));
+            }
+        }
         let payload = SampleBatch {
             first_sample_sequence: self.sample_sequence,
-            first_timestamp_us: u64::from(self.sample_sequence) * 1_000,
-            sample_period_us: 1_000,
-            channel_count: 1,
+            first_timestamp_us: u64::from(self.sample_sequence) * u64::from(self.sample_period_us),
+            sample_period_us: self.sample_period_us,
+            channel_count: self.channel_count,
             samples,
             status_flags: 1,
         }
@@ -2080,11 +2241,37 @@ impl SimulatorIo {
         self.queue(MessageType::SampleBatch, payload)
     }
 
-    fn signal_counts(&self, sequence: u32) -> u16 {
+    fn signal_counts(&self, sequence: u32, field: usize) -> u16 {
         let volts = match self.signal {
             SimulatorSignal::General => {
-                let phase = sequence as f64 * std::f64::consts::TAU * 2.0 / 1_000.0;
-                2.5 + phase.sin() * (1200.0 * 5.0 / 4095.0)
+                let rate = 1_000_000.0 / f64::from(self.sample_period_us);
+                let phase = sequence as f64 * std::f64::consts::TAU / rate;
+                match self.profile_category.as_str() {
+                    "course_emg_force" => match field {
+                        0 => 2.5 + (phase * 70.0).sin() * 0.7,
+                        1 => 2.5 + (phase * 70.0).sin().abs() * 0.7,
+                        2 => 2.5 + (phase * 1.5).sin() * 0.35,
+                        _ => 2.5 + (phase * 0.2).sin() * 0.8,
+                    },
+                    "course_blood_pressure" => match field {
+                        0 => 2.4 + (phase * 1.2).sin() * 0.35,
+                        1 => 2.5 + (phase * 0.08).sin() * 0.9,
+                        _ => 2.45 + (phase * 0.08 + 0.2).sin() * 0.75,
+                    },
+                    "course_pulseox" => {
+                        let state = field % 4;
+                        let dark = matches!(state, 1 | 3);
+                        let base = if field < 4 { 2.1 } else { 2.8 };
+                        if dark {
+                            0.15
+                        } else if state == 0 {
+                            base + 0.25
+                        } else {
+                            base + 0.4
+                        }
+                    }
+                    _ => 2.5 + (phase * 2.0).sin() * 1.1,
+                }
             }
             SimulatorSignal::Dc { volts } => volts,
             SimulatorSignal::Sine {
@@ -2104,7 +2291,8 @@ impl SimulatorIo {
                 }
             }
         };
-        (volts * 4095.0 / 5.0).round().clamp(0.0, 4095.0) as u16
+        let full_scale = if self.pulseox { 16_383.0 } else { 4_095.0 };
+        (volts * full_scale / 5.0).round().clamp(0.0, full_scale) as u16
     }
 }
 
@@ -2164,15 +2352,84 @@ impl Write for SimulatorIo {
         for command in self.commands.push(buffer) {
             match command.message_type {
                 MessageType::Ping => self.queue(MessageType::Pong, vec![]),
-                MessageType::Configure => self.queue(MessageType::ConfigAck, vec![]),
+                MessageType::Configure => {
+                    let payload = &command.payload;
+                    if payload.len() < 8 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "invalid Phase 4 simulator configure payload",
+                        ));
+                    }
+                    match payload[0] {
+                        0 => {
+                            let channel_count = payload[6];
+                            if channel_count == 0
+                                || channel_count > 6
+                                || payload.len() != 8 + usize::from(channel_count)
+                            {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "invalid simulator simultaneous channel layout",
+                                ));
+                            }
+                            self.pulseox = false;
+                            self.sample_period_us = 1_000_000
+                                / u32::from_le_bytes([
+                                    payload[2], payload[3], payload[4], payload[5],
+                                ]);
+                            self.channel_count = channel_count;
+                            self.output_mask =
+                                if payload[7 + usize::from(self.channel_count)] & 0x01 != 0 {
+                                    0x01
+                                } else {
+                                    0
+                                };
+                        }
+                        1 => {
+                            if payload.len() != 10 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "invalid simulator pulse-ox layout",
+                                ));
+                            }
+                            self.pulseox = true;
+                            self.sample_period_us = u32::from_le_bytes([
+                                payload[2], payload[3], payload[4], payload[5],
+                            ])
+                            .saturating_mul(4);
+                            self.channel_count = 8;
+                            self.output_mask = 0;
+                        }
+                        _ => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "unsupported simulator acquisition mode",
+                            ));
+                        }
+                    }
+                    if self.sample_period_us == 0 || self.channel_count == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "invalid simulator acquisition rate or channels",
+                        ));
+                    }
+                    self.sample_limit = self.requested_duration_seconds.map(|seconds| {
+                        seconds.saturating_mul(1_000_000 / u64::from(self.sample_period_us))
+                    });
+                    self.batch_interval = Some(Duration::from_micros(
+                        u64::from(self.sample_period_us).saturating_mul(10),
+                    ));
+                    self.queue(MessageType::ConfigAck, vec![])
+                }
                 MessageType::Start => {
                     self.active = true;
                     self.next_batch_at = Instant::now();
-                    self.queue(MessageType::Status, vec![])
+                    self.queue(MessageType::Status, vec![1, self.output_mask])
                 }
                 MessageType::Stop => {
                     self.active = false;
-                    self.queue(MessageType::Status, vec![])
+                    self.output_mask = 0;
+                    self.queue(MessageType::Status, vec![0, self.output_mask])
                 }
                 _ => Ok(()),
             }
@@ -2306,7 +2563,7 @@ mod tests {
                 commands: FrameParser::default(),
                 answer_on_ping,
                 pings: 0,
-                hello_payload: vec![1, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 12, 1, 0],
+                hello_payload: vec![2, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
             }
         }
 
@@ -2440,7 +2697,7 @@ mod tests {
     fn handshake_rejects_an_incompatible_firmware_identity() {
         let (session, mut acquisition) = handshake_session();
         let mut io = HandshakeMock::new(Some(1));
-        io.hello_payload[0] = 2;
+        io.hello_payload[0] = 3;
         assert!(session
             .wait_for_handshake_with_policy(
                 &mut io,
@@ -2597,7 +2854,8 @@ mod tests {
                 &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
             )
             .unwrap_or_else(|e| panic!("{e}"));
-        let mut writer = BmegWriter::create(&bmeg, &metadata).unwrap_or_else(|e| panic!("{e}"));
+        let mut writer =
+            BmegWriter::create_synchronized(&bmeg, &metadata, 1).unwrap_or_else(|e| panic!("{e}"));
         let (sender, receiver) = sync_channel(4_096);
         let mut acquisition = AcquisitionController::new(sender);
         acquisition.configure().unwrap_or_else(|e| panic!("{e}"));
@@ -2614,7 +2872,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}"));
             acquisition.ingest_bytes(&buffer[..received]);
             for sample in receiver.try_iter() {
-                writer.write(sample).unwrap_or_else(|e| panic!("{e}"));
+                writer
+                    .write_record(&sample)
+                    .unwrap_or_else(|e| panic!("{e}"));
                 if recent.len() == DISPLAY_CAPACITY {
                     recent.pop_front();
                 }
@@ -2631,6 +2891,82 @@ mod tests {
         assert_eq!(snapshot.integrity.host_channel_overflows, 0);
         assert_eq!(recent.len(), DISPLAY_CAPACITY);
         assert!(BmegReader::open(&bmeg).is_ok());
+    }
+
+    fn accelerated_multifield_soak(
+        profile: ProfileSnapshot,
+        fields: u8,
+        rate_hz: u32,
+        records: u64,
+    ) {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        let duration = RecordingDuration::Timed {
+            seconds: records / u64::from(rate_hz),
+        };
+        let bmeg = dir.path().join("multifield-soak.bmeg");
+        let metadata = session
+            .initial_metadata(true, "SIM", &bmeg, &duration, &profile)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut writer = BmegWriter::create_synchronized(&bmeg, &metadata, fields as usize)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (sender, receiver) = sync_channel(4_096);
+        let mut acquisition = AcquisitionController::new(sender);
+        acquisition.configure().unwrap_or_else(|e| panic!("{e}"));
+        acquisition.start().unwrap_or_else(|e| panic!("{e}"));
+        let mut simulator = SimulatorIo::new_accelerated_with_layout(
+            &profile,
+            duration,
+            fields,
+            rate_hz,
+            fields == 8,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        simulator.active = true;
+        let mut recent = VecDeque::with_capacity(DISPLAY_CAPACITY);
+        let mut buffer = [0u8; 1024];
+        while acquisition.sample_count < records {
+            let received = simulator
+                .read(&mut buffer)
+                .unwrap_or_else(|e| panic!("{e}"));
+            acquisition.ingest_bytes(&buffer[..received]);
+            for record in receiver.try_iter() {
+                assert_eq!(record.counts.len(), fields as usize);
+                writer
+                    .write_record(&record)
+                    .unwrap_or_else(|e| panic!("{e}"));
+                if recent.len() == DISPLAY_CAPACITY {
+                    recent.pop_front();
+                }
+                recent.push_back(record);
+            }
+        }
+        writer.finish().unwrap_or_else(|e| panic!("{e}"));
+        let snapshot = acquisition.snapshot();
+        assert_eq!(snapshot.sample_count, records);
+        assert_eq!(snapshot.integrity.crc_failures, 0);
+        assert_eq!(snapshot.integrity.missing_packet_sequences, 0);
+        assert_eq!(snapshot.integrity.missing_sample_sequences, 0);
+        assert_eq!(snapshot.integrity.host_channel_overflows, 0);
+        assert_eq!(recent.len(), DISPLAY_CAPACITY);
+        assert!(BmegReader::open(&bmeg).is_ok());
+    }
+
+    #[test]
+    fn accelerated_six_channel_ten_minute_equivalent_soak_preserves_bounds() {
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        accelerated_multifield_soak(profile, 6, 1_000, 10 * 60 * 1_000);
+    }
+
+    #[test]
+    fn accelerated_pulseox_ten_minute_equivalent_soak_preserves_raw_cycles() {
+        let profile = built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|candidate| candidate.category == "course_pulseox")
+            .unwrap_or_else(|| panic!("missing pulse-ox course profile"))
+            .snapshot(false);
+        accelerated_multifield_soak(profile, 8, 250, 10 * 60 * 250);
     }
 
     #[test]
@@ -2714,6 +3050,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let mut transport = DisconnectingSimulator {
             inner: SimulatorIo::new_with_signal(
+                &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
                 RecordingDuration::Timed { seconds: 2 },
                 SimulatorSignal::General,
             )
@@ -2750,7 +3087,7 @@ mod tests {
         let ecg = built_in_profiles()
             .unwrap_or_else(|e| panic!("{e}"))
             .into_iter()
-            .find(|profile| profile.category == "ecg")
+            .find(|profile| profile.category == "course_ecg")
             .unwrap_or_else(|| panic!("missing ECG profile"));
         assert!(session
             .begin_session(
@@ -2760,7 +3097,8 @@ mod tests {
                 RecordingDuration::Timed { seconds: 10 },
                 ecg.snapshot(false)
             )
-            .is_err());
+            .is_ok());
+        session.disconnect().unwrap_or_else(|e| panic!("{e}"));
         let snapshot = ecg.snapshot(true);
         session
             .begin_session(
@@ -2792,20 +3130,115 @@ mod tests {
             simulator_parameters: std::collections::BTreeMap::new(),
         };
         let signal = validation_simulator_signal(&sine).unwrap_or_else(|error| panic!("{error}"));
-        let simulator =
-            SimulatorIo::new_with_signal(RecordingDuration::Timed { seconds: 10 }, signal)
-                .unwrap_or_else(|error| panic!("{error}"));
-        assert!(simulator.signal_counts(0) >= 1_638 && simulator.signal_counts(0) <= 2_458);
+        let simulator = SimulatorIo::new_with_signal(
+            &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
+            RecordingDuration::Timed { seconds: 10 },
+            signal,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(simulator.signal_counts(0, 0) >= 1_638 && simulator.signal_counts(0, 0) <= 2_458);
         let clipping = ValidationRunContext {
             test_type: "saturation_margin".into(),
             ..sine
         };
         let signal =
             validation_simulator_signal(&clipping).unwrap_or_else(|error| panic!("{error}"));
-        let simulator =
-            SimulatorIo::new_with_signal(RecordingDuration::Timed { seconds: 10 }, signal)
+        let simulator = SimulatorIo::new_with_signal(
+            &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
+            RecordingDuration::Timed { seconds: 10 },
+            signal,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(simulator.signal_counts(0, 0), 0);
+        assert_eq!(simulator.signal_counts(10, 0), 4_095);
+    }
+
+    #[test]
+    fn phase4_configuration_payloads_bind_course_channel_maps_and_leds() {
+        let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
+        let lookup = |category: &str| {
+            profiles
+                .iter()
+                .find(|profile| profile.category == category)
+                .unwrap_or_else(|| panic!("missing {category}"))
+        };
+        let emg = configure_payload(&lookup("course_emg_force").acquisition)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(emg, vec![0, 12, 232, 3, 0, 0, 4, 0, 1, 2, 3, 0]);
+        let bp = configure_payload(&lookup("course_blood_pressure").acquisition)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(bp, vec![0, 12, 200, 0, 0, 0, 3, 0, 1, 2, 1]);
+        let pulseox = configure_payload(&lookup("course_pulseox").acquisition)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(pulseox, vec![1, 14, 232, 3, 0, 0, 2, 0, 1, 0]);
+    }
+
+    #[test]
+    fn simulator_emits_four_channel_and_eight_field_pulseox_records() {
+        let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
+        for (category, fields, period) in [
+            ("course_emg_force", 4u8, 1_000u32),
+            ("course_pulseox", 8u8, 4_000u32),
+        ] {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.category == category)
+                .unwrap_or_else(|| panic!("missing {category}"))
+                .snapshot(false);
+            let mut simulator = SimulatorIo::new_with_signal(
+                &profile,
+                RecordingDuration::Timed { seconds: 10 },
+                SimulatorSignal::General,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            let configure = configure_payload(&profile.profile.acquisition)
                 .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(simulator.signal_counts(0), 0);
-        assert_eq!(simulator.signal_counts(10), 4_095);
+            simulator
+                .write_all(
+                    &encode_frame(&Frame {
+                        message_type: MessageType::Configure,
+                        flags: 0,
+                        sequence: 1,
+                        payload: configure,
+                    })
+                    .unwrap_or_else(|error| panic!("{error:?}")),
+                )
+                .unwrap_or_else(|error| panic!("{error}"));
+            simulator
+                .write_all(
+                    &encode_frame(&Frame {
+                        message_type: MessageType::Start,
+                        flags: 0,
+                        sequence: 2,
+                        payload: vec![],
+                    })
+                    .unwrap_or_else(|error| panic!("{error:?}")),
+                )
+                .unwrap_or_else(|error| panic!("{error}"));
+            simulator.batch_interval = None;
+            let mut parser = FrameParser::default();
+            let mut buffer = [0u8; 256];
+            let mut batch = None;
+            for _ in 0..100 {
+                let read = simulator
+                    .read(&mut buffer)
+                    .unwrap_or_else(|error| panic!("{error}"));
+                for frame in parser.push(&buffer[..read]) {
+                    if frame.message_type == MessageType::SampleBatch {
+                        batch = Some(
+                            SampleBatch::from_payload(&frame.payload)
+                                .unwrap_or_else(|error| panic!("{error:?}")),
+                        );
+                    }
+                }
+                if batch.is_some() {
+                    break;
+                }
+            }
+            let batch = batch.unwrap_or_else(|| panic!("no batch for {category}"));
+            assert_eq!(batch.channel_count, fields);
+            assert_eq!(batch.sample_period_us, period);
+            assert!(batch.samples.len() >= usize::from(fields));
+        }
     }
 }

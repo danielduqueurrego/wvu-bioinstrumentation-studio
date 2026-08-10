@@ -29,7 +29,8 @@ struct AppState {
 struct RecentPoint {
     sequence: u32,
     timestamp_us: u64,
-    counts: u16,
+    values: Vec<u16>,
+    status_flags: u16,
 }
 
 #[derive(Serialize)]
@@ -80,11 +81,15 @@ struct CompleteValidationRunRequest {
 }
 
 #[tauri::command]
-fn list_boards(cli_path: Option<String>) -> Result<Vec<arduino_cli::BoardInfo>, String> {
-    let override_path = cli_path.as_deref().map(PathBuf::from);
-    let cli =
-        arduino_cli::ArduinoCli::discover(override_path.as_deref()).map_err(|e| e.to_string())?;
-    cli.boards().map_err(|e| e.to_string())
+async fn list_boards(cli_path: Option<String>) -> Result<Vec<arduino_cli::BoardInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let override_path = cli_path.as_deref().map(PathBuf::from);
+        let cli = arduino_cli::ArduinoCli::discover(override_path.as_deref())
+            .map_err(|error| error.to_string())?;
+        cli.boards().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("board discovery task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -118,10 +123,13 @@ fn firmware_error<T>(result: Result<T, firmware_workflow::FirmwareFailure>) -> R
 }
 
 #[tauri::command]
-fn firmware_environment(
+async fn firmware_environment(
     state: tauri::State<'_, AppState>,
-) -> firmware_workflow::FirmwareEnvironmentStatus {
-    state.firmware.environment()
+) -> Result<firmware_workflow::FirmwareEnvironmentStatus, String> {
+    let firmware = state.firmware.clone();
+    tauri::async_runtime::spawn_blocking(move || firmware.environment())
+        .await
+        .map_err(|error| format!("firmware environment task failed: {error}"))
 }
 
 #[tauri::command]
@@ -237,11 +245,15 @@ fn get_firmware_workflow_status(
 }
 
 #[tauri::command]
-fn verify_wvu_reference_firmware(
+async fn verify_wvu_reference_firmware(
     state: tauri::State<'_, AppState>,
     port: String,
 ) -> Result<firmware_workflow::FirmwareVerification, String> {
-    firmware_error(state.firmware.verify_existing_reference(port))
+    let firmware = state.firmware.clone();
+    tauri::async_runtime::spawn_blocking(move || firmware.verify_existing_reference(port))
+        .await
+        .map_err(|error| format!("firmware verification task failed: {error}"))
+        .and_then(firmware_error)
 }
 
 #[tauri::command]
@@ -290,6 +302,19 @@ fn update_profile_draft_description(
     state
         .profiles
         .update_draft_description(&profile_id, &profile_version, description)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_profile_draft_acquisition(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    profile_version: String,
+    acquisition: profiles::AcquisitionSettings,
+) -> Result<profiles::AcquisitionProfile, String> {
+    state
+        .profiles
+        .update_draft_acquisition(&profile_id, &profile_version, acquisition)
         .map_err(|error| error.to_string())
 }
 
@@ -824,6 +849,19 @@ fn stop_recording(state: tauri::State<'_, AppState>) -> Result<session::SessionS
         .map_err(|error| error.to_string())
 }
 
+/// Stores a short timestamped user annotation with the active recording. The worker owns the
+/// raw stream; this command only appends bounded metadata and never emits a sample event.
+#[tauri::command]
+fn add_recording_marker(
+    state: tauri::State<'_, AppState>,
+    label: String,
+) -> Result<recording::RecordingMarker, String> {
+    state
+        .session
+        .add_marker(label)
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn disconnect_session(state: tauri::State<'_, AppState>) -> Result<session::SessionStatus, String> {
     state
@@ -850,7 +888,8 @@ fn get_recent_display_data(state: tauri::State<'_, AppState>) -> Result<Vec<Rece
                 .map(|sample| RecentPoint {
                     sequence: sample.sequence,
                     timestamp_us: sample.timestamp_us,
-                    counts: sample.counts,
+                    values: sample.counts,
+                    status_flags: sample.status_flags,
                 })
                 .collect()
         })
@@ -891,13 +930,13 @@ fn ensure_validation_session_idle(state: &AppState) -> Result<(), String> {
 }
 
 fn ensure_bench_validation_profile(profile: &profiles::AcquisitionProfile) -> Result<(), String> {
-    if matches!(profile.category.as_str(), "ecg" | "emg") {
+    if matches!(
+        profile.category.as_str(),
+        "ecg" | "emg" | "course_ecg" | "course_emg_force"
+    ) {
         Ok(())
     } else {
-        Err(
-            "bench validation is available only for the locked ECG or EMG raw-output profiles"
-                .into(),
-        )
+        Err("bench validation is available only for the ECG or EMG course-capture profiles".into())
     }
 }
 
@@ -1012,6 +1051,7 @@ pub fn run() {
             set_profile_mode,
             duplicate_profile_to_draft,
             update_profile_draft_description,
+            update_profile_draft_acquisition,
             finalize_profile_draft,
             retire_profile,
             export_profile_package,
@@ -1034,6 +1074,7 @@ pub fn run() {
             reset_board_and_retry,
             retry_hardware_handshake,
             stop_recording,
+            add_recording_marker,
             disconnect_session,
             get_session_status,
             get_recent_display_data,

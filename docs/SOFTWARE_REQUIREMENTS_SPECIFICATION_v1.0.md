@@ -287,6 +287,24 @@ The project shall use:
 - Documented commands
 - No silent exception swallowing
 
+## Phase 4 course-capture amendment
+
+Phase 4 supersedes the earlier one-channel course-capture assumptions without changing the
+medical-device boundary. The controlled application shall support the UNO R4 WiFi with protocol
+v0.2 for one to six sequentially sampled analog inputs in a synchronized logical frame and one
+fixed pulse-ox four-state cycle mode. Course profiles shall capture the following raw variables:
+
+- ECG: A0 at 12 bit / 1000 frames/s.
+- EMG + force: A0, A1, A2, A3 at 12 bit / 1000 frames/s.
+- BP + PPG: A0, A1, A2 at 12 bit / 200 frames/s with D4 green active only while acquiring.
+- Pulse ox raw TX/RX: A0/A1 at 14 bit; D5 RED, DARK, D6 IR, DARK; approximately 1 ms/state and
+  250 cycles/s, preserving all eight state values per cycle.
+
+The app shall preserve raw counts, timing, channel map, controlled firmware identity, profile
+snapshot, markers, and integrity counters in BMEG, CSV, and metadata. It shall not calculate
+physiological values, apply hidden filtering, or make clinical claims. Optional Phase 3B physical
+characterization remains an instructor tool and is not a normal-course-recording prerequisite.
+
 ## 7. Deferred requirements
 
 - macOS/Linux

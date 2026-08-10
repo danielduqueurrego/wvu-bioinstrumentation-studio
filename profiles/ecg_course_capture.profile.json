@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "profile_id": "wvu.bmeg420l.ecg.course.capture.v1",
+  "profile_version": "1.0.0",
+  "display_name": "ECG — Course Capture",
+  "category": "course_ecg",
+  "status": "locked",
+  "source": "built_in",
+  "description": "Synchronized raw capture of the conditioned ECG module output for the BMEG 420L course.",
+  "target_board": "Arduino UNO R4 WiFi",
+  "fqbn": "arduino:renesas_uno:unor4wifi",
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 2, "build": "0x00010002", "device": "0x554E4F34" },
+  "acquisition": {
+    "analog_pin": "A0", "adc_resolution_bits": 12, "sample_rate_hz": 1000,
+    "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
+    "acquisition_mode": "simultaneous",
+    "channels": [{ "pin": "A0", "id": "ecg", "label": "ECG", "csv_name": "ecg_counts", "units": "ADC counts" }]
+  },
+  "display": { "primary_quantity": "arduino_input_volts", "channel_label": "ECG", "raw_units_label": "ADC counts", "voltage_units_label": "V", "voltage_reference_v": 5.0, "plot_min_v": 0.0, "plot_max_v": 5.0 },
+  "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "Do not use this application for diagnosis or clinical decisions."] },
+  "export": { "signal_name": "ecg_course_capture", "include_profile_snapshot": true },
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "cd04267743fd38066aa8daf91b6eafa9550e4406e2ef3d0d59ceae04051b782d" }
+}

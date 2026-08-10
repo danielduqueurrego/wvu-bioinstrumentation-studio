@@ -1,7 +1,7 @@
 //! Shared ingestion path for serial hardware and the simulator.
 use crate::{
     protocol::{Frame, FrameParser, IntegrityMonitor, MessageType, SampleBatch},
-    recording::RawSample,
+    recording::SynchronizedRecord,
 };
 use std::{
     sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
@@ -30,13 +30,14 @@ pub struct AcquisitionSnapshot {
     pub status_seen: bool,
     pub firmware_build: Option<u32>,
     pub firmware_board_id: Option<u32>,
+    pub digital_output_mask: Option<u8>,
     pub skipped_noise_bytes: u64,
 }
 pub struct AcquisitionController {
     pub state: AcquisitionState,
     parser: FrameParser,
     monitor: IntegrityMonitor,
-    sender: SyncSender<RawSample>,
+    sender: SyncSender<SynchronizedRecord>,
     pub sample_count: u64,
     first_timestamp: Option<u64>,
     last_timestamp: Option<u64>,
@@ -48,9 +49,10 @@ pub struct AcquisitionController {
     status_seen: bool,
     firmware_build: Option<u32>,
     firmware_board_id: Option<u32>,
+    digital_output_mask: Option<u8>,
 }
 impl AcquisitionController {
-    pub fn new(sender: SyncSender<RawSample>) -> Self {
+    pub fn new(sender: SyncSender<SynchronizedRecord>) -> Self {
         Self {
             state: AcquisitionState::Idle,
             parser: FrameParser::default(),
@@ -67,6 +69,7 @@ impl AcquisitionController {
             status_seen: false,
             firmware_build: None,
             firmware_board_id: None,
+            digital_output_mask: None,
         }
     }
     pub fn configure(&mut self) -> Result<(), &'static str> {
@@ -122,7 +125,12 @@ impl AcquisitionController {
             MessageType::Capabilities => self.capabilities_seen = true,
             MessageType::ConfigAck => self.config_ack_seen = true,
             MessageType::Pong => self.pong_seen = true,
-            MessageType::Status => self.status_seen = true,
+            MessageType::Status => {
+                self.status_seen = true;
+                if frame.payload.len() >= 2 {
+                    self.digital_output_mask = Some(frame.payload[1] & 0x07);
+                }
+            }
             _ => {}
         }
         if frame.message_type != MessageType::SampleBatch {
@@ -138,22 +146,24 @@ impl AcquisitionController {
             count as u32,
             batch.status_flags,
         );
-        if batch.channel_count != 1 || self.state != AcquisitionState::Running {
+        if self.state != AcquisitionState::Running {
             return;
         }
-        for (index, counts) in batch.samples.into_iter().enumerate() {
-            let sample = RawSample {
+        for index in 0..count {
+            let first = index * usize::from(batch.channel_count);
+            let record = SynchronizedRecord {
                 sequence: batch.first_sample_sequence.wrapping_add(index as u32),
                 timestamp_us: batch.first_timestamp_us
                     + u64::from(batch.sample_period_us) * index as u64,
-                counts,
+                status_flags: batch.status_flags,
+                counts: batch.samples[first..first + usize::from(batch.channel_count)].to_vec(),
             };
-            match self.sender.try_send(sample) {
+            match self.sender.try_send(record.clone()) {
                 Ok(()) => {
                     self.sample_count += 1;
-                    self.first_timestamp.get_or_insert(sample.timestamp_us);
-                    self.last_timestamp = Some(sample.timestamp_us);
-                    self.last_counts = Some(sample.counts);
+                    self.first_timestamp.get_or_insert(record.timestamp_us);
+                    self.last_timestamp = Some(record.timestamp_us);
+                    self.last_counts = record.counts.first().copied();
                 }
                 Err(TrySendError::Full(_)) => self.monitor.counters.host_channel_overflows += 1,
                 Err(TrySendError::Disconnected(_)) => {
@@ -183,11 +193,12 @@ impl AcquisitionController {
             status_seen: self.status_seen,
             firmware_build: self.firmware_build,
             firmware_board_id: self.firmware_board_id,
+            digital_output_mask: self.digital_output_mask,
             skipped_noise_bytes: self.parser.stats.skipped_noise_bytes,
         }
     }
 }
-pub fn simulator_stream(seconds: u32, sample_rate_hz: u32) -> Receiver<RawSample> {
+pub fn simulator_stream(seconds: u32, sample_rate_hz: u32) -> Receiver<SynchronizedRecord> {
     // Ten seconds at 1000 samples/s fits below this fixed bound; no unbounded queue is used.
     let (out_tx, out_rx) = sync_channel(16_384);
     thread::spawn(move || {
@@ -312,5 +323,27 @@ mod tests {
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.firmware_build, Some(0x0001_0001));
         assert_eq!(snapshot.firmware_board_id, Some(0x554e_4f34));
+    }
+
+    #[test]
+    fn protocol_v2_status_preserves_controlled_output_mask() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        let active = Frame {
+            message_type: MessageType::Status,
+            flags: 0,
+            sequence: 0,
+            payload: vec![1, 0b001],
+        };
+        controller.ingest_bytes(&crate::protocol::encode_frame(&active).unwrap_or_default());
+        assert_eq!(controller.snapshot().digital_output_mask, Some(0b001));
+        let stopped = Frame {
+            message_type: MessageType::Status,
+            flags: 0,
+            sequence: 1,
+            payload: vec![0, 0],
+        };
+        controller.ingest_bytes(&crate::protocol::encode_frame(&stopped).unwrap_or_default());
+        assert_eq!(controller.snapshot().digital_output_mask, Some(0));
     }
 }

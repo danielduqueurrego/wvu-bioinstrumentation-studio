@@ -6,7 +6,7 @@
 - FQBN: `arduino:renesas_uno:unor4wifi`
 - USB communication only for version 1
 - One board at a time
-- Default ADC resolution: 12 bits
+- Supported ADC resolutions: 12 and 14 bits, as constrained by the active profile
 - Expected analog input range for this project: 0–5 V
 
 ## 2. Configurable pin philosophy
@@ -46,33 +46,30 @@ Typical signals:
 
 ## 3. Default profile mappings
 
-### ECG & EMG
+### ECG and EMG / force
 
-- Signal: A0
-- Optional notch: A1
-- LOD+: D2
-- LOD-: D3
-- Event marker: D4
+- ECG: A0 = conditioned ECG output, 12 bit, 1000 frames/s
+- EMG / force: A0 = raw EMG; A1 = analog rectified EMG; A2 = EMG envelope; A3 = pressure/force
+  surrogate, 12 bit, 1000 synchronized frames/s
 
-For Phases 3A–3B, the locked raw ECG/EMG profiles use only A0 at 12 bits and 1000 samples/s for a
-simulator, UNO-alone, or safe 0–5 V direct bench-input test. Optional notch and leads-off inputs
-are deferred. Phase 3B may record module-output or function-generator bench conditions only with
-explicit instructor acknowledgement and evidence; no person, electrode system, or
-module-to-person connection is authorized.
+The individual analog conversions are ordered sequentially within a logical frame. They share a
+frame sequence/timestamp but are not physically simultaneous conversions. The app preserves raw
+counts and Arduino-input volts only; it performs no physiological analysis.
 
-### Pulse Oximetry
+### Pulse oximetry
 
-- Reflection: A0
-- Transmission: A1
-- Red: D4
-- Infrared: D5
-- Green: D6
+- Transmission TIA: A0
+- Reflectance TIA: A1
+- Green: D4
+- Red: D5
+- Infrared: D6
 
-### Blood Pressure
+### Blood pressure + PPG
 
-- MPXV or XGZP conditioned output: A0
-- Optional second pressure channel: A1
-- Event marker: D4
+- PPG: A0
+- MPXV/reference pressure: A1
+- XGZP/instrumented pressure: A2
+- Green LED: D4, active HIGH only while this profile is acquiring
 
 Defaults are editable within profile rules.
 
@@ -94,27 +91,18 @@ Defaults are editable within profile rules.
 
 ## 5. Initial pulse-ox timing
 
-Default optical frame rate: 100 Hz (10 ms/frame).
-
-### Standard mode
+Phase 4 fixed raw cycle rate: approximately 250 cycles/s (1 ms per state, 4 ms per cycle).
 
 ```text
-All off / dark settle: 250 us
-Dark acquisition:      500 us
-Red settle:             250 us
-Red acquisition:        750 us
-All off / dark settle:  250 us
-Dark acquisition:       500 us
-IR settle:              250 us
-IR acquisition:         750 us
-All off / idle:         remainder of 10 ms
+RED on:  sample TX/RX
+DARK 1:  sample TX/RX
+IR on:   sample TX/RX
+DARK 2:  sample TX/RX
 ```
 
-During each acquisition window, begin with four conversions per available detector channel and average them in normal mode. Diagnostic mode may preserve individual conversions.
-
-### Multicolor mode
-
-Add a third dark/green state while maintaining one active LED at a time. The exact timing remains profile-versioned and must be measured on assembled hardware before being considered final.
+The raw record retains all eight values; ambient-subtracted signals are optional display previews
+only. The firmware never drives D5 and D6 HIGH together and forces D4–D6 LOW when idle, stopped,
+or faulted. It does not compute SpO2 or heart rate.
 
 ## 6. Clipping
 

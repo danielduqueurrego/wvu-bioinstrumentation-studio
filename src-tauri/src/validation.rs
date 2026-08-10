@@ -1420,7 +1420,7 @@ mod tests {
             board: "Arduino UNO R4 WiFi".into(),
             board_serial: "serial".into(),
             com_port: "SIM".into(),
-            firmware_build: "0x00010001".into(),
+            firmware_build: "0x00010002".into(),
             firmware_device: "0x554E4F34".into(),
             module_name: "ECG module".into(),
             module_identifier: "bench".into(),

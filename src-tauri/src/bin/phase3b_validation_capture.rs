@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&root)?;
     let profile = built_in_profiles()?
         .into_iter()
-        .find(|profile| profile.category == "ecg")
+        .find(|profile| profile.category == "course_ecg")
         .ok_or("ECG profile unavailable")?;
     let store = ValidationStore::with_root(root.join("evidence"))?;
     let validation_id = "wvu.bmeg420l.ecg.interface.validation.simulator.001";

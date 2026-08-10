@@ -1,17 +1,22 @@
-//! Binary USB protocol v0.1. Constants here are the host-side source of truth.
+//! Binary USB protocol. Constants here are the host-side source of truth.
 
 use std::collections::VecDeque;
 
 pub const MAGIC: [u8; 4] = *b"BMEG";
 pub const PROTOCOL_MAJOR: u8 = 0;
-pub const PROTOCOL_MINOR: u8 = 1;
+/// Protocol v0.2 adds synchronized multi-channel records and the fixed pulse-ox cycle mode.
+pub const PROTOCOL_MINOR: u8 = 2;
+pub const LEGACY_PROTOCOL_MINOR: u8 = 1;
+/// USB CDC configuration used by the controlled v0.2 firmware. This leaves
+/// headroom for a six-channel 1 kHz logical-frame stream.
+pub const CONTROLLED_SERIAL_BAUD: u32 = 921_600;
 pub const HEADER_LEN: usize = 14;
 pub const CRC_LEN: usize = 2;
 pub const MAX_PAYLOAD_LEN: usize = 1024;
 
 /// Immutable identity expected from the controlled Phase 1 UNO R4 WiFi sketch.
 /// The matching values are encoded in `firmware/reference_unor4wifi`'s HELLO frame.
-pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0001;
+pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0002;
 pub const REFERENCE_DEVICE_ID: u32 = 0x554e_4f34;
 
 #[repr(u8)]
@@ -145,7 +150,9 @@ impl FrameParser {
                 self.stats.crc_failures += 1;
                 continue;
             }
-            if raw[4] != PROTOCOL_MAJOR || raw[5] != PROTOCOL_MINOR {
+            if raw[4] != PROTOCOL_MAJOR
+                || !(LEGACY_PROTOCOL_MINOR..=PROTOCOL_MINOR).contains(&raw[5])
+            {
                 self.drain(total);
                 self.stats.invalid_frames += 1;
                 self.stats.unsupported_versions += 1;
@@ -364,6 +371,36 @@ mod tests {
         let mut rest = a[5..].to_vec();
         rest.extend(b);
         assert_eq!(p.push(&rest).len(), 2);
+    }
+
+    #[test]
+    fn multichannel_batches_preserve_record_major_synchronized_fields() {
+        let batch = SampleBatch {
+            first_sample_sequence: u32::MAX - 1,
+            first_timestamp_us: 123,
+            sample_period_us: 1_000,
+            channel_count: 6,
+            samples: vec![1, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16],
+            status_flags: 1,
+        };
+        let decoded = SampleBatch::from_payload(
+            &batch
+                .to_payload()
+                .unwrap_or_else(|error| panic!("{error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(decoded.channel_count, 6);
+        assert_eq!(decoded.samples[0..6], [1, 2, 3, 4, 5, 6]);
+        assert_eq!(decoded.samples[6..12], [11, 12, 13, 14, 15, 16]);
+    }
+
+    #[test]
+    fn multichannel_batch_rejects_field_count_mismatch() {
+        let mut payload = vec![0; 20];
+        payload[16] = 4;
+        payload[17] = 1;
+        payload.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        assert!(SampleBatch::from_payload(&payload).is_err());
     }
     #[test]
     fn complete_back_to_back_identity_frames_preserve_each_crc() {

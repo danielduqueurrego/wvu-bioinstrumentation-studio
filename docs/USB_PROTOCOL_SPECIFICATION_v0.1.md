@@ -1,6 +1,8 @@
 # USB protocol specification v0.1
 
-Status: initial implementation contract for Phase 1.
+Status: legacy Phase 1 implementation contract. New multi-channel capture uses
+[`USB_PROTOCOL_SPECIFICATION_v0.2.md`](USB_PROTOCOL_SPECIFICATION_v0.2.md); this document is
+retained because v0.1 recordings remain readable.
 
 ## 1. Byte order
 

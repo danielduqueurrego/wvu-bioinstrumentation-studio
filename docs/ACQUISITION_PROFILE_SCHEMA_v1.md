@@ -3,8 +3,9 @@
 ## Safety boundary
 
 Profiles are teaching/engineering configuration packages, not medical-device configurations.
-Phase 3A ECG and EMG profiles permit only simulator signals, the UNO R4 WiFi alone, or a safe
-0–5 V bench signal applied directly to A0. No human-connected recording is authorized.
+Locked course profiles require their controlled UNO firmware identity and preserve raw ADC
+counts/Arduino-input volts. They do not authorize diagnosis or clinical use. The optional
+Validation workflow remains bench-only; normal course capture does not require Validation evidence.
 
 ## Package shape
 
@@ -26,26 +27,30 @@ lowercase 64-character `canonical_hash`. This detects accidental/tampered profil
 
 ## Built-in locked packages
 
-| ID | Name | Pin / ADC / rate | Signal label | SHA-256 |
+| ID | Name | Mapping / ADC / logical rate | Signal label | SHA-256 |
 | --- | --- | --- | --- | --- |
-| `wvu.bmeg420l.general.a0.development.v1` | General A0 — Development | A0 / 12 bit / 1000 Hz | `general_a0_raw_input` | `028bc317057b90f1f070cd215ce8d9d6200214819c32494a492a3af51661b77e` |
-| `wvu.bmeg420l.ecg.raw.v1` | ECG Module — Raw Output | A0 / 12 bit / 1000 Hz | `ecg_module_raw_output` | `1cfd886ac74c0d9ee3a59213dec19176f86677cbcf508326f176adfc122d8c59` |
-| `wvu.bmeg420l.emg.raw.v1` | EMG Module — Raw Output | A0 / 12 bit / 1000 Hz | `emg_module_raw_output` | `863f918ef494afb74fb15c8b878ab1009128431a00698eb706088e91c8502ea3` |
+| `wvu.bmeg420l.general.analog.development.v2` | General Analog — Development | A0 default; instructor draft supports 1–6 unique A0–A5 / 12 or 14 bit / ≤1000 Hz | profile-defined | `d5ee6a65cbeb8c4b950586ad591cc7ac566718f38afeda74f5fb1a45ee71ef2d` |
+| `wvu.bmeg420l.ecg.course.capture.v1` | ECG — Course Capture | A0 / 12 bit / 1000 frames/s | `ecg_counts` | `cd04267743fd38066aa8daf91b6eafa9550e4406e2ef3d0d59ceae04051b782d` |
+| `wvu.bmeg420l.emg.force.course.capture.v1` | EMG + Force — Course Capture | A0–A3 / 12 bit / 1000 frames/s | four synchronized raw fields | `ddad92c2805f04b5af546bcd5bf9dc05b74b6e92163e99a279c3e7fbf13ddcd9` |
+| `wvu.bmeg420l.blood_pressure.ppg.course.capture.v1` | Blood Pressure + PPG — Course Capture | A0–A2, D4 green / 12 bit / 200 frames/s | three synchronized raw fields | `14cf52a6b4c097474efd1303e872dcad5d54532518b6c0b8bb36d4a68166be7a` |
+| `wvu.bmeg420l.pulseox.txrx.raw.course.capture.v1` | Pulse Oximetry — TX + RX Raw Capture | A0/A1, D5 red, D6 IR / 14 bit / 250 cycles/s | eight state-preserved raw fields | `2ada45d1e96dbd2747c0a6e897fff234e9441e599dc7077df529196cc62d021e` |
 
-All require UNO R4 WiFi FQBN `arduino:renesas_uno:unor4wifi`, protocol 0.1, build
-`0x00010001`, device `0x554E4F34`, raw ADC counts and direct Arduino input volts using
-`counts * 5.0 / 4095.0`. All allow timed (10/30/60/300/600 s plus custom ≥10 s) and
-Until-stopped runs. ECG/EMG require a session-local acknowledgement of the bench-only notice.
+All require UNO R4 WiFi FQBN `arduino:renesas_uno:unor4wifi`, protocol 0.2, build
+`0x00010002`, and device `0x554E4F34`. All allow timed (10/30/60/300/600 s plus custom ≥10 s)
+and Until-stopped runs. Values are raw ADC counts; direct Arduino-input volts use the explicitly
+recorded reference-voltage assumption. See `COURSE_ACQUISITION_PROFILES.md` for field order and
+the teaching-use boundary.
 
 ## Recording provenance and compatibility
 
 At start, the controller freezes `ProfileSnapshot { captured_utc, bench_notice_acknowledged,
-profile }`. It is embedded in the existing BMEG JSON header and the `.metadata.json` sidecar.
-Sample records and BMEG magic `BMEGREC1` do not change. Readers treat absent profile provenance
-as a legacy/general-development recording; they never infer ECG or EMG.
+profile }`. It is embedded in the BMEG JSON header and the `.metadata.json` sidecar. v0.2 BMEG
+records are record-major synchronized arrays whose field count comes from the frozen profile;
+v0.1 single-count records remain readable. Readers treat absent profile provenance as a
+legacy/general-development recording and never infer a course modality.
 
-New profile-aware CSVs add `profile_id`, `profile_version`, and `signal_label` columns after the
-existing spreadsheet-compatible raw-data columns. Legacy CSV remains unchanged.
+v0.2 CSV begins with `record_sequence,t_us` (or `cycle_index,t_us` for pulse ox) followed by the
+frozen profile's raw field names. Legacy CSV remains unchanged.
 
 ## Local authoring workflow
 

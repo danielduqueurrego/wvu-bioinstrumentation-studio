@@ -161,6 +161,17 @@ the frontend and keeps a job visible until its terminal result and diagnostic lo
 - Manifest-hashed validation package export/import and explicit legacy recording compatibility
 - Bench sources or simulator only; no human/electrode system, physiological analysis, or medical claim
 
+### Phase 4 — multi-channel course acquisition
+
+- Protocol v0.2 and controlled UNO R4 WiFi firmware for one-to-six synchronized logical analog
+  fields, plus a fixed four-state pulse-ox raw cycle
+- Locked course capture profiles: ECG; EMG + force; Blood Pressure + PPG; and pulse-ox TX/RX
+- Record-major raw BMEG/CSV fields, profile/pin/output/marker provenance, and legacy v0.1 reader
+- Bounded multitrace uPlot and 20–30 Hz frontend polling while full-rate raw writes remain in Rust
+- Active-HIGH D4 green only for BP capture; D5 RED/D6 IR only in the fixed pulse cycle; low on
+  every safe transition
+- No physiological analysis or clinical claim; optional Phase 3B characterization remains separate
+
 ### Phase 1 — tested vertical slice
 
 - Repository and toolchain

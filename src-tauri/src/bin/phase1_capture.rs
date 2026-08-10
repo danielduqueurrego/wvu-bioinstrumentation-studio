@@ -9,7 +9,7 @@ use std::{
 };
 use wvu_bioinstrumentation_studio_lib::{
     arduino_cli::ArduinoCli,
-    protocol::{encode_frame, Frame, FrameParser, MessageType},
+    protocol::{encode_frame, Frame, FrameParser, MessageType, CONTROLLED_SERIAL_BAUD},
     recording::{BmegReader, RecordingDuration, RecordingMetadata, StopReason},
     session::{ResetTarget, SessionController},
 };
@@ -178,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter()
             .next()
             .ok_or("no UNO R4 WiFi discovered")?;
-        let mut port = serialport::new(&board.port, 115_200)
+        let mut port = serialport::new(&board.port, CONTROLLED_SERIAL_BAUD)
             .timeout(Duration::from_millis(50))
             .open()?;
         port.clear(serialport::ClearBuffer::Input)?;

@@ -1,10 +1,40 @@
 # WVU Bioinstrumentation Studio
 
-Windows teaching/engineering software for BMEG 420L. It is **not a medical device**.
-Phase 1 uses only the simulator, the UNO R4 WiFi alone, or a safe 0–5 V bench signal
-on A0. Do not connect a person or enable optical LEDs.
+Windows teaching software for BMEG 420L. It is **not a medical device** and never produces
+diagnostic or treatment advice. The app records raw engineering signals and preserves the timing,
+channel map, firmware identity, profile snapshot, and integrity counters needed for course work.
 
-## Reproduce checks
+## Current Phase 4 capabilities
+
+- One UNO R4 WiFi at a time, with controlled protocol v0.2 firmware:
+  build `0x00010002`, device `0x554E4F34`, USB CDC configured at 921600 baud.
+- Synchronized logical analog frames with one to six unique A0–A5 inputs; ADC reads are sequential
+  within a frame, not electrically simultaneous.
+- Locked course captures: ECG (A0); EMG + force (A0–A3); blood pressure + PPG (A0–A2, D4 green);
+  and pulse-ox TX/RX raw capture (A0/A1, D5 red, D6 IR).
+- Timed and **Until stopped** recording, bounded uPlot display updates, markers, continuous BMEG,
+  profile-aware CSV, metadata, storage guards, disconnect finalization, and simulator support.
+- A firmware workspace for one-file UNO projects and an optional instructor-only bench-validation
+  evidence workflow. Formal physical module characterization is not required for ordinary course
+  capture and remains a separate future activity.
+
+See [course profile mapping](docs/COURSE_ACQUISITION_PROFILES.md),
+[protocol v0.2](docs/USB_PROTOCOL_SPECIFICATION_v0.2.md), and
+[profile schema](docs/ACQUISITION_PROFILE_SCHEMA_v1.md).
+
+## Safety boundary
+
+Follow BMEG 420L lab instructions and instructor safety procedures. Do not use this app for
+diagnosis or clinical decisions. The optional Validation page is explicitly bench-only. Phase 4
+does not calculate heart rate, SpO2, blood pressure, EMG activation/fatigue, or any physiological
+interpretation. Raw ADC counts remain authoritative; volts are direct Arduino-input conversion
+only, never calibrated physiological units.
+
+The reference firmware makes D4/D5/D6 LOW at startup, idle, Stop, protocol/configuration errors,
+and watchdog faults. D4 may be HIGH only during the configured BP/PPG capture; D5/D6 are active
+HIGH only during the fixed pulse-ox RED/DARK/IR/DARK sequence and are never HIGH together.
+
+## Build and checks
 
 ```powershell
 $env:Path = 'C:\Users\dd00055\.cargo\bin;' + $env:Path
@@ -19,230 +49,53 @@ npm run build
 npm run tauri build
 ```
 
-Run the desktop app with `npm run tauri dev`. Its Acquisition page uses the shared Rust
-controller, bounded 25 Hz display polling, uPlot, continuous BMEG recording, metadata,
-and CSV export.
+Run the desktop app with `npm run tauri dev`. The frontend only polls bounded snapshots at about
+25 Hz; it does not receive one UI event per raw ADC record.
 
-## Recording duration and storage safeguards
+## Controlled firmware
 
-The Acquisition page has an explicit **Timed** mode (10 seconds, 30 seconds, 60 seconds,
-5 minutes, 10 minutes, or a validated custom whole-second value of at least 10 seconds) and
-an explicit **Until stopped** mode. Until stopped has no hidden time limit: it ends only when
-the user presses Stop recording, the transport disconnects, a fault occurs, the application
-performs a controlled close, or the storage guard triggers. Raw samples stream directly to the
-temporary BMEG file; the bounded live plot never retains the complete recording. The controller
-warns below 1 GiB free space and performs a controlled incomplete finalization below 250 MiB.
-
-Final metadata records duration mode, requested duration when applicable, actual duration,
-stop reason, completion status, and initial/final observed free disk space. CSV continues to be
-streamed from finalized BMEG rather than assembled in memory.
-
-## UNO R4 WiFi connection recovery
-
-Normal hardware connection uses a bounded startup grace and up to three CRC-valid PING retries.
-If an idle, discovered UNO R4 WiFi opens but returns no protocol frames, the Acquisition page
-shows structured diagnostics and offers **Retry handshake** first. **Reset board and retry** is a
-separate, explicit user action: it closes the selected session, performs a 1200-bps touch on that
-identified UNO only, polls for its returning USB port (which may have a different COM number),
-and repeats the normal handshake. It never uploads firmware, cannot run during recording, and
-never concatenates sessions across a reset. See
-`logs/phase1_1_touch_reset_characterization_2026-08-06.md` for measured limitations.
-
-The controlled reference identity is protocol v0.1, firmware build `0x00010001`, and device
-ID `0x554E4F34`. Upload success alone is not proof of identity. After a controlled upload,
-verify it with the production-parser probe shown below. The current manual Arduino CLI upload
-path is verified; an in-app firmware installer is not part of the Phase 1.1 release. A known
-hardware limitation remains: the explicit 1200-bps reset/retry action can return COM12 but leave
-the protocol silent, requiring an explicit controlled firmware recovery rather than an automatic
-upload.
-
-## Firmware
+Close Arduino IDE, Serial Monitor, Serial Plotter, and other serial tools before using the app.
+Rediscover the port; do not assume `COM12`.
 
 ```powershell
+arduino-cli board list --format json
 arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi firmware\reference_unor4wifi
-arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port <CURRENT_UNO_PORT> firmware\reference_unor4wifi
-```
-
-Rediscover the port with `arduino-cli board list`; do not assume COM12. The safe Phase 1
-sketch forces D4, D5, and D6 LOW.
-
-## Phase 2 firmware workspace
-
-The **Firmware** view is a one-file Arduino workspace for the UNO R4 WiFi. A project is a
-student-selected folder containing exactly:
-
-```text
-<ProjectName>/
-  <ProjectName>.ino
-  project.json
-```
-
-`project.json` records the project schema, target/FQBN, timestamps, template origin,
-optional notes and remembered COM port, and the last successful compile/upload identity.
-Project names must begin with an ASCII letter and contain only letters, digits, and underscores;
-the sketch file always matches the project folder name. Saves use a temporary sibling file then
-rename where Windows permits it. Existing non-empty project folders are never overwritten.
-
-The workspace supplies five version-controlled templates: blank UNO R4 WiFi, an ASCII A0
-example, the byte-identical WVU protocol reference, a D4/D5/D6-LOW digital-output example,
-and an ASCII serial diagnostic. Templates are copied into student projects; the controlled
-reference source in `firmware/reference_unor4wifi/` is never edited by the workspace.
-
-Arduino CLI is located from `C:\\arduino-cli\\arduino-cli.exe`, the current `PATH`, or the
-instructor-controlled `BMEG_ARDUINO_CLI` environment variable. Editing and saving stay
-available if the CLI or `arduino:renesas_uno` core is absent; the Firmware environment panel
-shows the exact missing prerequisite and install command. Compile and upload use argument arrays,
-capture command/output/duration/exit code, and write JSON workflow logs under the application
-data directory—not the student project folder.
-
-Upload is deliberate: the current saved source must have compiled successfully, a single
-detected UNO R4 WiFi must be selected, acquisition must be stopped, and the user must confirm the
-board/port warning. Arduino CLI performs the 1200-bps reset/upload transition; the workflow
-rediscovers the returning application port using the UNO serial number where available and never
-chooses an unrelated port. A non-WVU sketch is a successful upload but disables Acquisition.
-**Restore WVU reference firmware** is a separate confirmed action that compiles the repository
-reference, uploads it, and requires HELLO, CAPABILITIES, PONG, protocol v0.1,
-build `0x00010001`, device `0x554E4F34`, and zero CRC failures before re-enabling Acquisition.
-
-For a reproducible controller-level hardware sequence (A0 ASCII upload, compatibility block,
-reference restore, protocol verification, and 30-second raw A0 recording), run:
-
-```powershell
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase2_firmware_capture
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase2_firmware_capture -- validate <recording.bmeg>
-```
-
-The harness uses the same workspace, firmware workflow, and serial session controller as the
-Tauri commands. It creates only a temporary student project and ignored temporary recordings.
-
-## Phase 3A locked ECG and EMG profiles
-
-Phase 3A adds the **General A0 — Development**, **ECG Module — Raw Output**, and **EMG Module —
-Raw Output** locked profiles. All are UNO R4 WiFi / A0 / 12-bit / 1000 samples/s and display only
-raw ADC counts or direct Arduino input volts (`counts * 5.0 / 4095.0`). ECG and EMG are explicitly
-bench-validation profiles: **not a medical device and no human-connected recording is authorized**.
-They require a session-local acknowledgement before recording.
-
-Student mode is the default and can select valid locked profiles only. Instructor authoring mode
-requires an explicit local acknowledgement, is not authentication, and creates new finalized
-versions from drafts rather than editing a locked package. Every recording freezes the selected
-profile snapshot into BMEG/metadata/CSV provenance. Legacy BMEG files remain readable and are
-shown as general/legacy data, never inferred to be ECG or EMG. See
-`docs/ACQUISITION_PROFILE_SCHEMA_v1.md` for the schema, SHA-256 integrity behavior, and built-in
-profile hashes.
-
-Bench-only controller captures can be reproduced with:
-
-```powershell
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase3a_profile_capture -- simulator development 10
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase3a_profile_capture -- hardware ecg 30
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase3a_profile_capture -- hardware emg 30
-```
-
-## Phase 3B bench validation
-
-The **Validation** view is an instructor-only, bench-validation workflow for the locked ECG and
-EMG raw-output profiles. It creates a separate versioned evidence document tied to the exact
-profile ID/version/hash and controlled firmware identity. It guides distinct baseline, DC sweep,
-sine, saturation-margin, and three-repeat runs, retaining the raw BMEG/metadata/CSV triplet for
-each run. It computes transparent engineering metrics only; it neither filters raw samples nor
-creates clinical or physiological results.
-
-Every validation workflow repeats the safety boundary: **bench-validation use only; no person or
-electrode system may be connected; not a medical device.** A finalized SHA-256 evidence hash is
-an integrity check, not authentication or human-use authorization. Validation-aware recordings
-embed a compact validation context while the immutable full evidence remains separate. Existing
-BMEG files remain readable.
-
-The deterministic simulator acceptance harness exercises the production parser, writer, metadata,
-CSV exporter, evidence finalization, and manifest-verified package import without opening a
-serial port:
-
-```powershell
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase3b_validation_capture
-```
-
-See `docs/VALIDATION_EVIDENCE_SCHEMA_v1.md` and `docs/BENCH_VALIDATION_WORKFLOW.md`. Physical
-ECG/EMG module characterization requires documented safe bench sources and remains separate from
-this simulator evidence. The Validation-page matrix passed at 100% Windows scaling and a
-UNO-alone USB disconnect/reconnect run passed; neither result validates an ECG/EMG module or
-authorizes human-connected use.
-
-## Phase 2 firmware workspace
-
-The **Firmware** view is a one-file Arduino workspace for the UNO R4 WiFi. A project is a
-student-selected folder containing exactly:
-
-```text
-<ProjectName>/
-  <ProjectName>.ino
-  project.json
-```
-
-`project.json` records the project schema, target/FQBN, timestamps, template origin,
-optional notes and remembered COM port, and the last successful compile/upload identity.
-Project names must begin with an ASCII letter and contain only letters, digits, and underscores;
-the sketch file always matches the project folder name. Saves use a temporary sibling file then
-rename where Windows permits it. Existing non-empty project folders are never overwritten.
-
-The workspace supplies five version-controlled templates: blank UNO R4 WiFi, an ASCII A0
-example, the byte-identical WVU protocol reference, a D4/D5/D6-LOW digital-output example,
-and an ASCII serial diagnostic. Templates are copied into student projects; the controlled
-reference source in `firmware/reference_unor4wifi/` is never edited by the workspace.
-
-Arduino CLI is located from `C:\arduino-cli\arduino-cli.exe`, the current `PATH`, or the
-instructor-controlled `BMEG_ARDUINO_CLI` environment variable. Editing and saving stay
-available if the CLI or `arduino:renesas_uno` core is absent; the Firmware environment panel
-shows the exact missing prerequisite and install command. Compile and upload use argument arrays,
-capture command/output/duration/exit code, and write JSON workflow logs under the application
-data directory—not the student project folder.
-
-Upload is deliberate: the current saved source must have compiled successfully, a single
-detected UNO R4 WiFi must be selected, acquisition must be stopped, and the user must confirm the
-board/port warning. Arduino CLI performs the 1200-bps reset/upload transition; the workflow
-rediscovers the returning application port using the UNO serial number where available and never
-chooses an unrelated port. A non-WVU sketch is a successful upload but disables Acquisition.
-**Restore WVU reference firmware** is a separate confirmed action that compiles the repository
-reference, uploads it, and requires HELLO, CAPABILITIES, PONG, protocol v0.1,
-build `0x00010001`, device `0x554E4F34`, and zero CRC failures before re-enabling Acquisition.
-
-For a reproducible controller-level hardware sequence (A0 ASCII upload, compatibility block,
-reference restore, protocol verification, and 30-second raw A0 recording), run:
-
-```powershell
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase2_firmware_capture
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase2_firmware_capture -- validate <recording.bmeg>
-```
-
-The harness uses the same workspace, firmware workflow, and serial session controller as the
-Tauri commands. It creates only a temporary student project and ignored temporary recordings.
-
-## Acceptance harness
-
-The feature-gated harness calls the same nonblocking session start/status path as Tauri
-commands, without the frontend. It is useful for controlled engineering acceptance:
-
-```powershell
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase1_capture -- simulator 10
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase1_capture -- simulator until 20
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase1_capture -- hardware 61
+arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port <CURRENT_UNO_PORT> firmware\reference_unor4wifi --verbose
 cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase1_capture -- probe
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase1_capture -- verify
 ```
 
-For the harness only, `until <seconds>` requests Until stopped and issues the production Stop
-path after the supplied observation time; the desktop application's Stop recording button remains
-the normal user control.
+The probe must show HELLO, CAPABILITIES, PONG, zero CRC failures, protocol 0.2, build
+`0x00010002`, and device `0x554E4F34`. A successful upload alone is not identity proof. The
+Firmware workspace’s **Restore WVU reference firmware** action uses the same controlled source and
+requires a verified protocol handshake before Acquisition is re-enabled.
 
-`probe` sends a CRC-valid PING and prints raw bytes plus frames decoded by the production parser.
-`verify` runs the bounded production handshake and enforces the controlled firmware identity.
-`validate <recording.bmeg>` streams the BMEG and CSV, deserializes metadata, and checks row
-counts, monotonic sequences/timestamps, voltage conversion, and Until-stopped finalization fields.
+## Recording and exports
 
-The Phase 1 BMEG layout is `BMEGREC1`, a little-endian `u16` JSON-header length, UTF-8
-metadata JSON, followed by little-endian `(u32 sample_sequence, u64 timestamp_us,
-u16 counts)` records. CSV is streamed from BMEG and uses direct conversion
-`volts = counts * 5.0 / 4095.0`. Generated recordings are ignored by Git.
+BMEG is the authoritative raw recording and streams while acquisition runs; the entire session is
+never held in RAM. Metadata includes start/stop time, duration mode, profile snapshot, firmware,
+board/port, active analog pins, digital mapping, ADC/rate, markers, free space, completion/stop
+reason, and integrity counters. CSV streams from BMEG after finalization.
 
-See [PHASE_1_REPORT.md](PHASE_1_REPORT.md) and the dated files under `logs/` for
-measured acceptance results.
+For Phase 4 BMEG/CSV, leading columns are `record_sequence,t_us` (or `cycle_index,t_us` for
+pulse ox), followed by profile-defined raw count fields. Existing Phase 1–3 single-channel BMEG
+files remain readable and are never relabelled as course profiles.
+
+## Controlled acceptance harnesses
+
+The harnesses call the same Rust session/controller path as Tauri and write temporary ignored
+outputs. They never authorize human measurement.
+
+```powershell
+# protocol identity probe
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase1_capture -- probe
+
+# Phase 4 simulator or UNO-only (floating inputs/safe bench source) profile smoke capture
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- simulator emg 10
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- hardware ecg 30
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- hardware emg 30
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- hardware bp 30
+cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- hardware pulseox 30
+```
+
+`KNOWN_ISSUES.md` lists the separately documented reset/retry recovery limitation and any pending
+manual display-scaling checks.

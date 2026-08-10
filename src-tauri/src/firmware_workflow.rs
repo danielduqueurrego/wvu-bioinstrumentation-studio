@@ -278,7 +278,6 @@ impl FirmwareWorkflow {
         let cli_path = Some(cli.executable().display().to_string());
         let cli_version = cli.version().ok().map(|log| log.stdout.trim().to_owned());
         let uno_r4_core_version = cli.uno_r4_core_version().ok();
-        let boards = cli.boards().unwrap_or_default();
         let problem = if cli_version.is_none() {
             Some("Arduino CLI is present but did not return a version.".into())
         } else if uno_r4_core_version.is_none() {
@@ -291,7 +290,10 @@ impl FirmwareWorkflow {
             cli_version,
             uno_r4_core_version,
             expected_fqbn: UNO_R4_WIFI_FQBN.into(),
-            boards,
+            // Board enumeration intentionally lives in the application-level discovery
+            // workflow.  Inspecting the Firmware page must not spawn `arduino-cli board
+            // list` or change the shared board cache.
+            boards: Vec::new(),
             ready: problem.is_none(),
             problem,
         }

@@ -120,6 +120,23 @@ Profile files are versioned JSON, validated against a schema, and cannot be sile
 - No clinical SpO2 estimate.
 - No automatic heart-rate, EMG-envelope, blood-pressure, or diagnostic interpretation in v1.
 
+## Phase 4 multi-channel course-capture decisions
+
+- Course development prioritizes synchronized raw variables, pin mapping, timing, and provenance;
+  formal Phase 3B physical analog characterization remains optional and does not block normal lab
+  capture. It remains a separate no-person engineering workflow.
+- Protocol v0.2 retains major zero and moves controlled USB CDC configuration to 921600 baud to
+  leave headroom for six 16-bit fields at 1000 logical frames/s. v0.1 recordings remain readable.
+- Two firmware acquisition modes are deliberately fixed: simultaneous 1–6 channel frames and the
+  pulse-ox RED/DARK/IR/DARK four-state cycle. The firmware is not a generic arbitrary sequencer.
+- D4 is the active-HIGH green control for the BP/PPG profile; D5 and D6 are active-HIGH RED/IR.
+  All three are driven LOW on startup, idle, Stop, malformed configuration, timeout, and fault.
+- Course profiles are locked at their prescribed maps. Instructor drafts may make a unique A0–A5
+  general-development map, but no built-in profile is edited in place.
+- Course capture stores raw counts as authoritative data. Counts-to-Arduino-input-volts display is
+  explicit. No SpO2, heart rate, pressure estimate, calibration fit, EMG activation/fatigue, or
+  automatic filter is added in Phase 4.
+
 ## Branding
 
 - Use the approved WVU/college lockup without redrawing or recoloring it.
