@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible problem without recordings or participant data.
+body:
+  - type: markdown
+    attributes:
+      value: "Do not attach physiological recordings, participant data, or student-identifying information."
+  - type: input
+    id: version
+    attributes:
+      label: Application version
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+  - type: input
+    id: board
+    attributes:
+      label: Board and port
+      description: "For example: Arduino UNO R4 WiFi — COM5"
+  - type: input
+    id: lab
+    attributes:
+      label: Selected lab
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: details
+    attributes:
+      label: Advanced details or diagnostic-log excerpt
+      description: "Remove personal paths and sensitive data first."

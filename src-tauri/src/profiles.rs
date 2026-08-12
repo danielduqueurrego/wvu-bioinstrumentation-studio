@@ -116,6 +116,8 @@ pub struct PlotDefaults {
     pub groups: Vec<PlotDefaultGroup>,
 }
 
+/// Historical optional sketch metadata retained only for older lab packages.
+/// The distributed application does not expose a sketch editor or association UI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssociatedSketch {
     pub name: String,
@@ -145,7 +147,7 @@ pub struct LedOutputs {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AcquisitionSettings {
-    /// Retained for Phase 1–3 profile snapshots. New profiles use `channels`.
+    /// Retained for legacy profile snapshots. Current labs use `channels`.
     #[serde(default = "default_analog_pin")]
     pub analog_pin: String,
     pub adc_resolution_bits: u8,
@@ -163,8 +165,8 @@ pub struct AcquisitionSettings {
     pub led_outputs: Option<LedOutputs>,
     #[serde(default)]
     pub state_dwell_us: Option<u32>,
-    /// Phase 6 uses this explicit description. `led_outputs` remains readable for
-    /// Phase 1–5 recordings and is treated as a legacy shorthand.
+    /// Current labs use this explicit description. `led_outputs` remains readable
+    /// in historical recordings and is treated as a legacy shorthand.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub digital_outputs: Vec<DigitalOutput>,
 }
@@ -306,6 +308,7 @@ pub struct AcquisitionProfile {
     pub integrity: ProfileIntegrity,
     #[serde(default, skip_serializing_if = "PlotDefaults::is_empty")]
     pub plot_defaults: PlotDefaults,
+    /// Retained for backward-reading imported historical lab definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub associated_sketch: Option<AssociatedSketch>,
     /// Retain optional future fields in deterministic key order on import/export.
@@ -425,7 +428,7 @@ impl AcquisitionProfile {
         }
         if !matches!(self.acquisition.adc_resolution_bits, 12 | 14) {
             return Err(ProfileError::Validation(
-                "the controlled Phase 4 firmware supports 12-bit or 14-bit ADC acquisition".into(),
+                "the controlled firmware supports 12-bit or 14-bit ADC acquisition".into(),
             ));
         }
         if self.acquisition.sample_rate_hz == 0 || self.acquisition.sample_rate_hz > 1_000 {
@@ -918,7 +921,7 @@ impl ProfileStore {
         Ok(draft)
     }
 
-    /// Creates the Phase 6 Blank Simultaneous Analog template. It intentionally
+    /// Creates the blank simultaneous-analog template. It intentionally
     /// starts as an instructor draft; only an explicitly saved/hashed revision
     /// becomes visible to Student mode.
     pub fn create_blank_simultaneous_lab(
@@ -1484,7 +1487,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     #[test]
-    fn phase4_builtin_hashes_are_deterministic() {
+    fn builtin_hashes_are_deterministic() {
         let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(profiles.len(), 5);
         assert!(profiles

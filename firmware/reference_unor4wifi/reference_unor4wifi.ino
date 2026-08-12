@@ -1,5 +1,5 @@
 /*
- * WVU Bioinstrumentation Studio controlled UNO R4 WiFi firmware, Phase 6.
+ * WVU Bioinstrumentation Studio controlled UNO R4 WiFi firmware.
  * Teaching use only; not a medical device. This sketch performs no physiological
  * interpretation. Analog channels are read in deterministic sequential order
  * within one logical timestamped frame; they are not literally simultaneous.

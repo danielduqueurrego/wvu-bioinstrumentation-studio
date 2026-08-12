@@ -1,4 +1,4 @@
-//! Phase 1 production session controller.
+//! Production acquisition-session controller.
 //!
 //! The controller is shared by Tauri commands, but a worker owns every blocking
 //! transport read and disk write. Status and the bounded display history are copied
@@ -1689,7 +1689,7 @@ impl SessionController {
             completion_status: "active".into(),
             profile_snapshot: Some(profile.clone()),
             // Retained as an optional legacy metadata field. New course recordings
-            // never create the retired Phase 3B context.
+            // never create the retired validation context.
             validation_context: None,
             markers: Vec::new(),
             calibration: Some(calibration),
@@ -2149,7 +2149,7 @@ fn validate_firmware_capabilities(
 ) -> Result<(), SessionError> {
     let Some(capabilities) = capabilities else {
         // Legacy CAPABILITIES packets did not carry enough detail to make a
-        // Phase 6 resource claim. Their existing conservative configuration
+        // Resource claim. The existing conservative configuration
         // checks above remain in effect for backward reader compatibility.
         return Ok(());
     };
@@ -2500,7 +2500,7 @@ impl SimulatorIo {
             },
             "course_blood_pressure" => {
                 // The deterministic simulator has an explicit MPXV-to-XGZP
-                // relationship so students can exercise the Phase 5 linear-fit
+                // relationship so students can exercise the linear-fit
                 // workflow without calling it a physical sensor validation.
                 let mpxv_volts = 2.5 + (phase * 0.08).sin() * 0.9;
                 match field {
@@ -2593,7 +2593,7 @@ impl Write for SimulatorIo {
                     if payload.len() < 8 {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
-                            "invalid Phase 4 simulator configure payload",
+                            "invalid simulator configure payload",
                         ));
                     }
                     match payload[0] {
@@ -3528,7 +3528,7 @@ mod tests {
     }
 
     #[test]
-    fn phase4_configuration_payloads_bind_course_channel_maps_and_leds() {
+    fn course_configuration_payloads_bind_channel_maps_and_leds() {
         let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
         let lookup = |category: &str| {
             profiles
@@ -3548,7 +3548,7 @@ mod tests {
     }
 
     #[test]
-    fn phase6_configuration_uses_advertised_firmware_capabilities() {
+    fn configuration_uses_advertised_firmware_capabilities() {
         let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
         let emg = profiles
             .iter()

@@ -13,7 +13,7 @@ import {
   visibleChannels
 } from './multichannel';
 
-describe('Phase 4 multi-channel UI helpers', () => {
+describe('multi-channel UI helpers', () => {
   const channels = [
     { id: 'raw_emg', label: 'Raw EMG', csv_name: 'raw_emg_counts' },
     { id: 'rectified_emg', label: 'Rectified EMG', csv_name: 'rectified_emg_counts' },

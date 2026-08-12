@@ -20,6 +20,5 @@
   "safety": { "bench_only": true, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Use simulator, UNO alone, or a safe 0–5 V bench signal for development."] },
   "export": { "signal_name": "general_analog_raw", "include_profile_snapshot": true },
   "plot_defaults": { "groups": [{ "channel_ids": ["general_a0"] }] },
-  "associated_sketch": { "name": "WVU Reference Firmware", "is_wvu_reference": true },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "4b04390a944d34f28b1b334c37e794ee4ef017532a1f25e558954b884a8bc1af" }
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "679940266c5d31c7fabfc1423afea8b091a68d673fe69cada428a011e3545def" }
 }

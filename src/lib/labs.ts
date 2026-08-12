@@ -33,6 +33,7 @@ export type LabProfile = {
   export: { signal_name: string; include_profile_snapshot: boolean };
   integrity: { canonical_hash_algorithm: string; canonical_hash: string };
   plot_defaults?: { groups: LabPlotGroup[] };
+  /** Historical metadata accepted when importing an older lab package; no UI exposes it. */
   associated_sketch?: { name: string; relative_path?: string; source_hash?: string; is_wvu_reference: boolean };
 };
 

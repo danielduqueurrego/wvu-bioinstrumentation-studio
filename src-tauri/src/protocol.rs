@@ -15,7 +15,7 @@ pub const HEADER_LEN: usize = 14;
 pub const CRC_LEN: usize = 2;
 pub const MAX_PAYLOAD_LEN: usize = 1024;
 
-/// Immutable identity expected from the controlled Phase 1 UNO R4 WiFi sketch.
+/// Immutable identity expected from the controlled UNO R4 WiFi reference firmware.
 /// The matching values are encoded in `firmware/reference_unor4wifi`'s HELLO frame.
 pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0003;
 pub const REFERENCE_DEVICE_ID: u32 = 0x554e_4f34;

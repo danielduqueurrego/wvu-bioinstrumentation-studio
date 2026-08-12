@@ -1,16 +1,18 @@
-# WVU Bioinstrumentation Studio — Student Quick Start
+# Student Quick Start
 
-1. Install WVU Bioinstrumentation Studio on Windows.
-2. Connect the Arduino UNO R4 WiFi by USB.
-3. Open the application and confirm the Board and Firmware status at the top.
-4. If a firmware update is required, choose **Restore WVU Firmware**.
-5. Select your **Project folder**.
-6. Choose the lab assigned by your instructor.
-7. Enter an **Output folder** for the trial if needed. It is a folder inside the Project folder.
-8. Choose a source, duration, units, and plot arrangement as instructed.
-9. Start the recording. **Add marker** records an unlabeled event timestamp when your lab calls for one.
-10. Stop the recording. The BMEG, CSV, and metadata files are saved together in the selected Project/Output folder.
+1. Install WVU Bioinstrumentation Studio and connect the Arduino UNO R4 WiFi.
+2. Open the application and confirm the Board and Firmware status at the top of the window.
+3. If firmware needs attention, select **Restore WVU Firmware** and wait for it to complete.
+4. Choose a writable **Project folder**.
+5. Select the lab assigned by your instructor.
+6. Enter an optional relative **Output folder** for this trial, such as `Participant01\Trial03`.
+7. Choose duration, display units, and plot arrangement as instructed.
+8. Select **Connect, configure, and start recording**.
+9. Stop the recording when directed, or wait for a timed run to finish.
+10. Find the `.bmeg`, `.csv`, metadata, and any event sidecar in the shown Project/Output folder.
 
-Teaching use only — not a medical device. Follow BMEG 420L lab instructions and instructor safety procedures. Do not use the application for diagnosis or clinical decisions.
+The CSV contains raw counts and applicable derived voltage or engineering-unit columns. The raw BMEG data remain authoritative.
 
-If the Arduino is not detected, check the USB cable and choose **Refresh Board**. If Firmware is not ready, use **Restore WVU Firmware**.
+For pulse oximetry, the application records raw RED, DARK 1, IR, and DARK 2 measurements for both detectors. It does not calculate SpO2, heart rate, or other physiological results.
+
+Teaching use only — not a medical device.

@@ -20,6 +20,5 @@
   "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "Do not use this application for diagnosis or clinical decisions."] },
   "export": { "signal_name": "ecg_course_capture", "include_profile_snapshot": true },
   "plot_defaults": { "groups": [{ "channel_ids": ["ecg"] }] },
-  "associated_sketch": { "name": "WVU Reference Firmware", "is_wvu_reference": true },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "49e33fbbaa280686f2f1876e81349f3086b5e7d5205e1b9251d74b2d47185510" }
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "f889ca6f783ece8b9078100d2111b2be3211b409cda19bf9ef8288004095d424" }
 }

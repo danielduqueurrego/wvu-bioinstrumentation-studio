@@ -26,6 +26,5 @@
   "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "Raw data only: no MVC, fatigue, RMS, envelope, or physiological interpretation is calculated here."] },
   "export": { "signal_name": "emg_force_course_capture", "include_profile_snapshot": true },
   "plot_defaults": { "groups": [{ "channel_ids": ["raw_emg"] }, { "channel_ids": ["rectified_emg"] }, { "channel_ids": ["emg_envelope"] }, { "channel_ids": ["pressure"] }] },
-  "associated_sketch": { "name": "WVU Reference Firmware", "is_wvu_reference": true },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "87d5940dfcf206cedd5b80f1608761746ecc9ac58d1f14b936328816ce688322" }
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "e0936fc2512fcf42d0b18c264fcc4c2adc04bbc5b77d62d26d8a674f2037835e" }
 }

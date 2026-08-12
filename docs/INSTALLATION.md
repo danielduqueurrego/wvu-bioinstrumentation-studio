@@ -1,34 +1,33 @@
 # Installation
 
-## Requirements
+## Install on Windows
 
-- Windows 11 x64 (Windows 10 x64 may also work when the required WebView2 runtime can be installed).
-- Arduino UNO R4 WiFi for hardware acquisition.
+Use the WVU Bioinstrumentation Studio NSIS setup executable supplied by the course. It is the primary installer.
 
-No Arduino IDE, Arduino CLI, Renesas board package, Node.js, Rust, Git, or development tools are required for students.
+1. Run the setup executable.
+2. Approve the Windows administrator prompt for the system-wide installation.
+3. Complete setup, then launch WVU Bioinstrumentation Studio from the Start menu.
 
-## Install
+The application installs in the normal Program Files location and is available to users of that computer. It runs as a standard user after installation.
 
-1. Run `WVU Bioinstrumentation Studio_1.0.0_x64-setup.exe`.
-2. Accept the Administrator prompt for the system-wide Program Files installation.
-3. Start **WVU Bioinstrumentation Studio** from the Start menu.
+## Included tools
 
-On first start, the application prepares its included Arduino tools in the current user's local
-application-data folder. Project-folder choices, recordings, local calibrations, lab customizations,
-and logs also remain per-user and writable without Administrator rights. The application does not
-modify an existing Arduino IDE installation or its configuration. The installer includes an offline
-WebView2 installer so ordinary course use can proceed without an Internet connection after installation.
+The distribution bundles its tested Arduino CLI, Arduino UNO R4 core, compiler/upload tools, and an offline WebView2 installer. Arduino IDE, Arduino CLI, Node.js, Rust, Git, and development tools are not required for normal course use.
 
-## Verify
+On first use, the app may show **Preparing Arduino tools…** while it prepares a per-user writable runtime. This does not modify an existing Arduino IDE installation or its global configuration.
 
-Connect the Arduino UNO R4 WiFi, start the application, and confirm:
+## User data
 
-- Arduino: Connected
-- Firmware: Ready
-- Arduino tools: Ready
+Project folders, recordings, calibration presets, local instructor customizations, logs, and the writable Arduino runtime are stored in per-user locations. They are not written into Program Files. Uninstalling the application does not delete student Project folders or recordings by default.
 
-If firmware needs attention, choose **Restore WVU Firmware** at the top of the application. This replaces the sketch currently on the board.
+## Offline use
+
+After installation, normal board discovery, firmware verification/restoration, acquisition, calibration, and export work without Internet access. The application does not automatically update Arduino packages.
 
 ## Uninstall
 
-Use Windows **Installed apps** to uninstall WVU Bioinstrumentation Studio. Uninstalling does not delete student Project folders, recordings, or saved local calibrations by default.
+Use Windows **Installed apps** or the Start-menu uninstall entry. Remove a Project folder manually only when its recordings are no longer needed.
+
+## Installer status
+
+The installer is unsigned unless the repository owner supplies an approved Windows code-signing workflow. Windows may therefore display a trust warning.

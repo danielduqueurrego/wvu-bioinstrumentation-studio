@@ -14,35 +14,11 @@ edition = "2021"
 name = "wvu_bioinstrumentation_studio_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[features]
-acceptance-harness = []
-
-[[bin]]
-name = "phase1_capture"
-path = "src/bin/phase1_capture.rs"
-required-features = ["acceptance-harness"]
-
-[[bin]]
-name = "phase2_firmware_capture"
-path = "src/bin/phase2_firmware_capture.rs"
-required-features = ["acceptance-harness"]
-
-[[bin]]
-name = "phase3a_profile_capture"
-path = "src/bin/phase3a_profile_capture.rs"
-required-features = ["acceptance-harness"]
-
-[[bin]]
-name = "phase4_multichannel_capture"
-path = "src/bin/phase4_multichannel_capture.rs"
-required-features = ["acceptance-harness"]
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.19"

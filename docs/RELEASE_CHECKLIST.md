@@ -1,33 +1,32 @@
-# Student Distribution Release Checklist
+# Release Checklist
 
-## Package
+## Source and verification
 
-- [ ] Version, identifier, icons, and Windows metadata verified.
-- [ ] Pinned Arduino CLI and UNO R4 runtime assets verified against `runtime-manifest.json`.
-- [ ] NSIS and MSI installers built.
-- [ ] Distribution ZIP and SHA-256 checksums produced.
-- [ ] Generated installers, runtime caches, recordings, and ZIPs are not staged in Git.
+- Confirm `package.json`, Tauri configuration, release manifest, and release notes use the intended application version.
+- Run `cargo fmt --manifest-path src-tauri\Cargo.toml -- --check`.
+- Run Cargo check, test, and Clippy with `-D warnings`.
+- Run `npm run check`, `npm test`, and `npm run build`.
+- Run `npm run tauri build`; do not substitute `cargo build --release` for a production application build.
+- Launch the resulting Tauri release executable with no Vite or Node development server running. It must load bundled frontend assets and never request localhost.
 
-## Student experience
+## Functional smoke
 
-- [ ] Single-window Board, Project folder, and Acquisition workflow uses student-facing copy.
-- [ ] Advanced technical details are collapsed by default.
-- [ ] Startup scan, Refresh Board, verify, and restore show no external console window.
-- [ ] First start prepares included Arduino tools and does not rely on Arduino IDE or global Arduino15 settings.
-- [ ] One connected UNO R4 WiFi is selected and verified without firmware modification.
-- [ ] Launch the final Tauri-built release executable with no Vite/dev server running. The bundled
-  UI loads without requesting localhost.
-- [ ] A detected UNO with **Firmware update required** still permits Board selection, Refresh Board,
-  Verify Firmware, and Restore WVU Firmware.
-- [ ] After Verify Firmware or Restore WVU Firmware succeeds, a valid Project/Output folder and
-  selected course lab can start a new recording without restarting the application.
-- [ ] A blocked Start shows a concise, actionable student message; **Advanced details** retains the
-  recording-start stage, code, selected board/lab, and exact technical detail.
+- Confirm board discovery, firmware verification, and firmware restore work without external console windows.
+- Record a short ECG session, a second session without restart, and a short multi-channel EMG session.
+- Confirm raw pulse-ox fields and safe LED behavior with the appropriate setup or simulator.
+- Open Instructor Manage Labs and verify that reading/selecting labs creates no version.
 
-## Acceptance
+## Installer and distribution
 
-- [ ] Firmware verify and restore pass.
-- [ ] ECG, EMG, BP, and pulse-ox acquisition/export smoke checks pass.
-- [ ] Instructor Manage Labs remains usable.
-- [ ] UI matrix completed at the actual Windows scaling.
-- [ ] Clean-install or isolated-runtime result recorded.
+- Validate the Arduino runtime manifest and bundled archive before running `scripts\build_student_release.ps1`.
+- Install the NSIS package on a clean or isolated Windows user if available; confirm Program Files installation and standard-user operation.
+- Confirm uninstall preserves Project folders and recordings.
+- Regenerate installer, MSI, ZIP, manifest, and SHA-256 values for each candidate.
+- Verify the icon, no-console behavior, offline startup, and student-facing copy.
+
+## Publication review
+
+- Confirm a project-owner-approved root `LICENSE` exists before granting public reuse rights.
+- Confirm third-party notices for the bundled runtime.
+- Confirm no secrets, recordings, personal calibration files, or developer paths are tracked.
+- Confirm branding and code-signing decisions with the repository owner.

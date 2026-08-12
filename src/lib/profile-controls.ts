@@ -8,7 +8,7 @@ export type ProfileControlInput = {
 
 /** UI policy only; Rust independently validates every profile start request. */
 export function profileControls(input: ProfileControlInput) {
-  // Legacy Phase 3A bench profiles retain their explicit acknowledgement. Course
+  // Legacy bench profiles retain their explicit acknowledgement. Course
   // capture uses its profile safety notice and firmware compatibility instead.
   const requiresBenchAcknowledgement = input.category === 'ecg' || input.category === 'emg';
   const acknowledgementSatisfied = !requiresBenchAcknowledgement || input.benchAcknowledged;

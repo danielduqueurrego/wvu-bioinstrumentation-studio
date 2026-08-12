@@ -26,6 +26,5 @@
   "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "No blood-pressure, heart-rate, or calibration result is calculated by this application."] },
   "export": { "signal_name": "blood_pressure_ppg_course_capture", "include_profile_snapshot": true },
   "plot_defaults": { "groups": [{ "channel_ids": ["ppg"] }, { "channel_ids": ["mpxv"] }, { "channel_ids": ["xgzp"] }] },
-  "associated_sketch": { "name": "WVU Reference Firmware", "is_wvu_reference": true },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "18e9d0fc8e90612d0747e0bf455b5fcfc034d29c084078987342565cdc820d45" }
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "12b892f66dd83dfed4863ea8fc012031389779e17427cd516c74ee0bf1d2c967" }
 }

@@ -52,6 +52,15 @@ $runtimeManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Jso
 if ($runtimeManifest.arduino_cli -ne '1.5.2-rc.1' -or $runtimeManifest.renesas_uno_core -ne '1.6.0') {
   throw 'Unexpected Arduino runtime manifest. Update the reviewed release metadata before building.'
 }
+$releaseManifest = Get-Content -LiteralPath $releaseManifestPath -Raw | ConvertFrom-Json
+$expectedRuntimeArchiveSha256 = $releaseManifest.arduino_runtime_archive_sha256
+if ($expectedRuntimeArchiveSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+  throw 'Release manifest is missing the reviewed Arduino runtime archive SHA-256 digest.'
+}
+$runtimeArchiveHash = (Get-FileHash -LiteralPath $runtimeArchive -Algorithm SHA256).Hash
+if (-not $runtimeArchiveHash.Equals($expectedRuntimeArchiveSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "Arduino runtime archive hash does not match the reviewed manifest: $runtimeArchiveHash"
+}
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $runtimeZip = [System.IO.Compression.ZipFile]::OpenRead($runtimeArchive)
 try {

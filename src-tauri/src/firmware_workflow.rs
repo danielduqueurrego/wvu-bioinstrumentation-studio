@@ -1,26 +1,24 @@
-//! Phase 2 compile/upload orchestration.
+//! WVU reference-firmware restore and verification orchestration.
 //!
-//! This controller owns no frontend serial handle. It coordinates the existing
-//! acquisition `SessionController`, the safe Arduino CLI adapter, and one active
-//! firmware job. Arduino CLI performs the UNO upload/reset; this module observes
-//! and records only the selected board's application-port return.
+//! This controller coordinates the acquisition `SessionController`, the safe
+//! Arduino CLI adapter, and one active restore job. It intentionally does not
+//! expose a general sketch editor, compiler, or arbitrary upload path.
 use crate::{
     arduino_cli::{
         parse_compile_usage, parse_compiler_diagnostics, ArduinoCli, BoardInfo, CommandLog,
         CompileUsage, CompilerDiagnostic, UNO_R4_WIFI_FQBN,
     },
-    firmware_workspace::{
-        stable_hash, FirmwareIdentity, FirmwareProject, FirmwareVerificationKind,
-        FirmwareWorkspace, WorkspaceError,
-    },
     protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR, REFERENCE_DEVICE_ID, REFERENCE_FIRMWARE_BUILD},
+    reference_firmware::{
+        controlled_reference_source, source_hash, FirmwareIdentity, FirmwareVerificationKind,
+    },
     session::{ResetTarget, SessionController},
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -38,7 +36,6 @@ pub enum FirmwareCompatibility {
     Unknown,
     WvuProtocolCompatible,
     WvuProtocolIncompatible,
-    NonWvuSketch,
     UploadInProgress,
     VerificationFailed,
 }
@@ -46,8 +43,6 @@ pub enum FirmwareCompatibility {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FirmwareJobKind {
-    Compile,
-    Upload,
     RestoreReference,
 }
 
@@ -73,15 +68,11 @@ pub enum FirmwareJobStage {
 pub enum FirmwareErrorCategory {
     ArduinoCliMissing,
     CoreMissing,
-    ProjectInvalid,
-    UnsavedChanges,
+    ConfirmationRequired,
     CompileFailed,
     PortBusy,
-    UnsupportedBoard,
     BoardNotFound,
     AmbiguousBoard,
-    ResetFailed,
-    BootloaderNotFound,
     UploadFailed,
     ApplicationPortNotFound,
     ProtocolVerificationFailed,
@@ -125,8 +116,7 @@ pub struct FirmwareJobStatus {
     pub kind: FirmwareJobKind,
     pub stage: FirmwareJobStage,
     pub active: bool,
-    pub project_folder: Option<String>,
-    /// Stable hash of the saved source compiled for this job, when applicable.
+    /// SHA-256 of the immutable reference source compiled for this restore.
     pub source_hash: Option<String>,
     pub original_port: Option<String>,
     pub bootloader_port: Option<String>,
@@ -168,20 +158,6 @@ pub struct FirmwareEnvironmentStatus {
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
-pub struct CompileProjectRequest {
-    pub project_folder: String,
-    pub unsaved_changes: bool,
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-pub struct UploadProjectRequest {
-    pub project_folder: String,
-    pub port: String,
-    pub unsaved_changes: bool,
-    pub confirmation: bool,
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
 pub struct RestoreReferenceRequest {
     pub port: String,
     pub confirmation: bool,
@@ -191,14 +167,12 @@ pub struct RestoreReferenceRequest {
 pub struct FirmwareWorkflowStatus {
     pub compatibility: FirmwareCompatibility,
     pub job: Option<FirmwareJobStatus>,
-    pub last_compile: Option<FirmwareJobStatus>,
-    pub last_upload: Option<FirmwareJobStatus>,
+    pub last_restore: Option<FirmwareJobStatus>,
     pub last_failure: Option<FirmwareFailure>,
 }
 
 #[derive(Clone)]
 pub struct FirmwareWorkflow {
-    workspace: FirmwareWorkspace,
     session: SessionController,
     state: Arc<Mutex<WorkflowRuntime>>,
     cancel: Arc<AtomicBool>,
@@ -209,35 +183,19 @@ pub struct FirmwareWorkflow {
 struct WorkflowRuntime {
     compatibility: FirmwareCompatibility,
     active_job: Option<FirmwareJobStatus>,
-    last_compile: Option<FirmwareJobStatus>,
-    last_upload: Option<FirmwareJobStatus>,
+    last_restore: Option<FirmwareJobStatus>,
     last_failure: Option<FirmwareFailure>,
-    build_artifact: Option<BuildArtifact>,
-}
-
-#[derive(Clone, Debug)]
-struct BuildArtifact {
-    project_folder: String,
-    source_hash: String,
-    binary_path: PathBuf,
 }
 
 impl FirmwareWorkflow {
     pub fn new(session: SessionController) -> Self {
-        Self::with_workspace(FirmwareWorkspace::default(), session)
-    }
-
-    pub fn with_workspace(workspace: FirmwareWorkspace, session: SessionController) -> Self {
         Self {
-            workspace,
             session,
             state: Arc::new(Mutex::new(WorkflowRuntime {
                 compatibility: FirmwareCompatibility::Unknown,
                 active_job: None,
-                last_compile: None,
-                last_upload: None,
+                last_restore: None,
                 last_failure: None,
-                build_artifact: None,
             })),
             cancel: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
@@ -245,17 +203,12 @@ impl FirmwareWorkflow {
         }
     }
 
-    pub fn workspace(&self) -> &FirmwareWorkspace {
-        &self.workspace
-    }
-
     pub fn status(&self) -> Result<FirmwareWorkflowStatus, FirmwareFailure> {
         let runtime = self.lock_state()?;
         Ok(FirmwareWorkflowStatus {
             compatibility: runtime.compatibility,
             job: runtime.active_job.clone(),
-            last_compile: runtime.last_compile.clone(),
-            last_upload: runtime.last_upload.clone(),
+            last_restore: runtime.last_restore.clone(),
             last_failure: runtime.last_failure.clone(),
         })
     }
@@ -291,65 +244,11 @@ impl FirmwareWorkflow {
             uno_r4_core_version,
             expected_fqbn: UNO_R4_WIFI_FQBN.into(),
             // Board enumeration intentionally lives in the application-level discovery
-            // workflow.  Inspecting the Firmware page must not spawn `arduino-cli board
-            // list` or change the shared board cache.
+            // workflow so opening the application does not spuriously rescan devices.
             boards: Vec::new(),
             ready: problem.is_none(),
             problem,
         }
-    }
-
-    pub fn start_compile(
-        &self,
-        request: CompileProjectRequest,
-    ) -> Result<FirmwareJobStatus, FirmwareFailure> {
-        if request.unsaved_changes {
-            return Err(failure_unsaved(FirmwareJobStage::Preparing));
-        }
-        let project = self.open_project(&request.project_folder, FirmwareJobStage::Preparing)?;
-        let job = self.new_job(
-            FirmwareJobKind::Compile,
-            Some(project.project_folder.clone()),
-            Some(project.source_hash.clone()),
-            None,
-            None,
-        );
-        self.start_worker(job.clone(), move |workflow| {
-            workflow.compile_project(job.id, project)
-        })?;
-        Ok(job)
-    }
-
-    pub fn start_upload(
-        &self,
-        request: UploadProjectRequest,
-    ) -> Result<FirmwareJobStatus, FirmwareFailure> {
-        if !request.confirmation {
-            return Err(FirmwareFailure::new(
-                FirmwareErrorCategory::ProjectInvalid,
-                FirmwareJobStage::Preparing,
-                "Upload requires explicit confirmation showing the project and selected board.",
-                "confirmation=false",
-            ));
-        }
-        if request.unsaved_changes {
-            return Err(failure_unsaved(FirmwareJobStage::Preparing));
-        }
-        let project = self.open_project(&request.project_folder, FirmwareJobStage::Preparing)?;
-        let board = self.selected_board(&request.port, FirmwareJobStage::Preparing)?;
-        let artifact = self.current_build_for(&project, FirmwareJobStage::Preparing)?;
-        self.ensure_upload_is_safe(FirmwareJobStage::Preparing)?;
-        let job = self.new_job(
-            FirmwareJobKind::Upload,
-            Some(project.project_folder.clone()),
-            Some(project.source_hash.clone()),
-            Some(board.port.clone()),
-            board.serial_number.clone(),
-        );
-        self.start_worker(job.clone(), move |workflow| {
-            workflow.upload_artifact(job.id, project, board, artifact, false)
-        })?;
-        Ok(job)
     }
 
     pub fn start_restore_reference(
@@ -358,7 +257,7 @@ impl FirmwareWorkflow {
     ) -> Result<FirmwareJobStatus, FirmwareFailure> {
         if !request.confirmation {
             return Err(FirmwareFailure::new(
-                FirmwareErrorCategory::ProjectInvalid,
+                FirmwareErrorCategory::ConfirmationRequired,
                 FirmwareJobStage::Preparing,
                 "Restoring the WVU reference firmware replaces the sketch currently on the board.",
                 "confirmation=false",
@@ -368,7 +267,6 @@ impl FirmwareWorkflow {
         self.ensure_upload_is_safe(FirmwareJobStage::Preparing)?;
         let job = self.new_job(
             FirmwareJobKind::RestoreReference,
-            None,
             None,
             Some(board.port.clone()),
             board.serial_number.clone(),
@@ -440,7 +338,7 @@ impl FirmwareWorkflow {
         Ok(
             runtime.compatibility == FirmwareCompatibility::WvuProtocolCompatible
                 && runtime
-                    .last_upload
+                    .last_restore
                     .as_ref()
                     .and_then(|job| job.final_port.as_ref().or(job.original_port.as_ref()))
                     .is_none_or(|known| known.eq_ignore_ascii_case(port)),
@@ -473,12 +371,7 @@ impl FirmwareWorkflow {
             let mut runtime = self.lock_state()?;
             runtime.active_job = Some(job.clone());
             runtime.last_failure = None;
-            if matches!(
-                job.kind,
-                FirmwareJobKind::Upload | FirmwareJobKind::RestoreReference
-            ) {
-                runtime.compatibility = FirmwareCompatibility::UploadInProgress;
-            }
+            runtime.compatibility = FirmwareCompatibility::UploadInProgress;
         }
         let controller = self.clone();
         let handle = thread::spawn(move || {
@@ -491,174 +384,6 @@ impl FirmwareWorkflow {
             .lock()
             .map_err(|_| internal_failure("firmware worker lock poisoned"))? = Some(handle);
         Ok(())
-    }
-
-    fn compile_project(
-        &self,
-        job_id: u64,
-        project: FirmwareProject,
-    ) -> Result<(), FirmwareFailure> {
-        self.set_stage(
-            job_id,
-            FirmwareJobStage::Compiling,
-            "Compiling the saved project with Arduino CLI.",
-        )?;
-        let cli = required_cli(FirmwareJobStage::Compiling)?;
-        require_core(&cli, FirmwareJobStage::Compiling)?;
-        let build_dir = job_directory(job_id).join("compile");
-        fs::create_dir_all(&build_dir)
-            .map_err(|error| io_failure(FirmwareJobStage::Compiling, error))?;
-        let log = cli
-            .compile_to(Path::new(&project.project_folder), &build_dir, &self.cancel)
-            .map_err(|error| {
-                cli_failure(
-                    FirmwareJobStage::Compiling,
-                    FirmwareErrorCategory::CompileFailed,
-                    error,
-                )
-            })?;
-        let usage = parse_compile_usage(&format!("{}\n{}", log.stdout, log.stderr));
-        let diagnostics = parse_compiler_diagnostics(&format!("{}\n{}", log.stdout, log.stderr));
-        self.update_job(job_id, |job| {
-            job.compile_usage = Some(usage);
-            job.diagnostics = diagnostics;
-            job.compile_log = Some(log.clone());
-        })?;
-        if log.canceled {
-            return Err(FirmwareFailure::new(
-                FirmwareErrorCategory::Canceled,
-                FirmwareJobStage::Canceled,
-                "Compile canceled by the user.",
-                "Arduino CLI child was terminated",
-            ));
-        }
-        if !log.succeeded() {
-            return Err(FirmwareFailure::new(
-                FirmwareErrorCategory::CompileFailed,
-                FirmwareJobStage::Compiling,
-                "Arduino CLI could not compile the saved project. The board was not changed.",
-                combined_output(&log),
-            ));
-        }
-        let binary = build_dir.join(format!("{}.bin", project.metadata.source_filename));
-        if !binary.is_file() {
-            return Err(FirmwareFailure::new(
-                FirmwareErrorCategory::CompileFailed,
-                FirmwareJobStage::Compiling,
-                "Arduino CLI reported success but did not produce the expected binary.",
-                binary.display().to_string(),
-            ));
-        }
-        self.workspace
-            .update_compile_success(&project.project_folder, project.source_hash.clone())
-            .map_err(workspace_failure)?;
-        {
-            let mut runtime = self.lock_state()?;
-            runtime.build_artifact = Some(BuildArtifact {
-                project_folder: project.project_folder.clone(),
-                source_hash: project.source_hash,
-                binary_path: binary,
-            });
-        }
-        self.finish_success(job_id, FirmwareCompatibility::Unknown)
-    }
-
-    fn upload_artifact(
-        &self,
-        job_id: u64,
-        project: FirmwareProject,
-        board: BoardInfo,
-        artifact: BuildArtifact,
-        restore: bool,
-    ) -> Result<(), FirmwareFailure> {
-        self.set_stage(
-            job_id,
-            FirmwareJobStage::ClosingSerialSession,
-            "Closing any idle acquisition session before upload.",
-        )?;
-        self.session.disconnect().map_err(session_failure)?;
-        let cli = required_cli(FirmwareJobStage::Uploading)?;
-        require_core(&cli, FirmwareJobStage::Uploading)?;
-        self.set_stage(
-            job_id,
-            FirmwareJobStage::TouchReset,
-            "Arduino CLI will reset the selected UNO R4 WiFi for upload.",
-        )?;
-        self.set_stage(
-            job_id,
-            FirmwareJobStage::WaitingForBootloader,
-            "Waiting for Arduino CLI bootloader/upload transition.",
-        )?;
-        self.set_stage(
-            job_id,
-            FirmwareJobStage::Uploading,
-            "Uploading the compiled binary to the selected UNO R4 WiFi.",
-        )?;
-        let log = cli
-            .upload_input(&artifact.binary_path, &board.port, &self.cancel)
-            .map_err(|error| {
-                cli_failure(
-                    FirmwareJobStage::Uploading,
-                    FirmwareErrorCategory::UploadFailed,
-                    error,
-                )
-            })?;
-        self.update_job(job_id, |job| job.upload_log = Some(log.clone()))?;
-        if log.canceled {
-            return Err(FirmwareFailure::new(
-                FirmwareErrorCategory::Canceled,
-                FirmwareJobStage::Canceled,
-                "Upload canceled by the user.",
-                "Arduino CLI child was terminated",
-            ));
-        }
-        if !log.succeeded() {
-            return Err(FirmwareFailure::new(
-                FirmwareErrorCategory::UploadFailed,
-                FirmwareJobStage::Uploading,
-                "Arduino CLI upload failed; the board may still contain its prior sketch.",
-                combined_output(&log),
-            ));
-        }
-        self.set_stage(
-            job_id,
-            FirmwareJobStage::WaitingForApplicationPort,
-            "Waiting for the selected UNO R4 WiFi application port to return.",
-        )?;
-        let final_board = wait_for_application_port(&cli, &board, &self.cancel, |candidate| {
-            self.update_job(job_id, |job| {
-                if !candidate.port.eq_ignore_ascii_case(&board.port) {
-                    job.final_port = Some(candidate.port.clone());
-                }
-            })
-        })?;
-        self.update_job(job_id, |job| {
-            job.final_port = Some(final_board.port.clone())
-        })?;
-        match project.metadata.verification_kind {
-            FirmwareVerificationKind::NonWvu => {
-                let verification = FirmwareVerification {
-                    declared_kind: FirmwareVerificationKind::NonWvu,
-                    compatible: false,
-                    protocol_version: None,
-                    identity: None,
-                    bytes_received: None,
-                    valid_frames: None,
-                    crc_failures: None,
-                    explanation: "Upload completed. This project is declared as non-WVU firmware, so binary acquisition remains unavailable until compatible firmware is restored.".into(),
-                };
-                self.update_job(job_id, |job| job.verification = Some(verification))?;
-                if !restore {
-                    self.workspace
-                        .update_upload_success(&project.project_folder, final_board.port, None)
-                        .map_err(workspace_failure)?;
-                }
-                self.finish_success(job_id, FirmwareCompatibility::NonWvuSketch)
-            }
-            FirmwareVerificationKind::WvuProtocolReference => {
-                self.verify_uploaded_reference(job_id, project.project_folder, final_board, restore)
-            }
-        }
     }
 
     fn restore_reference(&self, job_id: u64, board: BoardInfo) -> Result<(), FirmwareFailure> {
@@ -679,11 +404,8 @@ impl FirmwareWorkflow {
         fs::create_dir_all(&reference_dir)
             .map_err(|error| io_failure(FirmwareJobStage::Compiling, error))?;
         let source_path = reference_dir.join("reference_unor4wifi.ino");
-        fs::write(
-            &source_path,
-            FirmwareWorkspace::controlled_reference_source().map_err(workspace_failure)?,
-        )
-        .map_err(|error| io_failure(FirmwareJobStage::Compiling, error))?;
+        fs::write(&source_path, controlled_reference_source())
+            .map_err(|error| io_failure(FirmwareJobStage::Compiling, error))?;
         let build_dir = job_directory(job_id).join("compile");
         fs::create_dir_all(&build_dir)
             .map_err(|error| io_failure(FirmwareJobStage::Compiling, error))?;
@@ -719,42 +441,94 @@ impl FirmwareWorkflow {
                 combined_output(&log),
             ));
         }
-        let artifact = BuildArtifact {
-            project_folder: "controlled-reference".into(),
-            source_hash: stable_hash(
-                &fs::read(&source_path)
-                    .map_err(|error| io_failure(FirmwareJobStage::Compiling, error))?,
-            ),
-            binary_path: build_dir.join("reference_unor4wifi.ino.bin"),
-        };
-        self.update_job(job_id, |job| {
-            job.source_hash = Some(artifact.source_hash.clone())
-        })?;
-        if !artifact.binary_path.is_file() {
+        let source_hash = source_hash(
+            &fs::read(&source_path)
+                .map_err(|error| io_failure(FirmwareJobStage::Compiling, error))?,
+        );
+        let binary_path = build_dir.join("reference_unor4wifi.ino.bin");
+        self.update_job(job_id, |job| job.source_hash = Some(source_hash))?;
+        if !binary_path.is_file() {
             return Err(FirmwareFailure::new(
                 FirmwareErrorCategory::CompileFailed,
                 FirmwareJobStage::Compiling,
                 "Reference compile did not produce a binary.",
-                artifact.binary_path.display().to_string(),
+                binary_path.display().to_string(),
             ));
         }
-        let project = FirmwareProject {
-            project_folder: artifact.project_folder.clone(),
-            source_path: source_path.display().to_string(),
-            metadata_path: String::new(),
-            metadata: controlled_reference_metadata(),
-            source: String::new(),
-            source_hash: artifact.source_hash.clone(),
-        };
-        self.upload_artifact(job_id, project, board, artifact, true)
+        self.upload_reference_artifact(job_id, board, binary_path)
+    }
+
+    fn upload_reference_artifact(
+        &self,
+        job_id: u64,
+        board: BoardInfo,
+        binary_path: PathBuf,
+    ) -> Result<(), FirmwareFailure> {
+        self.set_stage(
+            job_id,
+            FirmwareJobStage::TouchReset,
+            "Arduino CLI will reset the selected UNO R4 WiFi for upload.",
+        )?;
+        self.set_stage(
+            job_id,
+            FirmwareJobStage::WaitingForBootloader,
+            "Waiting for Arduino CLI bootloader/upload transition.",
+        )?;
+        self.set_stage(
+            job_id,
+            FirmwareJobStage::Uploading,
+            "Uploading the WVU reference firmware to the selected UNO R4 WiFi.",
+        )?;
+        let cli = required_cli(FirmwareJobStage::Uploading)?;
+        require_core(&cli, FirmwareJobStage::Uploading)?;
+        let log = cli
+            .upload_input(&binary_path, &board.port, &self.cancel)
+            .map_err(|error| {
+                cli_failure(
+                    FirmwareJobStage::Uploading,
+                    FirmwareErrorCategory::UploadFailed,
+                    error,
+                )
+            })?;
+        self.update_job(job_id, |job| job.upload_log = Some(log.clone()))?;
+        if log.canceled {
+            return Err(FirmwareFailure::new(
+                FirmwareErrorCategory::Canceled,
+                FirmwareJobStage::Canceled,
+                "Firmware restore was canceled.",
+                "Arduino CLI child was terminated",
+            ));
+        }
+        if !log.succeeded() {
+            return Err(FirmwareFailure::new(
+                FirmwareErrorCategory::UploadFailed,
+                FirmwareJobStage::Uploading,
+                "The WVU firmware could not be uploaded; the board may still contain its prior firmware.",
+                combined_output(&log),
+            ));
+        }
+        self.set_stage(
+            job_id,
+            FirmwareJobStage::WaitingForApplicationPort,
+            "Waiting for the UNO R4 WiFi application port to return.",
+        )?;
+        let final_board = wait_for_application_port(&cli, &board, &self.cancel, |candidate| {
+            self.update_job(job_id, |job| {
+                if !candidate.port.eq_ignore_ascii_case(&board.port) {
+                    job.final_port = Some(candidate.port.clone());
+                }
+            })
+        })?;
+        self.update_job(job_id, |job| {
+            job.final_port = Some(final_board.port.clone())
+        })?;
+        self.verify_uploaded_reference(job_id, final_board)
     }
 
     fn verify_uploaded_reference(
         &self,
         job_id: u64,
-        project_folder: String,
         board: BoardInfo,
-        restore: bool,
     ) -> Result<(), FirmwareFailure> {
         self.set_stage(
             job_id,
@@ -787,11 +561,6 @@ impl FirmwareWorkflow {
                 "Upload completed, but the required WVU protocol identity was not verified.",
                 verification.explanation,
             ));
-        }
-        if !restore {
-            self.workspace
-                .update_upload_success(&project_folder, board.port, verification.identity.clone())
-                .map_err(workspace_failure)?;
         }
         self.session
             .prepare_for_new_recording()
@@ -836,28 +605,6 @@ impl FirmwareWorkflow {
         }
     }
 
-    fn current_build_for(
-        &self,
-        project: &FirmwareProject,
-        stage: FirmwareJobStage,
-    ) -> Result<BuildArtifact, FirmwareFailure> {
-        let artifact = self.lock_state()?.build_artifact.clone().ok_or_else(|| {
-            FirmwareFailure::new(
-                FirmwareErrorCategory::CompileFailed,
-                stage,
-                "Compile this saved project before uploading.",
-                "no current build artifact",
-            )
-        })?;
-        if artifact.project_folder != project.project_folder
-            || artifact.source_hash != project.source_hash
-            || !artifact.binary_path.is_file()
-        {
-            return Err(FirmwareFailure::new(FirmwareErrorCategory::CompileFailed, stage, "The selected project has not been successfully compiled in its current saved state.", "compile artifact does not match project/source hash"));
-        }
-        Ok(artifact)
-    }
-
     fn ensure_upload_is_safe(&self, stage: FirmwareJobStage) -> Result<(), FirmwareFailure> {
         if self.session.is_recording().map_err(session_failure)? {
             return Err(FirmwareFailure::new(
@@ -873,7 +620,6 @@ impl FirmwareWorkflow {
     fn new_job(
         &self,
         kind: FirmwareJobKind,
-        project_folder: Option<String>,
         source_hash: Option<String>,
         original_port: Option<String>,
         board_serial: Option<String>,
@@ -883,7 +629,6 @@ impl FirmwareWorkflow {
             kind,
             stage: FirmwareJobStage::Preparing,
             active: true,
-            project_folder,
             source_hash,
             original_port,
             bootloader_port: None,
@@ -943,8 +688,8 @@ impl FirmwareWorkflow {
         job_id: u64,
         compatibility: FirmwareCompatibility,
     ) -> Result<(), FirmwareFailure> {
-        // Keep the active snapshot published while log I/O runs. Otherwise a
-        // status poll can observe neither `job` nor `last_compile/upload`.
+        // Keep the active snapshot published while log I/O runs so polling
+        // never observes a gap between the active and completed restore state.
         let mut job = self.active_job_snapshot(job_id)?;
         job.stage = FirmwareJobStage::Complete;
         job.active = false;
@@ -955,11 +700,7 @@ impl FirmwareWorkflow {
         verify_active_job(&runtime, job_id)?;
         runtime.active_job = None;
         runtime.compatibility = compatibility;
-        if job.kind == FirmwareJobKind::Compile {
-            runtime.last_compile = Some(job);
-        } else {
-            runtime.last_upload = Some(job);
-        }
+        runtime.last_restore = Some(job);
         Ok(())
     }
 
@@ -981,12 +722,8 @@ impl FirmwareWorkflow {
         verify_active_job(&runtime, job_id)?;
         runtime.active_job = None;
         runtime.last_failure = Some(failure);
-        if job.kind == FirmwareJobKind::Compile {
-            runtime.last_compile = Some(job);
-        } else {
-            runtime.compatibility = FirmwareCompatibility::VerificationFailed;
-            runtime.last_upload = Some(job);
-        }
+        runtime.compatibility = FirmwareCompatibility::VerificationFailed;
+        runtime.last_restore = Some(job);
         Ok(())
     }
 
@@ -1000,16 +737,6 @@ impl FirmwareWorkflow {
             return Err(internal_failure("firmware job identity changed"));
         }
         Ok(job.clone())
-    }
-
-    fn open_project(
-        &self,
-        path: &str,
-        stage: FirmwareJobStage,
-    ) -> Result<FirmwareProject, FirmwareFailure> {
-        self.workspace
-            .open_project(path)
-            .map_err(|error| workspace_failure_at(stage, error))
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, WorkflowRuntime>, FirmwareFailure> {
@@ -1082,8 +809,8 @@ where
 }
 
 /// Matches a returning application port without assuming the COM number is
-/// stable. A serial number is authoritative; without one, the safer Phase 2
-/// fallback is the original port rather than picking a different unknown device.
+/// stable. A serial number is authoritative; without one, the safer fallback
+/// is the original port rather than picking a different unknown device.
 fn select_returned_application_port(
     original: &BoardInfo,
     boards: Vec<BoardInfo>,
@@ -1144,27 +871,6 @@ fn verification_from_handshake(
     }
 }
 
-fn controlled_reference_metadata() -> crate::firmware_workspace::ProjectMetadata {
-    crate::firmware_workspace::ProjectMetadata {
-        schema_version: crate::firmware_workspace::PROJECT_SCHEMA_VERSION,
-        project_name: "reference_unor4wifi".into(),
-        created_utc: Utc::now(),
-        modified_utc: Utc::now(),
-        target_board: "Arduino UNO R4 WiFi".into(),
-        fqbn: UNO_R4_WIFI_FQBN.into(),
-        source_filename: "reference_unor4wifi.ino".into(),
-        selected_com_port: None,
-        template_origin: crate::firmware_workspace::TemplateKind::WvuProtocolReference,
-        verification_kind: FirmwareVerificationKind::WvuProtocolReference,
-        lab_profile: None,
-        notes: None,
-        last_successful_compile_utc: None,
-        last_successful_upload_utc: None,
-        last_verified_firmware_identity: None,
-        last_compile_source_hash: None,
-    }
-}
-
 fn job_directory(job_id: u64) -> PathBuf {
     default_log_dir().join("jobs").join(format!("job_{job_id}"))
 }
@@ -1174,7 +880,7 @@ fn default_log_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("firmware_workspace_data"))
         .join("WVU Bioinstrumentation Studio")
-        .join("firmware_workspace")
+        .join("firmware")
         .join("logs")
 }
 
@@ -1233,35 +939,18 @@ fn failure_copy(category: FirmwareErrorCategory) -> (&'static str, &'static str)
     match category {
         FirmwareErrorCategory::ArduinoCliMissing => ("Arduino tools unavailable", "Restart the application. If the problem continues, reinstall WVU Bioinstrumentation Studio or contact your instructor."),
         FirmwareErrorCategory::CoreMissing => ("Arduino tools incomplete", "Reinstall WVU Bioinstrumentation Studio or contact your instructor."),
-        FirmwareErrorCategory::ProjectInvalid => ("Project needs attention", "Correct the project path/name or confirm the requested destructive action."),
-        FirmwareErrorCategory::UnsavedChanges => ("Save required", "Save the editor contents, then compile or upload again."),
-        FirmwareErrorCategory::CompileFailed => ("Compile failed", "Review the compiler output and navigate to the reported source line."),
+        FirmwareErrorCategory::ConfirmationRequired => ("Confirmation required", "Confirm that you want to restore the WVU firmware."),
+        FirmwareErrorCategory::CompileFailed => ("Firmware preparation failed", "Review the advanced details and contact your instructor if the problem continues."),
         FirmwareErrorCategory::PortBusy => ("Serial port is busy", "Stop/finalize acquisition and close other serial programs, then retry."),
-        FirmwareErrorCategory::UnsupportedBoard => ("Unsupported board", "Select a detected Arduino UNO R4 WiFi."),
         FirmwareErrorCategory::BoardNotFound => ("Board not found", "Refresh boards and select the connected UNO R4 WiFi."),
         FirmwareErrorCategory::AmbiguousBoard => ("Board identity is ambiguous", "Disconnect other matching boards and retry with the board serial shown."),
-        FirmwareErrorCategory::ResetFailed => ("Reset transition failed", "Reconnect the selected UNO R4 WiFi and retry the explicit upload."),
-        FirmwareErrorCategory::BootloaderNotFound => ("Bootloader not found", "Confirm the selected UNO R4 WiFi is connected, then retry upload."),
         FirmwareErrorCategory::UploadFailed => ("Upload failed", "Review Arduino CLI output and ensure no other program owns the selected COM port."),
         FirmwareErrorCategory::ApplicationPortNotFound => ("Application port did not return", "Refresh boards after upload. Do not assume the old COM number."),
         FirmwareErrorCategory::ProtocolVerificationFailed => ("Firmware verification failed", "Use Restore WVU Firmware before using Acquisition."),
         FirmwareErrorCategory::WrongFirmwareIdentity => ("Firmware update required", "Use Restore WVU Firmware before using Acquisition."),
-        FirmwareErrorCategory::Canceled => ("Operation canceled", "Review the operation log and compile again before uploading."),
+        FirmwareErrorCategory::Canceled => ("Operation canceled", "Reconnect the board if needed, then restore the WVU firmware again."),
         FirmwareErrorCategory::InternalError => ("Firmware workflow error", "Copy diagnostics and contact the instructor/developer."),
     }
-}
-
-fn workspace_failure(error: WorkspaceError) -> FirmwareFailure {
-    workspace_failure_at(FirmwareJobStage::Preparing, error)
-}
-
-fn workspace_failure_at(stage: FirmwareJobStage, error: WorkspaceError) -> FirmwareFailure {
-    FirmwareFailure::new(
-        FirmwareErrorCategory::ProjectInvalid,
-        stage,
-        error.to_string(),
-        error.to_string(),
-    )
 }
 
 fn session_failure(error: crate::session::SessionError) -> FirmwareFailure {
@@ -1303,20 +992,9 @@ fn internal_failure(details: impl Into<String>) -> FirmwareFailure {
     )
 }
 
-fn failure_unsaved(stage: FirmwareJobStage) -> FirmwareFailure {
-    FirmwareFailure::new(
-        FirmwareErrorCategory::UnsavedChanges,
-        stage,
-        "Save editor changes before compiling or uploading.",
-        "frontend reported unsaved changes",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::firmware_workspace::{CreateProjectRequest, TemplateKind};
-    use tempfile::tempdir;
 
     fn board(port: &str, serial: Option<&str>) -> BoardInfo {
         BoardInfo {
@@ -1422,12 +1100,8 @@ mod tests {
 
     #[test]
     fn terminal_status_snapshot_does_not_create_a_polling_gap() {
-        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
-        let workflow = FirmwareWorkflow::with_workspace(
-            FirmwareWorkspace::new(dir.path().join("workspace")),
-            SessionController::default(),
-        );
-        let job = workflow.new_job(FirmwareJobKind::Compile, None, None, None, None);
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        let job = workflow.new_job(FirmwareJobKind::RestoreReference, None, None, None);
         {
             let mut runtime = workflow
                 .lock_state()
@@ -1443,37 +1117,5 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error:?}"))
             .job
             .is_some());
-    }
-
-    #[test]
-    fn upload_preflight_requires_current_matching_compile_and_no_active_session() {
-        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
-        let workspace = FirmwareWorkspace::new(dir.path().join("appdata"));
-        let project = workspace
-            .create_project(CreateProjectRequest {
-                parent_folder: dir.path().display().to_string(),
-                project_name: "NonWvu".into(),
-                template: TemplateKind::SerialDiagnostic,
-                notes: None,
-                overwrite_confirmed: false,
-            })
-            .unwrap_or_else(|error| panic!("{error}"));
-        let workflow = FirmwareWorkflow::with_workspace(workspace, SessionController::default());
-        assert!(workflow
-            .current_build_for(&project, FirmwareJobStage::Preparing)
-            .is_err());
-        let artifact = BuildArtifact {
-            project_folder: project.project_folder.clone(),
-            source_hash: project.source_hash.clone(),
-            binary_path: PathBuf::from("missing.bin"),
-        };
-        workflow
-            .lock_state()
-            .unwrap_or_else(|error| panic!("{:?}", error.category))
-            .build_artifact = Some(artifact);
-        assert!(workflow
-            .current_build_for(&project, FirmwareJobStage::Preparing)
-            .is_err());
-        assert_eq!(board("COM12", Some("ABC")).fqbn, UNO_R4_WIFI_FQBN);
     }
 }

@@ -1,112 +1,71 @@
 # WVU Bioinstrumentation Studio
 
-Windows teaching software for BMEG 420L. It is **not a medical device** and never produces
-diagnostic or treatment advice. The app records raw engineering signals and preserves the timing,
-channel map, firmware identity, profile snapshot, and integrity counters needed for course work.
+WVU Bioinstrumentation Studio is a Windows desktop application for BMEG 420L. It acquires, visualizes, calibrates, and saves synchronized biomedical-instrumentation signals from an Arduino UNO R4 WiFi and course hardware.
+
+Teaching use only — not a medical device. Follow BMEG 420L lab instructions and instructor safety procedures. Do not use this software for diagnosis or clinical decisions.
 
 ## Capabilities
 
-- One Arduino UNO R4 WiFi at a time, with WVU firmware that supports synchronized course capture.
-- Synchronized logical analog frames with one to six unique A0–A5 inputs; ADC reads are sequential
-  within a frame, not electrically simultaneous.
-- Course captures: ECG (A0); EMG + force (A0–A3); blood pressure + PPG (A0–A2, D4 green);
-  and pulse-ox TX/RX raw capture (A0/A1, D5 red, D6 IR). All shipped course profiles default to
-  14-bit ADC acquisition; instructors may explicitly select a firmware-supported alternative in a
-  new lab revision.
-- Timed and **Until stopped** recording, bounded uPlot display updates, markers, continuous BMEG,
-  profile-aware CSV, metadata, storage guards, disconnect finalization, and simulator support.
-- Course capture with display-only plot groups, board verification, and controlled WVU firmware
-  restoration. Formal analog-module characterization is outside the runtime app scope and does
-  not gate ordinary course capture.
-- A lightweight **Calibration & Units** card: raw counts, stored-reference volts, MPXV kPa/mmHg,
-  and a student-created XGZP linear mmHg conversion. These are derived display/export values;
-  raw BMEG values remain authoritative.
-- An Instructor-only **Manage Labs** workflow with five always-available factory course labs.
-  Editing opens an in-memory draft; only explicit **Save changes** creates one immutable active
-  instructor revision. It supports pin/channel/rate/ADC/output/plot-default changes, fixed
-  pulse-ox phase configuration, export/import, retirement/restore, and factory-default
-  activation. Reading, selecting, acquiring, plotting, calibrating, or navigating never creates
-  a lab version. Earlier recording snapshots never change.
+- Automatic Arduino UNO R4 WiFi discovery, WVU firmware verification, and controlled firmware restoration.
+- ECG capture; EMG + pressure capture; blood pressure + PPG capture; and raw four-state pulse-ox capture.
+- Synchronized acquisition of one to six analog channels, configurable multi-channel plot groups, markers, and bounded live displays.
+- Counts, volts, MPXV pressure conversion, and student-created linear calibration for supported channels.
+- Project-folder and trial-folder organization with automatic raw BMEG, CSV, metadata, and event-sidecar output.
+- Instructor-managed, versioned course-lab definitions with factory defaults, import/export, and safe pin/rate/output configuration.
 
-For students, start with [Student Quick Start](docs/STUDENT_QUICK_START.md) and
-[Installation](docs/INSTALLATION.md). Course details are in
-[course profile mapping](docs/COURSE_ACQUISITION_PROFILES.md) and
-[calibration and units](docs/CALIBRATION_AND_UNITS.md). Instructor configuration is documented
-in [instructor lab authoring](docs/INSTRUCTOR_LAB_AUTHORING.md).
+The distributed application bundles the Arduino command-line runtime and UNO R4 core. Students do not need Arduino IDE or Arduino CLI for normal use.
 
-## Safety boundary
+## Requirements
 
-Follow BMEG 420L lab instructions and instructor safety procedures. Do not use this app for
-diagnosis or clinical decisions. The app does not calculate heart rate, SpO2, SBP/DBP, EMG
-activation/fatigue, or any physiological interpretation. Raw ADC counts remain authoritative;
-calibration produces only documented engineering display/export values, never physiological units.
+- Windows x64, primarily Windows 11.
+- Arduino UNO R4 WiFi.
+- The relevant BMEG 420L course hardware and instructor-approved setup.
+- Administrator approval to install the primary system-wide installer; the application runs normally without elevation after installation.
 
-The reference firmware makes D4/D5/D6 LOW at startup, idle, Stop, protocol/configuration errors,
-and watchdog faults. D4 may be HIGH only during the configured BP/PPG capture; D5/D6 are active
-HIGH only during the fixed pulse-ox RED/DARK/IR/DARK sequence and are never HIGH together.
+## Getting started
 
-## Maintainer build and checks
+1. [Install the application](docs/INSTALLATION.md).
+2. Connect the Arduino UNO R4 WiFi and open the application.
+3. Confirm the Board and Firmware status at the top of the window.
+4. Select a Project folder, choose the assigned course lab, and set an Output folder for the trial.
+5. Record and retrieve the generated files from the selected Project/Output folder.
 
-```powershell
-$env:Path = 'C:\Users\dd00055\.cargo\bin;' + $env:Path
-npm install
-cargo fmt --manifest-path src-tauri\Cargo.toml -- --check
-cargo check --manifest-path src-tauri\Cargo.toml
-cargo test --manifest-path src-tauri\Cargo.toml
-cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
-npm run check
-npm test
-npm run build
-npm run tauri build
-```
+See the concise [Student Quick Start](docs/STUDENT_QUICK_START.md) and the [Troubleshooting guide](docs/TROUBLESHOOTING.md).
 
-Run the desktop app with `npm run tauri dev`. The frontend only polls bounded snapshots at about
-25 Hz; it does not receive one UI event per raw ADC record.
+## Course labs
 
-## Maintainer firmware verification
+| Lab | Default inputs | Default rate | Default ADC |
+| --- | --- | ---: | ---: |
+| ECG — Course Capture | A0 ECG | 1000 frames/s | 14 bit |
+| EMG + Force — Course Capture | A0 raw EMG, A1 rectified EMG, A2 envelope, A3 pressure surrogate | 1000 frames/s | 14 bit |
+| Blood Pressure + PPG — Course Capture | A0 PPG, A1 MPXV, A2 XGZP; D4 green LED | 200 frames/s | 14 bit |
+| Pulse Oximetry — TX + RX Raw Capture | A0 TX, A1 RX; D5 red, D6 IR | about 250 cycles/s | 14 bit |
+| General Analog — Development | 1–6 inputs selected from A0–A5 | 1000 frames/s | 14 bit |
 
-Close Arduino IDE, Serial Monitor, Serial Plotter, and other serial tools before using the app.
-Rediscover the port; do not assume `COM12`.
+More detail is in [Lab Configuration](docs/LAB_CONFIGURATION.md). Instructors should use the [Instructor Guide](docs/INSTRUCTOR_GUIDE.md).
 
-```powershell
-arduino-cli board list --format json
-arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi firmware\reference_unor4wifi
-arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port <CURRENT_UNO_PORT> firmware\reference_unor4wifi --verbose
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase1_capture -- probe
-```
+## Data files
 
-The probe must show HELLO, CAPABILITIES, PONG, zero CRC failures, protocol 0.3, build
-`0x00010003`, and device `0x554E4F34`. A successful upload alone is not identity proof. The
-application’s **Restore WVU Firmware** action uses the same controlled source and
-requires a verified protocol handshake before Acquisition is re-enabled.
+Raw `.bmeg` data are authoritative. Each recording also produces metadata and a profile-aware CSV in the effective session folder. Raw counts are always retained; voltage and engineering-unit columns are derived from the recording-time settings.
 
-## Recording and exports
+Pulse oximetry preserves raw TX/RX measurements for RED, DARK 1, IR, and DARK 2. The application does not subtract ambient states, calculate SpO2, calculate heart rate, or perform physiological interpretation.
 
-BMEG is the authoritative raw recording and streams while acquisition runs; the entire session is
-never held in RAM. Metadata includes start/stop time, duration mode, profile snapshot, firmware,
-board/port, active analog pins, digital mapping, ADC/rate, markers, free space, completion/stop
-reason, and integrity counters. CSV streams from BMEG after finalization.
+## Building from source
 
-For current BMEG/CSV recordings, leading columns are `record_sequence,t_us` (or `cycle_index,t_us` for
-pulse ox), followed by profile-defined raw count fields and direct voltage/selected engineering
-columns. Existing Phase 1–4 BMEG files remain readable and are never relabelled as course profiles.
+Development requirements, commands, the bundled Arduino runtime, and the production-build distinction are documented in the [Developer Guide](docs/DEVELOPER_GUIDE.md). Use the Tauri production build pipeline; a plain Cargo release build is not a distributable application because it does not package the frontend assets.
 
-## Maintainer acceptance harnesses
+## Documentation
 
-The harnesses call the same Rust session/controller path as Tauri and write temporary ignored
-outputs. They never authorize human measurement.
+- [Installation](docs/INSTALLATION.md)
+- [Student Quick Start](docs/STUDENT_QUICK_START.md)
+- [Instructor Guide](docs/INSTRUCTOR_GUIDE.md)
+- [Calibration and Units](docs/CALIBRATION_AND_UNITS.md)
+- [Hardware](docs/HARDWARE.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [USB Protocol](docs/USB_PROTOCOL.md)
+- [Release Checklist](docs/RELEASE_CHECKLIST.md)
 
-```powershell
-# protocol identity probe
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase1_capture -- probe
+## License
 
-# Phase 4 simulator or UNO-only (floating inputs/safe bench source) profile smoke capture
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- simulator emg 10
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- hardware ecg 30
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- hardware emg 30
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- hardware bp 30
-cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --bin phase4_multichannel_capture -- hardware pulseox 30
-```
-
-`KNOWN_ISSUES.md` lists the separately documented reset/retry recovery limitation and any pending
-manual display-scaling checks.
+No root `LICENSE` file has been supplied for this repository. The repository owner must approve and add the project license before public publication if normal reuse permissions are intended.

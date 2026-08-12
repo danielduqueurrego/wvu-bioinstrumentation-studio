@@ -8,6 +8,7 @@ node_modules
 /student-projects
 /firmware-projects
 /logs/firmware_build_*/
+/logs/
 *.bmeg
 *.bmeg.part
 *.metadata.json
@@ -19,6 +20,9 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 /dist/
 /release/*.zip
+/dist/
+/release/*.exe
+/release/*.msi
 /src-tauri/resources/arduino-runtime/arduino-cli.exe
 /src-tauri/resources/arduino-runtime/data/
 /src-tauri/resources/arduino-runtime.zip

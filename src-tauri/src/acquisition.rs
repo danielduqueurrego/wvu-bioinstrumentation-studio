@@ -52,7 +52,7 @@ impl FirmwareCapabilities {
     /// v0.3 CAPABILITIES is:
     /// min ADC bits, max ADC bits, max analog channels, mode bits, output
     /// mask, rate count, then little-endian u16 rates.  Earlier capability
-    /// payloads remain readable but cannot prove the richer Phase 6 limits.
+    /// payloads remain readable but cannot prove the current configuration limits.
     fn from_payload(payload: &[u8]) -> Option<Self> {
         if payload.len() < 6 {
             return None;
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn phase6_capabilities_are_parsed_for_configuration_checks() {
+    fn capabilities_are_parsed_for_configuration_checks() {
         let (tx, _rx) = sync_channel(4);
         let mut controller = AcquisitionController::new(tx);
         let capabilities = Frame {
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_capabilities_are_seen_but_do_not_claim_phase6_limits() {
+    fn legacy_capabilities_are_seen_but_do_not_claim_current_limits() {
         let (tx, _rx) = sync_channel(4);
         let mut controller = AcquisitionController::new(tx);
         let legacy = Frame {

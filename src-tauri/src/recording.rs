@@ -1,6 +1,6 @@
 //! `.bmeg`: `BMEGREC1` + u16 JSON-header length + UTF-8 header + streamed records.
-//! Legacy Phase 1–3 records are `u32 sequence, u64 timestamp_us, u16 ADC counts`.
-//! Phase 4 profile-aware records preserve a synchronized frame as
+//! Legacy single-channel records are `u32 sequence, u64 timestamp_us, u16 ADC counts`.
+//! Current profile-aware records preserve a synchronized frame as
 //! `u32 sequence, u64 timestamp_us, u16 status_flags, u16[field_count] counts`.
 use crate::{
     calibration::{
@@ -130,7 +130,7 @@ pub struct RecordingMetadata {
     pub project_folder: Option<String>,
     #[serde(default)]
     pub output_folder: Option<String>,
-    /// Optional fields preserve read compatibility with Phase 1.0 sidecars.
+    /// Optional fields preserve read compatibility with early sidecars.
     #[serde(default)]
     pub duration_mode: Option<String>,
     #[serde(default)]
@@ -143,18 +143,19 @@ pub struct RecordingMetadata {
     pub final_free_disk_bytes: Option<u64>,
     #[serde(default)]
     pub completion_status: String,
-    /// Phase 3A writes a frozen profile into both the BMEG JSON header and the
+    /// A frozen lab definition is written into both the BMEG JSON header and the
     /// metadata sidecar. Files made before this field existed remain legacy/general recordings.
     #[serde(default)]
     pub profile_snapshot: Option<ProfileSnapshot>,
-    /// Historical Phase 3B metadata retained only so previously recorded BMEG
+    /// Historical metadata retained only so previously recorded BMEG
     /// files deserialize safely after the class application removed Validation.
     #[serde(default)]
+    /// Historical optional metadata accepted only to read older recordings.
     pub validation_context: Option<LegacyValidationContext>,
     /// Manual, non-protocol experiment annotations. Markers never alter or remove raw samples.
     #[serde(default)]
     pub markers: Vec<RecordingMarker>,
-    /// Phase 5 derived-unit settings captured at recording start. Raw BMEG records
+    /// Derived-unit settings captured at recording start. Raw BMEG records
     /// remain ADC counts regardless of whether any of these conversions are selected.
     #[serde(default)]
     pub calibration: Option<RecordingCalibration>,
@@ -218,7 +219,7 @@ pub enum RecordingError {
     Json(#[from] serde_json::Error),
     #[error("recording header exceeds 65535 bytes")]
     HeaderTooLarge,
-    #[error("not a Phase 1 BMEG recording")]
+    #[error("not a supported BMEG recording")]
     BadMagic,
     #[error("recording is truncated")]
     Truncated,
@@ -301,7 +302,7 @@ impl BmegWriter {
     }
 }
 
-/// Streaming reader for finalized Phase 1 recordings. It retains just one record.
+/// Streaming reader for finalized BMEG recordings. It retains just one record.
 pub struct BmegReader {
     reader: BufReader<File>,
     pub metadata: RecordingMetadata,
@@ -755,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_one_metadata_without_new_fields_still_deserializes() {
+    fn legacy_metadata_without_new_fields_still_deserializes() {
         let metadata = RecordingMetadata {
             utc_start: Utc::now(),
             local_start: Local::now(),
