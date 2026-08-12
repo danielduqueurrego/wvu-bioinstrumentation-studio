@@ -32,7 +32,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DISPLAY_CAPACITY: usize = 1_500;
+/// Display data are deliberately independent of the raw BMEG writer.  Retain
+/// enough full-rate frames to satisfy the longest supported 30-second live
+/// window at the maximum 1 kHz course frame rate, then decimate only the UI
+/// response when necessary.
+pub const DISPLAY_HISTORY_SECONDS: f64 = 30.0;
+pub const DISPLAY_CAPACITY: usize = 30_000;
+pub const DEFAULT_DISPLAY_WINDOW_SECONDS: f64 = 5.0;
+pub const MAX_DISPLAY_RENDER_POINTS: usize = 2_000;
+const MIN_DISPLAY_WINDOW_SECONDS: f64 = 0.5;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_STARTUP_GRACE: Duration = Duration::from_millis(1_250);
 const HANDSHAKE_OVERALL_TIMEOUT: Duration = Duration::from_secs(8);
@@ -47,6 +55,56 @@ const DISK_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
 const DISK_CRITICAL_BYTES: u64 = 250 * 1024 * 1024;
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const RECORDING_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+fn normalize_display_window_seconds(window_seconds: f64) -> f64 {
+    if window_seconds.is_finite() {
+        window_seconds.clamp(MIN_DISPLAY_WINDOW_SECONDS, DISPLAY_HISTORY_SECONDS)
+    } else {
+        DEFAULT_DISPLAY_WINDOW_SECONDS
+    }
+}
+
+fn normalize_display_max_points(max_points: usize) -> usize {
+    max_points.clamp(1, MAX_DISPLAY_RENDER_POINTS)
+}
+
+/// Filters a chronological display cache by timestamp and deterministically
+/// decimates it for rendering. The final element is always the exact newest
+/// record, even when the interval contains more records than the UI budget.
+fn select_display_records(
+    records: &VecDeque<SynchronizedRecord>,
+    window_seconds: f64,
+    max_points: usize,
+) -> Vec<SynchronizedRecord> {
+    let Some(latest) = records.back() else {
+        return Vec::new();
+    };
+    let window_us = (window_seconds * 1_000_000.0).round() as u64;
+    let earliest_timestamp = latest.timestamp_us.saturating_sub(window_us);
+    let filtered: Vec<SynchronizedRecord> = records
+        .iter()
+        .filter(|record| record.timestamp_us >= earliest_timestamp)
+        .cloned()
+        .collect();
+
+    if filtered.len() <= max_points {
+        return filtered;
+    }
+    if max_points == 1 {
+        return filtered.last().cloned().into_iter().collect();
+    }
+
+    // Include both interval endpoints with evenly distributed indices. The
+    // newest exact raw display record is therefore never replaced by a stride
+    // approximation, while recorded BMEG/CSV frames are never decimated.
+    let last_index = filtered.len() - 1;
+    (0..max_points)
+        .map(|index| {
+            let selected = index * last_index / (max_points - 1);
+            filtered[selected].clone()
+        })
+        .collect()
+}
 
 /// Kept behind a small interface so storage guard behavior is deterministic in
 /// tests and the production implementation remains Windows-compatible.
@@ -353,8 +411,26 @@ impl SessionController {
         Ok(Self::status_from_runtime(&runtime))
     }
 
+    /// Returns the complete bounded display cache for diagnostics and tests.
+    /// Callers rendering the live UI should use `recent_display_samples` so a
+    /// long window never transfers tens of thousands of frames every poll.
     pub fn recent_samples(&self) -> Result<Vec<SynchronizedRecord>, SessionError> {
         Ok(self.lock_runtime()?.recent.iter().cloned().collect())
+    }
+
+    /// Read-only, timestamp-windowed display snapshot. This never changes the
+    /// acquisition state, raw writer, integrity counters, or retained records.
+    pub fn recent_display_samples(
+        &self,
+        window_seconds: f64,
+        max_points: usize,
+    ) -> Result<Vec<SynchronizedRecord>, SessionError> {
+        let runtime = self.lock_runtime()?;
+        Ok(select_display_records(
+            &runtime.recent,
+            normalize_display_window_seconds(window_seconds),
+            normalize_display_max_points(max_points),
+        ))
     }
 
     pub fn is_recording(&self) -> Result<bool, SessionError> {
@@ -2693,10 +2769,7 @@ mod tests {
         assert_eq!(summary.samples, 2_000);
         assert_eq!(summary.integrity.crc_failures, 0);
         assert_eq!(summary.integrity.missing_packet_sequences, 0);
-        assert_eq!(
-            session.recent_samples().unwrap_or_default().len(),
-            DISPLAY_CAPACITY
-        );
+        assert_eq!(session.recent_samples().unwrap_or_default().len(), 2_000);
         assert!(BmegReader::open(Path::new(&summary.bmeg_path)).is_ok());
         assert_eq!(
             std::fs::read_to_string(&summary.csv_path)
@@ -2704,6 +2777,96 @@ mod tests {
                 .lines()
                 .count(),
             2_001
+        );
+    }
+
+    fn display_records(rate_hz: u64, seconds: u64) -> VecDeque<SynchronizedRecord> {
+        let count = rate_hz * seconds;
+        (0..count)
+            .map(|sequence| SynchronizedRecord {
+                sequence: sequence as u32,
+                timestamp_us: sequence * 1_000_000 / rate_hz,
+                status_flags: 0,
+                counts: vec![sequence as u16],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn display_history_is_bounded_to_thirty_seconds_at_maximum_rate() {
+        let mut recent = VecDeque::with_capacity(DISPLAY_CAPACITY);
+        for sequence in 0..=DISPLAY_CAPACITY {
+            if recent.len() == DISPLAY_CAPACITY {
+                recent.pop_front();
+            }
+            recent.push_back(SynchronizedRecord {
+                sequence: sequence as u32,
+                timestamp_us: sequence as u64 * 1_000,
+                status_flags: 0,
+                counts: vec![0],
+            });
+        }
+        assert_eq!(recent.len(), DISPLAY_CAPACITY);
+        assert_eq!(recent.front().map(|record| record.sequence), Some(1));
+        assert_eq!(
+            recent.back().map(|record| record.sequence),
+            Some(DISPLAY_CAPACITY as u32)
+        );
+    }
+
+    #[test]
+    fn display_windows_use_timestamps_at_every_supported_rate() {
+        for rate_hz in [100, 250, 500, 1_000] {
+            let records = display_records(rate_hz, 10);
+            let selected = select_display_records(&records, 5.0, MAX_DISPLAY_RENDER_POINTS);
+            let latest = records
+                .back()
+                .unwrap_or_else(|| panic!("missing display record"));
+            assert!(selected.iter().all(|record| {
+                record.timestamp_us >= latest.timestamp_us.saturating_sub(5_000_000)
+            }));
+            assert_eq!(selected.last(), Some(latest));
+            assert!(selected
+                .windows(2)
+                .all(|pair| pair[0].timestamp_us <= pair[1].timestamp_us));
+        }
+    }
+
+    #[test]
+    fn display_decimation_is_bounded_and_keeps_the_exact_newest_record() {
+        let records = display_records(1_000, 30);
+        let selected = select_display_records(&records, 30.0, 2_000);
+        assert_eq!(selected.len(), 2_000);
+        assert_eq!(selected.first(), records.front());
+        assert_eq!(selected.last(), records.back());
+        assert!(selected
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
+    }
+
+    #[test]
+    fn display_queries_do_not_mutate_session_or_integrity_state() {
+        let session = SessionController::default();
+        {
+            let mut runtime = session
+                .lock_runtime()
+                .unwrap_or_else(|error| panic!("{error}"));
+            runtime.state = SessionState::Acquiring;
+            runtime.samples = 42;
+            runtime.integrity.host_channel_overflows = 3;
+            runtime.recent = display_records(1_000, 10);
+        }
+        let before = session.status().unwrap_or_else(|error| panic!("{error}"));
+        let selected = session
+            .recent_display_samples(5.0, 500)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let after = session.status().unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(selected.len(), 500);
+        assert_eq!(before.state, after.state);
+        assert_eq!(before.samples, after.samples);
+        assert_eq!(
+            before.integrity.host_channel_overflows,
+            after.integrity.host_channel_overflows
         );
     }
 

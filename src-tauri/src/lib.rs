@@ -686,12 +686,20 @@ fn get_session_status(state: tauri::State<'_, AppState>) -> Result<session::Sess
     state.session.status().map_err(|error| error.to_string())
 }
 
-/// Bounded snapshot for a 20–30 Hz polling UI; it never emits per-sample events.
+/// Bounded, display-only snapshot for a 20–30 Hz polling UI. The window and
+/// render-point budget affect neither recording nor the raw BMEG writer.
 #[tauri::command]
-fn get_recent_display_data(state: tauri::State<'_, AppState>) -> Result<Vec<RecentPoint>, String> {
+fn get_recent_display_data(
+    state: tauri::State<'_, AppState>,
+    window_seconds: Option<f64>,
+    max_points: Option<usize>,
+) -> Result<Vec<RecentPoint>, String> {
     state
         .session
-        .recent_samples()
+        .recent_display_samples(
+            window_seconds.unwrap_or(session::DEFAULT_DISPLAY_WINDOW_SECONDS),
+            max_points.unwrap_or(session::MAX_DISPLAY_RENDER_POINTS),
+        )
         .map_err(|error| error.to_string())
         .map(|samples| {
             samples

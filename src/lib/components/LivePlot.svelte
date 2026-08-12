@@ -3,6 +3,11 @@
   import uPlot from 'uplot';
   import { visiblePlotSeries, shouldShowPlotLegend, type PlotSeries } from '$lib/multichannel';
   import { displayedValue, displayUnitLabel, type DisplayUnit, type RecordingCalibration } from '$lib/calibration';
+  import {
+    formatLiveDisplayValue,
+    layoutEndpointLabels,
+    MAX_RENDERED_DISPLAY_POINTS
+  } from '$lib/live-display';
   import 'uplot/dist/uPlot.min.css';
 
   type PlotChannel = { id: string; label: string; csv_name: string };
@@ -21,7 +26,11 @@
   // scheduling its own sample refresh loop.
   export let displayRevision = 0;
 
-  const maximum = 1_500;
+  type EndpointLabel = { id: string; label: string; color: string; value: string; top: number };
+
+  // The backend returns no more than this many timestamp-windowed records. Keep
+  // a matching defensive cap here in case a future backend response is larger.
+  const maximum = MAX_RENDERED_DISPLAY_POINTS;
   let element: HTMLDivElement;
   let plot: uPlot | undefined;
   let resizeObserver: ResizeObserver | undefined;
@@ -31,6 +40,7 @@
   let failedSignature = '';
   let recoveryAttemptedSignature = '';
   let activeSeries: PlotSeries[] = [];
+  let endpointLabels: EndpointLabel[] = [];
 
   function displayChannels(): PlotSeries[] {
     return activeSeries;
@@ -62,6 +72,7 @@
     const previous = plot;
     plot = undefined;
     plotSignature = '';
+    endpointLabels = [];
     if (!previous) return;
     try {
       previous.destroy();
@@ -131,6 +142,7 @@
       plotSignature = currentSignature();
       failedSignature = '';
       recoveryAttemptedSignature = '';
+      refreshEndpointLabels();
     } catch (error) {
       handlePlotFailure('create', error, allowRecovery);
     }
@@ -139,7 +151,10 @@
   function update() {
     try {
       if (plotSignature !== currentSignature()) createPlot();
-      else plot?.setData(chartData());
+      else {
+        plot?.setData(chartData());
+        refreshEndpointLabels();
+      }
     } catch (error) {
       handlePlotFailure('update', error);
     }
@@ -151,7 +166,10 @@
     try {
       const width = Math.floor(element.clientWidth);
       const height = Math.floor(element.clientHeight);
-      if (width >= 220 && height >= 180) plot.setSize({ width, height });
+      if (width >= 220 && height >= 180) {
+        plot.setSize({ width, height });
+        refreshEndpointLabels();
+      }
     } catch (error) {
       handlePlotFailure('resize', error);
     }
@@ -159,6 +177,44 @@
 
   function queueResize() {
     if (resizeFrame === undefined) resizeFrame = window.requestAnimationFrame(resizePlot);
+  }
+
+  /**
+   * Endpoint values always use the newest exact frame returned by the bounded
+   * display query. They are converted solely for display; no endpoint overlay
+   * can alter acquisition, the serial transport, or the raw recording.
+   */
+  function refreshEndpointLabels() {
+    if (!plot || !activeSeries.length || !samples.length) {
+      endpointLabels = [];
+      return;
+    }
+    const currentPlot = plot;
+    const newest = samples[samples.length - 1];
+    const bounds = currentPlot.bbox;
+    const pending = activeSeries.map((channel) => {
+      const channelIndex = channels.findIndex((candidate) => candidate.id === channel.id);
+      const unit = channelUnits[channel.id] ?? 'counts';
+      const value = displayedValue(newest.values[channelIndex] ?? 0, channel.id, unit, adcBits, calibration);
+      return {
+        id: channel.id,
+        label: channel.label,
+        color: channel.color,
+        value: formatLiveDisplayValue(value, unit, calibration, channel.id),
+        naturalTop: currentPlot.valToPos(value, 'y')
+      };
+    });
+    const positions = new Map(
+      layoutEndpointLabels(pending, bounds.top, bounds.top + bounds.height)
+        .map((label) => [label.id, label.top ?? bounds.top])
+    );
+    endpointLabels = pending.map((label) => ({
+      id: label.id,
+      label: label.label,
+      color: label.color,
+      value: label.value,
+      top: positions.get(label.id) ?? bounds.top
+    }));
   }
 
   // Mention every display input in this reactive block so a live trace toggle or
@@ -203,11 +259,26 @@
     {/each}
   </div>
 {/if}
-<div class="plot" bind:this={element} aria-label="Bounded synchronized live acquisition plot"></div>
+<div class="plot-shell">
+  <div class="plot" bind:this={element} aria-label="Bounded synchronized live acquisition plot"></div>
+  <div class="endpoint-labels" aria-label="Newest visible signal values">
+    {#each endpointLabels as endpoint (endpoint.id)}
+      <span
+        class="endpoint-label"
+        style:top={`${endpoint.top}px`}
+        style:--series-color={endpoint.color}
+        aria-label={`${endpoint.label}: ${endpoint.value}`}
+      >{endpoint.value}</span>
+    {/each}
+  </div>
+</div>
 
 <style>
   .plot-legend { display: flex; flex-wrap: wrap; gap: .35rem .8rem; align-items: center; margin: 0 0 .45rem; color: #42515d; font-size: .87rem; }
   .plot-legend-item { display: inline-flex; min-width: 0; align-items: center; gap: .35rem; overflow-wrap: anywhere; }
   .plot-legend-swatch { display: inline-block; flex: 0 0 .85rem; width: .85rem; height: .26rem; border-radius: .15rem; }
+  .plot-shell { position: relative; min-width: 0; }
   .plot { width: 100%; height: clamp(260px, 42vh, 500px); min-width: 0; min-height: 240px; overflow: hidden; }
+  .endpoint-labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 2; }
+  .endpoint-label { position: absolute; right: .45rem; max-width: calc(100% - 1rem); transform: translateY(-50%); padding: .1rem .34rem; border: 1px solid var(--series-color); border-radius: .25rem; background: rgb(255 255 255 / 88%); color: #172b3a; box-shadow: 0 1px 2px rgb(0 0 0 / 12%); font-size: .76rem; font-weight: 700; line-height: 1.15; white-space: nowrap; }
 </style>

@@ -40,6 +40,12 @@
   import { boardControls } from '$lib/board-controls';
   import { hardwareStartInvokePayload, recordingStartFailure, recordingStartReadiness, type RecordingStartFailure, type RecordingStartReadiness } from '$lib/recording-start';
   import { effectiveRecordingFolder, relativeOutputFolderError } from '$lib/project-folder';
+  import {
+    DEFAULT_PLOT_TIME_WINDOW_SECONDS,
+    MAX_RENDERED_DISPLAY_POINTS,
+    normalizePlotTimeWindow,
+    previewPlotTimeWindow
+  } from '$lib/live-display';
   import logoUrl from '../../assets/branding/WVU-CBE Logo.svg';
 
   type Point = { sequence: number; timestamp_us: number; values: number[]; status_flags: number };
@@ -101,6 +107,10 @@
 
   let samples: Point[] = [];
   let displayRevision = 0;
+  // One display-only time extent is shared by every rendered plot group. It
+  // changes only the bounded display query, never the active acquisition.
+  let plotTimeWindowSeconds = DEFAULT_PLOT_TIME_WINDOW_SECONDS;
+  let plotTimeWindowInput = String(DEFAULT_PLOT_TIME_WINDOW_SECONDS);
   let boards: Board[] = [];
   let selectedPort = '';
   let boardScanStatus: 'idle' | 'scanning' | 'complete' | 'error' = 'idle';
@@ -430,7 +440,10 @@
     polling = true;
     try {
       session = await invoke<SessionStatus>('get_session_status');
-      samples = await invoke<Point[]>('get_recent_display_data');
+      samples = await invoke<Point[]>('get_recent_display_data', {
+        windowSeconds: plotTimeWindowSeconds,
+        maxPoints: MAX_RENDERED_DISPLAY_POINTS
+      });
       displayRevision += 1;
       if (session.state === 'Faulted' && session.last_error) {
         statusMessage = 'The Arduino connection needs attention. Verify the firmware or refresh the board before starting a new recording.';
@@ -740,6 +753,24 @@
 
   function setChannelVisible(channelId: string, isVisible: boolean) {
     traceVisibility = setTraceVisibility(traceVisibility, channelId, isVisible);
+  }
+
+  function updatePlotTimeWindowInput(value: string) {
+    plotTimeWindowInput = value;
+    // Preserve the last valid extent while a student temporarily clears the
+    // numeric field, but let valid edits refresh the shared display snapshot.
+    const next = previewPlotTimeWindow(value, plotTimeWindowSeconds);
+    if (next !== plotTimeWindowSeconds) {
+      plotTimeWindowSeconds = next;
+      void pollSession();
+    }
+  }
+
+  function commitPlotTimeWindow() {
+    const next = normalizePlotTimeWindow(plotTimeWindowInput, plotTimeWindowSeconds);
+    plotTimeWindowSeconds = next;
+    plotTimeWindowInput = String(next);
+    void pollSession();
   }
 
   function changePlotCount(delta: number) {
@@ -1171,6 +1202,24 @@
               {/each}
             </div>
           {/if}
+          <div class="plot-time-window" aria-label="Shared plot time window">
+            <label for="plot-time-window">Plot time window</label>
+            <input
+              id="plot-time-window"
+              type="number"
+              min="0.5"
+              max="30"
+              step="0.5"
+              inputmode="decimal"
+              aria-describedby="plot-time-window-help"
+              value={plotTimeWindowInput}
+              oninput={(event) => updatePlotTimeWindowInput(event.currentTarget.value)}
+              onblur={commitPlotTimeWindow}
+              onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); commitPlotTimeWindow(); event.currentTarget.blur(); } }}
+            />
+            <span aria-hidden="true">s</span>
+            <span id="plot-time-window-help" class="help">0.5–30 s. Applies to all live plots. Recording is unaffected.</span>
+          </div>
           <div class="action-row marker-row"><button onclick={addMarker} disabled={session.state !== 'Acquiring'}>Add marker</button></div>
         </section>
         {#if session.last_summary}
@@ -1262,7 +1311,7 @@
   fieldset { min-width: 0; border: 0; padding: 0; margin: 0; } legend { font-weight: 650; margin-bottom: .3rem; } .choice-row, .duration-controls, .action-row, .plot-heading { display: flex; min-width: 0; flex-wrap: wrap; gap: .7rem; align-items: end; } .choice { display: flex; align-items: center; gap: .4rem; } .choice input { width: auto; min-height: auto; }
   .duration-controls { margin-top: .75rem; } .action-row { margin: 1rem 0; } .recording-actions button { flex: 0 1 20rem; } .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: .55rem; margin: 1rem 0; } .metric-grid span { min-width: 0; padding: .6rem .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #fff; overflow-wrap: anywhere; } .metric-grid strong { display: block; color: #42515d; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; }
   .plot-panel { min-width: 0; } .plot-heading { justify-content: space-between; align-items: center; }
-  .plot-arrangement { min-width: 0; margin-top: .75rem; padding: .75rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .plot-arrangement-heading { display: flex; min-width: 0; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: start; } .plot-arrangement h4 { margin: 0; } .plot-arrangement .help { max-width: 72ch; } .plot-count-control { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; font-weight: 700; } .plot-count-control button { min-height: 2.1rem; min-width: 2.1rem; padding: .2rem .55rem; text-align: center; } .plot-count-control strong { min-width: 1.5rem; text-align: center; } .plot-assignment-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .65rem; margin-top: .8rem; } .trace-controls { display: flex; flex-wrap: wrap; gap: .45rem .8rem; margin: .75rem 0; } .trace-controls .choice { font-size: .9rem; } .stacked-plots { display: grid; gap: .85rem; min-width: 0; } .stacked-plot { min-width: 0; min-height: 0; padding: .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .stacked-plot-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; margin-bottom: .5rem; color: #42515d; } .marker-row { align-items: end; }
+  .plot-arrangement { min-width: 0; margin-top: .75rem; padding: .75rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .plot-arrangement-heading { display: flex; min-width: 0; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: start; } .plot-arrangement h4 { margin: 0; } .plot-arrangement .help { max-width: 72ch; } .plot-count-control { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; font-weight: 700; } .plot-count-control button { min-height: 2.1rem; min-width: 2.1rem; padding: .2rem .55rem; text-align: center; } .plot-count-control strong { min-width: 1.5rem; text-align: center; } .plot-assignment-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .65rem; margin-top: .8rem; } .trace-controls { display: flex; flex-wrap: wrap; gap: .45rem .8rem; margin: .75rem 0; } .trace-controls .choice { font-size: .9rem; } .stacked-plots { display: grid; gap: .85rem; min-width: 0; } .stacked-plot { min-width: 0; min-height: 0; padding: .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .stacked-plot-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; margin-bottom: .5rem; color: #42515d; } .plot-time-window { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; margin-top: .85rem; } .plot-time-window label { width: auto; font-weight: 700; } .plot-time-window input { width: 6rem; } .plot-time-window .help { flex: 1 1 20rem; margin: 0; } .marker-row { align-items: end; }
   .paths p, .status { overflow-wrap: anywhere; word-break: break-word; } .paths p { margin: .35rem 0; } .status { margin: 1rem 0 0; padding: .7rem; border: 1px solid #d7dde2; background: #fff; border-radius: .3rem; } .diagnostic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: .75rem; }
   .operation-backdrop { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 1rem; background: rgb(12 27 42 / 52%); } .operation-modal { width: min(100%, 35rem); display: flex; gap: 1rem; align-items: flex-start; padding: 1.2rem; border: 2px solid #002855; border-radius: .45rem; background: #fff; box-shadow: 0 1rem 3rem rgb(0 0 0 / 25%); } .operation-modal h2 { margin: 0; } .operation-modal p { margin: .4rem 0; overflow-wrap: anywhere; } .spinner { flex: 0 0 2rem; width: 2rem; height: 2rem; border: .3rem solid #d7dde2; border-top-color: #002855; border-radius: 50%; animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
   @media (max-width: 650px) { .app-header { align-items: flex-start; } .app-header img { max-width: 150px; } .content { padding: 1rem; } .recording-actions button { flex-basis: 100%; } .plot-heading { align-items: flex-start; } }
