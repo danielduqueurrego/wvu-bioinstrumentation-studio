@@ -18,14 +18,41 @@ jobs:
           components: rustfmt, clippy
       - name: Install frontend dependencies
         run: npm ci
-      - name: Frontend checks
+      - name: Svelte check
+        shell: pwsh
+        run: npm run check
+      # The release-config test verifies the generated frontend directory, so
+      # build it before running frontend tests in a clean checkout.
+      - name: Build production frontend
+        shell: pwsh
+        run: npm run build
+      - name: Frontend tests
+        shell: pwsh
+        run: npm test
+      # The real, hash-pinned Arduino runtime archive is intentionally not in
+      # Git. This disposable archive exists only for Tauri resource-path
+      # validation during source checks; release packaging still requires and
+      # validates the real archive in scripts/build_student_release.ps1.
+      - name: Prepare CI placeholder Arduino runtime
+        shell: pwsh
         run: |
-          npm run check
-          npm test
-          npm run build
-      - name: Rust checks
-        run: |
-          cargo fmt --manifest-path src-tauri\Cargo.toml -- --check
-          cargo check --manifest-path src-tauri\Cargo.toml
-          cargo test --manifest-path src-tauri\Cargo.toml
-          cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
+          $ErrorActionPreference = 'Stop'
+          $placeholderDir = Join-Path $env:RUNNER_TEMP 'arduino-runtime-ci-placeholder'
+          New-Item -ItemType Directory -Force -Path $placeholderDir | Out-Null
+          Set-Content -LiteralPath (Join-Path $placeholderDir 'CI_PLACEHOLDER.txt') -Value @'
+          This archive exists only so Tauri source checks can validate the configured resource path in CI.
+          It is not a distributable Arduino runtime and must never be used for release packaging.
+          '@
+          Compress-Archive -Path (Join-Path $placeholderDir '*') -DestinationPath 'src-tauri/resources/arduino-runtime.zip' -Force
+      - name: Rust format
+        shell: pwsh
+        run: cargo fmt --manifest-path src-tauri\Cargo.toml -- --check
+      - name: Rust check
+        shell: pwsh
+        run: cargo check --manifest-path src-tauri\Cargo.toml
+      - name: Rust tests
+        shell: pwsh
+        run: cargo test --manifest-path src-tauri\Cargo.toml
+      - name: Rust clippy
+        shell: pwsh
+        run: cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
