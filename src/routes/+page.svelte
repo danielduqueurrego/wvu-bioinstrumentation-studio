@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { confirm, open } from '@tauri-apps/plugin-dialog';
   import LivePlot from '$lib/components/LivePlot.svelte';
   import LabManager from '$lib/components/LabManager.svelte';
   import type { LabProfile } from '$lib/labs';
   import OperatingModeControl from '$lib/components/OperatingModeControl.svelte';
-  import type FirmwareWorkspaceComponent from '$lib/components/FirmwareWorkspace.svelte';
   import { connectionActions } from '$lib/connection-actions';
   import { durationRequest, isTimedDurationValid, type RecordingDurationRequest } from '$lib/duration';
   import {
@@ -36,8 +36,10 @@
     type PlotGroup,
     type VisibleChannelMap
   } from '$lib/multichannel';
-  import { PRIMARY_NAVIGATION, type PrimaryView } from '$lib/navigation';
   import { reconcileBoardCache } from '$lib/board-cache';
+  import { boardControls } from '$lib/board-controls';
+  import { hardwareStartInvokePayload, recordingStartFailure, recordingStartReadiness, type RecordingStartFailure, type RecordingStartReadiness } from '$lib/recording-start';
+  import { effectiveRecordingFolder, relativeOutputFolderError } from '$lib/project-folder';
   import logoUrl from '../../assets/branding/WVU-CBE Logo.svg';
 
   type Point = { sequence: number; timestamp_us: number; values: number[]; status_flags: number };
@@ -97,7 +99,6 @@
   };
   const activeStates = ['Connecting', 'Connected', 'Configured', 'Acquiring', 'Stopping'];
 
-  let view: PrimaryView = 'Home';
   let samples: Point[] = [];
   let displayRevision = 0;
   let boards: Board[] = [];
@@ -109,7 +110,8 @@
   let activeOperation: ActiveOperation | undefined;
   let firmwareEnvironment: FirmwareEnvironment = { expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false };
   let source: 'simulator' | 'hardware' = 'simulator';
-  let outputDirectory = 'recordings';
+  let projectFolder = '';
+  let outputDirectory = '';
   let durationMode: 'timed' | 'until_stopped' = 'timed';
   let durationPreset = '60';
   let customSeconds = 60;
@@ -143,6 +145,11 @@
   let calibrationFit: { slope: number; offset: number; r_squared: number; paired_samples: number } | undefined;
   let calibrationError = '';
   let statusMessage = 'Ready.';
+  let startFeedback = '';
+  let lastStartFailure: (RecordingStartFailure & { timestamp: string; port: string; lab: string }) | undefined;
+  let startInFlight = false;
+  let displayedSummaryPath = '';
+  let startReadiness: RecordingStartReadiness = { canStart: false };
   let arduinoToolsReady = false;
   let session: SessionStatus = {
     state: 'Disconnected', board: '', port: '', protocol_version: '0.1', simulator: false,
@@ -150,7 +157,6 @@
     elapsed_seconds: 0
   };
   let polling = false;
-  let FirmwareWorkspace: typeof FirmwareWorkspaceComponent | undefined;
   let firmwareCompatibility = 'unknown';
   let firmwareWorkflow: FirmwareWorkflowStatus = { compatibility: 'unknown' };
   let acquisitionProfiles: AcquisitionProfile[] = [];
@@ -162,7 +168,6 @@
   let traceVisibility: VisibleChannelMap = {};
   let traceProfileKey = '';
   let plotGroups: PlotGroup[] = [];
-  let markerLabel = '';
 
   $: if (source === 'hardware') {
     note = 'Arduino data source — follow the assigned lab instructions.';
@@ -177,10 +182,14 @@
   $: pulseoxProfile = activeProfile?.acquisition.acquisition_mode === 'pulseox_4state';
   $: plotChannels = pulseoxProfile
     ? [
-      { id: 'red_tx', label: 'RED TX − DARK 1', csv_name: 'red_TX_minus_dark1_TX', allowed_conversions: ['counts_volts'] },
-      { id: 'ir_tx', label: 'IR TX − DARK 2', csv_name: 'ir_TX_minus_dark2_TX', allowed_conversions: ['counts_volts'] },
-      { id: 'red_rx', label: 'RED RX − DARK 1', csv_name: 'red_RX_minus_dark1_RX', allowed_conversions: ['counts_volts'] },
-      { id: 'ir_rx', label: 'IR RX − DARK 2', csv_name: 'ir_RX_minus_dark2_RX', allowed_conversions: ['counts_volts'] }
+      { id: 'red_tx', label: 'TX Red', csv_name: 'red_TX', allowed_conversions: ['counts_volts'] },
+      { id: 'dark1_tx', label: 'TX Dark 1', csv_name: 'dark1_TX', allowed_conversions: ['counts_volts'] },
+      { id: 'ir_tx', label: 'TX IR', csv_name: 'ir_TX', allowed_conversions: ['counts_volts'] },
+      { id: 'dark2_tx', label: 'TX Dark 2', csv_name: 'dark2_TX', allowed_conversions: ['counts_volts'] },
+      { id: 'red_rx', label: 'RX Red', csv_name: 'red_RX', allowed_conversions: ['counts_volts'] },
+      { id: 'dark1_rx', label: 'RX Dark 1', csv_name: 'dark1_RX', allowed_conversions: ['counts_volts'] },
+      { id: 'ir_rx', label: 'RX IR', csv_name: 'ir_RX', allowed_conversions: ['counts_volts'] },
+      { id: 'dark2_rx', label: 'RX Dark 2', csv_name: 'dark2_RX', allowed_conversions: ['counts_volts'] }
     ]
     : activeChannels;
   $: linearCalibrationChannels = activeChannels.filter((channel) =>
@@ -194,14 +203,16 @@
   $: if (!linearCalibrationChannels.some((channel) => channel.id === calibrationChannelId)) {
     calibrationChannelId = linearCalibrationChannels[0]?.id ?? '';
   }
-  $: plotProfileKey = `${activeProfile?.profile_id ?? ''}:${pulseoxProfile ? 'pulseox-preview' : 'analog'}:${plotChannels.map((channel) => channel.id).join('|')}`;
+  $: plotProfileKey = `${activeProfile?.profile_id ?? ''}:${pulseoxProfile ? 'pulseox-raw' : 'analog'}:${plotChannels.map((channel) => channel.id).join('|')}`;
   // Visibility is reset only when the selected profile's display fields change.  It is
   // never reconciled during a live checkbox toggle, which keeps checkbox DOM state and
   // uPlot series derived from one authoritative map.
   $: if (plotProfileKey !== traceProfileKey) {
     traceProfileKey = plotProfileKey;
     traceVisibility = Object.fromEntries(plotChannels.map((channel) => [channel.id, !('default_visible' in channel) || channel.default_visible !== false]));
-    plotGroups = activeProfile?.plot_defaults?.groups?.length
+    plotGroups = pulseoxProfile
+      ? defaultPlotGroups(activeProfile?.category, plotChannels)
+      : activeProfile?.plot_defaults?.groups?.length
       ? normalizePlotGroups(plotChannels, activeProfile.plot_defaults.groups.map((group, index) => ({ id: `profile-${index + 1}`, channelIds: group.channel_ids })))
       : defaultPlotGroups(activeProfile?.category, plotChannels);
     channelUnits = initialChannelUnits(plotChannels.map((channel) => channel.id));
@@ -239,12 +250,37 @@
   $: profileTimedPresets = activeProfile?.acquisition.timed_presets_seconds ?? [10, 30, 60, 300, 600];
   $: timedDurationValid = isTimedDurationValid(timedSeconds);
   $: duration = durationRequest(durationMode, timedSeconds);
-  $: canStart = session.state === 'Disconnected'
-    && (source === 'simulator' || (Boolean(selectedPort) && firmwareCompatibility === 'wvu_protocol_compatible'))
-    && Boolean(activeProfile)
-    && (durationMode === 'until_stopped' || timedDurationValid)
-    && (!activeProfile?.safety.bench_only || !['ecg', 'emg'].includes(activeProfile.category) || benchNoticeAcknowledged);
+  $: outputFolderError = relativeOutputFolderError(outputDirectory);
   $: isActive = activeStates.includes(session.state);
+  // A failed verification deliberately leaves the session Faulted so its
+  // diagnostics are available. Faulted does not own a serial handle and must
+  // therefore still permit board selection, retry, and firmware restoration.
+  $: boardOperationBusy = boardScanInFlight
+    || Boolean(activeOperation)
+    || firmwareWorkflow.job?.active === true;
+  $: boardControlState = boardControls({
+    selectedBoard: Boolean(selectedPort),
+    recordingActive: isActive,
+    boardOperationBusy,
+    arduinoToolsReady,
+    firmwareStatus: firmwareCompatibility
+  });
+  $: startReadiness = recordingStartReadiness({
+    source,
+    selectedBoard: Boolean(selectedPort),
+    firmwareReady: firmwareCompatibility === 'wvu_protocol_compatible',
+    sessionState: session.state,
+    boardOperationBusy,
+    startInFlight,
+    activeProfile: Boolean(activeProfile),
+    projectFolder: Boolean(projectFolder),
+    outputFolderError,
+    durationValid: durationMode === 'until_stopped' || timedDurationValid,
+    acknowledgementSatisfied: !activeProfile?.safety.bench_only
+      || !['ecg', 'emg'].includes(activeProfile.category)
+      || benchNoticeAcknowledged
+  });
+  $: canStart = startReadiness.canStart;
   $: recoveryActions = connectionActions({
     source,
     active: isActive,
@@ -265,6 +301,7 @@
       * 2.5
       / (1024 * 1024)
     : 0;
+  $: effectiveOutputFolder = effectiveRecordingFolder(projectFolder, outputDirectory);
 
   function formatDuration(seconds: number | undefined) {
     if (seconds === undefined || !Number.isFinite(seconds)) return '—';
@@ -333,17 +370,21 @@
     }
   }
 
-  async function verifySelectedFirmware(port = selectedPort): Promise<FirmwareVerification | undefined> {
-    if (!port || session.state !== 'Disconnected') return undefined;
+  async function verifySelectedFirmware(
+    port = selectedPort,
+    allowWithinBoardOperation = false
+  ): Promise<FirmwareVerification | undefined> {
+    if (!port || isActive || (!allowWithinBoardOperation && !boardControlState.canVerifyFirmware)) return undefined;
     return runOperation(
       { title: 'Verifying firmware…', stage: 'Opening the selected UNO R4 WiFi and performing a read-only WVU protocol handshake.', cancelable: false },
       async () => {
         try {
           const verification = await invoke<FirmwareVerification>('verify_wvu_reference_firmware', { port });
           await refreshFirmwareCompatibility();
+          await pollSession();
           statusMessage = verification.compatible
             ? `Firmware ready on ${port}.`
-            : 'The Arduino was detected, but its WVU firmware is not ready. Open Firmware and use Restore WVU Firmware if needed.';
+            : 'The Arduino was detected, but its WVU firmware is not ready. Use Restore WVU Firmware above if needed.';
           return verification;
         } catch (error) {
           await refreshFirmwareCompatibility();
@@ -355,7 +396,7 @@
   }
 
   async function refreshBoards(reason: 'startup' | 'manual' | 'transition' = 'manual') {
-    if (boardScanInFlight) return;
+    if (boardScanInFlight || (reason === 'manual' && !boardControlState.canRefreshBoards)) return;
     boardScanInFlight = true;
     boardScanStatus = 'scanning';
     boardScanError = '';
@@ -368,7 +409,7 @@
           boardScanLastCompleted = new Date().toLocaleTimeString();
           boardScanStatus = 'complete';
           selectedPort = scan.selectedPort;
-          if (scan.verificationPort) await verifySelectedFirmware(scan.verificationPort);
+          if (scan.verificationPort) await verifySelectedFirmware(scan.verificationPort, true);
           statusMessage = boards.length
             ? `${boards.length} Arduino UNO R4 WiFi board${boards.length === 1 ? '' : 's'} found${selectedPort ? `; ${selectedPort} is selected.` : '. Select a board to continue.'}`
             : 'Arduino not detected. Check the USB connection, then select Refresh Board.';
@@ -390,8 +431,11 @@
       session = await invoke<SessionStatus>('get_session_status');
       samples = await invoke<Point[]>('get_recent_display_data');
       displayRevision += 1;
-      if (session.last_error) statusMessage = 'The recording stopped because the Arduino connection was lost. Reconnect the board and start a new recording.';
-      if (session.last_summary) {
+      if (session.state === 'Faulted' && session.last_error) {
+        statusMessage = 'The Arduino connection needs attention. Verify the firmware or refresh the board before starting a new recording.';
+      }
+      if (session.last_summary && session.last_summary.bmeg_path !== displayedSummaryPath) {
+        displayedSummaryPath = session.last_summary.bmeg_path;
         statusMessage = `${session.last_summary.recording_status}: ${session.last_summary.samples} validated samples at ${session.last_summary.measured_rate_hz.toFixed(3)} Hz.`;
       }
     } catch (error) {
@@ -403,16 +447,19 @@
 
   async function refreshFirmwareCompatibility() {
     try {
+      const firmwareJobWasActive = firmwareWorkflow.job?.active === true;
       firmwareWorkflow = await invoke<FirmwareWorkflowStatus>('get_firmware_workflow_status');
       firmwareCompatibility = firmwareWorkflow.compatibility;
+      if (firmwareJobWasActive && !firmwareWorkflow.job?.active) {
+        // A completed restore/reverification must refresh the independent
+        // acquisition state immediately; it must not wait for a route change
+        // or leave a stale Faulted snapshot behind.
+        await pollSession();
+      }
     } catch {
       firmwareCompatibility = 'unknown';
       firmwareWorkflow = { compatibility: 'unknown' };
     }
-  }
-
-  function reportFirmwareJob(job: FirmwareJob) {
-    firmwareWorkflow = { ...firmwareWorkflow, job, compatibility: firmwareWorkflow.compatibility };
   }
 
   async function cancelFirmwareJob() {
@@ -425,7 +472,7 @@
   }
 
   async function selectedBoardChanged() {
-    if (selectedPort && session.state === 'Disconnected') await verifySelectedFirmware(selectedPort);
+    if (selectedPort && boardControlState.canVerifyFirmware) await verifySelectedFirmware(selectedPort);
   }
 
   async function refreshProfiles() {
@@ -441,15 +488,41 @@
     }
   }
 
+  async function chooseProjectFolder() {
+    const selected = await open({ directory: true, multiple: false, defaultPath: projectFolder || undefined });
+    if (typeof selected !== 'string') return;
+    try {
+      const saved = await invoke<{ project_folder: string }>('set_project_folder', { projectFolder: selected });
+      projectFolder = saved.project_folder;
+      statusMessage = 'Project folder updated. New recordings will use this location.';
+    } catch (error) {
+      statusMessage = `Project folder could not be used: ${String(error)}`;
+    }
+  }
+
+  async function restoreWvuFirmware() {
+    if (!boardControlState.canRestoreFirmware) return;
+    const approved = await confirm(
+      `Restore WVU Firmware on ${selectedPort}? This replaces the current Arduino sketch.`,
+      { title: 'Restore WVU Firmware', kind: 'warning', okLabel: 'Restore firmware', cancelLabel: 'Cancel' }
+    );
+    if (!approved) return;
+    try {
+      firmwareWorkflow = {
+        ...firmwareWorkflow,
+        job: await invoke<FirmwareJob>('restore_wvu_reference_firmware', { request: { port: selectedPort, confirmation: true } })
+      };
+      statusMessage = 'Restoring WVU Firmware. The board will be verified when the update finishes.';
+    } catch (error) {
+      statusMessage = `WVU Firmware could not be restored: ${String(error)}`;
+    }
+  }
+
   async function labRevisionSaved(profile: AcquisitionProfile) {
     await refreshProfiles();
     selectedProfileId = profile.profile_id;
     traceProfileKey = '';
     selectProfile();
-  }
-
-  function openAssociatedFirmware() {
-    view = 'Firmware';
   }
 
   async function refreshCalibrations() {
@@ -686,7 +759,7 @@
 
   function bufferedRailCount(channelId: string): number {
     const channelIndex = plotChannels.findIndex((channel) => channel.id === channelId);
-    if (channelIndex < 0 || pulseoxProfile) return 0;
+    if (channelIndex < 0) return 0;
     const fullScale = Math.pow(2, activeProfile?.acquisition.adc_resolution_bits ?? 12) - 1;
     return samples.reduce((count, sample) => {
       const value = sample.values[channelIndex];
@@ -737,19 +810,57 @@
   }
 
   async function startRecording() {
-    if (!canStart) {
-      statusMessage = 'Choose a valid timed duration of at least 10 seconds, or select Until stopped.';
+    if (startInFlight) {
+      startFeedback = 'The Arduino is busy. Wait for the current operation to finish and try again.';
+      statusMessage = startFeedback;
       return;
     }
-    statusMessage = 'Connecting to the Arduino…';
+    if (!startReadiness.canStart) {
+      startFeedback = startReadiness.message ?? 'Recording cannot start yet.';
+      statusMessage = startFeedback;
+      return;
+    }
+    startInFlight = true;
+    lastStartFailure = undefined;
+    startFeedback = source === 'hardware' ? 'Connecting to Arduino…' : 'Starting simulator recording…';
+    statusMessage = startFeedback;
     try {
       session = source === 'simulator'
-        ? await invoke<SessionStatus>('start_profile_simulator_recording', { outputDirectory, duration, profileId: selectedProfileId, benchNoticeAcknowledged, calibration: currentRecordingCalibration })
-        : await invoke<SessionStatus>('start_profile_hardware_recording', { port: selectedPort, outputDirectory, duration, profileId: selectedProfileId, benchNoticeAcknowledged, calibration: currentRecordingCalibration });
-      view = 'Acquisition';
+        ? await invoke<SessionStatus>('start_profile_simulator_recording', { projectFolder, outputFolder: outputDirectory, duration, profileId: selectedProfileId, benchNoticeAcknowledged, calibration: currentRecordingCalibration })
+        : await invoke<SessionStatus>('start_profile_hardware_recording', hardwareStartInvokePayload({
+            port: selectedPort,
+            project_folder: projectFolder,
+            output_folder: outputDirectory,
+            duration,
+            profile_id: selectedProfileId,
+            bench_notice_acknowledged: benchNoticeAcknowledged,
+            calibration: currentRecordingCalibration
+          }));
+      startFeedback = source === 'hardware' ? 'Configuring recording…' : 'Starting recording…';
+      statusMessage = startFeedback;
     } catch (error) {
-      statusMessage = 'Recording could not start. Confirm the Arduino is connected and Firmware is ready, then try again.';
+      const failure = recordingStartFailure(error);
+      lastStartFailure = {
+        ...failure,
+        timestamp: new Date().toLocaleString(),
+        port: selectedPort || 'No board selected',
+        lab: activeProfile ? `${activeProfile.display_name} ${activeProfile.profile_version}` : 'No lab selected'
+      };
+      startFeedback = failure.userMessage;
+      statusMessage = startFeedback;
+    } finally {
+      startInFlight = false;
+      await pollSession();
     }
+  }
+
+  function sessionStateLabel(state: string): string {
+    if (state === 'Acquiring') return 'Recording…';
+    if (state === 'Connecting') return 'Connecting…';
+    if (state === 'Connected' || state === 'Configured') return 'Configuring recording…';
+    if (state === 'Stopping') return 'Stopping…';
+    if (state === 'Faulted') return 'Connection needs attention';
+    return 'Ready';
   }
 
   async function stopRecording() {
@@ -757,15 +868,14 @@
       session = await invoke<SessionStatus>('stop_recording');
       statusMessage = 'Stopping and saving the recording…';
     } catch (error) {
-      statusMessage = 'The recording could not be stopped cleanly. Check Diagnostics for details.';
+      statusMessage = 'The recording could not be stopped cleanly. Open Advanced details for troubleshooting information.';
     }
   }
 
   async function addMarker() {
     try {
-      const marker = await invoke<{ timestamp_us: number; label: string }>('add_recording_marker', { label: markerLabel });
-      statusMessage = `Marker added at ${marker.timestamp_us} µs${marker.label ? `: ${marker.label}` : ''}.`;
-      markerLabel = '';
+      const marker = await invoke<{ timestamp_us: number; label: string }>('add_recording_marker', { label: '' });
+      statusMessage = `Marker added at ${marker.timestamp_us} µs.`;
     } catch (error) {
       statusMessage = `Marker error: ${String(error)}`;
     }
@@ -810,27 +920,15 @@
     }
   }
 
-  async function exportCsv() {
-    try {
-      const csvPath = await invoke<string>('export_session_csv');
-      statusMessage = `CSV was streamed from the finalized BMEG recording: ${csvPath}`;
-    } catch (error) {
-      statusMessage = `Export error: ${String(error)}`;
-    }
-  }
-
-  async function selectView(nextView: PrimaryView) {
-    if (nextView === 'Firmware' && !FirmwareWorkspace) {
-      const module = await import('$lib/components/FirmwareWorkspace.svelte');
-      FirmwareWorkspace = module.default;
-    }
-    view = nextView;
-  }
-
   onMount(() => {
     // The shell renders first. One application-level scan then populates the shared
     // cache; route changes consume that cache and never invoke Arduino CLI discovery.
     void (async () => {
+      try {
+        projectFolder = (await invoke<{ project_folder: string }>('get_project_folder')).project_folder;
+      } catch (error) {
+        statusMessage = `Project folder needs attention: ${String(error)}`;
+      }
       await prepareArduinoTools();
       if (arduinoToolsReady) {
         await refreshEnvironmentSummary();
@@ -857,54 +955,43 @@
 <div class="app-shell">
   <header class="app-header">
     <img src={logoUrl} alt="Approved WVU College of Business and Economics logo" />
-    <div>
-      <h1>WVU Bioinstrumentation Studio</h1>
-      <p>Firmware, Acquisition, Visualization, Calibration, and Data Export for BMEG 420L</p>
-    </div>
+    <h1>WVU Bioinstrumentation Studio</h1>
   </header>
 
-  <div class="workspace">
-    <aside class="navigation">
-      <nav aria-label="Primary">
-        {#each PRIMARY_NAVIGATION as item}
-          <button class:active={view === item} aria-current={view === item ? 'page' : undefined} onclick={() => void selectView(item)}>{item}</button>
-        {/each}
-      </nav>
-    </aside>
+  <main class="content wide-content">
+    <section class="panel board-panel" aria-labelledby="board-title">
+      <div class="panel-heading"><div><h2 id="board-title">Board</h2><p class="help">Select the Arduino UNO R4 WiFi used for this recording.</p></div><span class:locked={firmwareCompatibility === 'wvu_protocol_compatible'} class="mode-badge">{firmwareCompatibility === 'wvu_protocol_compatible' ? 'Firmware ready' : selectedPort ? 'Firmware update required' : 'Arduino not detected'}</span></div>
+      <div class="control-grid">
+        <label>Board
+          <select bind:value={selectedPort} onchange={() => void selectedBoardChanged()} disabled={!boardControlState.canSelectBoard}>
+            <option value="">Select an Arduino UNO R4 WiFi</option>
+            {#each boards as board}<option value={board.port}>{board.name} — {board.port}</option>{/each}
+          </select>
+        </label>
+        <div class="field-action"><span>Board actions</span><div class="button-pair"><button onclick={() => void refreshBoards()} disabled={!boardControlState.canRefreshBoards}>Refresh Board</button><button onclick={() => void verifySelectedFirmware()} disabled={!boardControlState.canVerifyFirmware}>Verify Firmware</button><button class="gold" onclick={restoreWvuFirmware} disabled={!boardControlState.canRestoreFirmware}>Restore WVU Firmware</button></div></div>
+      </div>
+      <p class="device-cache-status" role="status">Board: {selectedPort ? `${boards.find((board) => board.port === selectedPort)?.name ?? 'Arduino UNO R4 WiFi'} — ${selectedPort}` : 'Not connected'} · Firmware: {firmwareCompatibility === 'wvu_protocol_compatible' ? 'Ready' : selectedPort ? 'Update required' : '—'} · Arduino tools: {arduinoToolsReady ? 'Ready' : 'Preparing…'}</p>
+      <details class="advanced-details"><summary>Advanced details</summary><div class="diagnostic-grid"><p>Protocol: {session.protocol_version}</p><p>Firmware status: {firmwareCompatibility}</p>{#if session.connection_diagnostics?.firmware_build}<p>Firmware build: {session.connection_diagnostics.firmware_build}</p>{/if}{#if session.connection_diagnostics?.firmware_board_id}<p>Board ID: {session.connection_diagnostics.firmware_board_id}</p>{/if}<p>Arduino tools: {firmwareEnvironment.cli_version ?? firmwareEnvironment.problem ?? 'preparing'}</p><p>Last board refresh: {boardScanLastCompleted || 'not yet completed'}</p><p>Received packets: {session.integrity.received_packets}</p><p>CRC failures: {session.integrity.crc_failures}</p>{#if lastStartFailure}<p>Last recording start: {lastStartFailure.timestamp}</p><p>Stage: {lastStartFailure.stage}</p><p>Code: {lastStartFailure.code}</p><p>Board: {lastStartFailure.port}</p><p>Lab: {lastStartFailure.lab}</p><p>Detail: {lastStartFailure.technicalDetail}</p>{/if}{#if session.last_error}<p>Recent connection error: {session.last_error}</p>{/if}</div></details>
+    </section>
 
-    <main class="content" class:wide-content={view === 'Firmware' || view === 'Acquisition'}>
-      <p class="device-cache-status" role="status">Arduino: {selectedPort ? `Connected — ${boards.find((board) => board.port === selectedPort)?.name ?? 'UNO R4 WiFi'} (${selectedPort})` : 'Not connected'} · Firmware: {firmwareCompatibility === 'wvu_protocol_compatible' ? 'Ready' : selectedPort ? 'Update required' : '—'} · Arduino tools: {arduinoToolsReady ? 'Ready' : 'Preparing…'}</p>
-      {#if view === 'Home'}
-        <h2>Home</h2>
-        <p class="notice">Teaching use only — not a medical device. Follow the BMEG 420L lab instructions and instructor safety procedures. Do not use this software for diagnosis or clinical decisions.</p>
-        <section class="panel quick-start" aria-labelledby="quick-start-title">
-          <h3 id="quick-start-title">BMEG 420L quick start</h3>
-          <ol>
-            <li>Connect the Arduino UNO R4 WiFi.</li>
-            <li>Confirm that Firmware is ready.</li>
-            <li>Open Acquisition and choose the assigned lab.</li>
-            <li>Choose the recording duration and start recording.</li>
-            <li>Stop and export your data when finished.</li>
-          </ol>
-        </section>
-        <div class="action-row">
-          <button onclick={() => void refreshBoards()}>Refresh Board</button>
-          <button class="gold" onclick={() => { source = 'simulator'; view = 'Acquisition'; }}>Open simulator acquisition</button>
-        </div>
-      {:else if view === 'Firmware'}
-        {#if FirmwareWorkspace}<FirmwareWorkspace environment={firmwareEnvironment} boards={boards} bind:selectedPort refreshBoardCache={refreshBoards} verifySelectedBoard={verifySelectedFirmware} {reportFirmwareJob} />{/if}
-      {:else if view === 'Acquisition'}
-        <h2>Acquisition</h2>
+    <section class="panel project-panel" aria-labelledby="project-folder-title">
+      <h2 id="project-folder-title">Project folder</h2>
+      <div class="control-grid"><label>Project folder<input value={projectFolder} readonly title={projectFolder} /></label><div class="field-action"><span>Location</span><button onclick={chooseProjectFolder} disabled={session.state !== 'Disconnected'}>Browse</button></div></div>
+      <p class="help">Recordings are saved under this folder. Choose the Output folder in Session setup to create a trial subfolder.</p>
+    </section>
+
+    <section class="acquisition-section" aria-labelledby="acquisition-title">
+        <h2 id="acquisition-title">Acquisition</h2>
         <p class="notice">Teaching use only — not a medical device. Follow BMEG 420L lab instructions and instructor safety procedures. Raw counts and Arduino-input volts are preserved; this app makes no diagnostic or clinical decision.</p>
         {#if source === 'hardware' && firmwareCompatibility !== 'wvu_protocol_compatible'}
-          <p class="warning" role="status">Hardware recording is unavailable until Firmware is ready. Open <button class="inline-action" onclick={() => void selectView('Firmware')}>Firmware</button> and use Verify Firmware or Restore WVU Firmware.</p>
+          <p class="warning" role="status">Hardware recording is unavailable until Firmware is ready. Use Verify Firmware or Restore WVU Firmware above.</p>
         {/if}
 
         <section class="panel profile-panel" aria-labelledby="profile-title">
           <div class="panel-heading"><div><h3 id="profile-title">Lab</h3><p class="help">Choose the assigned course lab. Its required channels and recording settings are applied automatically.</p></div><span class:locked={!instructorModeActive} class="mode-badge">{instructorModeActive ? 'Instructor mode' : 'Student mode'}</span></div>
           <OperatingModeControl bind:operatingMode bind:instructorAcknowledgement disabled={session.state !== 'Disconnected' || modeChangeInFlight} {onModeConfirmed} {onInstructorBlocked} />
           {#if instructorModeActive}
-            <LabManager selectedProfile={activeProfile} onSaved={labRevisionSaved} onStatus={(message) => statusMessage = message} openFirmware={openAssociatedFirmware} />
+            <LabManager selectedProfile={activeProfile} onSaved={labRevisionSaved} onStatus={(message) => statusMessage = message} />
           {/if}
           <label>Selected lab
             <select bind:value={selectedProfileId} onchange={selectProfile} disabled={session.state !== 'Disconnected'}>
@@ -946,21 +1033,14 @@
                 <option value="hardware">Hardware</option>
               </select>
             </label>
-            <div class="field-action"><span>Detected devices</span><button onclick={() => void refreshBoards()} disabled={session.state !== 'Disconnected'}>Refresh devices</button></div>
-            {#if source === 'hardware'}
-              <label>UNO R4 WiFi port
-                <select bind:value={selectedPort} onchange={() => void selectedBoardChanged()} disabled={session.state !== 'Disconnected'}>
-                  {#each boards as board}<option value={board.port}>{board.name} — {board.port} ({board.fqbn})</option>{/each}
-                </select>
-              </label>
-            {/if}
-            <label>Output folder <input bind:value={outputDirectory} disabled={session.state !== 'Disconnected'} aria-describedby="output-help" /></label>
+            <label>Output folder <input bind:value={outputDirectory} placeholder="Participant01\Trial03" disabled={session.state !== 'Disconnected'} aria-describedby="output-help" /></label>
             <label>Analog pins <input value={activeProfile ? activeProfile.acquisition.acquisition_mode === 'pulseox_4state' ? `TX ${activeProfile.acquisition.analog_inputs?.tx ?? 'A0'}; RX ${activeProfile.acquisition.analog_inputs?.rx ?? 'A1'}` : activeChannels.map((channel) => channel.pin).join(', ') : '—'} readonly title="Protected by the selected profile" /></label>
             <label>ADC resolution <input value={activeProfile ? `${activeProfile.acquisition.adc_resolution_bits} bit` : '—'} readonly title="Protected by the selected profile" /></label>
             <label>Frame / cycle rate <input value={activeProfile ? `${activeProfile.acquisition.sample_rate_hz} ${pulseoxProfile ? 'cycles/s' : 'frames/s'}` : '—'} readonly title="Protected by the selected profile" /></label>
             <label>Test note <input bind:value={note} readonly /></label>
           </div>
-          <p id="output-help" class="help">Files use a timestamped name. Existing files are never overwritten.</p>
+          <p id="output-help" class="help">Effective destination: <strong>{effectiveOutputFolder || 'Choose a Project folder'}</strong>. Output folder is relative to Project folder; nested trial folders are allowed. Files use timestamped names and existing files are never overwritten.</p>
+          {#if outputFolderError}<p class="error" role="alert">{outputFolderError}</p>{/if}
         </section>
 
         <section class="panel" aria-labelledby="duration-title">
@@ -1026,20 +1106,24 @@
           </div>
           {#if hasMpxvChannel}<p class="help">MPXV uses P<sub>kPa</sub> = (Vout / Vs − 0.04) / 0.009 and P<sub>mmHg</sub> = 7.5006 × P<sub>kPa</sub>. A channel configured for generic linear calibration offers mmHg only after you save its local fit.</p>{/if}
           {#if activeProfile?.category === 'course_emg_force'}<p class="help">The A3 conversion is labeled <strong>Pressure (kPa)</strong>; it does not infer muscular force.</p>{/if}
-          {#if pulseoxProfile}<p class="help">Pulse-ox units apply only to the ambient-subtracted live preview. The eight raw LED-state count values remain unchanged.</p>{/if}
+          {#if pulseoxProfile}<p class="help">Pulse-ox units apply directly to the eight raw LED-state values. No background subtraction or optical processing is applied.</p>{/if}
         </section>
 
         <div class="action-row recording-actions">
-          <button class="gold" onclick={startRecording} disabled={!canStart}>Connect, configure, and start recording</button>
+          <button class="gold" onclick={startRecording} disabled={isActive || startInFlight || boardOperationBusy}>Connect, configure, and start recording</button>
           <button class="stop" onclick={stopRecording} disabled={!isActive || session.state === 'Stopping'}>Stop recording</button>
           <button onclick={disconnect} disabled={session.state === 'Disconnected'}>Disconnect</button>
           {#if canRetryHandshake}<button onclick={retryHandshake}>Retry handshake</button>{/if}
           {#if canReset}<button onclick={resetBoardAndRetry}>Reset board and retry</button>{/if}
-          <button onclick={exportCsv} disabled={!session.last_summary}>Export CSV</button>
         </div>
+        {#if !canStart}
+          <p class="warning" role="status">{startReadiness.message}</p>
+        {:else if startFeedback}
+          <p class="status" role="status">{startFeedback}</p>
+        {/if}
 
         <section class="metric-grid" aria-label="Acquisition metrics">
-          <span><strong>Status</strong>{session.state === 'Acquiring' ? 'Recording…' : session.state === 'Disconnected' ? 'Ready' : session.state}</span><span><strong>Arduino</strong>{session.board || 'Not connected'} {session.port ? `(${session.port})` : ''}</span>
+          <span><strong>Status</strong>{sessionStateLabel(session.state)}</span><span><strong>Arduino</strong>{session.board || 'Not connected'} {session.port ? `(${session.port})` : ''}</span>
           <span><strong>Duration</strong>{session.duration?.mode === 'until_stopped' ? 'Until stopped' : session.duration?.seconds ? `${session.duration.seconds} s timed` : durationMode === 'until_stopped' ? 'Until stopped' : `${timedSeconds} s timed`}</span>
           <span><strong>Elapsed host</strong>{formatDuration(session.elapsed_seconds)}</span>
           {#if session.remaining_seconds !== undefined}<span><strong>Remaining</strong>{formatDuration(session.remaining_seconds)}</span>{/if}
@@ -1048,25 +1132,8 @@
         </section>
         {#if session.storage_warning}<p class="warning" role="status">{session.storage_warning}</p>{/if}
         {#if session.last_error}<p class="error" role="alert">The Arduino connection was interrupted. Reconnect the board, refresh it, and start a new recording.</p>{/if}
-        {#if session.connection_diagnostics}
-          <details class="panel diagnostics advanced-details" aria-label="Connection diagnostics">
-            <summary>Advanced connection details</summary>
-            <div class="metric-grid">
-              <span><strong>Original / final port</strong>{session.connection_diagnostics.original_port ?? session.connection_diagnostics.selected_port} / {session.connection_diagnostics.final_port ?? session.connection_diagnostics.selected_port}</span>
-              <span><strong>Port opened / handshake</strong>{session.connection_diagnostics.port_opened ? 'yes' : 'no'} / {session.connection_diagnostics.handshake_elapsed_ms} ms</span>
-              <span><strong>Bytes / valid frames / CRC</strong>{session.connection_diagnostics.bytes_received} / {session.connection_diagnostics.valid_frames} / {session.connection_diagnostics.crc_failures}</span>
-              <span><strong>HELLO / capabilities / PONG</strong>{session.connection_diagnostics.hello_received ? 'yes' : 'no'} / {session.connection_diagnostics.capabilities_received ? 'yes' : 'no'} / {session.connection_diagnostics.pong_received ? 'yes' : 'no'}</span>
-              <span><strong>Firmware build / board ID</strong>{session.connection_diagnostics.firmware_build ?? '—'} / {session.connection_diagnostics.firmware_board_id ?? '—'}</span>
-              <span><strong>Received bytes</strong>{session.connection_diagnostics.raw_byte_classification}</span>
-              <span><strong>Failure category</strong>{session.connection_diagnostics.failure_category ?? 'none'}</span>
-              {#if session.connection_diagnostics.reset_attempted}<span><strong>Reset discovery</strong>bootloader: {session.connection_diagnostics.bootloader_observed ? 'yes' : 'no'}; disappeared: {session.connection_diagnostics.disappearance_observed ? 'yes' : 'no'}; returned: {session.connection_diagnostics.reappearance_observed ? 'yes' : 'no'}</span>{/if}
-            </div>
-            <p class="help">{session.connection_diagnostics.recommended_action}</p>
-          </details>
-        {/if}
-
         <section class="panel plot-panel">
-          <div class="plot-heading"><h3>{pulseoxProfile ? 'Bounded live ambient-subtracted preview' : 'Bounded live synchronized raw plot'}</h3><span class="help">Each plot autoscales to its selected display unit.</span></div>
+          <div class="plot-heading"><h3>{pulseoxProfile ? 'Bounded live raw pulse-ox plot' : 'Bounded live synchronized raw plot'}</h3><span class="help">Each plot autoscales to its selected display unit.</span></div>
           <section class="plot-arrangement" aria-labelledby="plot-arrangement-title">
             <div class="plot-arrangement-heading"><div><h4 id="plot-arrangement-title">Plot arrangement</h4><p class="help">Display-only grouping. Every captured signal remains in the raw BMEG, CSV, and metadata even when hidden.</p></div><div class="plot-count-control" aria-label="Number of plots"><span>Number of plots</span><button aria-label="Use one fewer plot" onclick={() => changePlotCount(-1)} disabled={plotGroups.length <= 1 || !plotChannels.length}>−</button><strong>{plotGroups.length}</strong><button aria-label="Use one more plot" onclick={() => changePlotCount(1)} disabled={plotGroups.length >= plotChannels.length || !plotChannels.length}>+</button></div></div>
             <div class="button-pair"><button onclick={useOverlayAll} disabled={!plotChannels.length}>Overlay all</button><button onclick={useOnePlotPerSignal} disabled={!plotChannels.length}>One plot per signal</button></div>
@@ -1077,20 +1144,20 @@
             </div>
           </section>
           <div class="trace-controls" aria-label="Visible traces">{#each plotChannels as channel}<label class="choice"><input type="checkbox" checked={traceVisibility[channel.id] !== false} onchange={(event) => setChannelVisible(channel.id, event.currentTarget.checked)} /> {channel.label}</label>{/each}</div>
-          {#if pulseoxProfile}<p class="help">Preview subtraction is display-only. The raw RED, DARK 1, IR, DARK 2 TX/RX values are recorded unchanged.</p>{/if}
+          {#if pulseoxProfile}<p class="help">TX and RX plots show each raw RED, DARK 1, IR, and DARK 2 measurement. The eight raw values are recorded unchanged.</p>{/if}
           {#if !visibleTraceIds.length}
             <p class="help">No traces are selected for display. Recording and export continue for every profile field.</p>
           {:else}
             <div class="stacked-plots" aria-label="Synchronized plot groups">
               {#each renderedPlotGroups as group, index (group.id)}
                 <section class="stacked-plot" aria-label={`Plot ${index + 1}: ${group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(', ')}`}>
-                  <div class="stacked-plot-heading"><strong>Plot {index + 1}: {group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(' + ')}</strong><span>{unitsForGroup(group.channelIds, channelUnits, currentRecordingCalibration)}{!pulseoxProfile && group.channelIds.some((id) => bufferedRailCount(id)) ? `; ${group.channelIds.reduce((count, id) => count + bufferedRailCount(id), 0)} buffered rail samples` : ''}</span></div>
-                  <LivePlot {samples} channels={plotChannels} visibleChannelIds={group.channelIds} {channelUnits} calibration={currentRecordingCalibration} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} pulseoxPreview={pulseoxProfile} {displayRevision} />
+                  <div class="stacked-plot-heading"><strong>Plot {index + 1}: {group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(' + ')}</strong><span>{unitsForGroup(group.channelIds, channelUnits, currentRecordingCalibration)}{group.channelIds.some((id) => bufferedRailCount(id)) ? `; ${group.channelIds.reduce((count, id) => count + bufferedRailCount(id), 0)} buffered rail samples` : ''}</span></div>
+                  <LivePlot {samples} channels={plotChannels} visibleChannelIds={group.channelIds} {channelUnits} calibration={currentRecordingCalibration} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} {displayRevision} />
                 </section>
               {/each}
             </div>
           {/if}
-          <div class="action-row marker-row"><label>Marker label <input bind:value={markerLabel} maxlength="80" placeholder="baseline, rest, start inflation…" disabled={session.state !== 'Acquiring'} /></label><button onclick={addMarker} disabled={session.state !== 'Acquiring'}>Add marker</button></div>
+          <div class="action-row marker-row"><button onclick={addMarker} disabled={session.state !== 'Acquiring'}>Add marker</button></div>
         </section>
         {#if session.last_summary}
           <section class="panel paths">
@@ -1102,22 +1169,9 @@
             <details class="advanced-details"><summary>Recording details</summary><p>Stop reason: {session.last_summary.stop_reason}.</p>{#if instructorModeActive && session.last_summary.profile}<p>Lab reference: {session.last_summary.profile.profile.profile_id} {session.last_summary.profile.profile.profile_version}</p>{/if}</details>
           </section>
         {/if}
-      {:else}
-        <h2>Diagnostics</h2>
-        <section class="panel diagnostic-grid">
-          <p>Arduino: <strong>{selectedPort ? 'Connected' : 'Not connected'}</strong></p>
-          <p>Port: {selectedPort || '—'}</p>
-          <p>Firmware: {firmwareCompatibility === 'wvu_protocol_compatible' ? 'Ready' : 'Update required'}</p>
-          <p>Arduino tools: {arduinoToolsReady ? 'Ready' : 'Needs attention'}</p>
-          <p>Last recording: {session.last_summary ? `${session.last_summary.samples} frames` : 'None yet'}</p>
-          <p>Dropped data: {session.integrity.missing_sample_sequences}</p>
-          <p>Storage: {formatStorage(session.available_disk_bytes)}</p>
-        </section>
-        <details class="panel advanced-details"><summary>Advanced details</summary><div class="diagnostic-grid"><p>Protocol: {session.protocol_version}</p><p>Received packets: {session.integrity.received_packets}</p><p>CRC failures: {session.integrity.crc_failures}</p><p>Missing frames: {session.integrity.missing_packet_sequences}</p><p>ADC reference: {session.calibration?.adc_reference_v?.toFixed(3) ?? adcReferenceV.toFixed(3)} V</p><p>MPXV supply: {session.calibration?.mpxv_sensor_supply_v?.toFixed(3) ?? mpxvSensorSupplyV.toFixed(3)} V</p><p>Active calibrations: {session.calibration?.active_calibrations?.map((calibration) => calibration.label).join(', ') || 'none'}</p>{#if session.last_error}<p>Last error: {session.last_error}</p>{/if}</div></details>
-      {/if}
       <p class="status" aria-live="polite">{statusMessage}</p>
+    </section>
     </main>
-  </div>
 </div>
 
 {#if calibrationDialogOpen}
@@ -1168,26 +1222,19 @@
   :global(button), :global(input), :global(select) { font: inherit; }
   .app-shell { min-height: 100vh; min-width: 0; }
   .app-header { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: clamp(.65rem, 2vw, 1.2rem); padding: clamp(.75rem, 2vw, 1.2rem) clamp(1rem, 3vw, 2rem); background: #002855; color: #F7F7F7; }
-  .app-header img { width: clamp(110px, 16vw, 150px); max-width: 100%; max-height: 72px; object-fit: contain; flex: 0 1 auto; }
+  .app-header img { width: clamp(132px, 19vw, 174px); max-width: 100%; max-height: 84px; object-fit: contain; flex: 0 1 auto; }
   .unit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .65rem; margin-top: .75rem; }
   .calibration-actions { align-self: end; }
   .calibration-dialog { width: min(46rem, calc(100vw - 2rem)); max-height: min(88vh, 52rem); overflow: auto; background: #fff; border: 1px solid #8aa0b6; border-radius: .35rem; padding: clamp(1rem, 3vw, 1.5rem); box-shadow: 0 .4rem 1.5rem #001b3640; }
   textarea { width: 100%; min-height: 7rem; resize: vertical; font: 0.92rem ui-monospace, Consolas, monospace; }
-  h1 { margin: 0; font-size: clamp(1.15rem, 2.2vw, 1.45rem); overflow-wrap: anywhere; } .app-header p { margin: .2rem 0 0; overflow-wrap: anywhere; }
-  .workspace { display: grid; grid-template-columns: minmax(10.5rem, 13rem) minmax(0, 1fr); min-height: calc(100vh - 96px); }
-  .navigation { background: #e8edf1; padding: clamp(.7rem, 2vw, 1.25rem) .75rem; } nav { display: grid; gap: .45rem; }
+  h1 { margin: 0; font-size: clamp(1.15rem, 2.2vw, 1.45rem); overflow-wrap: anywhere; }
   button { min-height: 2.5rem; border: 1px solid #002855; border-radius: .3rem; background: #fff; color: #002855; padding: .55rem .75rem; font-weight: 650; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
   button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #EEAA00; outline-offset: 2px; }
-  button:disabled { cursor: not-allowed; opacity: .55; } button.active, button:not(:disabled):hover { background: #002855; color: #fff; } button.gold { background: #EEAA00; color: #17222e; } button.stop { background: #9d2424; border-color: #761a1a; color: #fff; } button.inline-action { display: inline; min-height: auto; padding: 0; border: 0; background: transparent; color: #002855; text-decoration: underline; }
-  /* Keep prose-oriented pages comfortably readable, but let the data-dense Firmware and
-     Acquisition workspaces use the available desktop width.  `width: 100%` also avoids
-     percentage sizing being resolved against an intrinsic grid size on some WebView builds. */
-  .content { min-width: 0; width: 100%; max-width: 72rem; justify-self: start; padding: clamp(1rem, 3vw, 1.75rem); overflow-wrap: anywhere; }
-  .content.wide-content { max-width: none; justify-self: stretch; }
+  button:disabled { cursor: not-allowed; opacity: .55; } button:not(:disabled):hover { background: #002855; color: #fff; } button.gold { background: #EEAA00; color: #17222e; } button.stop { background: #9d2424; border-color: #761a1a; color: #fff; }
+  .content { min-width: 0; width: 100%; max-width: 112rem; margin: 0 auto; padding: clamp(1rem, 3vw, 1.75rem); overflow-wrap: anywhere; }
   .device-cache-status { margin: 0 0 .8rem; padding: .55rem .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #fff; color: #42515d; overflow-wrap: anywhere; }
   h2 { margin-top: 0; } h3 { margin: 0 0 .8rem; } .notice, .warning { border-left: 5px solid #EEAA00; background: #fff8e8; padding: .75rem; } .warning { border-color: #9b6700; }
   .panel { min-width: 0; margin: 1rem 0; padding: clamp(.8rem, 2vw, 1rem); background: #fff; border: 1px solid #d7dde2; border-radius: .35rem; }
-  .quick-start ol { margin: .5rem 0 0; padding-left: 1.4rem; } .quick-start li + li { margin-top: .35rem; }
   .advanced-details { min-width: 0; margin-top: .8rem; } .advanced-details > summary { cursor: pointer; color: #002855; font-weight: 700; } .advanced-details[open] > summary { margin-bottom: .75rem; }
   .panel-heading { display: flex; min-width: 0; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: start; } .panel-heading .help { max-width: 75ch; }
   .mode-badge { border: 1px solid #855a00; border-radius: 999px; padding: .35rem .6rem; background: #fff4dd; color: #684600; font-weight: 700; white-space: nowrap; } .mode-badge.locked { border-color: #176c33; background: #eaf6ee; color: #174f27; }
@@ -1201,9 +1248,8 @@
   fieldset { min-width: 0; border: 0; padding: 0; margin: 0; } legend { font-weight: 650; margin-bottom: .3rem; } .choice-row, .duration-controls, .action-row, .plot-heading { display: flex; min-width: 0; flex-wrap: wrap; gap: .7rem; align-items: end; } .choice { display: flex; align-items: center; gap: .4rem; } .choice input { width: auto; min-height: auto; }
   .duration-controls { margin-top: .75rem; } .action-row { margin: 1rem 0; } .recording-actions button { flex: 0 1 20rem; } .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: .55rem; margin: 1rem 0; } .metric-grid span { min-width: 0; padding: .6rem .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #fff; overflow-wrap: anywhere; } .metric-grid strong { display: block; color: #42515d; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; }
   .plot-panel { min-width: 0; } .plot-heading { justify-content: space-between; align-items: center; }
-  .plot-arrangement { min-width: 0; margin-top: .75rem; padding: .75rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .plot-arrangement-heading { display: flex; min-width: 0; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: start; } .plot-arrangement h4 { margin: 0; } .plot-arrangement .help { max-width: 72ch; } .plot-count-control { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; font-weight: 700; } .plot-count-control button { min-height: 2.1rem; min-width: 2.1rem; padding: .2rem .55rem; text-align: center; } .plot-count-control strong { min-width: 1.5rem; text-align: center; } .plot-assignment-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .65rem; margin-top: .8rem; } .trace-controls { display: flex; flex-wrap: wrap; gap: .45rem .8rem; margin: .75rem 0; } .trace-controls .choice { font-size: .9rem; } .stacked-plots { display: grid; gap: .85rem; min-width: 0; } .stacked-plot { min-width: 0; min-height: 0; padding: .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .stacked-plot-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; margin-bottom: .5rem; color: #42515d; } .marker-row { align-items: end; } .marker-row label { flex: 1 1 18rem; }
+  .plot-arrangement { min-width: 0; margin-top: .75rem; padding: .75rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .plot-arrangement-heading { display: flex; min-width: 0; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: start; } .plot-arrangement h4 { margin: 0; } .plot-arrangement .help { max-width: 72ch; } .plot-count-control { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; font-weight: 700; } .plot-count-control button { min-height: 2.1rem; min-width: 2.1rem; padding: .2rem .55rem; text-align: center; } .plot-count-control strong { min-width: 1.5rem; text-align: center; } .plot-assignment-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .65rem; margin-top: .8rem; } .trace-controls { display: flex; flex-wrap: wrap; gap: .45rem .8rem; margin: .75rem 0; } .trace-controls .choice { font-size: .9rem; } .stacked-plots { display: grid; gap: .85rem; min-width: 0; } .stacked-plot { min-width: 0; min-height: 0; padding: .7rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .stacked-plot-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; margin-bottom: .5rem; color: #42515d; } .marker-row { align-items: end; }
   .paths p, .status { overflow-wrap: anywhere; word-break: break-word; } .paths p { margin: .35rem 0; } .status { margin: 1rem 0 0; padding: .7rem; border: 1px solid #d7dde2; background: #fff; border-radius: .3rem; } .diagnostic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: .75rem; }
   .operation-backdrop { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 1rem; background: rgb(12 27 42 / 52%); } .operation-modal { width: min(100%, 35rem); display: flex; gap: 1rem; align-items: flex-start; padding: 1.2rem; border: 2px solid #002855; border-radius: .45rem; background: #fff; box-shadow: 0 1rem 3rem rgb(0 0 0 / 25%); } .operation-modal h2 { margin: 0; } .operation-modal p { margin: .4rem 0; overflow-wrap: anywhere; } .spinner { flex: 0 0 2rem; width: 2rem; height: 2rem; border: .3rem solid #d7dde2; border-top-color: #002855; border-radius: 50%; animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
-  @media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .navigation { padding: .65rem; } nav { grid-template-columns: repeat(4, minmax(0, 1fr)); } nav button { text-align: center; padding-inline: .35rem; } }
-  @media (max-width: 650px) { .app-header { align-items: flex-start; } .app-header img { max-width: 130px; } nav { grid-template-columns: repeat(2, minmax(0, 1fr)); } .content { padding: 1rem; } .recording-actions button { flex-basis: 100%; } .plot-heading { align-items: flex-start; } }
+  @media (max-width: 650px) { .app-header { align-items: flex-start; } .app-header img { max-width: 150px; } .content { padding: 1rem; } .recording-actions button { flex-basis: 100%; } .plot-heading { align-items: flex-start; } }
 </style>

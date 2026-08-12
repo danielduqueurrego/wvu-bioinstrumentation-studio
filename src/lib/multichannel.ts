@@ -41,8 +41,8 @@ export function defaultPlotGroups(category: string | undefined, channels: Displa
   if (!channels.length) return [];
   if (category === 'course_pulseox') {
     return [
-      { id: groupId(0), channelIds: channels.filter((channel) => ['red_tx', 'ir_tx'].includes(channel.id)).map((channel) => channel.id) },
-      { id: groupId(1), channelIds: channels.filter((channel) => ['red_rx', 'ir_rx'].includes(channel.id)).map((channel) => channel.id) }
+      { id: groupId(0), channelIds: channels.filter((channel) => ['red_tx', 'dark1_tx', 'ir_tx', 'dark2_tx'].includes(channel.id)).map((channel) => channel.id) },
+      { id: groupId(1), channelIds: channels.filter((channel) => ['red_rx', 'dark1_rx', 'ir_rx', 'dark2_rx'].includes(channel.id)).map((channel) => channel.id) }
     ];
   }
   // ECG is easiest to read as one trace. General Analog and the other course
@@ -106,19 +106,6 @@ export function visiblePlotGroups(channels: DisplayChannel[], groups: PlotGroup[
   return normalizePlotGroups(channels, groups)
     .map((group) => ({ ...group, channelIds: group.channelIds.filter((id) => visibility[id] !== false) }))
     .filter((group) => group.channelIds.length > 0);
-}
-
-/**
- * Phase 4 pulse-ox preview only. Raw LED-state counts are never altered in BMEG/CSV.
- */
-export function pulseoxAmbientSubtractedPreview(values: number[]): number[] {
-  if (values.length < 8) return [];
-  return [
-    values[0] - values[1],
-    values[2] - values[3],
-    values[4] - values[5],
-    values[6] - values[7]
-  ];
 }
 
 export function hasUniqueAnalogPins(pins: string[]): boolean {

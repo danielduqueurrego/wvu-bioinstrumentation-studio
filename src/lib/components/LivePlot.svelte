@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import uPlot from 'uplot';
-  import { pulseoxAmbientSubtractedPreview, visibleChannels } from '$lib/multichannel';
+  import { visibleChannels } from '$lib/multichannel';
   import { displayedValue, displayUnitLabel, type DisplayUnit, type RecordingCalibration } from '$lib/calibration';
   import 'uplot/dist/uPlot.min.css';
 
@@ -12,7 +12,6 @@
   export let channelUnits: Record<string, DisplayUnit> = {};
   export let calibration: RecordingCalibration = { adc_reference_v: 5, mpxv_sensor_supply_v: 5, channel_units: {}, active_calibrations: [] };
   export let adcBits = 12;
-  export let pulseoxPreview = false;
   // The Acquisition page advances this once per bounded display snapshot.  Multiple
   // stacked plots therefore consume one shared update rather than each polling or
   // scheduling its own sample refresh loop.
@@ -30,11 +29,6 @@
     return visibleChannels(channels, visibleChannelIds);
   }
 
-  function previewValues(values: number[]): number[] {
-    if (!pulseoxPreview || values.length < 8) return values;
-    return pulseoxAmbientSubtractedPreview(values);
-  }
-
   function chartData(): uPlot.AlignedData {
     const bounded = samples.slice(-maximum);
     const active = displayChannels();
@@ -42,7 +36,7 @@
     const values = active.map((channel) => {
       const index = channels.findIndex((candidate) => candidate.id === channel.id);
       return bounded.map((point) => {
-        const value = previewValues(point.values)[index] ?? 0;
+        const value = point.values[index] ?? 0;
         return displayedValue(value, channel.id, channelUnits[channel.id] ?? 'counts', adcBits, calibration);
       });
     });
@@ -50,7 +44,7 @@
   }
 
   function currentSignature() {
-    return `${channels.map((channel) => channel.id).join('|')}/${visibleChannelIds.join('|')}/${pulseoxPreview}/${JSON.stringify(channelUnits)}/${JSON.stringify(calibration)}/${adcBits}`;
+    return `${channels.map((channel) => channel.id).join('|')}/${visibleChannelIds.join('|')}/${JSON.stringify(channelUnits)}/${JSON.stringify(calibration)}/${adcBits}`;
   }
 
   function createPlot() {
@@ -107,7 +101,6 @@
     const _units = channelUnits;
     const _calibration = calibration;
     const _adcBits = adcBits;
-    const _pulseoxPreview = pulseoxPreview;
     void _revision;
     void _samples;
     void _channels;
@@ -115,7 +108,6 @@
     void _units;
     void _calibration;
     void _adcBits;
-    void _pulseoxPreview;
     if (plot) update();
   }
 

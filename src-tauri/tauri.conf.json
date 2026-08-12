@@ -25,7 +25,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": "nsis",
     "category": "Education",
     "resources": [
       "resources/arduino-runtime.zip",
@@ -36,7 +36,7 @@
         "type": "offlineInstaller"
       },
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "perMachine"
       }
     },
     "icon": [

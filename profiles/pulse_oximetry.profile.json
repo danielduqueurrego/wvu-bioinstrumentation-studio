@@ -66,10 +66,6 @@
     "counts",
     "volts"
   ],
-  "derived_preview": [
-    "dark_corrected_red",
-    "dark_corrected_infrared"
-  ],
   "prohibited_outputs": [
     "clinical_spo2"
   ],

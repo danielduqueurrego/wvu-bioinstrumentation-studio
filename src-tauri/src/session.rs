@@ -285,6 +285,28 @@ struct CaptureRequest {
     duration: RecordingDuration,
     output_dir: PathBuf,
     calibration: RecordingCalibration,
+    recording_path_context: Option<RecordingPathContext>,
+}
+
+/// The Project folder and the relative trial folder selected at Start. The
+/// BMEG remains portable because its raw samples do not depend on this context.
+#[derive(Clone)]
+pub struct RecordingPathContext {
+    pub project_folder: String,
+    pub output_folder: String,
+}
+
+/// Inputs used exclusively to create the immutable recording metadata header.
+/// Keeping them together prevents recording provenance from growing another
+/// positional-argument list as student-facing settings evolve.
+struct InitialMetadataRequest<'a> {
+    simulator: bool,
+    source: &'a str,
+    bmeg: &'a Path,
+    duration: &'a RecordingDuration,
+    profile: &'a ProfileSnapshot,
+    calibration: RecordingCalibration,
+    recording_path_context: Option<&'a RecordingPathContext>,
 }
 
 impl Default for SessionController {
@@ -405,6 +427,23 @@ impl SessionController {
         output_dir: PathBuf,
         calibration: RecordingCalibration,
     ) -> Result<SessionStatus, SessionError> {
+        self.start_simulator_with_profile_calibration_and_path_context(
+            profile,
+            duration,
+            output_dir,
+            calibration,
+            None,
+        )
+    }
+
+    pub fn start_simulator_with_profile_calibration_and_path_context(
+        &self,
+        profile: ProfileSnapshot,
+        duration: RecordingDuration,
+        output_dir: PathBuf,
+        calibration: RecordingCalibration,
+        recording_path_context: Option<RecordingPathContext>,
+    ) -> Result<SessionStatus, SessionError> {
         self.validate_duration(&duration)?;
         calibration
             .validate()
@@ -419,7 +458,13 @@ impl SessionController {
         )?;
         let controller = self.clone();
         self.spawn_worker(move || {
-            controller.capture_simulator_worker(profile, duration, output_dir, calibration)
+            controller.capture_simulator_worker(
+                profile,
+                duration,
+                output_dir,
+                calibration,
+                recording_path_context,
+            )
         })?;
         self.status()
     }
@@ -458,6 +503,25 @@ impl SessionController {
         output_dir: PathBuf,
         calibration: RecordingCalibration,
     ) -> Result<SessionStatus, SessionError> {
+        self.start_serial_with_profile_calibration_and_path_context(
+            profile,
+            port_name,
+            duration,
+            output_dir,
+            calibration,
+            None,
+        )
+    }
+
+    pub fn start_serial_with_profile_calibration_and_path_context(
+        &self,
+        profile: ProfileSnapshot,
+        port_name: String,
+        duration: RecordingDuration,
+        output_dir: PathBuf,
+        calibration: RecordingCalibration,
+        recording_path_context: Option<RecordingPathContext>,
+    ) -> Result<SessionStatus, SessionError> {
         self.validate_duration(&duration)?;
         calibration
             .validate()
@@ -472,7 +536,14 @@ impl SessionController {
         )?;
         let controller = self.clone();
         self.spawn_worker(move || {
-            controller.capture_serial_worker(profile, port_name, duration, output_dir, calibration)
+            controller.capture_serial_worker(
+                profile,
+                port_name,
+                duration,
+                output_dir,
+                calibration,
+                recording_path_context,
+            )
         })?;
         self.status()
     }
@@ -506,6 +577,7 @@ impl SessionController {
             duration,
             output_dir.to_path_buf(),
             RecordingCalibration::default(),
+            None,
         )?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "simulator session did not produce a summary",
@@ -532,6 +604,7 @@ impl SessionController {
             duration,
             output_dir.to_path_buf(),
             RecordingCalibration::default(),
+            None,
         )?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "simulator session did not produce a summary",
@@ -575,6 +648,7 @@ impl SessionController {
             duration,
             output_dir.to_path_buf(),
             RecordingCalibration::default(),
+            None,
         )?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "serial session did not produce a summary",
@@ -619,6 +693,32 @@ impl SessionController {
         }
         let mut runtime = self.lock_runtime()?;
         runtime.state = SessionState::Disconnected;
+        Ok(Self::status_from_runtime(&runtime))
+    }
+
+    /// Clears an idle terminal fault before a new, explicitly requested recording.
+    ///
+    /// A failed handshake intentionally retains `Faulted` diagnostics for recovery,
+    /// but it owns no serial transport. Once a later verification has succeeded (or
+    /// a fresh start has passed all of its checks), that historical fault must not
+    /// prevent a new session. Active sessions remain protected and are never reset.
+    pub fn prepare_for_new_recording(&self) -> Result<SessionStatus, SessionError> {
+        if self.is_recording()? {
+            return Err(SessionError::State(
+                "cannot begin a new session while a recording or connection is active",
+            ));
+        }
+        self.wait_for_worker()?;
+        let mut runtime = self.lock_runtime()?;
+        runtime.state = SessionState::Disconnected;
+        runtime.last_error = None;
+        runtime.stop_reason = None;
+        runtime.connection_diagnostics = None;
+        self.cancel.store(false, Ordering::Release);
+        *self
+            .stop_reason
+            .lock()
+            .map_err(|_| SessionError::State("stop reason lock poisoned"))? = None;
         Ok(Self::status_from_runtime(&runtime))
     }
 
@@ -922,6 +1022,7 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: PathBuf,
         calibration: RecordingCalibration,
+        recording_path_context: Option<RecordingPathContext>,
     ) -> Result<(), SessionError> {
         let result = (|| {
             let mut simulator = SimulatorIo::new(&profile, duration.clone())?;
@@ -935,6 +1036,7 @@ impl SessionController {
                     duration,
                     output_dir,
                     calibration,
+                    recording_path_context,
                 },
             )
         })();
@@ -949,12 +1051,22 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: PathBuf,
         calibration: RecordingCalibration,
+        recording_path_context: Option<RecordingPathContext>,
     ) -> Result<(), SessionError> {
         let result = (|| {
+            crate::app_log::record("INFO", &format!("SERIAL_OPEN_BEGIN port={port_name}"));
             let mut port = serialport::new(&port_name, CONTROLLED_SERIAL_BAUD)
                 .timeout(Duration::from_millis(25))
-                .open()?;
+                .open()
+                .map_err(|error| {
+                    crate::app_log::record(
+                        "WARN",
+                        &format!("START_FAIL stage=SERIAL_OPEN detail={error}"),
+                    );
+                    SessionError::Serial(error)
+                })?;
             self.mark_port_opened(&port_name)?;
+            crate::app_log::record("INFO", &format!("SERIAL_OPEN_OK port={port_name}"));
             // Clear stale bytes before asserting host control lines. The firmware then emits HELLO.
             port.clear(serialport::ClearBuffer::Input)?;
             port.write_data_terminal_ready(true)?;
@@ -971,6 +1083,7 @@ impl SessionController {
                     duration,
                     output_dir,
                     calibration,
+                    recording_path_context,
                 },
             )
         })();
@@ -990,9 +1103,20 @@ impl SessionController {
             duration,
             output_dir,
             calibration,
+            recording_path_context,
         } = request;
         // Collect tooling provenance before START so no external command can delay raw intake.
-        let (temporary_bmeg, bmeg, csv, metadata) = self.allocate_paths(&output_dir, &profile)?;
+        crate::app_log::record("INFO", "OPEN_RECORDING_FILE_BEGIN");
+        let (temporary_bmeg, bmeg, csv, metadata) = self
+            .allocate_paths(&output_dir, &profile)
+            .map_err(|error| {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("START_FAIL stage=OPEN_RECORDING_FILE detail={error}"),
+                );
+                error
+            })?;
+        crate::app_log::record("INFO", "OPEN_RECORDING_FILE_OK");
         let initial_free_disk_bytes = self.free_disk_space(&output_dir)?;
         self.update_disk_space(initial_free_disk_bytes)?;
         if initial_free_disk_bytes < DISK_CRITICAL_BYTES {
@@ -1003,13 +1127,38 @@ impl SessionController {
                 DISK_CRITICAL_BYTES / (1024 * 1024)
             )));
         }
-        let mut initial_meta =
-            self.initial_metadata(simulator, &source, &bmeg, &duration, &profile, calibration)?;
+        let mut initial_meta = self
+            .initial_metadata(InitialMetadataRequest {
+                simulator,
+                source: &source,
+                bmeg: &bmeg,
+                duration: &duration,
+                profile: &profile,
+                calibration,
+                recording_path_context: recording_path_context.as_ref(),
+            })
+            .map_err(|error| {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("START_FAIL stage=PREPARE_METADATA detail={error}"),
+                );
+                error
+            })?;
         initial_meta.initial_free_disk_bytes = Some(initial_free_disk_bytes);
         let (tx, rx) = sync_channel(4_096);
         let mut acquisition = AcquisitionController::new(tx);
-        self.wait_for_handshake(io, &mut acquisition)?;
+        crate::app_log::record("INFO", "HANDSHAKE_BEGIN");
+        self.wait_for_handshake(io, &mut acquisition)
+            .map_err(|error| {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("START_FAIL stage=HANDSHAKE detail={error}"),
+                );
+                error
+            })?;
+        crate::app_log::record("INFO", "HANDSHAKE_OK");
         let negotiated_capabilities = acquisition.snapshot().firmware_capabilities;
+        crate::app_log::record("INFO", "CONFIGURE_SEND");
         self.send_command(
             io,
             MessageType::Configure,
@@ -1018,8 +1167,23 @@ impl SessionController {
                 &profile.profile.acquisition,
                 negotiated_capabilities.as_ref(),
             )?,
-        )?;
-        self.wait_until(io, &mut acquisition, |s| s.config_ack_seen, "CONFIG_ACK")?;
+        )
+        .map_err(|error| {
+            crate::app_log::record(
+                "WARN",
+                &format!("START_FAIL stage=CONFIGURE_SEND detail={error}"),
+            );
+            error
+        })?;
+        self.wait_until(io, &mut acquisition, |s| s.config_ack_seen, "CONFIG_ACK")
+            .map_err(|error| {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("START_FAIL stage=CONFIG_ACK detail={error}"),
+                );
+                error
+            })?;
+        crate::app_log::record("INFO", "CONFIG_ACK_RECEIVED");
         acquisition.configure().map_err(SessionError::State)?;
         self.set_state(SessionState::Configured)?;
         // The recording is open before START, so every validated post-start sample has a sink.
@@ -1027,11 +1191,34 @@ impl SessionController {
             &temporary_bmeg,
             &initial_meta,
             profile.profile.acquisition.record_field_names().len(),
-        )?;
+        )
+        .map_err(|error| {
+            crate::app_log::record(
+                "WARN",
+                &format!("START_FAIL stage=OPEN_RECORDING_FILE detail={error}"),
+            );
+            error
+        })?;
         acquisition.start().map_err(SessionError::State)?;
-        self.send_command(io, MessageType::Start, 2, vec![])?;
-        self.wait_until(io, &mut acquisition, |s| s.status_seen, "START status")?;
+        crate::app_log::record("INFO", "START_SEND");
+        self.send_command(io, MessageType::Start, 2, vec![])
+            .map_err(|error| {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("START_FAIL stage=START_SEND detail={error}"),
+                );
+                error
+            })?;
+        self.wait_until(io, &mut acquisition, |s| s.status_seen, "START status")
+            .map_err(|error| {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("START_FAIL stage=START_ACK_OR_FIRST_SAMPLE detail={error}"),
+                );
+                error
+            })?;
         self.set_state(SessionState::Acquiring)?;
+        crate::app_log::record("INFO", "RECORDING_ACTIVE");
         let active_digital_output_mask = acquisition.snapshot().digital_output_mask;
 
         let started = Instant::now();
@@ -1397,12 +1584,15 @@ impl SessionController {
 
     fn initial_metadata(
         &self,
-        simulator: bool,
-        source: &str,
-        bmeg: &Path,
-        duration: &RecordingDuration,
-        profile: &ProfileSnapshot,
-        calibration: RecordingCalibration,
+        InitialMetadataRequest {
+            simulator,
+            source,
+            bmeg,
+            duration,
+            profile,
+            calibration,
+            recording_path_context,
+        }: InitialMetadataRequest<'_>,
     ) -> Result<RecordingMetadata, SessionError> {
         let (arduino_cli_version, uno_r4_core_version, board_serial) = if simulator {
             ("not applicable".into(), "not applicable".into(), None)
@@ -1489,6 +1679,8 @@ impl SessionController {
                 "A0 raw floating/uncalibrated engineering communication test; no human signal."
                     .into()
             },
+            project_folder: recording_path_context.map(|context| context.project_folder.clone()),
+            output_folder: recording_path_context.map(|context| context.output_folder.clone()),
             duration_mode: Some(duration.label().into()),
             requested_duration_seconds: duration.requested_seconds(),
             stop_reason: None,
@@ -2527,6 +2719,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn faulted_handshake_does_not_own_the_serial_session_for_recovery() {
+        let session = SessionController::default();
+        session
+            .set_fault("firmware did not respond".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(!session
+            .is_recording()
+            .unwrap_or_else(|error| panic!("{error}")));
+    }
+
+    #[test]
+    fn successful_recovery_normalizes_an_idle_fault_before_the_next_recording() {
+        let session = SessionController::default();
+        session
+            .set_fault("firmware did not respond".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let status = session
+            .prepare_for_new_recording()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(status.state, SessionState::Disconnected);
+        assert!(status.last_error.is_none());
+        assert!(status.connection_diagnostics.is_none());
+    }
+
+    #[test]
+    fn recovery_normalization_never_interrupts_an_active_session() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        session
+            .start_simulator(RecordingDuration::Timed { seconds: 10 }, dir.path().into())
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(matches!(
+            session.prepare_for_new_recording(),
+            Err(SessionError::State(_))
+        ));
+        session
+            .disconnect()
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
     fn uno(port: &str, serial: Option<&str>) -> UnoUsbPort {
         UnoUsbPort {
             port: port.into(),
@@ -2888,14 +3125,15 @@ mod tests {
         let duration = RecordingDuration::Timed { seconds: 15 * 60 };
         let bmeg = dir.path().join("soak.bmeg");
         let metadata = session
-            .initial_metadata(
-                true,
-                "SIM",
-                &bmeg,
-                &duration,
-                &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
-                RecordingCalibration::default(),
-            )
+            .initial_metadata(InitialMetadataRequest {
+                simulator: true,
+                source: "SIM",
+                bmeg: &bmeg,
+                duration: &duration,
+                profile: &default_general_profile().unwrap_or_else(|e| panic!("{e}")),
+                calibration: RecordingCalibration::default(),
+                recording_path_context: None,
+            })
             .unwrap_or_else(|e| panic!("{e}"));
         let mut writer =
             BmegWriter::create_synchronized(&bmeg, &metadata, 1).unwrap_or_else(|e| panic!("{e}"));
@@ -2949,14 +3187,15 @@ mod tests {
         };
         let bmeg = dir.path().join("multifield-soak.bmeg");
         let metadata = session
-            .initial_metadata(
-                true,
-                "SIM",
-                &bmeg,
-                &duration,
-                &profile,
-                RecordingCalibration::default(),
-            )
+            .initial_metadata(InitialMetadataRequest {
+                simulator: true,
+                source: "SIM",
+                bmeg: &bmeg,
+                duration: &duration,
+                profile: &profile,
+                calibration: RecordingCalibration::default(),
+                recording_path_context: None,
+            })
             .unwrap_or_else(|e| panic!("{e}"));
         let mut writer = BmegWriter::create_synchronized(&bmeg, &metadata, fields as usize)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -3118,6 +3357,7 @@ mod tests {
                     duration: RecordingDuration::Timed { seconds: 2 },
                     output_dir: dir.path().to_path_buf(),
                     calibration: RecordingCalibration::default(),
+                    recording_path_context: None,
                 },
             )
             .err()
@@ -3218,14 +3458,15 @@ mod tests {
         let bmeg = dir.path().join("bp-calibration.bmeg");
         let session = SessionController::default();
         let metadata = session
-            .initial_metadata(
-                true,
-                "SIM",
-                &bmeg,
-                &RecordingDuration::Timed { seconds: 10 },
-                &profile,
-                RecordingCalibration::default(),
-            )
+            .initial_metadata(InitialMetadataRequest {
+                simulator: true,
+                source: "SIM",
+                bmeg: &bmeg,
+                duration: &RecordingDuration::Timed { seconds: 10 },
+                profile: &profile,
+                calibration: RecordingCalibration::default(),
+                recording_path_context: None,
+            })
             .unwrap_or_else(|e| panic!("{e}"));
         let simulator = SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
             .unwrap_or_else(|e| panic!("{e}"));
@@ -3259,6 +3500,31 @@ mod tests {
         assert!((fit.slope - 120.0).abs() < 0.25);
         assert!((fit.offset + 10.0).abs() < 1.0);
         assert!(fit.r_squared > 0.999);
+    }
+
+    #[test]
+    fn recording_metadata_snapshots_project_and_relative_trial_folder() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        let metadata = session
+            .initial_metadata(InitialMetadataRequest {
+                simulator: true,
+                source: "SIM",
+                bmeg: &dir.path().join("project-context.bmeg"),
+                duration: &RecordingDuration::Timed { seconds: 10 },
+                profile: &default_general_profile().unwrap_or_else(|error| panic!("{error}")),
+                calibration: RecordingCalibration::default(),
+                recording_path_context: Some(&RecordingPathContext {
+                    project_folder: "C:\\Users\\Student\\Documents\\BMEG 420L".into(),
+                    output_folder: "Lab6\\Trial1".into(),
+                }),
+            })
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            metadata.project_folder.as_deref(),
+            Some("C:\\Users\\Student\\Documents\\BMEG 420L")
+        );
+        assert_eq!(metadata.output_folder.as_deref(), Some("Lab6\\Trial1"));
     }
 
     #[test]

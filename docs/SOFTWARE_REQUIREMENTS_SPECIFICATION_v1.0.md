@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-WVU Bioinstrumentation Studio is a Windows desktop application for the BMEG 420L biomedical instrumentation laboratory. It provides firmware editing, compilation, upload, synchronized USB acquisition, live plotting, calibration support, recording, diagnostics, and export for an Arduino UNO R4 WiFi and the course biomedical instrumentation hardware.
+WVU Bioinstrumentation Studio is a Windows desktop application for the BMEG 420L biomedical instrumentation laboratory. It provides controlled firmware verification/restoration, synchronized USB acquisition, live plotting, calibration support, recording, and export for an Arduino UNO R4 WiFi and the course biomedical instrumentation hardware.
 
 The system is teaching and engineering equipment, not a medical device.
 
@@ -14,8 +14,6 @@ A student must be able to:
 
 - Select an instructor-approved lab profile.
 - Assign exposed hardware signals to permitted Arduino pins.
-- Create an editable copy of one approved `.ino` sketch.
-- Compile and upload the sketch.
 - View raw signals in real time.
 - Start and stop a recording.
 - Enter group/session identifiers.
@@ -65,30 +63,18 @@ Before acquisition, the application shall verify:
 - Required session metadata
 - Locked profile schema/integrity and any profile-required course acknowledgement
 
-### FR-004 Sketch editing
+### FR-004 Controlled firmware
 
-The application shall provide a single-file `.ino` editor with syntax highlighting, line numbers, search, undo/redo, compile-error navigation, restore-template, save-as, and modified-template status.
+The application shall provide explicit **Verify Firmware** and **Restore WVU Firmware** actions for
+the selected UNO R4 WiFi. Restoration uses the pinned WVU reference source and the included Arduino
+runtime; it is not an arbitrary student-sketch editor or uploader. A controlled-firmware installation
+shall not be considered verified from uploader exit status alone: the host shall receive CRC-valid
+protocol identity frames and verify the expected build/device identity before hardware acquisition.
 
-For the UNO R4 WiFi classroom workflow, a project shall contain exactly one source file named
-`<ProjectName>.ino` and a versioned `project.json` in the matching project folder. The application
-shall validate Arduino/Windows-safe names, prevent source-path traversal, use an explicit
-overwrite confirmation, preserve UTF-8 source without hidden transformations, and warn before
-discarding unsaved changes. Controlled templates shall be copied to a student project; they shall
-not be modified in place.
-
-### FR-005 Compile and upload
-
-The application shall call Arduino CLI as a subprocess, capture structured output where supported, report build size, show actionable errors, and upload to the selected UNO R4 WiFi. A controlled-firmware
-installation shall not be considered verified from uploader exit status alone: the host shall receive
-CRC-valid protocol identity frames and verify the expected build/device identity before acquisition.
-
-Compile and upload shall be separate user actions. Upload shall require a current successful
-compile of the saved source, explicit confirmation, one selected supported board, and no active
-acquisition/recording. The uploader shall release the application serial session first, handle
-bounded reset/bootloader/application-port re-enumeration without assuming a fixed COM number, and
-record exact argument arrays, output, timing, exit code, board identity, and verification result.
-A non-WVU sketch may report successful upload, but it shall disable Acquisition and explain that
-the controlled reference must be restored before binary acquisition is possible.
+Restore shall require explicit confirmation, one selected supported board, and no active recording.
+It shall release the application serial session, handle bounded bootloader/application-port
+re-enumeration without assuming a fixed COM number, and record structured technical details in the
+per-user diagnostic log.
 
 ### FR-006 Pin assignment
 
@@ -185,7 +171,7 @@ The application shall display and export:
 - Duplicate/out-of-order packets
 - Buffer overflows
 - Reconnects
-- Build/upload logs
+- Firmware verification/restoration logs
 
 ### FR-014 Offline operation
 
@@ -230,7 +216,7 @@ On firmware startup, acquisition stop, command timeout, communication failure, o
 - Normal pulse-ox mode: dark, red, dark, infrared
 - Optional multicolor mode adds green
 - Store raw illuminated and dark measurements
-- Optional derived dark-corrected preview
+- Display the raw RED, DARK 1, IR, and DARK 2 measurements directly
 - No clinical SpO2 output
 
 ### Blood Pressure
@@ -328,8 +314,7 @@ RED/DARK/IR/DARK. The pulse template shall automatically select the latter, pres
 phase order and eight raw values, and allow only TX/RX pin, RED/IR pin, ADC, labels, plot defaults,
 and supported dwell changes. It shall never offer a generic waveform sequencer or drive RED and
 IR together. Lab changes shall not automatically compile, upload, reset, or otherwise modify the
-Arduino. Existing Firmware-workspace explicit compile/upload/verification controls remain the
-only firmware mutation path.
+Arduino. The top-of-window Restore WVU Firmware control remains the only firmware mutation path.
 
 ## 7. Deferred requirements
 

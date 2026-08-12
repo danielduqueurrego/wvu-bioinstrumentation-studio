@@ -15,9 +15,9 @@ channel map, firmware identity, profile snapshot, and integrity counters needed 
   new lab revision.
 - Timed and **Until stopped** recording, bounded uPlot display updates, markers, continuous BMEG,
   profile-aware CSV, metadata, storage guards, disconnect finalization, and simulator support.
-- A firmware workspace for one-file UNO projects plus course capture and
-  display-only plot groups. Formal analog-module characterization is outside the runtime app
-  scope and does not gate ordinary course capture.
+- Course capture with display-only plot groups, board verification, and controlled WVU firmware
+  restoration. Formal analog-module characterization is outside the runtime app scope and does
+  not gate ordinary course capture.
 - A lightweight **Calibration & Units** card: raw counts, stored-reference volts, MPXV kPa/mmHg,
   and a student-created XGZP linear mmHg conversion. These are derived display/export values;
   raw BMEG values remain authoritative.
@@ -77,7 +77,7 @@ cargo run --manifest-path src-tauri\Cargo.toml --features acceptance-harness --b
 
 The probe must show HELLO, CAPABILITIES, PONG, zero CRC failures, protocol 0.3, build
 `0x00010003`, and device `0x554E4F34`. A successful upload alone is not identity proof. The
-Firmware workspace’s **Restore WVU reference firmware** action uses the same controlled source and
+application’s **Restore WVU Firmware** action uses the same controlled source and
 requires a verified protocol handshake before Acquisition is re-enabled.
 
 ## Recording and exports

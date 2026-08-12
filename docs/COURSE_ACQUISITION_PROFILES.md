@@ -37,4 +37,4 @@ signal** creates one group for each signal. Hiding, regrouping, or re-showing a 
 stops acquisition and never changes BMEG, CSV, metadata, or the captured channel list.
 
 Default arrangements are ECG: one plot; EMG + force: four plots; blood pressure + PPG: three
-plots; pulse oximetry: two TX/RX preview plots; and General Analog: one plot per selected channel.
+plots; pulse oximetry: two TX/RX raw-phase plots; and General Analog: one plot per selected channel.

@@ -495,9 +495,13 @@ impl AcquisitionProfile {
                     &self.plot_defaults,
                     &[
                         "red_tx".into(),
+                        "dark1_tx".into(),
                         "ir_tx".into(),
+                        "dark2_tx".into(),
                         "red_rx".into(),
+                        "dark1_rx".into(),
                         "ir_rx".into(),
+                        "dark2_rx".into(),
                     ],
                 )?;
             }

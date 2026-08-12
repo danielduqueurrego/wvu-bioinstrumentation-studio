@@ -413,6 +413,11 @@ impl FirmwareWorkflow {
             &result.diagnostics,
             result.handshake_succeeded,
         );
+        if verification.compatible {
+            self.session
+                .prepare_for_new_recording()
+                .map_err(session_failure)?;
+        }
         let mut runtime = self.lock_state()?;
         runtime.compatibility = if verification.compatible {
             FirmwareCompatibility::WvuProtocolCompatible
@@ -788,6 +793,9 @@ impl FirmwareWorkflow {
                 .update_upload_success(&project_folder, board.port, verification.identity.clone())
                 .map_err(workspace_failure)?;
         }
+        self.session
+            .prepare_for_new_recording()
+            .map_err(session_failure)?;
         self.finish_success(job_id, FirmwareCompatibility::WvuProtocolCompatible)
     }
 

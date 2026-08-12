@@ -108,8 +108,8 @@ IR on:   sample TX/RX
 DARK 2:  sample TX/RX
 ```
 
-The raw record retains all eight values; ambient-subtracted signals are optional display previews
-only. The firmware never drives D5 and D6 HIGH together and forces D4–D6 LOW when idle, stopped,
+The raw record and live display retain all eight values directly; no ambient-subtracted signals are
+produced. The firmware never drives D5 and D6 HIGH together and forces D4–D6 LOW when idle, stopped,
 or faulted. It does not compute SpO2 or heart rate.
 
 ## 6. Clipping

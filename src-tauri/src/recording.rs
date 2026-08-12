@@ -124,6 +124,12 @@ pub struct RecordingMetadata {
     pub bmeg_filename: String,
     pub csv_filename: Option<String>,
     pub notes: String,
+    /// User-selected destination provenance. This is optional so recordings made
+    /// before the single-window Project folder workflow remain readable.
+    #[serde(default)]
+    pub project_folder: Option<String>,
+    #[serde(default)]
+    pub output_folder: Option<String>,
     /// Optional fields preserve read compatibility with Phase 1.0 sidecars.
     #[serde(default)]
     pub duration_mode: Option<String>,
@@ -670,6 +676,8 @@ mod tests {
             bmeg_filename: "r.bmeg".into(),
             csv_filename: None,
             notes: "test".into(),
+            project_folder: None,
+            output_folder: None,
             duration_mode: Some("timed".into()),
             requested_duration_seconds: Some(10),
             stop_reason: None,
@@ -777,6 +785,8 @@ mod tests {
             bmeg_filename: "r.bmeg".into(),
             csv_filename: None,
             notes: "test".into(),
+            project_folder: None,
+            output_folder: None,
             duration_mode: Some("timed".into()),
             requested_duration_seconds: Some(10),
             stop_reason: Some(StopReason::TimedComplete),
@@ -846,6 +856,8 @@ mod tests {
             bmeg_filename: "profile.bmeg".into(),
             csv_filename: None,
             notes: "synthetic".into(),
+            project_folder: None,
+            output_folder: None,
             duration_mode: Some("timed".into()),
             requested_duration_seconds: Some(10),
             stop_reason: Some(StopReason::TimedComplete),
@@ -938,6 +950,38 @@ mod tests {
             .metadata
             .calibration
             .is_some());
+        let pulseox = crate::profiles::built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_pulseox")
+            .unwrap_or_else(|| panic!("missing pulse-ox profile"))
+            .snapshot(false);
+        metadata.profile_snapshot = Some(pulseox);
+        metadata.calibration = None;
+        metadata.adc_bits = 14;
+        let pulse_bmeg = dir.path().join("pulse.bmeg");
+        let pulse_csv = dir.path().join("pulse.csv");
+        let mut pulse_writer = BmegWriter::create_synchronized(&pulse_bmeg, &metadata, 8)
+            .unwrap_or_else(|e| panic!("{e}"));
+        pulse_writer
+            .write_record(&SynchronizedRecord {
+                sequence: 7,
+                timestamp_us: 28_000,
+                status_flags: 1,
+                counts: vec![101, 102, 103, 104, 201, 202, 203, 204],
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        pulse_writer.finish().unwrap_or_else(|e| panic!("{e}"));
+        export_bmeg_csv(&pulse_bmeg, &pulse_csv).unwrap_or_else(|e| panic!("{e}"));
+        let pulse_text = std::fs::read_to_string(pulse_csv).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            pulse_text.lines().next(),
+            Some("cycle_index,t_us,red_TX,dark1_TX,ir_TX,dark2_TX,red_RX,dark1_RX,ir_RX,dark2_RX")
+        );
+        assert_eq!(
+            pulse_text.lines().nth(1),
+            Some("7,28000,101,102,103,104,201,202,203,204")
+        );
         metadata.profile_snapshot = None;
         assert!(metadata.profile_snapshot.is_none());
     }
@@ -980,6 +1024,8 @@ mod tests {
             bmeg_filename: "validation.bmeg".into(),
             csv_filename: None,
             notes: "bench only".into(),
+            project_folder: None,
+            output_folder: None,
             duration_mode: Some("timed".into()),
             requested_duration_seconds: Some(10),
             stop_reason: Some(StopReason::TimedComplete),

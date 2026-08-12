@@ -68,6 +68,6 @@ the recorded raw samples. CSV adds derived columns alongside raw counts (for exa
 `mpxv_V`, `mpxv_kPa`, `mpxv_mmHg`, and, when selected, `xgzp_mmHg`). A missing XGZP calibration
 never creates an `xgzp_mmHg` column.
 
-Pulse-ox remains raw: its ambient-subtracted preview can show counts or volts, while all eight
+Pulse-ox remains raw: each of its eight phase measurements can show counts or volts, while all eight
 RED/DARK/IR/DARK raw count fields remain unchanged. The app does **not** calculate ECG heart rate,
 EMG MVC/fatigue, SBP/DBP, SpO2, R, perfusion index, or any clinical conclusion.

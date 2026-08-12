@@ -10,6 +10,8 @@ $runtimeRoot = Join-Path $tauriRoot 'resources'
 $runtimeArchive = Join-Path $runtimeRoot 'arduino-runtime.zip'
 $manifestPath = Join-Path $runtimeRoot 'arduino-runtime-manifest.json'
 $releaseManifestPath = Join-Path $projectRoot 'release\release-manifest.json'
+$iconSource = Join-Path $projectRoot 'assets\icon.svg'
+$tauriConfigPath = Join-Path $tauriRoot 'tauri.conf.json'
 $distRoot = Join-Path $projectRoot 'dist\WVU-Bioinstrumentation-Studio-1.0.0'
 $zipPath = Join-Path $projectRoot 'dist\WVU-Bioinstrumentation-Studio-1.0.0-Windows-x64.zip'
 
@@ -25,12 +27,26 @@ if ($dirty.Count -gt 0) {
 foreach ($required in @(
   $runtimeArchive,
   $manifestPath,
-  $releaseManifestPath
+  $releaseManifestPath,
+  $iconSource,
+  $tauriConfigPath
 )) {
   if (-not (Test-Path -LiteralPath $required)) {
     throw "Required pinned release asset is missing: $required"
   }
 }
+
+$tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json
+if ($tauriConfig.bundle.windows.nsis.installMode -ne 'perMachine') {
+  throw 'The student NSIS installer must use the reviewed perMachine installation mode.'
+}
+if ([string]::IsNullOrWhiteSpace($tauriConfig.build.frontendDist) -or $tauriConfig.build.frontendDist -match '^[a-z][a-z0-9+.-]*://') {
+  throw 'The production Tauri frontendDist must be a local filesystem path, never a development URL.'
+}
+if ([string]::IsNullOrWhiteSpace($tauriConfig.build.beforeBuildCommand)) {
+  throw 'The production Tauri configuration must define a frontend build command.'
+}
+$frontendDistPath = [System.IO.Path]::GetFullPath((Join-Path $tauriRoot $tauriConfig.build.frontendDist))
 
 $runtimeManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 if ($runtimeManifest.arduino_cli -ne '1.5.2-rc.1' -or $runtimeManifest.renesas_uno_core -ne '1.6.0') {
@@ -63,7 +79,21 @@ try {
 & npm run check
 & npm test
 & npm run build
+if (-not (Test-Path -LiteralPath $frontendDistPath) -or -not (Test-Path -LiteralPath (Join-Path $frontendDistPath 'index.html'))) {
+  throw "Tauri frontendDist is not a built local frontend with index.html: $frontendDistPath"
+}
+# The Tauri Windows bundlers patch the same release executable. Build them
+# serially so MSI and NSIS cannot contend for that file on slower computers.
 & npm run tauri build
+& npm run tauri -- build --bundles msi
+
+$releaseExe = Join-Path $tauriRoot 'target\release\wvu_bioinstrumentation_studio.exe'
+if (-not (Test-Path -LiteralPath $releaseExe)) {
+  throw "Tauri did not produce the expected release executable: $releaseExe"
+}
+Write-Host "Production frontend: $frontendDistPath"
+Write-Host "Production executable (built by Tauri): $releaseExe"
+Write-Host 'Manual release smoke test: launch the executable with no Vite dev server running; it must load bundled UI and never request localhost.'
 
 $nsis = Get-ChildItem -LiteralPath (Join-Path $tauriRoot 'target\release\bundle\nsis') -Filter '*-setup.exe' -File |
   Sort-Object LastWriteTime -Descending | Select-Object -First 1

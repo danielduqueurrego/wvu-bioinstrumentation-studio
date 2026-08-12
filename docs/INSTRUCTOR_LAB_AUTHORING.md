@@ -67,14 +67,14 @@ Raw fields remain authoritative:
 cycle_index,t_us,red_TX,dark1_TX,ir_TX,dark2_TX,red_RX,dark1_RX,ir_RX,dark2_RX
 ```
 
-Preview plots never replace those fields or calculate SpO2, R, perfusion index, or heart rate.
+Raw phase plots never replace those fields or calculate SpO2, R, perfusion index, or heart rate.
 RED and IR are never HIGH simultaneously.
 
 ## Firmware association and import/export
 
-A lab may name **WVU Reference Firmware** or an optional local relative `.ino` reference with an
-optional source hash. Saving a lab never compiles or uploads it. The Firmware workspace remains
-responsible for explicit Save, Save As, Compile, Upload, and Restore Reference Firmware actions.
+A lab uses the shipped WVU Reference Firmware. Saving a lab never compiles, uploads, or changes
+firmware. Board controls at the top of the application provide explicit Verify Firmware and Restore
+WVU Firmware actions when needed.
 
 Lab export is portable JSON and excludes recordings, local calibration presets, absolute machine
 paths, compiled artifacts, and firmware binaries. Import validates schema, resource safety,
@@ -88,5 +88,5 @@ a same-ID/version content collision is rejected rather than silently incremented
 | ECG | A0 ECG | 1000 Hz / 14-bit | ECG |
 | EMG + Force | A0 raw, A1 rectified, A2 envelope, A3 pressure | 1000 Hz / 14-bit | one per signal |
 | Blood Pressure + PPG | A0 PPG, A1 MPXV, A2 XGZP, D4 green while recording | 200 Hz / 14-bit | one per signal |
-| Pulse Oximetry | TX A0, RX A1, RED D5, IR D6 | 1000 µs dwell / 14-bit | TX previews / RX previews |
+| Pulse Oximetry | TX A0, RX A1, RED D5, IR D6 | 1000 µs dwell / 14-bit | TX raw phases / RX raw phases |
 | General / Blank simultaneous | Instructor-defined 1–6 inputs | advertised supported settings | one per signal |

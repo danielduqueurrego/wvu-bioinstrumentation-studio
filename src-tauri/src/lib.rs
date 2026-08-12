@@ -1,10 +1,12 @@
 pub mod acquisition;
+pub mod app_log;
 pub mod arduino_cli;
 pub mod arduino_runtime;
 pub mod calibration;
 pub mod firmware_workflow;
 pub mod firmware_workspace;
 pub mod profiles;
+pub mod project_paths;
 pub mod protocol;
 pub mod recording;
 pub mod session;
@@ -22,6 +24,50 @@ struct AppState {
     profiles: profiles::ProfileStore,
     /// Student-facing local calibration presets. They never modify a locked profile.
     calibrations: calibration::CalibrationStore,
+}
+
+#[derive(serde::Deserialize)]
+struct StartProfileHardwareRequest {
+    port: String,
+    project_folder: String,
+    output_folder: String,
+    duration: recording::RecordingDuration,
+    profile_id: String,
+    bench_notice_acknowledged: bool,
+    calibration: Option<calibration::RecordingCalibration>,
+}
+
+/// A concise, structured failure returned only when a recording cannot enter the
+/// session worker.  Asynchronous transport failures remain on `SessionStatus`,
+/// where their exact detail is retained in `last_error`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartRecordingFailure {
+    stage: &'static str,
+    code: &'static str,
+    user_message: &'static str,
+    technical_detail: String,
+}
+
+impl StartRecordingFailure {
+    fn new(
+        stage: &'static str,
+        code: &'static str,
+        user_message: &'static str,
+        technical_detail: impl ToString,
+    ) -> Self {
+        let technical_detail = technical_detail.to_string();
+        app_log::record(
+            "WARN",
+            &format!("START_FAIL stage={stage} code={code} detail={technical_detail}"),
+        );
+        Self {
+            stage,
+            code,
+            user_message,
+            technical_detail,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -58,6 +104,18 @@ async fn prepare_arduino_runtime(
         .await
         .map_err(|error| format!("Arduino tool preparation task failed: {error}"))?
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_project_folder() -> Result<project_paths::ProjectFolderSettings, String> {
+    project_paths::load_project_folder()
+}
+
+#[tauri::command]
+fn set_project_folder(
+    project_folder: String,
+) -> Result<project_paths::ProjectFolderSettings, String> {
+    project_paths::save_project_folder(&project_folder)
 }
 
 #[tauri::command]
@@ -98,96 +156,6 @@ async fn firmware_environment(
     tauri::async_runtime::spawn_blocking(move || firmware.environment())
         .await
         .map_err(|error| format!("firmware environment task failed: {error}"))
-}
-
-#[tauri::command]
-fn list_firmware_templates() -> Vec<firmware_workspace::TemplateInfo> {
-    firmware_workspace::FirmwareWorkspace::templates()
-}
-
-#[tauri::command]
-fn create_firmware_project(
-    state: tauri::State<'_, AppState>,
-    request: firmware_workspace::CreateProjectRequest,
-) -> Result<firmware_workspace::FirmwareProject, String> {
-    state
-        .firmware
-        .workspace()
-        .create_project(request)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn open_firmware_project(
-    state: tauri::State<'_, AppState>,
-    project_folder: String,
-) -> Result<firmware_workspace::FirmwareProject, String> {
-    state
-        .firmware
-        .workspace()
-        .open_project(&project_folder)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn save_firmware_project(
-    state: tauri::State<'_, AppState>,
-    request: firmware_workspace::SaveProjectRequest,
-) -> Result<firmware_workspace::FirmwareProject, String> {
-    state
-        .firmware
-        .workspace()
-        .save_project(request)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn save_firmware_project_as(
-    state: tauri::State<'_, AppState>,
-    request: firmware_workspace::SaveAsProjectRequest,
-) -> Result<firmware_workspace::FirmwareProject, String> {
-    state
-        .firmware
-        .workspace()
-        .save_as_project(request)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn list_recent_firmware_projects(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    state
-        .firmware
-        .workspace()
-        .recent_projects()
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn restore_firmware_project_saved_source(
-    state: tauri::State<'_, AppState>,
-    project_folder: String,
-) -> Result<String, String> {
-    state
-        .firmware
-        .workspace()
-        .restore_saved_source(&project_folder)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn start_firmware_compile(
-    state: tauri::State<'_, AppState>,
-    request: firmware_workflow::CompileProjectRequest,
-) -> Result<firmware_workflow::FirmwareJobStatus, String> {
-    firmware_error(state.firmware.start_compile(request))
-}
-
-#[tauri::command]
-fn start_firmware_upload(
-    state: tauri::State<'_, AppState>,
-    request: firmware_workflow::UploadProjectRequest,
-) -> Result<firmware_workflow::FirmwareJobStatus, String> {
-    firmware_error(state.firmware.start_upload(request))
 }
 
 #[tauri::command]
@@ -462,6 +430,10 @@ fn start_simulator_recording(
     checked_output_directory(&output_directory)?;
     state
         .session
+        .prepare_for_new_recording()
+        .map_err(|error| error.to_string())?;
+    state
+        .session
         .start_simulator(duration, PathBuf::from(output_directory))
         .map_err(|error| error.to_string())
 }
@@ -469,13 +441,15 @@ fn start_simulator_recording(
 #[tauri::command]
 fn start_profile_simulator_recording(
     state: tauri::State<'_, AppState>,
-    output_directory: String,
+    project_folder: String,
+    output_folder: String,
     duration: recording::RecordingDuration,
     profile_id: String,
     bench_notice_acknowledged: bool,
     calibration: Option<calibration::RecordingCalibration>,
 ) -> Result<session::SessionStatus, String> {
-    checked_output_directory(&output_directory)?;
+    let destination =
+        project_paths::resolve_recording_destination(&project_folder, &output_folder)?;
     let profile = state
         .profiles
         .get_locked(&profile_id)
@@ -483,11 +457,19 @@ fn start_profile_simulator_recording(
     let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())?;
     state
         .session
-        .start_simulator_with_profile_and_calibration(
+        .prepare_for_new_recording()
+        .map_err(|error| error.to_string())?;
+    state
+        .session
+        .start_simulator_with_profile_calibration_and_path_context(
             profile.snapshot(bench_notice_acknowledged),
             duration,
-            PathBuf::from(output_directory),
+            destination.effective_folder,
             calibration,
+            Some(session::RecordingPathContext {
+                project_folder: destination.project_folder.to_string_lossy().into_owned(),
+                output_folder: destination.output_folder,
+            }),
         )
         .map_err(|error| error.to_string())
 }
@@ -502,7 +484,10 @@ fn start_hardware_recording(
 ) -> Result<session::SessionStatus, String> {
     checked_output_directory(&output_directory)?;
     if !firmware_error(state.firmware.is_acquisition_allowed(&port))? {
-        return Err("firmware compatibility is not verified. Open Firmware, select the UNO R4 WiFi, and verify or restore the WVU reference firmware before acquisition.".into());
+        return Err(
+            "WVU firmware is not ready. Verify or restore the firmware before hardware recording."
+                .into(),
+        );
     }
     if !serialport::available_ports()
         .map_err(|error| format!("could not enumerate serial ports: {error}"))?
@@ -525,6 +510,10 @@ fn start_hardware_recording(
     }
     state
         .session
+        .prepare_for_new_recording()
+        .map_err(|error| error.to_string())?;
+    state
+        .session
         .start_serial(port, duration, PathBuf::from(output_directory))
         .map_err(|error| error.to_string())
 }
@@ -532,51 +521,151 @@ fn start_hardware_recording(
 #[tauri::command]
 fn start_profile_hardware_recording(
     state: tauri::State<'_, AppState>,
-    port: String,
-    output_directory: String,
-    duration: recording::RecordingDuration,
-    profile_id: String,
-    bench_notice_acknowledged: bool,
-    calibration: Option<calibration::RecordingCalibration>,
-) -> Result<session::SessionStatus, String> {
-    checked_output_directory(&output_directory)?;
-    let profile = state
-        .profiles
-        .get_locked(&profile_id)
-        .map_err(|error| error.to_string())?;
-    if !firmware_error(state.firmware.is_acquisition_allowed(&port))? {
-        return Err("Profile requires the controlled WVU firmware. Verify or restore it in Firmware before hardware recording.".into());
+    request: StartProfileHardwareRequest,
+) -> Result<session::SessionStatus, StartRecordingFailure> {
+    let StartProfileHardwareRequest {
+        port,
+        project_folder,
+        output_folder,
+        duration,
+        profile_id,
+        bench_notice_acknowledged,
+        calibration,
+    } = request;
+    app_log::record(
+        "INFO",
+        &format!("START_REQUEST port={port} lab={profile_id}"),
+    );
+    app_log::record("INFO", "VALIDATE_PATHS_BEGIN");
+    let destination = project_paths::resolve_recording_destination(&project_folder, &output_folder)
+        .map_err(|error| {
+            StartRecordingFailure::new(
+                "VALIDATE_PATHS",
+                "recording_folder",
+                "The recording folder is not writable. Choose another Project or Output folder before recording.",
+                error,
+            )
+        })?;
+    app_log::record(
+        "INFO",
+        &format!(
+            "VALIDATE_PATHS_OK destination={}",
+            destination.effective_folder.display()
+        ),
+    );
+    let profile = state.profiles.get_locked(&profile_id).map_err(|error| {
+        StartRecordingFailure::new(
+            "LOAD_LAB",
+            "lab_unavailable",
+            "The selected lab is not available. Choose the assigned lab and try again.",
+            error,
+        )
+    })?;
+    let firmware_allowed =
+        firmware_error(state.firmware.is_acquisition_allowed(&port)).map_err(|error| {
+            StartRecordingFailure::new(
+                "CHECK_FIRMWARE",
+                "firmware_status",
+                "WVU firmware is not ready. Verify or restore the firmware before recording.",
+                error,
+            )
+        })?;
+    if !firmware_allowed {
+        return Err(StartRecordingFailure::new(
+            "CHECK_FIRMWARE",
+            "firmware_not_ready",
+            "WVU firmware is not ready. Verify or restore the firmware before recording.",
+            "firmware workflow did not report a compatible WVU firmware for the selected port",
+        ));
     }
     if !serialport::available_ports()
-        .map_err(|error| format!("could not enumerate serial ports: {error}"))?
+        .map_err(|error| {
+            StartRecordingFailure::new(
+                "SERIAL_ENUMERATE",
+                "serial_enumeration",
+                "The Arduino could not be opened. Reconnect it or click Refresh Board, then try again.",
+                error,
+            )
+        })?
         .iter()
         .any(|candidate| candidate.port_name.eq_ignore_ascii_case(&port))
     {
-        return Err("select a currently enumerated serial port".into());
+        return Err(StartRecordingFailure::new(
+            "SERIAL_ENUMERATE",
+            "selected_port_missing",
+            "The selected Arduino is no longer available. Reconnect it, then click Refresh Board.",
+            format!("selected port {port} was not present in the operating-system serial-port list"),
+        ));
     }
-    let cli = arduino_cli::ArduinoCli::discover(None).map_err(|error| error.to_string())?;
+    app_log::record("INFO", "BOARD_DISCOVERY_BEGIN");
+    let cli = arduino_cli::ArduinoCli::discover(None).map_err(|error| {
+        StartRecordingFailure::new(
+            "BOARD_DISCOVERY",
+            "arduino_tools",
+            "Arduino tools need attention. Click Refresh Board, then try again.",
+            error,
+        )
+    })?;
     if !cli
         .boards()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            StartRecordingFailure::new(
+                "BOARD_DISCOVERY",
+                "board_scan",
+                "The Arduino could not be confirmed. Reconnect it, then click Refresh Board.",
+                error,
+            )
+        })?
         .into_iter()
         .any(|board| board.port.eq_ignore_ascii_case(&port))
     {
-        return Err(
-            "selected port is not a detected Arduino UNO R4 WiFi; refresh boards or use Simulator"
-                .into(),
-        );
+        return Err(StartRecordingFailure::new(
+            "BOARD_DISCOVERY",
+            "unsupported_board",
+            "The selected board is no longer available. Reconnect the UNO R4 WiFi, then click Refresh Board.",
+            format!("selected port {port} was not reported as an Arduino UNO R4 WiFi"),
+        ));
     }
-    let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())?;
+    app_log::record("INFO", "BOARD_DISCOVERY_OK");
+    let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())
+        .map_err(|error| {
+            StartRecordingFailure::new(
+                "CHECK_CALIBRATION",
+                "calibration",
+                "The selected calibration cannot be used with this lab. Choose another calibration and try again.",
+                error,
+            )
+        })?;
+    state.session.prepare_for_new_recording().map_err(|error| {
+        StartRecordingFailure::new(
+            "PREPARE_SESSION",
+            "session_busy",
+            "The Arduino is busy. Wait for the current operation to finish and try again.",
+            error,
+        )
+    })?;
+    app_log::record("INFO", "SERIAL_OPEN_BEGIN");
     state
         .session
-        .start_serial_with_profile_and_calibration(
+        .start_serial_with_profile_calibration_and_path_context(
             profile.snapshot(bench_notice_acknowledged),
             port,
             duration,
-            PathBuf::from(output_directory),
+            destination.effective_folder,
             calibration,
+            Some(session::RecordingPathContext {
+                project_folder: destination.project_folder.to_string_lossy().into_owned(),
+                output_folder: destination.output_folder,
+            }),
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            StartRecordingFailure::new(
+                "INITIALIZE_SESSION",
+                "session_start",
+                "The recording could not be prepared. Try again. If it continues, open Advanced details and share the information with your instructor.",
+                error,
+            )
+        })
 }
 
 /// Explicit recovery action for a previously discovered UNO R4 WiFi. It performs
@@ -691,18 +780,6 @@ fn get_recent_display_data(state: tauri::State<'_, AppState>) -> Result<Vec<Rece
         })
 }
 
-/// CSV is finalized automatically from the BMEG stream. This exposes its recorded path.
-#[tauri::command]
-fn export_session_csv(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    state
-        .session
-        .status()
-        .map_err(|error| error.to_string())?
-        .last_summary
-        .map(|summary| summary.csv_path)
-        .ok_or_else(|| "no finalized recording is available to export".into())
-}
-
 fn checked_output_directory(value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err("choose a non-empty output directory".into());
@@ -733,19 +810,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             prepare_arduino_runtime,
+            get_project_folder,
+            set_project_folder,
             list_boards,
             list_serial_ports,
             arduino_cli_version,
             firmware_environment,
-            list_firmware_templates,
-            create_firmware_project,
-            open_firmware_project,
-            save_firmware_project,
-            save_firmware_project_as,
-            list_recent_firmware_projects,
-            restore_firmware_project_saved_source,
-            start_firmware_compile,
-            start_firmware_upload,
             restore_wvu_reference_firmware,
             cancel_firmware_job,
             get_firmware_workflow_status,
@@ -780,8 +850,7 @@ pub fn run() {
             add_recording_marker,
             disconnect_session,
             get_session_status,
-            get_recent_display_data,
-            export_session_csv
+            get_recent_display_data
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

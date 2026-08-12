@@ -24,7 +24,12 @@ export function pulseOxDraft(profile: LabProfile): LabProfile {
         { pin: 'D6', label: 'IR LED', behavior: 'acquisition_sequenced' }
       ]
     },
-    plot_defaults: { groups: [{ channel_ids: ['red_tx', 'ir_tx'] }, { channel_ids: ['red_rx', 'ir_rx'] }] }
+    plot_defaults: {
+      groups: [
+        { channel_ids: ['red_tx', 'dark1_tx', 'ir_tx', 'dark2_tx'] },
+        { channel_ids: ['red_rx', 'dark1_rx', 'ir_rx', 'dark2_rx'] }
+      ]
+    }
   };
 }
 

@@ -7,7 +7,6 @@ import {
   onePlotPerSignal,
   overlayAll,
   setPlotGroupCount,
-  pulseoxAmbientSubtractedPreview,
   setTraceVisibility,
   visiblePlotGroups,
   visibleChannelIds,
@@ -44,11 +43,18 @@ describe('Phase 4 multi-channel UI helpers', () => {
     expect(defaultPlotGroups('development', channels)).toHaveLength(4);
     expect(defaultPlotGroups('course_blood_pressure', channels.slice(0, 3))).toHaveLength(3);
     expect(defaultPlotGroups('course_pulseox', [
-      { id: 'red_tx', label: 'RED TX', csv_name: 'red_tx' },
-      { id: 'ir_tx', label: 'IR TX', csv_name: 'ir_tx' },
-      { id: 'red_rx', label: 'RED RX', csv_name: 'red_rx' },
-      { id: 'ir_rx', label: 'IR RX', csv_name: 'ir_rx' }
-    ]).map((group) => group.channelIds)).toEqual([['red_tx', 'ir_tx'], ['red_rx', 'ir_rx']]);
+      { id: 'red_tx', label: 'TX Red', csv_name: 'red_TX' },
+      { id: 'dark1_tx', label: 'TX Dark 1', csv_name: 'dark1_TX' },
+      { id: 'ir_tx', label: 'TX IR', csv_name: 'ir_TX' },
+      { id: 'dark2_tx', label: 'TX Dark 2', csv_name: 'dark2_TX' },
+      { id: 'red_rx', label: 'RX Red', csv_name: 'red_RX' },
+      { id: 'dark1_rx', label: 'RX Dark 1', csv_name: 'dark1_RX' },
+      { id: 'ir_rx', label: 'RX IR', csv_name: 'ir_RX' },
+      { id: 'dark2_rx', label: 'RX Dark 2', csv_name: 'dark2_RX' }
+    ]).map((group) => group.channelIds)).toEqual([
+      ['red_tx', 'dark1_tx', 'ir_tx', 'dark2_tx'],
+      ['red_rx', 'dark1_rx', 'ir_rx', 'dark2_rx']
+    ]);
   });
 
   it('merges removed plots deterministically and preserves assignments while hidden', () => {
@@ -83,10 +89,13 @@ describe('Phase 4 multi-channel UI helpers', () => {
     ]);
   });
 
-  it('preserves the raw pulse layout and derives preview subtraction explicitly', () => {
-    expect(pulseoxAmbientSubtractedPreview([100, 10, 120, 20, 200, 30, 240, 40]))
-      .toEqual([90, 100, 170, 200]);
-    expect(pulseoxAmbientSubtractedPreview([100, 10])).toEqual([]);
+  it('keeps all eight raw pulse-ox phase fields in the plot arrangement', () => {
+    const rawPulseChannels = [
+      'red_tx', 'dark1_tx', 'ir_tx', 'dark2_tx',
+      'red_rx', 'dark1_rx', 'ir_rx', 'dark2_rx'
+    ].map((id) => ({ id, label: id, csv_name: id }));
+    expect(defaultPlotGroups('course_pulseox', rawPulseChannels).flatMap((group) => group.channelIds))
+      .toEqual(rawPulseChannels.map((channel) => channel.id));
   });
 
   it('accepts one through six unique A0–A5 general-development pins only', () => {

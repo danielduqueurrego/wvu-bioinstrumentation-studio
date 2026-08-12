@@ -71,14 +71,10 @@ src/
     profiles/
     api/
   routes or views/
-    Home
-    Firmware
-    Setup
-    Acquisition
-    Calibration
-    Review
-    Diagnostics
-    Settings
+    Single-window course workflow
+      Board controls
+      Project folder
+      Acquisition and calibration
 ```
 
 ## 3. Threading and data flow
@@ -97,8 +93,7 @@ The packaged application invokes its included Arduino CLI directly with argument
 - `arduino-cli version`
 - `arduino-cli board list --format json`
 - `arduino-cli core list --format json`
-- `arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi --format json`
-- `arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port <COM>`
+- the pinned WVU reference-firmware compile/upload invocation used only by Restore WVU Firmware
 
 Store command arguments, exit code, stdout, and stderr in the diagnostic log. On Windows, the
 shared process helper applies `CREATE_NO_WINDOW`, captures output, and never launches a shell.
@@ -107,7 +102,9 @@ app-owned runtime. Development overrides are restricted to development builds.
 
 ## 5. Firmware organization
 
-Student-visible firmware is one `.ino` file. Codex may generate internal code before packaging, but the approved student template must remain a single-file sketch.
+The distributed application uses one pinned WVU reference `.ino` source internally for the explicit
+Restore WVU Firmware action. The student runtime does not expose arbitrary sketch editing,
+compilation, or upload.
 
 The firmware must:
 
@@ -120,29 +117,9 @@ The firmware must:
 - Stop safely on command timeout or reset.
 - Support simulator-compatible message semantics.
 
-## Phase 2 firmware-workspace flow
-
-```text
-CodeMirror editor -> explicit Save -> single-file project.json model
-                         |
-                  Arduino CLI compile (argument array)
-                         |
-                current-source build artifact
-                         |
-explicit confirmed upload -> release shared SessionController serial handle
-                         |
- Arduino CLI touch reset / upload -> serial-number-first port rediscovery
-                         |
-    declared non-WVU sketch                 declared WVU reference
-      -> Acquisition disabled          -> production HELLO/CAPABILITIES/PONG
-                                               + identity verification
-                                                     |
-                                           Acquisition re-enabled
-```
-
-`FirmwareWorkflow` coordinates one active compile/upload job and shares the same
-`SessionController` clone held by Tauri application state. It never exposes a serial handle to
-the frontend and keeps a job visible until its terminal result and diagnostic log are published.
+`FirmwareWorkflow` coordinates only the controlled reference restoration job and shares the same
+`SessionController` clone held by Tauri application state. It never exposes a serial handle to the
+frontend and keeps a job visible until its terminal result and diagnostic log are published.
 
 ## 6. Development phases
 
@@ -237,7 +214,7 @@ Formal characterization is an external instructor engineering activity and never
 - Safe D4–D6 output declarations and capability-checked configuration
 - Fixed-order pulse-ox template with remappable TX/RX and RED/IR, editable supported dwell, and
   authoritative raw eight-state records
-- Firmware association provenance, while compile/upload remain explicit Firmware-workspace actions
+- Firmware identity provenance, with Restore WVU Firmware as the only firmware mutation action
 - Protocol v0.3 capability advertisement and no automatic upload/reset when a lab changes
 
 ### Phase 7 — packaging and classroom hardening

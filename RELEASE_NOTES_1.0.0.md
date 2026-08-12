@@ -6,10 +6,12 @@
 - EMG and pressure acquisition
 - Blood pressure and PPG acquisition
 - Pulse-ox 4-state raw acquisition
+- Single-window Board, Project folder, and Acquisition workflow
+- Eight unprocessed raw pulse-ox phase measurements (TX/RX RED, DARK 1, IR, DARK 2)
 - Multi-channel plot groups
 - Calibration and engineering-unit display
 - BMEG and CSV export
-- Arduino firmware editor, compile, upload, and WVU firmware restore
+- Board verification and WVU firmware restore
 - Instructor Lab Manager
 
 ## Requirements
