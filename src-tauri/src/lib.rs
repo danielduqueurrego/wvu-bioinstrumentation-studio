@@ -112,6 +112,23 @@ fn set_project_folder(
     project_paths::save_project_folder(&project_folder)
 }
 
+/// Browser-side chart failures must never influence the acquisition controller.
+/// Retain a bounded diagnostic event so an instructor can distinguish a display
+/// issue from a serial/protocol session failure.
+#[tauri::command]
+fn record_frontend_plot_error(stage: String, detail: String) {
+    let stage = stage.replace(['\r', '\n'], " ");
+    let detail: String = detail
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(1_000)
+        .collect();
+    app_log::record(
+        "WARN",
+        &format!("PLOT_RENDER_FAIL stage={stage} detail={detail}"),
+    );
+}
+
 fn firmware_error<T>(result: Result<T, firmware_workflow::FirmwareFailure>) -> Result<T, String> {
     result.map_err(|failure| {
         serde_json::to_string(&failure)
@@ -710,6 +727,7 @@ pub fn run() {
             prepare_arduino_runtime,
             get_project_folder,
             set_project_folder,
+            record_frontend_plot_error,
             list_boards,
             firmware_environment,
             restore_wvu_reference_firmware,

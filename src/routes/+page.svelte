@@ -147,6 +147,7 @@
   let statusMessage = 'Ready.';
   let startFeedback = '';
   let lastStartFailure: (RecordingStartFailure & { timestamp: string; port: string; lab: string }) | undefined;
+  let lastPlotError: { timestamp: string; stage: string; detail: string } | undefined;
   let startInFlight = false;
   let displayedSummaryPath = '';
   let startReadiness: RecordingStartReadiness = { canStart: false };
@@ -757,6 +758,19 @@
     plotGroups = onePlotPerSignal(plotChannels);
   }
 
+  function reportPlotError(stage: string, detail: string) {
+    lastPlotError = { timestamp: new Date().toISOString(), stage, detail };
+    // A visualization failure is never a reason to stop the serial worker or
+    // finalize its BMEG writer.  The chart retries once locally; raw recording
+    // and the bounded display snapshot stay independent.
+    statusMessage = isActive
+      ? 'A live plot needed to refresh. Recording continues and raw data are still being saved.'
+      : 'A live plot needed to refresh. Change the plot arrangement to retry it.';
+    void invoke('record_frontend_plot_error', { stage, detail }).catch((error) => {
+      console.warn('Could not store live-plot diagnostic', error);
+    });
+  }
+
   function bufferedRailCount(channelId: string): number {
     const channelIndex = plotChannels.findIndex((channel) => channel.id === channelId);
     if (channelIndex < 0) return 0;
@@ -971,7 +985,7 @@
         <div class="field-action"><span>Board actions</span><div class="button-pair"><button onclick={() => void refreshBoards()} disabled={!boardControlState.canRefreshBoards}>Refresh Board</button><button onclick={() => void verifySelectedFirmware()} disabled={!boardControlState.canVerifyFirmware}>Verify Firmware</button><button class="gold" onclick={restoreWvuFirmware} disabled={!boardControlState.canRestoreFirmware}>Restore WVU Firmware</button></div></div>
       </div>
       <p class="device-cache-status" role="status">Board: {selectedPort ? `${boards.find((board) => board.port === selectedPort)?.name ?? 'Arduino UNO R4 WiFi'} — ${selectedPort}` : 'Not connected'} · Firmware: {firmwareCompatibility === 'wvu_protocol_compatible' ? 'Ready' : selectedPort ? 'Update required' : '—'} · Arduino tools: {arduinoToolsReady ? 'Ready' : 'Preparing…'}</p>
-      <details class="advanced-details"><summary>Advanced details</summary><div class="diagnostic-grid"><p>Protocol: {session.protocol_version}</p><p>Firmware status: {firmwareCompatibility}</p>{#if session.connection_diagnostics?.firmware_build}<p>Firmware build: {session.connection_diagnostics.firmware_build}</p>{/if}{#if session.connection_diagnostics?.firmware_board_id}<p>Board ID: {session.connection_diagnostics.firmware_board_id}</p>{/if}<p>Arduino tools: {firmwareEnvironment.cli_version ?? firmwareEnvironment.problem ?? 'preparing'}</p><p>Last board refresh: {boardScanLastCompleted || 'not yet completed'}</p><p>Received packets: {session.integrity.received_packets}</p><p>CRC failures: {session.integrity.crc_failures}</p>{#if lastStartFailure}<p>Last recording start: {lastStartFailure.timestamp}</p><p>Stage: {lastStartFailure.stage}</p><p>Code: {lastStartFailure.code}</p><p>Board: {lastStartFailure.port}</p><p>Lab: {lastStartFailure.lab}</p><p>Detail: {lastStartFailure.technicalDetail}</p>{/if}{#if session.last_error}<p>Recent connection error: {session.last_error}</p>{/if}</div></details>
+          <details class="advanced-details"><summary>Advanced details</summary><div class="diagnostic-grid"><p>Protocol: {session.protocol_version}</p><p>Firmware status: {firmwareCompatibility}</p>{#if session.connection_diagnostics?.firmware_build}<p>Firmware build: {session.connection_diagnostics.firmware_build}</p>{/if}{#if session.connection_diagnostics?.firmware_board_id}<p>Board ID: {session.connection_diagnostics.firmware_board_id}</p>{/if}<p>Arduino tools: {firmwareEnvironment.cli_version ?? firmwareEnvironment.problem ?? 'preparing'}</p><p>Last board refresh: {boardScanLastCompleted || 'not yet completed'}</p><p>Received packets: {session.integrity.received_packets}</p><p>CRC failures: {session.integrity.crc_failures}</p>{#if lastStartFailure}<p>Last recording start: {lastStartFailure.timestamp}</p><p>Stage: {lastStartFailure.stage}</p><p>Code: {lastStartFailure.code}</p><p>Board: {lastStartFailure.port}</p><p>Lab: {lastStartFailure.lab}</p><p>Detail: {lastStartFailure.technicalDetail}</p>{/if}{#if lastPlotError}<p>Last live-plot error: {lastPlotError.timestamp}</p><p>Plot stage: {lastPlotError.stage}</p><p>Plot detail: {lastPlotError.detail}</p>{/if}{#if session.last_error}<p>Recent connection error: {session.last_error}</p>{/if}</div></details>
     </section>
 
     <section class="panel project-panel" aria-labelledby="project-folder-title">
@@ -1152,7 +1166,7 @@
               {#each renderedPlotGroups as group, index (group.id)}
                 <section class="stacked-plot" aria-label={`Plot ${index + 1}: ${group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(', ')}`}>
                   <div class="stacked-plot-heading"><strong>Plot {index + 1}: {group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(' + ')}</strong><span>{unitsForGroup(group.channelIds, channelUnits, currentRecordingCalibration)}{group.channelIds.some((id) => bufferedRailCount(id)) ? `; ${group.channelIds.reduce((count, id) => count + bufferedRailCount(id), 0)} buffered rail samples` : ''}</span></div>
-                  <LivePlot {samples} channels={plotChannels} visibleChannelIds={group.channelIds} {channelUnits} calibration={currentRecordingCalibration} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} {displayRevision} />
+                  <LivePlot {samples} channels={plotChannels} visibleChannelIds={group.channelIds} {channelUnits} calibration={currentRecordingCalibration} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} {displayRevision} onPlotError={reportPlotError} />
                 </section>
               {/each}
             </div>

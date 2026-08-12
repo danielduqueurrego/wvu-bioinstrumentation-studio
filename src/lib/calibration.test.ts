@@ -32,6 +32,18 @@ describe('course calibration display helpers', () => {
     expect(mpxvMmhg(0.2, 5)).toBeCloseTo(0);
   });
 
+  it('uses the profile-declared MPXV capability for the EMG pressure channel', () => {
+    expect(
+      supportedDisplayUnits('course_emg_force', 'pressure', false, ['counts_volts', 'mpxv_pressure'])
+    ).toEqual(['counts', 'volts', 'kpa', 'mmhg']);
+
+    const volts = 2.5;
+    expect(mpxvMmhg(volts, 5)).toBeCloseTo(mpxvKpa(volts, 5) * 7.5006);
+    expect(displayedValue(4095, 'pressure', 'counts', 12, base)).toBe(4095);
+    expect(displayedValue(4095, 'pressure', 'kpa', 12, base)).toBeCloseTo(mpxvKpa(5, 5));
+    expect(displayedValue(4095, 'pressure', 'mmhg', 12, base)).toBeCloseTo(mpxvMmhg(5, 5));
+  });
+
   it('only exposes XGZP mmHg when an active linear calibration exists', () => {
     expect(supportedDisplayUnits('course_blood_pressure', 'xgzp', false)).toEqual(['counts', 'volts']);
     expect(supportedDisplayUnits('course_blood_pressure', 'xgzp', true)).toEqual(['counts', 'volts', 'mmhg']);

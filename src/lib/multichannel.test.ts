@@ -6,8 +6,11 @@ import {
   initialTraceVisibility,
   onePlotPerSignal,
   overlayAll,
+  seriesColor,
   setPlotGroupCount,
   setTraceVisibility,
+  shouldShowPlotLegend,
+  visiblePlotSeries,
   visiblePlotGroups,
   visibleChannelIds,
   visibleChannels
@@ -82,6 +85,57 @@ describe('multi-channel UI helpers', () => {
     ]);
   });
 
+  it('shows a per-plot legend only when that plot has at least two visible series', () => {
+    const one = visiblePlotSeries(channels, ['raw_emg']);
+    const two = visiblePlotSeries(channels, ['raw_emg', 'rectified_emg']);
+    const four = visiblePlotSeries(channels, channels.map((channel) => channel.id));
+
+    expect(shouldShowPlotLegend(one)).toBe(false);
+    expect(shouldShowPlotLegend(two)).toBe(true);
+    expect(shouldShowPlotLegend(four)).toBe(true);
+    expect(two.map((series) => series.label)).toEqual(['Raw EMG', 'Rectified EMG']);
+    expect(four).toHaveLength(4);
+  });
+
+  it('updates legend membership and exact stroke colors when signals are hidden or reassigned', () => {
+    const overlay = visiblePlotSeries(channels, ['raw_emg', 'rectified_emg']);
+    expect(overlay.map((series) => series.color)).toEqual([seriesColor(0), seriesColor(1)]);
+
+    const oneRemaining = visiblePlotSeries(channels, ['raw_emg']);
+    expect(shouldShowPlotLegend(oneRemaining)).toBe(false);
+
+    const firstPlot = visiblePlotSeries(channels, ['raw_emg', 'rectified_emg']);
+    const secondPlot = visiblePlotSeries(channels, ['envelope', 'pressure']);
+    expect(firstPlot.map((series) => series.label)).toEqual(['Raw EMG', 'Rectified EMG']);
+    expect(secondPlot.map((series) => series.label)).toEqual(['Envelope', 'Pressure / Force Surrogate']);
+    expect(firstPlot[0]?.color).toBe(seriesColor(0));
+    expect(secondPlot[0]?.color).toBe(seriesColor(0));
+  });
+
+  it('keeps plot IDs stable while an active recording is rearranged', () => {
+    let groups = onePlotPerSignal(channels);
+    expect(groups.map((group) => group.id)).toEqual(['plot-1', 'plot-2', 'plot-3', 'plot-4']);
+
+    groups = setPlotGroupCount(channels, groups, 2);
+    expect(groups.map((group) => group.id)).toEqual(['plot-1', 'plot-2']);
+    groups = setPlotGroupCount(channels, groups, 3);
+    expect(groups.map((group) => group.id)).toEqual(['plot-1', 'plot-2', 'plot-3']);
+    groups = setPlotGroupCount(channels, groups, 4);
+    expect(groups.map((group) => group.id)).toEqual(['plot-1', 'plot-2', 'plot-3', 'plot-4']);
+    expect(new Set(groups.map((group) => group.id)).size).toBe(groups.length);
+  });
+
+  it('keeps layout changes display-only and retains every captured channel assignment', () => {
+    let groups = onePlotPerSignal(channels);
+    groups = setPlotGroupCount(channels, groups, 2);
+    groups = assignChannelToPlot(channels, groups, 'rectified_emg', 0);
+    groups = overlayAll(channels);
+    groups = onePlotPerSignal(channels);
+
+    expect(groups.flatMap((group) => group.channelIds)).toEqual(channels.map((channel) => channel.id));
+    expect(visiblePlotGroups(channels, groups, initialTraceVisibility(channels))).toHaveLength(4);
+  });
+
   it('applies overlay and one-per-signal convenience presets without changing capture fields', () => {
     expect(overlayAll(channels)).toEqual([{ id: 'plot-1', channelIds: channels.map((channel) => channel.id) }]);
     expect(onePlotPerSignal(channels).map((group) => group.channelIds)).toEqual([
@@ -91,11 +145,16 @@ describe('multi-channel UI helpers', () => {
 
   it('keeps all eight raw pulse-ox phase fields in the plot arrangement', () => {
     const rawPulseChannels = [
-      'red_tx', 'dark1_tx', 'ir_tx', 'dark2_tx',
-      'red_rx', 'dark1_rx', 'ir_rx', 'dark2_rx'
-    ].map((id) => ({ id, label: id, csv_name: id }));
+      ['red_tx', 'TX Red'], ['dark1_tx', 'TX Dark 1'], ['ir_tx', 'TX IR'], ['dark2_tx', 'TX Dark 2'],
+      ['red_rx', 'RX Red'], ['dark1_rx', 'RX Dark 1'], ['ir_rx', 'RX IR'], ['dark2_rx', 'RX Dark 2']
+    ].map(([id, label]) => ({ id, label, csv_name: id }));
     expect(defaultPlotGroups('course_pulseox', rawPulseChannels).flatMap((group) => group.channelIds))
       .toEqual(rawPulseChannels.map((channel) => channel.id));
+    const pulseGroups = defaultPlotGroups('course_pulseox', rawPulseChannels);
+    expect(visiblePlotSeries(rawPulseChannels, pulseGroups[0]?.channelIds ?? []).map((series) => series.label))
+      .toEqual(['TX Red', 'TX Dark 1', 'TX IR', 'TX Dark 2']);
+    expect(visiblePlotSeries(rawPulseChannels, pulseGroups[1]?.channelIds ?? [])).toHaveLength(4);
+    expect(shouldShowPlotLegend(visiblePlotSeries(rawPulseChannels, pulseGroups[0]?.channelIds ?? []))).toBe(true);
   });
 
   it('accepts one through six unique A0–A5 general-development pins only', () => {

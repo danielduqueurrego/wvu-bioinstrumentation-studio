@@ -76,7 +76,6 @@ export function supportedDisplayUnits(
   linearOutputUnits = 'mmHg'
 ): DisplayUnit[] {
   if (category === 'course_pulseox') return ['counts', 'volts'];
-  if (channelId === 'pressure' && category === 'course_emg_force') return ['counts', 'volts', 'kpa'];
   if (allowedConversions.includes('mpxv_pressure')) return ['counts', 'volts', 'kpa', 'mmhg'];
   if (allowedConversions.includes('linear_calibration')) {
     const calibratedUnit: DisplayUnit = linearOutputUnits.trim().toLowerCase() === 'mmhg'

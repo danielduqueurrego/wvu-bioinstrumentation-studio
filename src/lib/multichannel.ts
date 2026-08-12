@@ -2,9 +2,31 @@
 export type DisplayChannel = { id: string; label: string; csv_name: string };
 export type VisibleChannelMap = Record<string, boolean>;
 export type PlotGroup = { id: string; channelIds: string[] };
+export type PlotSeries = DisplayChannel & { color: string };
+
+// One shared color mapping for each LivePlot instance.  The uPlot stroke and
+// the Svelte legend both consume this helper so a legend can never drift from
+// the line it identifies.
+const plotColors = ['#002855', '#EEAA00', '#007A78', '#9D2235', '#5D4E99', '#C65E00'];
+
+export function seriesColor(index: number): string {
+  return plotColors[index % plotColors.length];
+}
 
 export function visibleChannels(channels: DisplayChannel[], selected: string[]): DisplayChannel[] {
   return channels.filter((channel) => selected.includes(channel.id));
+}
+
+/** Series currently visible in one display-only plot group, in uPlot order. */
+export function visiblePlotSeries(channels: DisplayChannel[], selected: string[]): PlotSeries[] {
+  return visibleChannels(channels, selected).map((channel, index) => ({
+    ...channel,
+    color: seriesColor(index)
+  }));
+}
+
+export function shouldShowPlotLegend(series: PlotSeries[]): boolean {
+  return series.length >= 2;
 }
 
 /**

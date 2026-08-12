@@ -2,6 +2,14 @@
 
 All notable user-facing changes are documented here.
 
+## Unreleased
+
+### Fixed
+
+- EMG + Force pressure display now offers the same MPXV pressure units in kPa and mmHg.
+- Reconfiguring live plot groups is isolated from acquisition so a chart refresh cannot interrupt recording.
+- Multi-signal live plots now show a color-coded per-plot legend.
+
 ## 1.0.0
 
 ### Added
