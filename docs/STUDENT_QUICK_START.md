@@ -13,7 +13,7 @@
 
 The CSV contains raw counts and applicable derived voltage or engineering-unit columns. The raw BMEG data remain authoritative.
 
-While recording, plot changes are display-only: the **Plot time window** applies to all plots from 0.5 to 30 seconds, multi-signal legends identify waveform colors, and newest-value badges show the current rounded display value. You may rearrange plots, hide or show traces, change supported units, or use **Add marker** when instructed without changing the underlying recording.
+While recording, plot changes are display-only: the **Plot time window** applies to all plots from 0.5 to 30 seconds, the time axis shows elapsed recording seconds from 0, multi-signal legends identify waveform colors, and newest-value badges show the current rounded display value. You may rearrange plots, hide or show traces, change supported units, or use **Add marker** when instructed without changing the underlying recording.
 
 For pulse oximetry, the application records raw RED, DARK 1, IR, and DARK 2 measurements for both detectors. It does not calculate SpO2, heart rate, or other physiological results.
 

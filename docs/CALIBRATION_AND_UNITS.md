@@ -22,7 +22,7 @@ The sensor supply `Vs` is configurable and stored with the recording. Values are
 
 The EMG + Force pressure channel supports ADC counts, volts, pressure in kPa, and pressure in mmHg using this same MPXV conversion. It remains a pressure display; the application does not infer muscular force.
 
-Newest-value labels in live plots use the currently selected display unit. These conversions are display and export layers only and never mutate raw ADC counts.
+Newest-value labels in live plots use the currently selected display unit. Live plot x-axis labels show elapsed recording seconds from 0 rather than calendar timestamps. These conversions are display and export layers only and never mutate raw ADC counts.
 
 ## XGZP linear calibration
 

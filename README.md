@@ -11,6 +11,7 @@ Teaching use only — not a medical device. Follow BMEG 420L lab instructions an
 - Synchronized acquisition of one to six analog channels with configurable plot grouping and per-trace visibility.
 - Color-coded legends for plots containing multiple visible signals, a synchronized 0.5–30 s live display window, and persistent newest-value labels in the selected display units.
 - Display-only decimation for longer live windows while recorded BMEG and CSV data remain full-rate.
+- Live plot time axes use elapsed recording seconds, starting at 0 for the first accepted frame; they are not calendar timestamps.
 - Counts, volts, MPXV pressure conversion, and student-created local linear calibration for supported channels.
 - Project-folder and trial-folder organization with automatic raw BMEG, CSV, metadata, and event-sidecar output.
 - Instructor-managed, versioned course-lab definitions with factory defaults, import/export, and safe pin/rate/output configuration.
@@ -50,6 +51,7 @@ Live plots are display-only: changing plot groups, trace visibility, engineering
 - Longer windows may use display-only decimation to keep the interface responsive.
 - The newest value for each visible trace is shown in the selected display unit.
 - Multi-signal plots include a color-coded legend.
+- The time axis is elapsed recording time, beginning at 0 s for each recording.
 - Raw recordings remain full-rate and are not changed by display settings.
 
 

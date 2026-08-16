@@ -28,6 +28,20 @@ pub struct AcquisitionSnapshot {
     pub config_ack_seen: bool,
     pub pong_seen: bool,
     pub status_seen: bool,
+    /// Monotonic frame counts let the capture worker record when it most
+    /// recently observed a keepalive response or firmware status frame without
+    /// putting host timing into the protocol model.
+    pub pong_count: u64,
+    pub status_count: u64,
+    /// The controlled firmware sends this when it deliberately leaves its
+    /// acquisition state (for example, after its host-command watchdog).
+    /// Capture owns the policy for turning it into a terminal session fault.
+    pub firmware_error_code: Option<u8>,
+    pub firmware_error_count: u64,
+    /// Optional diagnostic bytes attached to a firmware ERROR frame. Normal
+    /// protocol errors remain one byte; temporary controlled-firmware
+    /// experiments may provide a small backwards-compatible detail payload.
+    pub firmware_error_payload: Option<Vec<u8>>,
     pub firmware_build: Option<u32>,
     pub firmware_board_id: Option<u32>,
     pub firmware_capabilities: Option<FirmwareCapabilities>,
@@ -105,6 +119,11 @@ pub struct AcquisitionController {
     config_ack_seen: bool,
     pong_seen: bool,
     status_seen: bool,
+    pong_count: u64,
+    status_count: u64,
+    firmware_error_code: Option<u8>,
+    firmware_error_count: u64,
+    firmware_error_payload: Option<Vec<u8>>,
     firmware_build: Option<u32>,
     firmware_board_id: Option<u32>,
     firmware_capabilities: Option<FirmwareCapabilities>,
@@ -126,6 +145,11 @@ impl AcquisitionController {
             config_ack_seen: false,
             pong_seen: false,
             status_seen: false,
+            pong_count: 0,
+            status_count: 0,
+            firmware_error_code: None,
+            firmware_error_count: 0,
+            firmware_error_payload: None,
             firmware_build: None,
             firmware_board_id: None,
             firmware_capabilities: None,
@@ -187,12 +211,21 @@ impl AcquisitionController {
                 self.firmware_capabilities = FirmwareCapabilities::from_payload(&frame.payload);
             }
             MessageType::ConfigAck => self.config_ack_seen = true,
-            MessageType::Pong => self.pong_seen = true,
+            MessageType::Pong => {
+                self.pong_seen = true;
+                self.pong_count += 1;
+            }
             MessageType::Status => {
                 self.status_seen = true;
+                self.status_count += 1;
                 if frame.payload.len() >= 2 {
                     self.digital_output_mask = Some(frame.payload[1] & 0x07);
                 }
+            }
+            MessageType::ErrorMessage => {
+                self.firmware_error_count += 1;
+                self.firmware_error_code = frame.payload.first().copied();
+                self.firmware_error_payload = Some(frame.payload.clone());
             }
             _ => {}
         }
@@ -254,6 +287,11 @@ impl AcquisitionController {
             config_ack_seen: self.config_ack_seen,
             pong_seen: self.pong_seen,
             status_seen: self.status_seen,
+            pong_count: self.pong_count,
+            status_count: self.status_count,
+            firmware_error_code: self.firmware_error_code,
+            firmware_error_count: self.firmware_error_count,
+            firmware_error_payload: self.firmware_error_payload.clone(),
             firmware_build: self.firmware_build,
             firmware_board_id: self.firmware_board_id,
             firmware_capabilities: self.firmware_capabilities.clone(),
@@ -428,6 +466,23 @@ mod tests {
         let snapshot = controller.snapshot();
         assert!(snapshot.capabilities_seen);
         assert!(snapshot.firmware_capabilities.is_none());
+    }
+
+    #[test]
+    fn firmware_error_frame_is_retained_for_capture_fault_handling() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        let error = Frame {
+            message_type: MessageType::ErrorMessage,
+            flags: 0,
+            sequence: 7,
+            payload: vec![7],
+        };
+        controller.ingest_bytes(&crate::protocol::encode_frame(&error).unwrap_or_default());
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.firmware_error_code, Some(7));
+        assert_eq!(snapshot.firmware_error_count, 1);
+        assert_eq!(snapshot.firmware_error_payload, Some(vec![7]));
     }
 
     #[test]

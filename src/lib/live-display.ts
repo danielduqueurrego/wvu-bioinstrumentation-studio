@@ -5,6 +5,10 @@ export const MIN_PLOT_TIME_WINDOW_SECONDS = 0.5;
 export const MAX_PLOT_TIME_WINDOW_SECONDS = 30;
 export const PLOT_TIME_WINDOW_STEP_SECONDS = 0.5;
 export const MAX_RENDERED_DISPLAY_POINTS = 2_000;
+/** Display-only ADC settling interval after a hardware START. */
+export const HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS = 0.1;
+
+type DisplaySample = { sequence: number; timestamp_us: number; values: number[] };
 
 function finiteNumber(value: string | number): number | undefined {
   if (typeof value === 'string' && !value.trim()) return undefined;
@@ -40,6 +44,69 @@ export function formatLiveDisplayValue(
   const suffix = calibrationForChannel(calibration?.active_calibrations ?? [], channelId ?? '')?.output_units
     || 'units';
   return `${value.toFixed(2)} ${suffix}`;
+}
+
+/**
+ * uPlot's default time scale treats values as Unix seconds. Live acquisition
+ * timestamps are board-relative microseconds, so format the x-axis explicitly
+ * as elapsed recording time instead of a calendar date.
+ */
+export function formatElapsedSeconds(value: number): string {
+  if (!Number.isFinite(value)) return '—';
+  if (Math.abs(value) < 0.05) return '0 s';
+  return `${value.toFixed(1)} s`;
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((left, right) => left - right);
+  if (!sorted.length) return 0;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
+}
+
+/**
+ * The first hardware ADC conversion can be a settling transient immediately
+ * after START. Remove it from the live display only when it is clearly
+ * converging toward the next samples. Raw BMEG/CSV records are never changed.
+ * The sequence check prevents this from re-running as the bounded plot window
+ * advances or when plots are rearranged.
+ */
+export function filterStartupDisplayTransient(
+  samples: DisplaySample[],
+  channelIndices: number[],
+  adcBits: number,
+  hardwareSource: boolean,
+  originTimestampUs?: number
+): DisplaySample[] {
+  if (!hardwareSource || !samples.length || !channelIndices.length) return samples;
+
+  // Once the backend has exposed the first accepted frame, use elapsed time
+  // rather than the first frame currently visible in the rolling window. This
+  // remains stable after decimation and after the window advances.
+  if (Number.isFinite(originTimestampUs)) {
+    const warmupEnd = (originTimestampUs as number) + HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS * 1_000_000;
+    const warmed = samples.filter((sample) => sample.timestamp_us >= warmupEnd);
+    // Keep the early points until at least one post-warmup point is available;
+    // this prevents a blank plot during the first few polling cycles.
+    if (warmed.length) return warmed;
+  }
+
+  if (samples.length < 8 || samples[0]?.sequence !== 0) return samples;
+  const fullScale = Math.max(1, (2 ** adcBits) - 1);
+  const threshold = Math.max(32, fullScale * 0.02);
+  const stableSamples = samples.slice(4, 8);
+  const transient = channelIndices.some((channelIndex) => {
+    const first = samples[0]?.values[channelIndex];
+    if (first === undefined) return false;
+    const stable = median(stableSamples.map((sample) => sample.values[channelIndex] ?? first));
+    const firstDistance = Math.abs(first - stable);
+    if (firstDistance <= threshold) return false;
+    const approach = samples.slice(1, 4).map((sample) => Math.abs((sample.values[channelIndex] ?? first) - stable));
+    return approach.every((distance, index) => distance < firstDistance && (index === 0 || distance <= approach[index - 1] + threshold * 0.05));
+  });
+  return transient ? samples.slice(1) : samples;
 }
 
 export type EndpointLabelPosition = { id: string; naturalTop: number; top?: number };

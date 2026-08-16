@@ -31,3 +31,7 @@ The explicit reset/retry action can observe a returning COM port that produces n
 ## Diagnostic information
 
 The collapsed **Advanced details** section contains firmware/protocol, connection, and recent error information. Application logs are stored in the per-user application-data folder and can be shared with an instructor without including recordings.
+
+## Live plot starts with a brief jump
+
+The first hardware ADC conversion can settle after a recording starts. When that first frame is an identifiable converging transient, the live display omits it so the y-axis remains readable; the raw `.bmeg` and `.csv` files still retain every acquired sample. Live x-axis labels are elapsed recording seconds beginning at 0.

@@ -5,13 +5,15 @@
   import { displayedValue, displayUnitLabel, type DisplayUnit, type RecordingCalibration } from '$lib/calibration';
   import {
     formatLiveDisplayValue,
+    formatElapsedSeconds,
+    filterStartupDisplayTransient,
     layoutEndpointLabels,
     MAX_RENDERED_DISPLAY_POINTS
   } from '$lib/live-display';
   import 'uplot/dist/uPlot.min.css';
 
   type PlotChannel = { id: string; label: string; csv_name: string };
-  export let samples: Array<{ timestamp_us: number; values: number[] }> = [];
+  export let samples: Array<{ sequence: number; timestamp_us: number; values: number[] }> = [];
   export let channels: PlotChannel[] = [];
   export let visibleChannelIds: string[] = [];
   export let channelUnits: Record<string, DisplayUnit> = {};
@@ -25,6 +27,8 @@
   // stacked plots therefore consume one shared update rather than each polling or
   // scheduling its own sample refresh loop.
   export let displayRevision = 0;
+  export let timeOriginUs: number | undefined = undefined;
+  export let hardwareSource = false;
 
   type EndpointLabel = { id: string; label: string; color: string; value: string; top: number };
 
@@ -47,9 +51,14 @@
   }
 
   function chartData(): uPlot.AlignedData {
-    const bounded = samples.slice(-maximum);
     const active = displayChannels();
-    const x = bounded.map((point) => point.timestamp_us / 1_000_000);
+    const channelIndices = active
+      .map((channel) => channels.findIndex((candidate) => candidate.id === channel.id))
+      .filter((index) => index >= 0);
+    const filtered = filterStartupDisplayTransient(samples, channelIndices, adcBits, hardwareSource, timeOriginUs);
+    const bounded = filtered.slice(-maximum);
+    const origin = timeOriginUs ?? bounded[0]?.timestamp_us ?? 0;
+    const x = bounded.map((point) => Math.max(0, (point.timestamp_us - origin) / 1_000_000));
     const values = active.map((channel) => {
       const index = channels.findIndex((candidate) => candidate.id === channel.id);
       return bounded.map((point) => {
@@ -122,11 +131,12 @@
         {
           width,
           height,
+          scales: { x: { time: false } },
           series: [
             {},
             ...active.map((channel) => ({ label: channel.label, stroke: channel.color, width: 2 }))
           ],
-          axes: [{}, {
+          axes: [{ values: (_u, splits) => splits.map((value) => formatElapsedSeconds(value)) }, {
             label: new Set(active.map((channel) => displayUnitLabel(channelUnits[channel.id] ?? 'counts', calibration, channel.id))).size === 1
               ? displayUnitLabel(channelUnits[active[0]?.id] ?? 'counts', calibration, active[0]?.id)
               : 'Mixed units'
@@ -227,6 +237,8 @@
     const _units = channelUnits;
     const _calibration = calibration;
     const _adcBits = adcBits;
+    const _timeOriginUs = timeOriginUs;
+    const _hardwareSource = hardwareSource;
     activeSeries = visiblePlotSeries(channels, visibleChannelIds);
     void _revision;
     void _samples;
@@ -235,6 +247,8 @@
     void _units;
     void _calibration;
     void _adcBits;
+    void _timeOriginUs;
+    void _hardwareSource;
     if (plot) update();
     else if (element && failedSignature !== currentSignature()) createPlot();
   }

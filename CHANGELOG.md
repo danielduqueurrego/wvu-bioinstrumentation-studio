@@ -13,6 +13,7 @@ All notable user-facing changes are documented here.
 - Bundled Arduino tools, firmware verification, and WVU reference-firmware restoration.
 - Safe live plot reconfiguration, configurable plot groups, and per-trace visibility during recording.
 - Color-coded legends for multi-signal plots, a synchronized 0.5–30 s live plot window, and newest-value endpoint labels.
+- Elapsed-seconds live plot axes starting at the first accepted recording frame, with the initial hardware ADC settling transient excluded from the display only; raw BMEG/CSV data remain unchanged.
 
 ### Known limitations
 

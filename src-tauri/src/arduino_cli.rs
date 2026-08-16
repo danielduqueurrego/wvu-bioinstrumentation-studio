@@ -18,6 +18,11 @@ use std::os::windows::process::CommandExt;
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub const UNO_R4_WIFI_FQBN: &str = "arduino:renesas_uno:unor4wifi";
+/// Override the upstream UNO R4 WiFi board recipe only for the controlled
+/// reference firmware. Omitting `NO_USB` makes `Serial` use RA4M1 native USB
+/// CDC instead of the intermittent RA4M1-to-ESP32 serial bridge.
+pub const NATIVE_USB_REFERENCE_BUILD_DEFINES: &str =
+    "-DF_CPU=48000000 -DBACKTRACE_SUPPORT -DARDUINO_UNOR4_WIFI";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CommandLog {
@@ -41,6 +46,10 @@ pub struct BoardInfo {
     pub name: String,
     pub fqbn: String,
     pub serial_number: Option<String>,
+    /// Arduino CLI's USB identity is needed to recognize the controlled
+    /// firmware's RA4M1 native-USB application port after an upload.
+    pub usb_vid: Option<u16>,
+    pub usb_pid: Option<u16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -245,6 +254,8 @@ impl ArduinoCli {
             "compile".into(),
             "--fqbn".into(),
             UNO_R4_WIFI_FQBN.into(),
+            "--build-property".into(),
+            format!("build.defines={NATIVE_USB_REFERENCE_BUILD_DEFINES}"),
             "--output-dir".into(),
             output_dir.display().to_string(),
             sketch.display().to_string(),
@@ -332,12 +343,26 @@ pub fn parse_boards_json(text: &str) -> Result<Vec<BoardInfo>, CliError> {
                             .and_then(|properties| properties.get("serialNumber"))
                             .and_then(|value| value.as_str())
                             .map(str::to_owned),
+                        usb_vid: port
+                            .get("properties")
+                            .and_then(|properties| properties.get("vid"))
+                            .and_then(|value| value.as_str())
+                            .and_then(parse_usb_id),
+                        usb_pid: port
+                            .get("properties")
+                            .and_then(|properties| properties.get("pid"))
+                            .and_then(|value| value.as_str())
+                            .and_then(parse_usb_id),
                     });
                 }
             }
         }
     }
     Ok(result)
+}
+
+fn parse_usb_id(value: &str) -> Option<u16> {
+    u16::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
 }
 
 pub fn parse_uno_core_json(text: &str) -> Result<String, CliError> {
@@ -464,10 +489,12 @@ mod tests {
     #[test]
     fn board_and_compiler_output_parsing_preserve_useful_diagnostics() {
         let boards = parse_boards_json(
-            r#"{"detected_ports":[{"port":{"address":"COM12","properties":{"serialNumber":"ABC"}},"matching_boards":[{"name":"Arduino UNO R4 WiFi","fqbn":"arduino:renesas_uno:unor4wifi"}]}]}"#,
+            r#"{"detected_ports":[{"port":{"address":"COM12","properties":{"serialNumber":"ABC","vid":"0x2341","pid":"0x006D"}},"matching_boards":[{"name":"Arduino UNO R4 WiFi","fqbn":"arduino:renesas_uno:unor4wifi"}]}]}"#,
         )
         .unwrap_or_default();
         assert_eq!(boards[0].port, "COM12");
+        assert_eq!(boards[0].usb_vid, Some(0x2341));
+        assert_eq!(boards[0].usb_pid, Some(0x006d));
         let usage = parse_compile_usage(
             "Sketch uses 53508 bytes (20%) of program storage space.\nGlobal variables use 7940 bytes (24%) of dynamic memory.",
         );
@@ -505,6 +532,12 @@ mod tests {
                 "list".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn controlled_reference_compile_uses_ra4m1_native_usb_without_no_usb() {
+        assert!(NATIVE_USB_REFERENCE_BUILD_DEFINES.contains("-DARDUINO_UNOR4_WIFI"));
+        assert!(!NATIVE_USB_REFERENCE_BUILD_DEFINES.contains("NO_USB"));
     }
 
     #[cfg(windows)]

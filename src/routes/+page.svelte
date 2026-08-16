@@ -49,7 +49,10 @@
   import logoUrl from '../../assets/branding/WVU-CBE Logo.svg';
 
   type Point = { sequence: number; timestamp_us: number; values: number[]; status_flags: number };
-  type Board = { port: string; name: string; fqbn: string; serial_number?: string };
+  type Board = {
+    port: string; name: string; fqbn: string; serial_number?: string;
+    usb_vid?: number; usb_pid?: number;
+  };
   type Duration = RecordingDurationRequest;
   type Integrity = {
     received_packets: number; crc_failures: number; invalid_frames: number; unsupported_versions: number;
@@ -73,6 +76,7 @@
     connection_diagnostics?: ConnectionDiagnostics;
     last_error?: string; last_summary?: Summary; calibration?: RecordingCalibration;
     digital_output_mask?: number;
+    display_origin_timestamp_us?: number;
   };
   type ConnectionDiagnostics = {
     selected_port: string; board: string; fqbn: string; port_opened: boolean;
@@ -82,6 +86,14 @@
     reset_attempted: boolean; original_port?: string; final_port?: string;
     disappearance_observed: boolean; reappearance_observed: boolean; bootloader_observed: boolean;
     failure_category?: string; recommended_action: string;
+    terminal_error_classification?: string; terminal_error_stage?: string;
+    terminal_error_kind?: string; terminal_error_raw_os_error?: number;
+    terminal_error_detail?: string; terminal_error_elapsed_ms?: number;
+    last_valid_packet_utc?: string; last_valid_sample_utc?: string;
+    last_successful_ping_utc?: string; last_pong_or_status_utc?: string;
+    selected_port_present_after_error?: boolean; same_vid_pid_present_after_error?: boolean;
+    same_serial_present_after_error?: boolean; uno_r4_present_after_error?: boolean;
+    port_enumeration_error?: string;
   };
   type ResetRetryResult = {
     original_port: string; final_port?: string; handshake_succeeded: boolean;
@@ -104,6 +116,7 @@
     firmware_overflows: 0, host_channel_overflows: 0, reconnects: 0, disconnect_events: 0
   };
   const activeStates = ['Connecting', 'Connected', 'Configured', 'Acquiring', 'Stopping'];
+  const yesNoUnknown = (value: boolean | undefined | null) => value === true ? 'yes' : value === false ? 'no' : 'unknown';
 
   let samples: Point[] = [];
   let displayRevision = 0;
@@ -113,6 +126,7 @@
   let plotTimeWindowInput = String(DEFAULT_PLOT_TIME_WINDOW_SECONDS);
   let boards: Board[] = [];
   let selectedPort = '';
+  let selectedBoardUsesNativeUsb = false;
   let boardScanStatus: 'idle' | 'scanning' | 'complete' | 'error' = 'idle';
   let boardScanLastCompleted = '';
   let boardScanError = '';
@@ -298,7 +312,11 @@
     selectedPort,
     failureCategory: session.connection_diagnostics?.failure_category
   });
-  $: canReset = recoveryActions.canReset;
+  // The controlled native-USB reference uses the RA4M1 CDC port (PID 0x006D).
+  // Arduino CLI cannot safely perform its regular 1200-bps touch through that
+  // port. Restore WVU Firmware provides the explicit double-Reset fallback.
+  $: selectedBoardUsesNativeUsb = boards.find((board) => board.port === selectedPort)?.usb_pid === 0x006d;
+  $: canReset = recoveryActions.canReset && !selectedBoardUsesNativeUsb;
   $: canRetryHandshake = recoveryActions.canRetryHandshake;
   // BMEG records stream continuously. This deliberately conservative estimate includes
   // the profile-defined raw fields plus a CSV of the same session; it is guidance,
@@ -465,9 +483,12 @@
       firmwareWorkflow = await invoke<FirmwareWorkflowStatus>('get_firmware_workflow_status');
       firmwareCompatibility = firmwareWorkflow.compatibility;
       if (firmwareJobWasActive && !firmwareWorkflow.job?.active) {
-        // A completed restore/reverification must refresh the independent
-        // acquisition state immediately; it must not wait for a route change
-        // or leave a stale Faulted snapshot behind.
+        // A native-USB restore intentionally returns on a different COM port
+        // from the ESP32 bridge used for upload. Refresh exactly once after a
+        // terminal firmware job so the selected board cannot remain stale.
+        await refreshBoards('transition');
+        // Refresh the independent acquisition state immediately as well; it
+        // must not wait for a route change or retain a stale Faulted snapshot.
         await pollSession();
       }
     } catch {
@@ -908,6 +929,19 @@
     return 'Ready';
   }
 
+  function recordingFaultMessage(): string {
+    switch (session.connection_diagnostics?.failure_category) {
+      case 'firmware_protocol_error':
+        return 'The Arduino reported that it stopped the recording. Verify Firmware, then Refresh Board before starting a new recording.';
+      case 'no_data_timeout':
+        return 'The Arduino stopped sending samples. Refresh Board and verify the firmware before starting a new recording.';
+      case 'device_disconnected':
+        return 'The Arduino connection was interrupted. Reconnect the board, refresh it, and start a new recording.';
+      default:
+        return 'The recording ended because the Arduino serial connection reported an error. Refresh Board and start a new recording. Open Advanced details if the problem continues.';
+    }
+  }
+
   async function stopRecording() {
     try {
       session = await invoke<SessionStatus>('stop_recording');
@@ -1016,7 +1050,7 @@
         <div class="field-action"><span>Board actions</span><div class="button-pair"><button onclick={() => void refreshBoards()} disabled={!boardControlState.canRefreshBoards}>Refresh Board</button><button onclick={() => void verifySelectedFirmware()} disabled={!boardControlState.canVerifyFirmware}>Verify Firmware</button><button class="gold" onclick={restoreWvuFirmware} disabled={!boardControlState.canRestoreFirmware}>Restore WVU Firmware</button></div></div>
       </div>
       <p class="device-cache-status" role="status">Board: {selectedPort ? `${boards.find((board) => board.port === selectedPort)?.name ?? 'Arduino UNO R4 WiFi'} — ${selectedPort}` : 'Not connected'} · Firmware: {firmwareCompatibility === 'wvu_protocol_compatible' ? 'Ready' : selectedPort ? 'Update required' : '—'} · Arduino tools: {arduinoToolsReady ? 'Ready' : 'Preparing…'}</p>
-          <details class="advanced-details"><summary>Advanced details</summary><div class="diagnostic-grid"><p>Protocol: {session.protocol_version}</p><p>Firmware status: {firmwareCompatibility}</p>{#if session.connection_diagnostics?.firmware_build}<p>Firmware build: {session.connection_diagnostics.firmware_build}</p>{/if}{#if session.connection_diagnostics?.firmware_board_id}<p>Board ID: {session.connection_diagnostics.firmware_board_id}</p>{/if}<p>Arduino tools: {firmwareEnvironment.cli_version ?? firmwareEnvironment.problem ?? 'preparing'}</p><p>Last board refresh: {boardScanLastCompleted || 'not yet completed'}</p><p>Received packets: {session.integrity.received_packets}</p><p>CRC failures: {session.integrity.crc_failures}</p>{#if lastStartFailure}<p>Last recording start: {lastStartFailure.timestamp}</p><p>Stage: {lastStartFailure.stage}</p><p>Code: {lastStartFailure.code}</p><p>Board: {lastStartFailure.port}</p><p>Lab: {lastStartFailure.lab}</p><p>Detail: {lastStartFailure.technicalDetail}</p>{/if}{#if lastPlotError}<p>Last live-plot error: {lastPlotError.timestamp}</p><p>Plot stage: {lastPlotError.stage}</p><p>Plot detail: {lastPlotError.detail}</p>{/if}{#if session.last_error}<p>Recent connection error: {session.last_error}</p>{/if}</div></details>
+          <details class="advanced-details"><summary>Advanced details</summary><div class="diagnostic-grid"><p>Protocol: {session.protocol_version}</p><p>Firmware status: {firmwareCompatibility}</p>{#if session.connection_diagnostics?.firmware_build}<p>Firmware build: {session.connection_diagnostics.firmware_build}</p>{/if}{#if session.connection_diagnostics?.firmware_board_id}<p>Board ID: {session.connection_diagnostics.firmware_board_id}</p>{/if}<p>Arduino tools: {firmwareEnvironment.cli_version ?? firmwareEnvironment.problem ?? 'preparing'}</p><p>Last board refresh: {boardScanLastCompleted || 'not yet completed'}</p><p>Received packets: {session.integrity.received_packets}</p><p>CRC failures: {session.integrity.crc_failures}</p>{#if session.connection_diagnostics?.terminal_error_stage}<p>Capture failure stage: {session.connection_diagnostics.terminal_error_stage}</p><p>Capture failure type: {session.connection_diagnostics.terminal_error_classification}</p><p>I/O error kind: {session.connection_diagnostics.terminal_error_kind}</p><p>Windows error: {session.connection_diagnostics.terminal_error_raw_os_error ?? 'none'}</p><p>Capture error detail: {session.connection_diagnostics.terminal_error_detail}</p><p>Capture failure elapsed: {session.connection_diagnostics.terminal_error_elapsed_ms} ms</p><p>Port still listed: {yesNoUnknown(session.connection_diagnostics.selected_port_present_after_error)}</p><p>Same VID/PID listed: {yesNoUnknown(session.connection_diagnostics.same_vid_pid_present_after_error)}</p><p>Same USB serial listed: {yesNoUnknown(session.connection_diagnostics.same_serial_present_after_error)}</p><p>UNO R4 listed: {yesNoUnknown(session.connection_diagnostics.uno_r4_present_after_error)}</p>{#if session.connection_diagnostics.port_enumeration_error}<p>Port enumeration error: {session.connection_diagnostics.port_enumeration_error}</p>{/if}<p>Last valid packet: {session.connection_diagnostics.last_valid_packet_utc ?? 'not recorded'}</p><p>Last valid sample: {session.connection_diagnostics.last_valid_sample_utc ?? 'not recorded'}</p><p>Last successful PING: {session.connection_diagnostics.last_successful_ping_utc ?? 'not recorded'}</p><p>Last PONG/status: {session.connection_diagnostics.last_pong_or_status_utc ?? 'not recorded'}</p>{/if}{#if lastStartFailure}<p>Last recording start: {lastStartFailure.timestamp}</p><p>Stage: {lastStartFailure.stage}</p><p>Code: {lastStartFailure.code}</p><p>Board: {lastStartFailure.port}</p><p>Lab: {lastStartFailure.lab}</p><p>Detail: {lastStartFailure.technicalDetail}</p>{/if}{#if lastPlotError}<p>Last live-plot error: {lastPlotError.timestamp}</p><p>Plot stage: {lastPlotError.stage}</p><p>Plot detail: {lastPlotError.detail}</p>{/if}{#if session.last_error}<p>Recent connection error: {session.last_error}</p>{/if}</div></details>
     </section>
 
     <section class="panel project-panel" aria-labelledby="project-folder-title">
@@ -1176,7 +1210,7 @@
           {#if activeProfile?.acquisition.digital_outputs?.length}<span><strong>Lab outputs</strong>{activeDigitalOutputStatus()}</span>{/if}
         </section>
         {#if session.storage_warning}<p class="warning" role="status">{session.storage_warning}</p>{/if}
-        {#if session.last_error}<p class="error" role="alert">The Arduino connection was interrupted. Reconnect the board, refresh it, and start a new recording.</p>{/if}
+        {#if session.last_error}<p class="error" role="alert">{recordingFaultMessage()}</p>{/if}
         <section class="panel plot-panel">
           <div class="plot-heading"><h3>{pulseoxProfile ? 'Bounded live raw pulse-ox plot' : 'Bounded live synchronized raw plot'}</h3><span class="help">Each plot autoscales to its selected display unit.</span></div>
           <section class="plot-arrangement" aria-labelledby="plot-arrangement-title">
@@ -1197,7 +1231,7 @@
               {#each renderedPlotGroups as group, index (group.id)}
                 <section class="stacked-plot" aria-label={`Plot ${index + 1}: ${group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(', ')}`}>
                   <div class="stacked-plot-heading"><strong>Plot {index + 1}: {group.channelIds.map((id) => plotChannels.find((channel) => channel.id === id)?.label ?? id).join(' + ')}</strong><span>{unitsForGroup(group.channelIds, channelUnits, currentRecordingCalibration)}{group.channelIds.some((id) => bufferedRailCount(id)) ? `; ${group.channelIds.reduce((count, id) => count + bufferedRailCount(id), 0)} buffered rail samples` : ''}</span></div>
-                  <LivePlot {samples} channels={plotChannels} visibleChannelIds={group.channelIds} {channelUnits} calibration={currentRecordingCalibration} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} {displayRevision} onPlotError={reportPlotError} />
+                  <LivePlot {samples} channels={plotChannels} visibleChannelIds={group.channelIds} {channelUnits} calibration={currentRecordingCalibration} adcBits={activeProfile?.acquisition.adc_resolution_bits ?? 12} {displayRevision} timeOriginUs={session.display_origin_timestamp_us} hardwareSource={source === 'hardware'} onPlotError={reportPlotError} />
                 </section>
               {/each}
             </div>

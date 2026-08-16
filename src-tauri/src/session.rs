@@ -16,7 +16,7 @@ use crate::{
         StopReason, SynchronizedRecord,
     },
 };
-use chrono::{Local, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use serde::Serialize;
 use std::{
     collections::VecDeque,
@@ -55,6 +55,25 @@ const DISK_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
 const DISK_CRITICAL_BYTES: u64 = 250 * 1024 * 1024;
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const RECORDING_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// `serialport` maps one configured timeout to both Windows read and write
+/// timeouts.  Twenty-five milliseconds is useful for short startup probes,
+/// but is too aggressive for a live 921600-baud CDC session: Windows may abort
+/// a harmless PING write with ERROR_OPERATION_ABORTED (995) even while sample
+/// frames are arriving.  This remains far below the firmware's five-second
+/// host-command watchdog and keeps Stop responsiveness bounded.
+const ACTIVE_SERIAL_IO_TIMEOUT: Duration = Duration::from_millis(250);
+/// The reference firmware's host-command watchdog expires after five seconds.
+/// Keep PINGs frequent enough to leave room for a small number of transient
+/// Windows CDC write timeouts without pretending that a persistent transport
+/// failure is healthy.
+const ACTIVE_PING_INTERVAL: Duration = Duration::from_secs(1);
+const PING_RECENT_SAMPLE_GRACE: Duration = Duration::from_secs(2);
+const PING_KEEPALIVE_RETRY_WINDOW: Duration = Duration::from_secs(4);
+const MAX_DEFERRED_PING_FAILURES: u8 = 3;
+/// A healthy course stream produces a sample batch far more frequently than
+/// this.  The bounded allowance covers ordinary Windows scheduling pauses, but
+/// prevents a dead stream from remaining visibly "Recording" forever.
+const SAMPLE_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(7);
 
 fn normalize_display_window_seconds(window_seconds: f64) -> f64 {
     if window_seconds.is_finite() {
@@ -131,6 +150,15 @@ pub enum ConnectionFailureCategory {
     MissingFirmwareIdentity,
     IncompatibleFirmwareIdentity,
     HandshakeIncomplete,
+    /// A serial operation failed, but Windows still enumerated the selected
+    /// port or the device identity could not be proven absent.
+    SerialTransportError,
+    /// The controlled firmware reported an explicit protocol-level capture
+    /// error, such as its host-command watchdog expiring.
+    FirmwareProtocolError,
+    /// The port remained open, but no synchronized sample was received within
+    /// the bounded active-stream deadline.
+    NoDataTimeout,
     DeviceDisconnected,
     ResetPortDidNotReturn,
     ResetReturnedDifferentPort,
@@ -165,6 +193,24 @@ pub struct ConnectionDiagnostics {
     pub bootloader_observed: bool,
     pub failure_category: Option<ConnectionFailureCategory>,
     pub recommended_action: String,
+    /// Capture-time serial diagnostics are intentionally retained only in
+    /// Advanced details/application.log. They distinguish a host transport
+    /// failure from a proven USB device removal.
+    pub terminal_error_classification: Option<String>,
+    pub terminal_error_stage: Option<String>,
+    pub terminal_error_kind: Option<String>,
+    pub terminal_error_raw_os_error: Option<i32>,
+    pub terminal_error_detail: Option<String>,
+    pub terminal_error_elapsed_ms: Option<u128>,
+    pub last_valid_packet_utc: Option<String>,
+    pub last_valid_sample_utc: Option<String>,
+    pub last_successful_ping_utc: Option<String>,
+    pub last_pong_or_status_utc: Option<String>,
+    pub selected_port_present_after_error: Option<bool>,
+    pub same_vid_pid_present_after_error: Option<bool>,
+    pub same_serial_present_after_error: Option<bool>,
+    pub uno_r4_present_after_error: Option<bool>,
+    pub port_enumeration_error: Option<String>,
 }
 
 impl ConnectionDiagnostics {
@@ -197,6 +243,21 @@ impl ConnectionDiagnostics {
             bootloader_observed: false,
             failure_category: None,
             recommended_action: "Retry handshake or refresh devices.".into(),
+            terminal_error_classification: None,
+            terminal_error_stage: None,
+            terminal_error_kind: None,
+            terminal_error_raw_os_error: None,
+            terminal_error_detail: None,
+            terminal_error_elapsed_ms: None,
+            last_valid_packet_utc: None,
+            last_valid_sample_utc: None,
+            last_successful_ping_utc: None,
+            last_pong_or_status_utc: None,
+            selected_port_present_after_error: None,
+            same_vid_pid_present_after_error: None,
+            same_serial_present_after_error: None,
+            uno_r4_present_after_error: None,
+            port_enumeration_error: None,
         }
     }
 }
@@ -280,6 +341,9 @@ pub struct SessionStatus {
     pub profile: Option<ProfileSnapshot>,
     pub calibration: RecordingCalibration,
     pub digital_output_mask: Option<u8>,
+    /// Timestamp of the first accepted recording frame. This is used only as
+    /// the live plot's elapsed-time origin; raw timestamps remain unchanged.
+    pub display_origin_timestamp_us: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -330,6 +394,7 @@ struct SessionRuntime {
     calibration: RecordingCalibration,
     markers: Vec<RecordingMarker>,
     digital_output_mask: Option<u8>,
+    display_origin_timestamp_us: Option<u64>,
 }
 
 /// Immutable inputs for one production capture worker.  Keeping these together
@@ -344,6 +409,227 @@ struct CaptureRequest {
     output_dir: PathBuf,
     calibration: RecordingCalibration,
     recording_path_context: Option<RecordingPathContext>,
+    /// Identity observed before the worker owns the serial handle. It is later
+    /// compared with a read-only Windows enumeration if a serial operation
+    /// fails; no reset, reopen, or Arduino CLI scan is performed at that time.
+    expected_port_identity: Option<UsbPortIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UsbPortIdentity {
+    port: String,
+    vid: u16,
+    pid: u16,
+    serial_number: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PortEnumerationDiagnostic {
+    selected_port_present: Option<bool>,
+    same_vid_pid_present: Option<bool>,
+    same_serial_present: Option<bool>,
+    uno_r4_present: Option<bool>,
+    observed_vid: Option<u16>,
+    observed_pid: Option<u16>,
+    observed_serial_number: Option<String>,
+    enumeration_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SerialFailureStage {
+    SerialRead,
+    PingWrite,
+    PingFlush,
+    FirmwareError,
+    NoDataTimeout,
+    StopWrite,
+    StopFlush,
+    StopStatusRead,
+}
+
+impl SerialFailureStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SerialRead => "SERIAL_READ",
+            Self::PingWrite => "PING_WRITE",
+            Self::PingFlush => "PING_FLUSH",
+            Self::FirmwareError => "FIRMWARE_ERROR",
+            Self::NoDataTimeout => "NO_DATA_TIMEOUT",
+            Self::StopWrite => "STOP_WRITE",
+            Self::StopFlush => "STOP_FLUSH",
+            Self::StopStatusRead => "STOP_STATUS_READ",
+        }
+    }
+
+    fn classification(self) -> &'static str {
+        match self {
+            Self::SerialRead => "SerialReadError",
+            Self::PingWrite | Self::PingFlush => "PingWriteError",
+            Self::FirmwareError => "ProtocolFailure",
+            Self::NoDataTimeout => "NoDataTimeout",
+            Self::StopWrite | Self::StopFlush => "SerialWriteError",
+            Self::StopStatusRead => "SerialReadError",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SerialTerminalFailure {
+    stage: SerialFailureStage,
+    error: std::io::Error,
+}
+
+impl SerialTerminalFailure {
+    fn new(stage: SerialFailureStage, error: std::io::Error) -> Self {
+        Self { stage, error }
+    }
+
+    fn detail(&self) -> String {
+        format!(
+            "{} [{}] kind={:?} raw_os_error={:?}: {}",
+            self.stage.label(),
+            self.stage.classification(),
+            self.error.kind(),
+            self.error.raw_os_error(),
+            self.error
+        )
+    }
+
+    fn into_session_error(self) -> SessionError {
+        SessionError::Io(self.error)
+    }
+}
+
+fn firmware_error_detail(code: Option<u8>, payload: Option<&[u8]>) -> String {
+    match code {
+        Some(7) => "firmware ERROR 7: host-command watchdog expired; acquisition stopped".into(),
+        Some(8) => {
+            let Some(payload) = payload.filter(|bytes| bytes.len() >= 16) else {
+                return "firmware ERROR 8: ADC conversion deadline expired; acquisition entered its safe fault state".into();
+            };
+            let stage = payload[1];
+            let channel = payload[2];
+            let fsp_error = payload[3];
+            let starts = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let completions =
+                u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+            let timeouts =
+                u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+            format!(
+                "firmware ERROR 8: ADC conversion deadline expired; stage={stage} channel=A{channel} fsp_error={fsp_error} adc_starts={starts} adc_completions={completions} adc_timeouts={timeouts}; acquisition entered its safe fault state"
+            )
+        }
+        Some(9) => "firmware ERROR 9: ADC driver operation failed; acquisition entered its safe fault state".into(),
+        Some(code) => format!("firmware ERROR {code}: acquisition stopped"),
+        None => "firmware sent ERROR_MESSAGE without an error code".into(),
+    }
+}
+
+fn no_data_timeout_detail(elapsed: Duration) -> String {
+    format!(
+        "no synchronized sample batch for {} ms while the recording session remained active",
+        elapsed.as_millis()
+    )
+}
+
+fn sample_stream_stall_failure(
+    progress: &CaptureProgress,
+    started: Instant,
+    now: Instant,
+) -> Option<SerialTerminalFailure> {
+    let sample_silence = now.duration_since(progress.last_valid_sample.unwrap_or(started));
+    (sample_silence >= SAMPLE_STREAM_STALL_TIMEOUT).then(|| {
+        SerialTerminalFailure::new(
+            SerialFailureStage::NoDataTimeout,
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                no_data_timeout_detail(sample_silence),
+            ),
+        )
+    })
+}
+
+/// Windows can report `TimedOut` (including ERROR_SEM_TIMEOUT / 121) or
+/// `WouldBlock` from a short CDC write while the same COM handle is still
+/// receiving current sample batches.  A single event does not prove that the
+/// USB device disappeared, and immediately faulting loses an otherwise sound
+/// recording.  We defer only these PING-path errors, only while samples remain
+/// current, and only while there is room to send another command before the
+/// firmware's five-second watchdog.
+fn may_defer_ping_failure(
+    failure: &SerialTerminalFailure,
+    now: Instant,
+    last_confirmed_keepalive: Instant,
+    last_valid_sample: Option<Instant>,
+    consecutive_failures: u8,
+) -> bool {
+    let is_ping_transport_timeout = matches!(
+        failure.stage,
+        SerialFailureStage::PingWrite | SerialFailureStage::PingFlush
+    ) && matches!(
+        failure.error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    );
+    let samples_are_current = last_valid_sample
+        .is_some_and(|last_sample| now.duration_since(last_sample) <= PING_RECENT_SAMPLE_GRACE);
+    let keepalive_has_margin =
+        now.duration_since(last_confirmed_keepalive) < PING_KEEPALIVE_RETRY_WINDOW;
+
+    is_ping_transport_timeout
+        && samples_are_current
+        && keepalive_has_margin
+        && consecutive_failures <= MAX_DEFERRED_PING_FAILURES
+}
+
+#[derive(Debug)]
+enum CaptureCommandError {
+    Protocol(String),
+    Serial(SerialTerminalFailure),
+}
+
+#[derive(Clone, Debug, Default)]
+struct CaptureProgress {
+    packets: u64,
+    samples: u64,
+    pongs: u64,
+    statuses: u64,
+    last_valid_packet: Option<Instant>,
+    last_valid_sample: Option<Instant>,
+    last_ping_attempt: Option<Instant>,
+    last_successful_ping: Option<Instant>,
+    last_ping_write_duration: Option<Duration>,
+    last_pong_or_status: Option<Instant>,
+    last_recording_flush: Option<Instant>,
+    last_recording_flush_duration: Option<Duration>,
+    last_disk_check: Option<Instant>,
+    last_disk_check_duration: Option<Duration>,
+}
+
+impl CaptureProgress {
+    fn observe(&mut self, snapshot: &AcquisitionSnapshot, now: Instant) {
+        if snapshot.integrity.received_packets > self.packets {
+            self.last_valid_packet = Some(now);
+            self.packets = snapshot.integrity.received_packets;
+        }
+        if snapshot.sample_count > self.samples {
+            self.last_valid_sample = Some(now);
+            self.samples = snapshot.sample_count;
+        }
+        if snapshot.pong_count > self.pongs || snapshot.status_count > self.statuses {
+            self.last_pong_or_status = Some(now);
+            self.pongs = snapshot.pong_count;
+            self.statuses = snapshot.status_count;
+        }
+    }
+}
+
+struct ActiveSerialFailureContext<'a> {
+    port: &'a str,
+    expected_identity: Option<&'a UsbPortIdentity>,
+    started: Instant,
+    started_utc: DateTime<Utc>,
+    progress: &'a CaptureProgress,
+    snapshot: &'a AcquisitionSnapshot,
 }
 
 /// The Project folder and the relative trial folder selected at Start. The
@@ -399,6 +685,7 @@ impl SessionController {
                 calibration: RecordingCalibration::default(),
                 markers: Vec::new(),
                 digital_output_mask: None,
+                display_origin_timestamp_us: None,
             })),
             cancel: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
@@ -1063,6 +1350,7 @@ impl SessionController {
         runtime.profile = Some(profile);
         runtime.calibration = calibration;
         runtime.markers.clear();
+        runtime.display_origin_timestamp_us = None;
         self.cancel.store(false, Ordering::Release);
         let mut stop_reason = self
             .stop_reason
@@ -1113,6 +1401,7 @@ impl SessionController {
                     output_dir,
                     calibration,
                     recording_path_context,
+                    expected_port_identity: None,
                 },
             )
         })();
@@ -1130,9 +1419,12 @@ impl SessionController {
         recording_path_context: Option<RecordingPathContext>,
     ) -> Result<(), SessionError> {
         let result = (|| {
+            // This is read-only Windows serial-port enumeration. The captured
+            // identity is used only if a later active-capture error occurs.
+            let expected_port_identity = usb_port_identity(&port_name);
             crate::app_log::record("INFO", &format!("SERIAL_OPEN_BEGIN port={port_name}"));
             let mut port = serialport::new(&port_name, CONTROLLED_SERIAL_BAUD)
-                .timeout(Duration::from_millis(25))
+                .timeout(ACTIVE_SERIAL_IO_TIMEOUT)
                 .open()
                 .map_err(|error| {
                     crate::app_log::record(
@@ -1142,7 +1434,13 @@ impl SessionController {
                     SessionError::Serial(error)
                 })?;
             self.mark_port_opened(&port_name)?;
-            crate::app_log::record("INFO", &format!("SERIAL_OPEN_OK port={port_name}"));
+            crate::app_log::record(
+                "INFO",
+                &format!(
+                    "SERIAL_OPEN_OK port={port_name} io_timeout_ms={}",
+                    ACTIVE_SERIAL_IO_TIMEOUT.as_millis()
+                ),
+            );
             // Clear stale bytes before asserting host control lines. The firmware then emits HELLO.
             port.clear(serialport::ClearBuffer::Input)?;
             port.write_data_terminal_ready(true)?;
@@ -1160,6 +1458,7 @@ impl SessionController {
                     output_dir,
                     calibration,
                     recording_path_context,
+                    expected_port_identity,
                 },
             )
         })();
@@ -1180,6 +1479,7 @@ impl SessionController {
             output_dir,
             calibration,
             recording_path_context,
+            expected_port_identity,
         } = request;
         // Collect tooling provenance before START so no external command can delay raw intake.
         crate::app_log::record("INFO", "OPEN_RECORDING_FILE_BEGIN");
@@ -1298,12 +1598,33 @@ impl SessionController {
         let active_digital_output_mask = acquisition.snapshot().digital_output_mask;
 
         let started = Instant::now();
+        let started_utc = Utc::now();
+        crate::app_log::record(
+            "INFO",
+            &format!(
+                "RECORDING_START duration_mode={} requested_seconds={:?} source={} lab={} port={} output_dir={} initial_free_disk_bytes={}",
+                duration.label(),
+                duration.requested_seconds(),
+                if simulator { "simulator" } else { "hardware" },
+                profile.profile.display_name,
+                source,
+                output_dir.display(),
+                initial_free_disk_bytes,
+            ),
+        );
+        // `START` was accepted before this loop, so it is a valid initial
+        // firmware-watchdog keepalive even though it is not a PING response.
         let mut last_ping = Instant::now();
+        let mut last_confirmed_keepalive = started;
+        let mut consecutive_deferred_ping_failures = 0u8;
         let mut last_disk_check = Instant::now();
         let mut last_flush = Instant::now();
         let mut buffer = [0u8; 512];
-        let mut terminal_error = None;
+        let mut terminal_error: Option<SerialTerminalFailure> = None;
+        let mut terminal_failure_category: Option<ConnectionFailureCategory> = None;
         let mut stop_reason = None;
+        let mut progress = CaptureProgress::default();
+        progress.observe(&acquisition.snapshot(), started);
 
         loop {
             if self.cancel.load(Ordering::Acquire) {
@@ -1317,49 +1638,186 @@ impl SessionController {
                 }
             }
             match io.read(&mut buffer) {
-                Ok(n) if n > 0 => acquisition.ingest_bytes(&buffer[..n]),
+                Ok(n) if n > 0 => {
+                    acquisition.ingest_bytes(&buffer[..n]);
+                    progress.observe(&acquisition.snapshot(), Instant::now());
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(error) => {
-                    terminal_error = Some(error);
+                    terminal_error = Some(SerialTerminalFailure::new(
+                        SerialFailureStage::SerialRead,
+                        error,
+                    ));
                     break;
                 }
             }
             self.drain_samples(&rx, &mut raw)?;
             self.update_from_acquisition(&acquisition)?;
-            if last_ping.elapsed() >= Duration::from_secs(1) {
-                if let Err(error) = self.send_command(io, MessageType::Ping, 3, vec![]) {
-                    terminal_error = Some(std::io::Error::other(error.to_string()));
-                    break;
+            let active_snapshot = acquisition.snapshot();
+            let observed_now = Instant::now();
+            progress.observe(&active_snapshot, observed_now);
+            if active_snapshot.firmware_error_count > 0 {
+                terminal_error = Some(SerialTerminalFailure::new(
+                    SerialFailureStage::FirmwareError,
+                    std::io::Error::other(firmware_error_detail(
+                        active_snapshot.firmware_error_code,
+                        active_snapshot.firmware_error_payload.as_deref(),
+                    )),
+                ));
+                break;
+            }
+            if let Some(stall) = sample_stream_stall_failure(&progress, started, observed_now) {
+                terminal_error = Some(stall);
+                break;
+            }
+            if last_ping.elapsed() >= ACTIVE_PING_INTERVAL {
+                let ping_started = Instant::now();
+                progress.last_ping_attempt = Some(ping_started);
+                match self.send_capture_command(io, MessageType::Ping, 3, vec![]) {
+                    Ok(()) => {
+                        let now = Instant::now();
+                        last_ping = now;
+                        last_confirmed_keepalive = now;
+                        consecutive_deferred_ping_failures = 0;
+                        progress.last_successful_ping = Some(now);
+                        progress.last_ping_write_duration = Some(now.duration_since(ping_started));
+                    }
+                    Err(CaptureCommandError::Serial(error)) => {
+                        let now = Instant::now();
+                        last_ping = now;
+                        consecutive_deferred_ping_failures =
+                            consecutive_deferred_ping_failures.saturating_add(1);
+                        progress.last_ping_write_duration = Some(now.duration_since(ping_started));
+
+                        if may_defer_ping_failure(
+                            &error,
+                            now,
+                            last_confirmed_keepalive,
+                            progress.last_valid_sample,
+                            consecutive_deferred_ping_failures,
+                        ) {
+                            let sample_age_ms = progress
+                                .last_valid_sample
+                                .map(|last_sample| now.duration_since(last_sample).as_millis())
+                                .unwrap_or(u128::MAX);
+                            crate::app_log::record(
+                                "WARN",
+                                &format!(
+                                    "PING_TRANSIENT_WRITE_FAILURE stage={} classification={} error_kind={:?} raw_os_error={:?} detail={} deferred_attempt={} sample_age_ms={} keepalive_age_ms={} next_ping_ms={}",
+                                    error.stage.label(),
+                                    error.stage.classification(),
+                                    error.error.kind(),
+                                    error.error.raw_os_error(),
+                                    error.error,
+                                    consecutive_deferred_ping_failures,
+                                    sample_age_ms,
+                                    now.duration_since(last_confirmed_keepalive).as_millis(),
+                                    ACTIVE_PING_INTERVAL.as_millis(),
+                                ),
+                            );
+                        } else {
+                            crate::app_log::record(
+                                "ERROR",
+                                &format!(
+                                    "PING_WRITE_FAILURE_TERMINAL stage={} error_kind={:?} raw_os_error={:?} deferred_attempts={} sample_age_ms={} keepalive_age_ms={}",
+                                    error.stage.label(),
+                                    error.error.kind(),
+                                    error.error.raw_os_error(),
+                                    consecutive_deferred_ping_failures,
+                                    progress
+                                        .last_valid_sample
+                                        .map(|last_sample| now.duration_since(last_sample).as_millis())
+                                        .unwrap_or(u128::MAX),
+                                    now.duration_since(last_confirmed_keepalive).as_millis(),
+                                ),
+                            );
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    }
+                    Err(CaptureCommandError::Protocol(detail)) => {
+                        terminal_error = Some(SerialTerminalFailure::new(
+                            SerialFailureStage::PingWrite,
+                            std::io::Error::other(format!(
+                                "protocol while encoding PING: {detail}"
+                            )),
+                        ));
+                        break;
+                    }
                 }
-                last_ping = Instant::now();
             }
             if last_flush.elapsed() >= RECORDING_FLUSH_INTERVAL {
+                let flush_started = Instant::now();
                 raw.flush()?;
-                last_flush = Instant::now();
+                let now = Instant::now();
+                last_flush = now;
+                progress.last_recording_flush = Some(now);
+                progress.last_recording_flush_duration = Some(now.duration_since(flush_started));
             }
             if last_disk_check.elapsed() >= DISK_CHECK_INTERVAL {
+                let disk_check_started = Instant::now();
                 let free = self.free_disk_space(&output_dir)?;
+                let now = Instant::now();
                 self.update_disk_space(free)?;
                 if free < DISK_CRITICAL_BYTES {
                     stop_reason = Some(self.set_stop_reason_once(StopReason::StorageGuard)?);
                     break;
                 }
-                last_disk_check = Instant::now();
+                last_disk_check = now;
+                progress.last_disk_check = Some(now);
+                progress.last_disk_check_duration = Some(now.duration_since(disk_check_started));
             }
         }
 
-        let _ = self.send_command(io, MessageType::Stop, 4, vec![]);
+        if let Some(error) = terminal_error.as_ref() {
+            // This reads only the operating system's port list. It does not
+            // reopen, reset, upload to, or otherwise touch the selected board.
+            terminal_failure_category = Some(self.record_active_serial_failure(
+                error,
+                ActiveSerialFailureContext {
+                    port: &source,
+                    expected_identity: expected_port_identity.as_ref(),
+                    started,
+                    started_utc,
+                    progress: &progress,
+                    snapshot: &acquisition.snapshot(),
+                },
+            )?);
+        }
+
+        match self.send_capture_command(io, MessageType::Stop, 4, vec![]) {
+            Ok(()) => {}
+            Err(CaptureCommandError::Serial(error)) => {
+                self.record_serial_cleanup_failure(&error, &source, started, started_utc, &progress)
+            }
+            Err(CaptureCommandError::Protocol(detail)) => crate::app_log::record(
+                "WARN",
+                &format!("SERIAL_CLEANUP_ERROR stage=STOP_PROTOCOL detail={detail}"),
+            ),
+        }
         // Give the controlled firmware a bounded opportunity to confirm that all
         // course LED outputs are low before the serial handle is released.
         let stop_status_deadline = Instant::now() + Duration::from_millis(300);
         while terminal_error.is_none() && Instant::now() < stop_status_deadline {
             match io.read(&mut buffer) {
-                Ok(n) if n > 0 => acquisition.ingest_bytes(&buffer[..n]),
+                Ok(n) if n > 0 => {
+                    acquisition.ingest_bytes(&buffer[..n]);
+                    progress.observe(&acquisition.snapshot(), Instant::now());
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(error) => {
-                    terminal_error = Some(error);
+                    // A failure after an intentional STOP cannot change the
+                    // completed capture into a device-removal result. Keep it
+                    // in diagnostics, but preserve the original stop reason.
+                    self.record_serial_cleanup_failure(
+                        &SerialTerminalFailure::new(SerialFailureStage::StopStatusRead, error),
+                        &source,
+                        started,
+                        started_utc,
+                        &progress,
+                    );
                     break;
                 }
             }
@@ -1373,12 +1831,25 @@ impl SessionController {
         let csv_rows = export_bmeg_csv(&bmeg, &csv)?;
         let mut snapshot = acquisition.snapshot();
         let final_digital_output_mask = snapshot.digital_output_mask;
-        if terminal_error.is_some() {
+        let terminal_error_detail = terminal_error.as_ref().map(SerialTerminalFailure::detail);
+        if terminal_error_detail.is_some()
+            && matches!(
+                terminal_failure_category,
+                Some(ConnectionFailureCategory::DeviceDisconnected)
+            )
+        {
             snapshot.integrity.disconnect_events += 1;
         }
         self.update_snapshot(&snapshot)?;
-        let reason = if terminal_error.is_some() {
-            StopReason::Disconnect
+        let reason = if terminal_error_detail.is_some() {
+            if matches!(
+                terminal_failure_category,
+                Some(ConnectionFailureCategory::DeviceDisconnected)
+            ) {
+                StopReason::Disconnect
+            } else {
+                StopReason::Fault
+            }
         } else {
             stop_reason.unwrap_or(StopReason::Fault)
         };
@@ -1389,6 +1860,33 @@ impl SessionController {
         if let Some(free) = final_free_disk_bytes {
             self.update_disk_space(free)?;
         }
+        let terminal_trigger = if terminal_error_detail.is_some() {
+            "serial_error"
+        } else {
+            match reason {
+                StopReason::User => "user_stop",
+                StopReason::TimedComplete => "timed_complete",
+                StopReason::Disconnect => "disconnect_request",
+                StopReason::StorageGuard => "storage_guard",
+                StopReason::ApplicationClose => "application_close",
+                StopReason::Fault => "fault",
+            }
+        };
+        crate::app_log::record(
+            if terminal_error_detail.is_some() { "ERROR" } else { "INFO" },
+            &format!(
+                "RECORDING_TERMINAL trigger={} stop_reason={:?} cancel={} terminal_error={} elapsed_ms={} port={} samples={} packets={} free_disk_bytes={:?}",
+                terminal_trigger,
+                reason,
+                self.cancel.load(Ordering::Acquire),
+                terminal_error_detail.as_deref().unwrap_or("none"),
+                (host_elapsed * 1_000.0).round() as u128,
+                source,
+                snapshot.sample_count,
+                snapshot.integrity.received_packets,
+                final_free_disk_bytes,
+            ),
+        );
         let mut final_meta = initial_meta;
         final_meta.utc_stop = Some(Utc::now());
         final_meta.local_stop = Some(Local::now());
@@ -1417,7 +1915,7 @@ impl SessionController {
                 .map_err(crate::recording::RecordingError::Json)?,
         )?;
         let summary = SessionSummary {
-            state: if terminal_error.is_some() {
+            state: if terminal_error_detail.is_some() {
                 SessionState::Faulted
             } else {
                 SessionState::Disconnected
@@ -1437,9 +1935,7 @@ impl SessionController {
             initial_free_disk_bytes: Some(initial_free_disk_bytes),
             final_free_disk_bytes,
             integrity: snapshot.integrity,
-            error: terminal_error
-                .as_ref()
-                .map(std::string::ToString::to_string),
+            error: terminal_error_detail.clone(),
             profile,
             calibration: final_meta.calibration.clone().unwrap_or_default(),
             active_digital_output_mask,
@@ -1448,8 +1944,10 @@ impl SessionController {
         self.set_summary(summary.clone())?;
         self.set_runtime_stop_reason(reason)?;
         if let Some(error) = terminal_error {
-            self.set_fault(error.to_string())?;
-            return Err(SessionError::Io(error));
+            // Preserve the stage/kind/Windows error in Advanced details rather
+            // than overwriting it with the generic I/O display string.
+            self.set_fault(terminal_error_detail.unwrap_or_else(|| error.detail()))?;
+            return Err(error.into_session_error());
         }
         if csv_rows != summary.samples {
             let error = SessionError::Recording(crate::recording::RecordingError::Truncated);
@@ -1630,16 +2128,188 @@ impl SessionController {
         sequence: u32,
         payload: Vec<u8>,
     ) -> Result<(), SessionError> {
-        let bytes = encode_frame(&Frame {
-            message_type,
-            flags: 0,
-            sequence,
-            payload,
-        })
-        .map_err(|error| SessionError::Protocol(format!("{error:?}")))?;
+        let bytes = encode_command(message_type, sequence, payload)?;
         io.write_all(&bytes)?;
         io.flush()?;
         Ok(())
+    }
+
+    /// Writes a command from the active capture loop while retaining whether a
+    /// Windows error originated in `write_all` or `flush`. Startup commands
+    /// deliberately remain on `send_command`.
+    fn send_capture_command<T: Write>(
+        &self,
+        io: &mut T,
+        message_type: MessageType,
+        sequence: u32,
+        payload: Vec<u8>,
+    ) -> Result<(), CaptureCommandError> {
+        let bytes = encode_command(message_type, sequence, payload)
+            .map_err(|error| CaptureCommandError::Protocol(error.to_string()))?;
+        let write_stage = if message_type == MessageType::Ping {
+            SerialFailureStage::PingWrite
+        } else {
+            SerialFailureStage::StopWrite
+        };
+        io.write_all(&bytes).map_err(|error| {
+            CaptureCommandError::Serial(SerialTerminalFailure::new(write_stage, error))
+        })?;
+        let flush_stage = if message_type == MessageType::Ping {
+            SerialFailureStage::PingFlush
+        } else {
+            SerialFailureStage::StopFlush
+        };
+        io.flush().map_err(|error| {
+            CaptureCommandError::Serial(SerialTerminalFailure::new(flush_stage, error))
+        })?;
+        Ok(())
+    }
+
+    fn record_serial_cleanup_failure(
+        &self,
+        error: &SerialTerminalFailure,
+        port: &str,
+        started: Instant,
+        started_utc: DateTime<Utc>,
+        progress: &CaptureProgress,
+    ) {
+        crate::app_log::record(
+            "WARN",
+            &format!(
+                "SERIAL_CLEANUP_ERROR stage={} classification={} error_kind={:?} raw_os_error={:?} detail={} elapsed_ms={} port={} samples={} packets={} last_valid_packet_utc={} last_valid_sample_utc={} last_successful_ping_utc={} last_pong_or_status_utc={}",
+                error.stage.label(),
+                error.stage.classification(),
+                error.error.kind(),
+                error.error.raw_os_error(),
+                error.error,
+                started.elapsed().as_millis(),
+                port,
+                progress.samples,
+                progress.packets,
+                capture_timestamp(started_utc, started, progress.last_valid_packet).unwrap_or_else(|| "none".into()),
+                capture_timestamp(started_utc, started, progress.last_valid_sample).unwrap_or_else(|| "none".into()),
+                capture_timestamp(started_utc, started, progress.last_successful_ping).unwrap_or_else(|| "none".into()),
+                capture_timestamp(started_utc, started, progress.last_pong_or_status).unwrap_or_else(|| "none".into()),
+            ),
+        );
+    }
+
+    fn record_active_serial_failure(
+        &self,
+        error: &SerialTerminalFailure,
+        context: ActiveSerialFailureContext<'_>,
+    ) -> Result<ConnectionFailureCategory, SessionError> {
+        // `available_ports` is a read-only operating-system enumeration. It
+        // never opens the COM handle and does not perform the 1200-bps reset.
+        let port_state = diagnose_port_enumeration(context.port, context.expected_identity);
+        let device_removed = port_state.selected_port_present == Some(false)
+            && port_state.same_serial_present == Some(false);
+        let category = if device_removed {
+            ConnectionFailureCategory::DeviceDisconnected
+        } else {
+            match error.stage {
+                SerialFailureStage::FirmwareError => {
+                    ConnectionFailureCategory::FirmwareProtocolError
+                }
+                SerialFailureStage::NoDataTimeout => ConnectionFailureCategory::NoDataTimeout,
+                _ => ConnectionFailureCategory::SerialTransportError,
+            }
+        };
+        let elapsed_ms = context.started.elapsed().as_millis();
+        let last_valid_packet_utc = capture_timestamp(
+            context.started_utc,
+            context.started,
+            context.progress.last_valid_packet,
+        );
+        let last_valid_sample_utc = capture_timestamp(
+            context.started_utc,
+            context.started,
+            context.progress.last_valid_sample,
+        );
+        let last_ping_attempt_utc = capture_timestamp(
+            context.started_utc,
+            context.started,
+            context.progress.last_ping_attempt,
+        );
+        let last_successful_ping_utc = capture_timestamp(
+            context.started_utc,
+            context.started,
+            context.progress.last_successful_ping,
+        );
+        let last_pong_or_status_utc = capture_timestamp(
+            context.started_utc,
+            context.started,
+            context.progress.last_pong_or_status,
+        );
+        let last_recording_flush_utc = capture_timestamp(
+            context.started_utc,
+            context.started,
+            context.progress.last_recording_flush,
+        );
+        let last_disk_check_utc = capture_timestamp(
+            context.started_utc,
+            context.started,
+            context.progress.last_disk_check,
+        );
+        let available_disk_bytes = self.lock_runtime()?.available_disk_bytes;
+
+        crate::app_log::record(
+            "ERROR",
+            &format!(
+                "SERIAL_TERMINAL_ERROR stage={} classification={} error_kind={:?} raw_os_error={:?} detail={} elapsed_ms={} port={} samples={} packets={} last_valid_packet_utc={} last_valid_sample_utc={} last_ping_attempt_utc={} last_successful_ping_utc={} last_ping_write_duration_ms={:?} last_pong_or_status_utc={} last_recording_flush_utc={} last_recording_flush_duration_ms={:?} last_disk_check_utc={} last_disk_check_duration_ms={:?} available_disk_bytes={:?} selected_port_present={:?} same_vid_pid_present={:?} same_serial_present={:?} uno_r4_present={:?} observed_vid={:?} observed_pid={:?} observed_serial={:?} enumeration_error={:?}",
+                error.stage.label(),
+                error.stage.classification(),
+                error.error.kind(),
+                error.error.raw_os_error(),
+                error.error,
+                elapsed_ms,
+                context.port,
+                context.snapshot.sample_count,
+                context.snapshot.integrity.received_packets,
+                last_valid_packet_utc.as_deref().unwrap_or("none"),
+                last_valid_sample_utc.as_deref().unwrap_or("none"),
+                last_ping_attempt_utc.as_deref().unwrap_or("none"),
+                last_successful_ping_utc.as_deref().unwrap_or("none"),
+                context.progress.last_ping_write_duration.map(|duration| duration.as_millis()),
+                last_pong_or_status_utc.as_deref().unwrap_or("none"),
+                last_recording_flush_utc.as_deref().unwrap_or("none"),
+                context.progress.last_recording_flush_duration.map(|duration| duration.as_millis()),
+                last_disk_check_utc.as_deref().unwrap_or("none"),
+                context.progress.last_disk_check_duration.map(|duration| duration.as_millis()),
+                available_disk_bytes,
+                port_state.selected_port_present,
+                port_state.same_vid_pid_present,
+                port_state.same_serial_present,
+                port_state.uno_r4_present,
+                port_state.observed_vid,
+                port_state.observed_pid,
+                port_state.observed_serial_number,
+                port_state.enumeration_error,
+            ),
+        );
+
+        let mut runtime = self.lock_runtime()?;
+        let diagnostics = runtime
+            .connection_diagnostics
+            .get_or_insert_with(|| ConnectionDiagnostics::new(context.port));
+        diagnostics.terminal_error_classification = Some(error.stage.classification().into());
+        diagnostics.terminal_error_stage = Some(error.stage.label().into());
+        diagnostics.terminal_error_kind = Some(format!("{:?}", error.error.kind()));
+        diagnostics.terminal_error_raw_os_error = error.error.raw_os_error();
+        diagnostics.terminal_error_detail = Some(error.error.to_string());
+        diagnostics.terminal_error_elapsed_ms = Some(elapsed_ms);
+        diagnostics.last_valid_packet_utc = last_valid_packet_utc;
+        diagnostics.last_valid_sample_utc = last_valid_sample_utc;
+        diagnostics.last_successful_ping_utc = last_successful_ping_utc;
+        diagnostics.last_pong_or_status_utc = last_pong_or_status_utc;
+        diagnostics.selected_port_present_after_error = port_state.selected_port_present;
+        diagnostics.same_vid_pid_present_after_error = port_state.same_vid_pid_present;
+        diagnostics.same_serial_present_after_error = port_state.same_serial_present;
+        diagnostics.uno_r4_present_after_error = port_state.uno_r4_present;
+        diagnostics.port_enumeration_error = port_state.enumeration_error;
+        diagnostics.failure_category = Some(category.clone());
+        diagnostics.recommended_action = recommended_action(&category).into();
+        Ok(category)
     }
 
     fn drain_samples(
@@ -1650,6 +2320,9 @@ impl SessionController {
         for sample in receiver.try_iter() {
             raw.write_record(&sample)?;
             let mut runtime = self.lock_runtime()?;
+            runtime
+                .display_origin_timestamp_us
+                .get_or_insert(sample.timestamp_us);
             if runtime.recent.len() == DISPLAY_CAPACITY {
                 runtime.recent.pop_front();
             }
@@ -1825,7 +2498,16 @@ impl SessionController {
                 self.set_state(SessionState::Disconnected)?;
             } else {
                 self.record_worker_failure_category(error)?;
-                self.set_fault(error.to_string())?;
+                // Active capture may already have stored a more useful serial
+                // stage/ErrorKind/Windows code. Do not replace it with the
+                // generic `I/O: ...` rendering as the worker unwinds.
+                let detailed_fault_is_present = {
+                    let runtime = self.lock_runtime()?;
+                    runtime.state == SessionState::Faulted && runtime.last_error.is_some()
+                };
+                if !detailed_fault_is_present {
+                    self.set_fault(error.to_string())?;
+                }
             }
         }
         Ok(())
@@ -1838,7 +2520,10 @@ impl SessionController {
                 let category = if !diagnostics.port_opened {
                     ConnectionFailureCategory::PortBusy
                 } else if matches!(error, SessionError::Io(_)) {
-                    ConnectionFailureCategory::DeviceDisconnected
+                    // An I/O error by itself does not prove that Windows
+                    // removed the USB device. Active capture records a
+                    // read-only enumeration before assigning DeviceDisconnected.
+                    ConnectionFailureCategory::SerialTransportError
                 } else {
                     ConnectionFailureCategory::HandshakeIncomplete
                 };
@@ -1987,6 +2672,7 @@ impl SessionController {
             profile: runtime.profile.clone(),
             calibration: runtime.calibration.clone(),
             digital_output_mask: runtime.digital_output_mask,
+            display_origin_timestamp_us: runtime.display_origin_timestamp_us,
         }
     }
 
@@ -2052,6 +2738,30 @@ fn file_name_string(path: &Path) -> Result<String, SessionError> {
         .and_then(|name| name.to_str())
         .map(str::to_owned)
         .ok_or(SessionError::State("recording filename is invalid"))
+}
+
+fn encode_command(
+    message_type: MessageType,
+    sequence: u32,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, SessionError> {
+    encode_frame(&Frame {
+        message_type,
+        flags: 0,
+        sequence,
+        payload,
+    })
+    .map_err(|error| SessionError::Protocol(format!("{error:?}")))
+}
+
+fn capture_timestamp(
+    started_utc: DateTime<Utc>,
+    started: Instant,
+    observed: Option<Instant>,
+) -> Option<String> {
+    let elapsed = observed?.checked_duration_since(started)?;
+    let elapsed = ChronoDuration::from_std(elapsed).ok()?;
+    Some((started_utc + elapsed).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 fn default_general_profile() -> Result<ProfileSnapshot, SessionError> {
@@ -2300,6 +3010,95 @@ fn enumerate_uno_usb_ports() -> Vec<UnoUsbPort> {
         .collect()
 }
 
+fn usb_port_identity(port_name: &str) -> Option<UsbPortIdentity> {
+    serialport::available_ports()
+        .ok()?
+        .into_iter()
+        .find_map(|candidate| {
+            if !candidate.port_name.eq_ignore_ascii_case(port_name) {
+                return None;
+            }
+            match candidate.port_type {
+                serialport::SerialPortType::UsbPort(info) => Some(UsbPortIdentity {
+                    port: candidate.port_name,
+                    vid: info.vid,
+                    pid: info.pid,
+                    serial_number: info.serial_number,
+                }),
+                _ => None,
+            }
+        })
+}
+
+/// Enumerates only the operating system's current serial-port list after an
+/// active-capture transport failure. It intentionally does not open the port,
+/// run Arduino CLI, change DTR/RTS, or invoke the 1200-bps reset path.
+fn diagnose_port_enumeration(
+    selected_port: &str,
+    expected: Option<&UsbPortIdentity>,
+) -> PortEnumerationDiagnostic {
+    let ports = match serialport::available_ports() {
+        Ok(ports) => ports,
+        Err(error) => {
+            return PortEnumerationDiagnostic {
+                selected_port_present: None,
+                same_vid_pid_present: None,
+                same_serial_present: None,
+                uno_r4_present: None,
+                observed_vid: None,
+                observed_pid: None,
+                observed_serial_number: None,
+                enumeration_error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let selected_port_present = ports
+        .iter()
+        .any(|candidate| candidate.port_name.eq_ignore_ascii_case(selected_port));
+    let identities: Vec<UsbPortIdentity> = ports
+        .iter()
+        .filter_map(|candidate| match &candidate.port_type {
+            serialport::SerialPortType::UsbPort(info) => Some(UsbPortIdentity {
+                port: candidate.port_name.clone(),
+                vid: info.vid,
+                pid: info.pid,
+                serial_number: info.serial_number.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let observed = identities
+        .iter()
+        .find(|candidate| candidate.port.eq_ignore_ascii_case(selected_port));
+    let same_vid_pid_present = expected.map(|identity| {
+        identities
+            .iter()
+            .any(|candidate| candidate.vid == identity.vid && candidate.pid == identity.pid)
+    });
+    let same_serial_present = expected.and_then(|identity| {
+        identity.serial_number.as_ref().map(|serial| {
+            identities
+                .iter()
+                .any(|candidate| candidate.serial_number.as_ref() == Some(serial))
+        })
+    });
+    let uno_r4_present = identities
+        .iter()
+        .any(|candidate| candidate.vid == 0x2341 && matches!(candidate.pid, 0x1002 | 0x006d));
+
+    PortEnumerationDiagnostic {
+        selected_port_present: Some(selected_port_present),
+        same_vid_pid_present,
+        same_serial_present,
+        uno_r4_present: Some(uno_r4_present),
+        observed_vid: observed.map(|identity| identity.vid),
+        observed_pid: observed.map(|identity| identity.pid),
+        observed_serial_number: observed.and_then(|identity| identity.serial_number.clone()),
+        enumeration_error: None,
+    }
+}
+
 fn target_matches_port(target: &ResetTarget, candidate: &UnoUsbPort) -> bool {
     candidate.role == UnoUsbRole::Application
         && candidate.port.eq_ignore_ascii_case(&target.port)
@@ -2423,6 +3222,15 @@ fn recommended_action(category: &ConnectionFailureCategory) -> &'static str {
         }
         ConnectionFailureCategory::HandshakeIncomplete => {
             "Retry handshake. If identity/PONG stays incomplete, select Reset board and retry."
+        }
+        ConnectionFailureCategory::SerialTransportError => {
+            "The serial connection reported an error, but the board was not proven removed. Refresh the board and review Advanced details before starting a new session."
+        }
+        ConnectionFailureCategory::FirmwareProtocolError => {
+            "The Arduino reported that it stopped the recording. Verify the firmware, then refresh the board before starting a new session."
+        }
+        ConnectionFailureCategory::NoDataTimeout => {
+            "The Arduino stopped sending samples. Refresh the board and verify the firmware before starting a new session."
         }
         ConnectionFailureCategory::DeviceDisconnected => {
             "Reconnect the UNO R4 WiFi, refresh devices, and explicitly start a new session."
@@ -3484,8 +4292,34 @@ mod tests {
         }
     }
 
+    struct FirmwareStoppingSimulator {
+        inner: SimulatorIo,
+        error_sent: bool,
+    }
+
+    impl Read for FirmwareStoppingSimulator {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.active && self.inner.sample_sequence >= 20 && !self.error_sent {
+                self.inner.active = false;
+                let _ = self.inner.queue(MessageType::ErrorMessage, vec![7]);
+                self.error_sent = true;
+            }
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Write for FirmwareStoppingSimulator {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buffer)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
     #[test]
-    fn terminal_transport_error_finalizes_a_readable_disconnected_recording() {
+    fn terminal_transport_error_finalizes_a_readable_faulted_recording_without_claiming_removal() {
         let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
         let session = SessionController::default();
         session
@@ -3521,6 +4355,7 @@ mod tests {
                     output_dir: dir.path().to_path_buf(),
                     calibration: RecordingCalibration::default(),
                     recording_path_context: None,
+                    expected_port_identity: None,
                 },
             )
             .err()
@@ -3532,9 +4367,276 @@ mod tests {
                 status.state, transport.reads
             )
         });
-        assert_eq!(summary.recording_status, "disconnected");
-        assert_eq!(summary.integrity.disconnect_events, 1);
+        assert_eq!(summary.recording_status, "faulted");
+        assert_eq!(summary.integrity.disconnect_events, 0);
+        assert!(summary
+            .error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("SERIAL_READ [SerialReadError]")));
+        let diagnostics = status
+            .connection_diagnostics
+            .unwrap_or_else(|| panic!("missing serial failure diagnostics"));
+        assert_eq!(
+            diagnostics.terminal_error_stage.as_deref(),
+            Some("SERIAL_READ")
+        );
+        assert_eq!(
+            diagnostics.terminal_error_classification.as_deref(),
+            Some("SerialReadError")
+        );
+        assert_eq!(
+            diagnostics.terminal_error_kind.as_deref(),
+            Some("ConnectionAborted")
+        );
+        assert_eq!(
+            diagnostics.failure_category,
+            Some(ConnectionFailureCategory::SerialTransportError)
+        );
         assert!(BmegReader::open(Path::new(&summary.bmeg_path)).is_ok());
+    }
+
+    #[test]
+    fn firmware_error_message_ends_an_active_session_instead_of_leaving_it_acquiring() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        session
+            .begin_session(
+                true,
+                "Simulator",
+                "SIM",
+                RecordingDuration::UntilStopped,
+                profile.clone(),
+                RecordingCalibration::default(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        session
+            .set_state(SessionState::Connected)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut transport = FirmwareStoppingSimulator {
+            inner: SimulatorIo::new(&profile, RecordingDuration::UntilStopped)
+                .unwrap_or_else(|e| panic!("{e}")),
+            error_sent: false,
+        };
+        let error = session
+            .capture_transport(
+                &mut transport,
+                CaptureRequest {
+                    simulator: true,
+                    source: "SIM".into(),
+                    profile,
+                    duration: RecordingDuration::UntilStopped,
+                    output_dir: dir.path().to_path_buf(),
+                    calibration: RecordingCalibration::default(),
+                    recording_path_context: None,
+                    expected_port_identity: None,
+                },
+            )
+            .err()
+            .unwrap_or_else(|| panic!("firmware error unexpectedly continued recording"));
+        assert!(error.to_string().contains("host-command watchdog expired"));
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        let diagnostics = status
+            .connection_diagnostics
+            .unwrap_or_else(|| panic!("missing firmware failure diagnostics"));
+        assert_eq!(
+            diagnostics.failure_category,
+            Some(ConnectionFailureCategory::FirmwareProtocolError)
+        );
+        assert_eq!(
+            diagnostics.terminal_error_stage.as_deref(),
+            Some("FIRMWARE_ERROR")
+        );
+        assert_eq!(
+            status
+                .last_summary
+                .as_ref()
+                .map(|summary| summary.stop_reason),
+            Some(StopReason::Fault)
+        );
+    }
+
+    struct FailingCommandWriter {
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingCommandWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "mock PING write failure",
+                ));
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "mock PING flush failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn periodic_ping_diagnostics_distinguish_write_and_flush_failures() {
+        let session = SessionController::default();
+        let mut write_failure = FailingCommandWriter {
+            fail_write: true,
+            fail_flush: false,
+        };
+        let write_error = session
+            .send_capture_command(&mut write_failure, MessageType::Ping, 3, vec![])
+            .err()
+            .unwrap_or_else(|| panic!("expected PING write failure"));
+        match write_error {
+            CaptureCommandError::Serial(error) => {
+                assert!(matches!(error.stage, SerialFailureStage::PingWrite));
+                assert_eq!(error.stage.classification(), "PingWriteError");
+                assert_eq!(error.error.kind(), std::io::ErrorKind::BrokenPipe);
+            }
+            CaptureCommandError::Protocol(detail) => panic!("unexpected protocol error: {detail}"),
+        }
+
+        let mut flush_failure = FailingCommandWriter {
+            fail_write: false,
+            fail_flush: true,
+        };
+        let flush_error = session
+            .send_capture_command(&mut flush_failure, MessageType::Ping, 3, vec![])
+            .err()
+            .unwrap_or_else(|| panic!("expected PING flush failure"));
+        match flush_error {
+            CaptureCommandError::Serial(error) => {
+                assert!(matches!(error.stage, SerialFailureStage::PingFlush));
+                assert_eq!(error.stage.classification(), "PingWriteError");
+                assert_eq!(error.error.kind(), std::io::ErrorKind::ConnectionReset);
+            }
+            CaptureCommandError::Protocol(detail) => panic!("unexpected protocol error: {detail}"),
+        }
+    }
+
+    #[test]
+    fn inactive_sample_stream_becomes_a_bounded_no_data_fault() {
+        let now = Instant::now();
+        let started = now
+            .checked_sub(SAMPLE_STREAM_STALL_TIMEOUT + Duration::from_millis(1))
+            .unwrap_or(now);
+        let failure = sample_stream_stall_failure(&CaptureProgress::default(), started, now)
+            .unwrap_or_else(|| panic!("expected a no-data timeout"));
+        assert!(matches!(failure.stage, SerialFailureStage::NoDataTimeout));
+        assert_eq!(failure.stage.classification(), "NoDataTimeout");
+        assert_eq!(failure.error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(failure
+            .error
+            .to_string()
+            .contains("no synchronized sample batch"));
+    }
+
+    #[test]
+    fn firmware_watchdog_error_is_reported_as_a_protocol_failure() {
+        let detail = firmware_error_detail(Some(7), None);
+        let failure = SerialTerminalFailure::new(
+            SerialFailureStage::FirmwareError,
+            std::io::Error::other(detail),
+        );
+        assert_eq!(failure.stage.classification(), "ProtocolFailure");
+        assert!(failure
+            .error
+            .to_string()
+            .contains("host-command watchdog expired"));
+    }
+
+    #[test]
+    fn adc_timeout_error_retains_firmware_diagnostic_counters() {
+        let payload = [8, 4, 3, 20, 44, 0, 0, 0, 43, 0, 0, 0, 1, 0, 0, 0];
+        let detail = firmware_error_detail(Some(8), Some(&payload));
+        assert!(detail.contains("ADC conversion deadline expired"));
+        assert!(detail.contains("stage=4"));
+        assert!(detail.contains("channel=A3"));
+        assert!(detail.contains("fsp_error=20"));
+        assert!(detail.contains("adc_starts=44"));
+        assert!(detail.contains("adc_completions=43"));
+        assert!(detail.contains("adc_timeouts=1"));
+    }
+
+    #[test]
+    fn active_serial_timeout_allows_windows_write_jitter_without_threatening_keepalive() {
+        assert!(ACTIVE_SERIAL_IO_TIMEOUT > Duration::from_millis(25));
+        assert!(ACTIVE_SERIAL_IO_TIMEOUT < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn transient_windows_ping_timeout_with_current_samples_is_deferred() {
+        let now = Instant::now();
+        let failure = SerialTerminalFailure::new(
+            SerialFailureStage::PingWrite,
+            std::io::Error::from_raw_os_error(121),
+        );
+        assert_eq!(failure.error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(may_defer_ping_failure(
+            &failure,
+            now,
+            now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
+            now.checked_sub(Duration::from_millis(500)),
+            1,
+        ));
+    }
+
+    #[test]
+    fn ping_timeout_is_not_deferred_without_keepalive_margin_or_current_samples() {
+        let now = Instant::now();
+        let failure = SerialTerminalFailure::new(
+            SerialFailureStage::PingFlush,
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "mock CDC busy"),
+        );
+        assert!(!may_defer_ping_failure(
+            &failure,
+            now,
+            now.checked_sub(PING_KEEPALIVE_RETRY_WINDOW).unwrap_or(now),
+            Some(now),
+            1,
+        ));
+        assert!(!may_defer_ping_failure(
+            &failure,
+            now,
+            now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
+            now.checked_sub(PING_RECENT_SAMPLE_GRACE + Duration::from_millis(1)),
+            1,
+        ));
+    }
+
+    #[test]
+    fn non_timeout_or_repeated_ping_failures_remain_terminal() {
+        let now = Instant::now();
+        let broken_pipe = SerialTerminalFailure::new(
+            SerialFailureStage::PingWrite,
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "mock disconnect"),
+        );
+        assert!(!may_defer_ping_failure(
+            &broken_pipe,
+            now,
+            now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
+            Some(now),
+            1,
+        ));
+        let timed_out = SerialTerminalFailure::new(
+            SerialFailureStage::PingWrite,
+            std::io::Error::from_raw_os_error(121),
+        );
+        assert!(!may_defer_ping_failure(
+            &timed_out,
+            now,
+            now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
+            Some(now),
+            MAX_DEFERRED_PING_FAILURES.saturating_add(1),
+        ));
     }
 
     #[test]

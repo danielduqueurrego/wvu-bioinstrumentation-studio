@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_PLOT_TIME_WINDOW_SECONDS,
+  filterStartupDisplayTransient,
+  formatElapsedSeconds,
+  HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS,
   formatLiveDisplayValue,
   layoutEndpointLabels,
   normalizePlotTimeWindow,
@@ -39,6 +42,46 @@ describe('live display helpers', () => {
         parameters: {}, created_at: '', label: 'Load'
       }]
     }, 'load')).toBe('12.35 g');
+  });
+
+  it('formats live x-axis values as elapsed recording seconds, not dates', () => {
+    expect(formatElapsedSeconds(0)).toBe('0 s');
+    expect(formatElapsedSeconds(2.5)).toBe('2.5 s');
+    expect(formatElapsedSeconds(12.4)).toBe('12.4 s');
+  });
+
+  it('removes only a converging first hardware ADC transient from the display', () => {
+    const samples = Array.from({ length: 8 }, (_, sequence) => ({
+      sequence,
+      timestamp_us: sequence * 1_000,
+      values: [sequence === 0 ? 5_061 : [5_371, 5_518, 5_632, 5_672, 5_665, 5_660, 5_662][sequence - 1]]
+    }));
+    const filtered = filterStartupDisplayTransient(samples, [0], 14, true);
+    expect(filtered[0]?.sequence).toBe(1);
+    expect(filtered).toHaveLength(7);
+    expect(filterStartupDisplayTransient(samples, [0], 14, false)).toBe(samples);
+  });
+
+  it('uses the recording origin to suppress the first hardware warm-up interval after decimation', () => {
+    const origin = 1_000_000;
+    const samples = [
+      { sequence: 0, timestamp_us: origin, values: [5_000] },
+      { sequence: 10, timestamp_us: origin + 10_000, values: [5_500] },
+      { sequence: 100, timestamp_us: origin + 100_000, values: [5_600] },
+      { sequence: 200, timestamp_us: origin + 200_000, values: [5_610] }
+    ];
+    const filtered = filterStartupDisplayTransient(samples, [0], 14, true, origin);
+    expect(filtered.map((sample) => sample.sequence)).toEqual([100, 200]);
+    expect(HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS).toBe(0.1);
+  });
+
+  it('does not remove a startup point when it is not an isolated converging transient', () => {
+    const samples = Array.from({ length: 8 }, (_, sequence) => ({
+      sequence,
+      timestamp_us: sequence * 1_000,
+      values: [5_000 + (sequence % 2 ? 100 : -100)]
+    }));
+    expect(filterStartupDisplayTransient(samples, [0], 14, true)).toBe(samples);
   });
 
   it('keeps clustered endpoint labels distinct and inside the plot bounds', () => {

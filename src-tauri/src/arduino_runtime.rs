@@ -110,6 +110,7 @@ pub fn prepare_from_archive(
     {
         return Err(RuntimeError::InvalidBundle);
     }
+    apply_native_usb_core_compatibility_patch(destination, &source_manifest)?;
     let config_file = destination.join("arduino-cli.yaml");
     let normalized_data = data.to_string_lossy().replace('\\', "/");
     let normalized_downloads = destination
@@ -135,6 +136,47 @@ pub fn prepare_from_archive(
         cli_version: source_manifest.arduino_cli,
         core_version: source_manifest.renesas_uno_core,
     })
+}
+
+/// The pinned Arduino Renesas UNO core routes the C-library `_write` hook through
+/// `Serial.write_raw`, but its native-USB `SerialUSB` class omits that member.
+/// The standard UNO R4 WiFi build defines `NO_USB`, so the upstream omission is
+/// normally hidden. WVU's controlled firmware deliberately uses the RA4M1 native
+/// USB CDC path to avoid the proven intermittent RA4M1-to-ESP32 bridge stall.
+///
+/// Apply the smallest possible, version-pinned compatibility shim to the
+/// app-owned extracted runtime. It is idempotent, never modifies an Arduino IDE
+/// installation, and rejects an unexpected upstream core layout rather than
+/// silently patching unknown third-party source.
+fn apply_native_usb_core_compatibility_patch(
+    destination: &Path,
+    manifest: &RuntimeManifest,
+) -> Result<(), RuntimeError> {
+    if manifest.renesas_uno_core != "1.6.0" {
+        return Err(RuntimeError::InvalidBundle);
+    }
+    let header = destination
+        .join("data/packages/arduino/hardware/renesas_uno")
+        .join(&manifest.renesas_uno_core)
+        .join("cores/arduino/usb/SerialUSB.h");
+    let source = fs::read_to_string(&header).map_err(|_| RuntimeError::InvalidBundle)?;
+    if source.contains("size_t write_raw(uint8_t *p, size_t len)") {
+        return Ok(());
+    }
+    let marker = "    virtual size_t write(const uint8_t *p, size_t len) override;";
+    if !source.contains(marker) {
+        return Err(RuntimeError::InvalidBundle);
+    }
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let replacement = format!(
+        "{marker}{newline}    // WVU native-USB compatibility shim for the pinned core's libc _write hook.{newline}    size_t write_raw(uint8_t *p, size_t len) {{ return write(p, len); }}"
+    );
+    fs::write(header, source.replacen(marker, &replacement, 1))?;
+    Ok(())
 }
 
 fn read_manifest(root: &Path) -> Result<RuntimeManifest, RuntimeError> {
@@ -205,6 +247,10 @@ mod tests {
                 "data/packages/arduino/hardware/renesas_uno/1.6.0/.keep",
                 b"".as_slice(),
             ),
+            (
+                "data/packages/arduino/hardware/renesas_uno/1.6.0/cores/arduino/usb/SerialUSB.h",
+                b"class SerialUSB {\n    virtual size_t write(const uint8_t *p, size_t len) override;\n    using Print::write;\n};\n".as_slice(),
+            ),
             ("data/packages/arduino/tools/.keep", b"".as_slice()),
         ] {
             archive
@@ -225,5 +271,10 @@ mod tests {
         assert!(fs::read_to_string(first.config_file)
             .unwrap_or_default()
             .contains("directories:"));
+        let serial_usb = root
+            .join("data/packages/arduino/hardware/renesas_uno/1.6.0/cores/arduino/usb/SerialUSB.h");
+        assert!(fs::read_to_string(serial_usb)
+            .unwrap_or_default()
+            .contains("size_t write_raw(uint8_t *p, size_t len)"));
     }
 }

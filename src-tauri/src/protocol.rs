@@ -396,6 +396,26 @@ mod tests {
     }
 
     #[test]
+    fn twenty_record_eight_channel_batch_stays_within_the_controlled_payload_limit() {
+        let batch = SampleBatch {
+            first_sample_sequence: 10,
+            first_timestamp_us: 100,
+            sample_period_us: 1_000,
+            channel_count: 8,
+            samples: vec![123; 20 * 8],
+            status_flags: 1,
+        };
+        let payload = batch
+            .to_payload()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(payload.len(), 20 + 20 * 8 * 2);
+        assert!(payload.len() <= 1_024);
+        let decoded =
+            SampleBatch::from_payload(&payload).unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(decoded.samples.len(), 20 * 8);
+    }
+
+    #[test]
     fn multichannel_batch_rejects_field_count_mismatch() {
         let mut payload = vec![0; 20];
         payload[16] = 4;

@@ -29,6 +29,9 @@ use std::{
 
 const APPLICATION_PORT_TIMEOUT: Duration = Duration::from_secs(15);
 const APPLICATION_PORT_POLL: Duration = Duration::from_millis(300);
+const NATIVE_USB_PID: u16 = 0x006d;
+const ESP32_BRIDGE_PID: u16 = 0x1002;
+const NATIVE_USB_MANUAL_RESET_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +78,7 @@ pub enum FirmwareErrorCategory {
     AmbiguousBoard,
     UploadFailed,
     ApplicationPortNotFound,
+    ManualResetRequired,
     ProtocolVerificationFailed,
     WrongFirmwareIdentity,
     Canceled,
@@ -464,10 +468,31 @@ impl FirmwareWorkflow {
         board: BoardInfo,
         binary_path: PathBuf,
     ) -> Result<(), FirmwareFailure> {
+        let cli = required_cli(FirmwareJobStage::Uploading)?;
+        require_core(&cli, FirmwareJobStage::Uploading)?;
+        let native_restore = uses_native_usb(&board);
+        let upload_board = if native_restore {
+            self.set_stage(
+                job_id,
+                FirmwareJobStage::WaitingForBootloader,
+                "The WVU firmware is using native USB. Press the board Reset button twice to switch safely to the upload interface.",
+            )?;
+            let bridge = wait_for_esp32_bridge_port(&cli, &self.cancel)?;
+            self.update_job(job_id, |job| {
+                job.bootloader_port = Some(bridge.port.clone())
+            })?;
+            bridge
+        } else {
+            board.clone()
+        };
         self.set_stage(
             job_id,
             FirmwareJobStage::TouchReset,
-            "Arduino CLI will reset the selected UNO R4 WiFi for upload.",
+            if native_restore {
+                "The board upload interface is ready. Arduino CLI will complete the controlled upload."
+            } else {
+                "Arduino CLI will reset the selected UNO R4 WiFi for upload."
+            },
         )?;
         self.set_stage(
             job_id,
@@ -479,10 +504,8 @@ impl FirmwareWorkflow {
             FirmwareJobStage::Uploading,
             "Uploading the WVU reference firmware to the selected UNO R4 WiFi.",
         )?;
-        let cli = required_cli(FirmwareJobStage::Uploading)?;
-        require_core(&cli, FirmwareJobStage::Uploading)?;
         let log = cli
-            .upload_input(&binary_path, &board.port, &self.cancel)
+            .upload_input(&binary_path, &upload_board.port, &self.cancel)
             .map_err(|error| {
                 cli_failure(
                     FirmwareJobStage::Uploading,
@@ -510,9 +533,9 @@ impl FirmwareWorkflow {
         self.set_stage(
             job_id,
             FirmwareJobStage::WaitingForApplicationPort,
-            "Waiting for the UNO R4 WiFi application port to return.",
+            "Waiting for the controlled WVU native-USB application port to return.",
         )?;
-        let final_board = wait_for_application_port(&cli, &board, &self.cancel, |candidate| {
+        let final_board = wait_for_native_reference_port(&cli, &self.cancel, |candidate| {
             self.update_job(job_id, |job| {
                 if !candidate.port.eq_ignore_ascii_case(&board.port) {
                     job.final_port = Some(candidate.port.clone());
@@ -778,9 +801,8 @@ fn require_core(cli: &ArduinoCli, stage: FirmwareJobStage) -> Result<(), Firmwar
     })
 }
 
-fn wait_for_application_port<F>(
+fn wait_for_native_reference_port<F>(
     cli: &ArduinoCli,
-    original: &BoardInfo,
     cancel: &AtomicBool,
     mut observe: F,
 ) -> Result<BoardInfo, FirmwareFailure>
@@ -798,33 +820,27 @@ where
             ));
         }
         if let Some(board) =
-            select_returned_application_port(original, cli.boards().unwrap_or_default())?
+            select_returned_native_reference_port(cli.boards().unwrap_or_default())?
         {
             observe(&board)?;
             return Ok(board);
         }
         thread::sleep(APPLICATION_PORT_POLL);
     }
-    Err(FirmwareFailure::new(FirmwareErrorCategory::ApplicationPortNotFound, FirmwareJobStage::WaitingForApplicationPort, "Arduino CLI reported upload success, but the selected UNO R4 WiFi application port did not return in time.", original.port.clone()))
+    Err(FirmwareFailure::new(FirmwareErrorCategory::ApplicationPortNotFound, FirmwareJobStage::WaitingForApplicationPort, "Arduino CLI reported upload success, but the controlled native-USB application port did not return in time.", "expected one Arduino UNO R4 WiFi port with PID 0x006D"))
 }
 
-/// Matches a returning application port without assuming the COM number is
-/// stable. A serial number is authoritative; without one, the safer fallback
-/// is the original port rather than picking a different unknown device.
-fn select_returned_application_port(
-    original: &BoardInfo,
+/// The controlled reference firmware deliberately uses RA4M1 native USB CDC.
+/// Its USB serial number differs from the ESP32 bridge's serial number, so an
+/// upload transition cannot use the legacy bridge serial as an identity key.
+/// Requiring exactly one native-USB UNO port after an already-completed upload
+/// is both deterministic and safer than silently selecting an arbitrary board.
+fn select_returned_native_reference_port(
     boards: Vec<BoardInfo>,
 ) -> Result<Option<BoardInfo>, FirmwareFailure> {
     let candidates: Vec<_> = boards
         .into_iter()
-        .filter(|candidate| {
-            candidate.fqbn == UNO_R4_WIFI_FQBN
-                && match (&original.serial_number, &candidate.serial_number) {
-                    (Some(expected), Some(actual)) => expected == actual,
-                    (Some(_), None) => false,
-                    (None, _) => candidate.port.eq_ignore_ascii_case(&original.port),
-                }
-        })
+        .filter(|candidate| candidate.fqbn == UNO_R4_WIFI_FQBN && uses_native_usb(candidate))
         .collect();
     match candidates.as_slice() {
         [] => Ok(None),
@@ -832,10 +848,62 @@ fn select_returned_application_port(
         _ => Err(FirmwareFailure::new(
             FirmwareErrorCategory::AmbiguousBoard,
             FirmwareJobStage::WaitingForApplicationPort,
-            "Multiple UNO R4 WiFi application ports match the returning board.",
-            "ambiguous board serial/port candidates",
+            "Multiple native-USB UNO R4 WiFi ports are present after the upload.",
+            "ambiguous native USB application candidates",
         )),
     }
+}
+
+fn uses_native_usb(board: &BoardInfo) -> bool {
+    board.usb_pid == Some(NATIVE_USB_PID)
+}
+
+/// A native-USB sketch has switched the physical USB mux away from the ESP32
+/// bridge, and this pinned core cannot perform a 1200-bps touch through that
+/// native CDC interface. The user-approved double reset returns the mux to the
+/// ordinary bridge. We only enumerate while waiting; no port is opened, reset,
+/// or otherwise touched until the normal Arduino CLI upload begins.
+fn wait_for_esp32_bridge_port(
+    cli: &ArduinoCli,
+    cancel: &AtomicBool,
+) -> Result<BoardInfo, FirmwareFailure> {
+    let started = Instant::now();
+    while started.elapsed() < NATIVE_USB_MANUAL_RESET_TIMEOUT {
+        if cancel.load(Ordering::Acquire) {
+            return Err(FirmwareFailure::new(
+                FirmwareErrorCategory::Canceled,
+                FirmwareJobStage::Canceled,
+                "Firmware restore canceled while waiting for the board reset.",
+                "cancel requested",
+            ));
+        }
+        let candidates: Vec<_> = cli
+            .boards()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|candidate| {
+                candidate.fqbn == UNO_R4_WIFI_FQBN && candidate.usb_pid == Some(ESP32_BRIDGE_PID)
+            })
+            .collect();
+        match candidates.as_slice() {
+            [board] => return Ok(board.clone()),
+            [] => thread::sleep(APPLICATION_PORT_POLL),
+            _ => {
+                return Err(FirmwareFailure::new(
+                    FirmwareErrorCategory::AmbiguousBoard,
+                    FirmwareJobStage::WaitingForBootloader,
+                    "More than one ESP32 bridge upload port is available.",
+                    "disconnect extra UNO R4 WiFi boards, then try Restore WVU Firmware again",
+                ));
+            }
+        }
+    }
+    Err(FirmwareFailure::new(
+        FirmwareErrorCategory::ManualResetRequired,
+        FirmwareJobStage::WaitingForBootloader,
+        "The board did not switch to its upload interface in time. While Restore WVU Firmware is open, press the board Reset button twice, then try again.",
+        "native USB reset window expired while waiting for one PID 0x1002 UNO R4 WiFi port",
+    ))
 }
 
 fn verification_from_handshake(
@@ -946,6 +1014,7 @@ fn failure_copy(category: FirmwareErrorCategory) -> (&'static str, &'static str)
         FirmwareErrorCategory::AmbiguousBoard => ("Board identity is ambiguous", "Disconnect other matching boards and retry with the board serial shown."),
         FirmwareErrorCategory::UploadFailed => ("Upload failed", "Review Arduino CLI output and ensure no other program owns the selected COM port."),
         FirmwareErrorCategory::ApplicationPortNotFound => ("Application port did not return", "Refresh boards after upload. Do not assume the old COM number."),
+        FirmwareErrorCategory::ManualResetRequired => ("Board reset needed", "While Restore WVU Firmware is open, press the board Reset button twice to switch safely to the upload interface."),
         FirmwareErrorCategory::ProtocolVerificationFailed => ("Firmware verification failed", "Use Restore WVU Firmware before using Acquisition."),
         FirmwareErrorCategory::WrongFirmwareIdentity => ("Firmware update required", "Use Restore WVU Firmware before using Acquisition."),
         FirmwareErrorCategory::Canceled => ("Operation canceled", "Reconnect the board if needed, then restore the WVU firmware again."),
@@ -1002,6 +1071,8 @@ mod tests {
             name: "Arduino UNO R4 WiFi".into(),
             fqbn: UNO_R4_WIFI_FQBN.into(),
             serial_number: serial.map(str::to_owned),
+            usb_vid: Some(0x2341),
+            usb_pid: Some(0x1002),
         }
     }
 
@@ -1034,6 +1105,21 @@ mod tests {
             bootloader_observed: false,
             failure_category: None,
             recommended_action: "ok".into(),
+            terminal_error_classification: None,
+            terminal_error_stage: None,
+            terminal_error_kind: None,
+            terminal_error_raw_os_error: None,
+            terminal_error_detail: None,
+            terminal_error_elapsed_ms: None,
+            last_valid_packet_utc: None,
+            last_valid_sample_utc: None,
+            last_successful_ping_utc: None,
+            last_pong_or_status_utc: None,
+            selected_port_present_after_error: None,
+            same_vid_pid_present_after_error: None,
+            same_serial_present_after_error: None,
+            uno_r4_present_after_error: None,
+            port_enumeration_error: None,
         };
         assert!(
             verification_from_handshake(
@@ -1056,27 +1142,25 @@ mod tests {
     }
 
     #[test]
-    fn returning_port_follows_board_serial_and_ignores_unrelated_ports() {
-        let original = board("COM12", Some("UNO-SERIAL"));
-        let returning = board("COM19", Some("UNO-SERIAL"));
-        let unrelated = board("COM3", Some("OTHER-UNO"));
-        let selected = select_returned_application_port(&original, vec![unrelated, returning])
+    fn native_reference_port_requires_the_ra4m1_native_usb_pid() {
+        let mut native = board("COM19", Some("RA4M1-SERIAL"));
+        native.usb_pid = Some(NATIVE_USB_PID);
+        let bridge = board("COM3", Some("ESP32-BRIDGE"));
+        let selected = select_returned_native_reference_port(vec![bridge, native])
             .unwrap_or_else(|error| panic!("{error:?}"));
         assert_eq!(selected.map(|item| item.port), Some("COM19".into()));
     }
 
     #[test]
-    fn returning_port_never_guesses_a_changed_port_without_identity() {
-        let original = board("COM12", None);
-        let changed_unknown = board("COM19", Some("UNKNOWN"));
-        assert!(
-            select_returned_application_port(&original, vec![changed_unknown])
-                .unwrap_or_else(|error| panic!("{error:?}"))
-                .is_none()
-        );
-        let same_port = board("COM12", None);
+    fn native_reference_port_does_not_select_the_esp32_bridge() {
+        let bridge = board("COM12", Some("ESP32-BRIDGE"));
+        assert!(select_returned_native_reference_port(vec![bridge])
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .is_none());
+        let mut native = board("COM12", None);
+        native.usb_pid = Some(NATIVE_USB_PID);
         assert_eq!(
-            select_returned_application_port(&original, vec![same_port])
+            select_returned_native_reference_port(vec![native])
                 .unwrap_or_else(|error| panic!("{error:?}"))
                 .map(|item| item.port),
             Some("COM12".into())
@@ -1084,17 +1168,14 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_returning_identity_is_an_actionable_error() {
-        let original = board("COM12", Some("UNO-SERIAL"));
-        let error = select_returned_application_port(
-            &original,
-            vec![
-                board("COM13", Some("UNO-SERIAL")),
-                board("COM14", Some("UNO-SERIAL")),
-            ],
-        )
-        .err()
-        .unwrap_or_else(|| panic!("expected an ambiguous-board failure"));
+    fn multiple_native_reference_ports_are_an_actionable_error() {
+        let mut first = board("COM13", Some("RA4M1-A"));
+        first.usb_pid = Some(NATIVE_USB_PID);
+        let mut second = board("COM14", Some("RA4M1-B"));
+        second.usb_pid = Some(NATIVE_USB_PID);
+        let error = select_returned_native_reference_port(vec![first, second])
+            .err()
+            .unwrap_or_else(|| panic!("expected an ambiguous-board failure"));
         assert_eq!(error.category, FirmwareErrorCategory::AmbiguousBoard);
     }
 

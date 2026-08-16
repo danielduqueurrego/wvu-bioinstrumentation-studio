@@ -459,6 +459,14 @@ mod tests {
     }
 
     #[test]
+    fn mpxv_kpa_and_mmhg_match_the_documented_transfer_equation() {
+        let kpa = mpxv_kpa(2.5, 5.0).unwrap_or_default();
+        assert!((kpa - ((2.5 / 5.0 - 0.04) / 0.009)).abs() < 1e-12);
+        assert!((mpxv_mmhg(2.5, 5.0).unwrap_or_default() - kpa * MMHG_PER_KPA).abs() < 1e-12);
+        assert!((mpxv_mmhg(2.5, 5.0).unwrap_or_default() - 383.364).abs() < 1e-3);
+    }
+
+    #[test]
     fn linear_fit_handles_exact_lines_and_degenerate_input() {
         let fit = fit_linear(&[
             CalibrationPoint {

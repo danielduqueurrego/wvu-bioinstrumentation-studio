@@ -45,4 +45,20 @@ mod tests {
             source_hash(controlled_reference_source())
         );
     }
+
+    #[test]
+    fn controlled_reference_preserves_the_protocol_and_safe_output_contract() {
+        let source = std::str::from_utf8(controlled_reference_source())
+            .unwrap_or_else(|error| panic!("reference sketch is not UTF-8: {error}"));
+
+        assert!(source.contains("PROTOCOL_MAJOR = 0, PROTOCOL_MINOR = 3"));
+        assert!(source.contains("FIRMWARE_BUILD = 0x00010003UL"));
+        assert!(source.contains("D4_GREEN = 4, D5_RED = 5, D6_IR = 6"));
+        assert!(source.contains("void forceSafeOutputs()"));
+        assert!(source.contains(
+            "else if(frame[6]==PING){sendHello();sendCapabilities();sendFrame(PONG,nullptr,0);}"
+        ));
+        assert!(!source.contains("DIAGNOSTIC_TRANSPORT_ONLY"));
+        assert!(!source.contains("FspTimer.h"));
+    }
 }

@@ -32,6 +32,13 @@ describe('course calibration display helpers', () => {
     expect(mpxvMmhg(0.2, 5)).toBeCloseTo(0);
   });
 
+  it('matches the MPXV transfer equation in both pressure units', () => {
+    const kpa = mpxvKpa(2.5, 5);
+    expect(kpa).toBeCloseTo((2.5 / 5 - 0.04) / 0.009, 12);
+    expect(mpxvMmhg(2.5, 5)).toBeCloseTo(kpa * 7.5006, 12);
+    expect(mpxvMmhg(2.5, 5)).toBeCloseTo(383.364, 3);
+  });
+
   it('uses the profile-declared MPXV capability for the EMG pressure channel', () => {
     expect(
       supportedDisplayUnits('course_emg_force', 'pressure', false, ['counts_volts', 'mpxv_pressure'])
