@@ -1,6 +1,7 @@
 [package]
 name = "wvu_bioinstrumentation_studio"
 version = "1.0.0"
+default-run = "wvu_bioinstrumentation_studio"
 license = "Apache-2.0"
 description = "Firmware, acquisition, and calibration for BMEG 420L"
 authors = ["WVU BMEG 420L"]

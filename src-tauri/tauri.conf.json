@@ -3,6 +3,7 @@
   "productName": "WVU Bioinstrumentation Studio",
   "version": "1.0.0",
   "identifier": "edu.wvu.bioinstrumentationstudio",
+  "mainBinaryName": "wvu_bioinstrumentation_studio",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",

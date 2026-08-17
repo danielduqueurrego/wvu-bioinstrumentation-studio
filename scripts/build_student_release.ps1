@@ -24,6 +24,13 @@ if ($dirty.Count -gt 0) {
   Write-Warning 'Building from a dirty working tree by explicit request.'
 }
 
+$diagnosticBinRoot = Join-Path $tauriRoot 'src\bin'
+$diagnosticBins = @(Get-ChildItem -LiteralPath $diagnosticBinRoot -Filter '*.rs' -File -ErrorAction SilentlyContinue)
+if ($diagnosticBins.Count -gt 0) {
+  $names = ($diagnosticBins | ForEach-Object Name) -join ', '
+  throw "Diagnostic Rust binaries are present under src-tauri/src/bin ($names). Move them outside the release worktree before packaging; they must never be eligible as the application binary."
+}
+
 foreach ($required in @(
   $runtimeArchive,
   $manifestPath,
@@ -45,6 +52,9 @@ if ([string]::IsNullOrWhiteSpace($tauriConfig.build.frontendDist) -or $tauriConf
 }
 if ([string]::IsNullOrWhiteSpace($tauriConfig.build.beforeBuildCommand)) {
   throw 'The production Tauri configuration must define a frontend build command.'
+}
+if ($tauriConfig.mainBinaryName -ne 'wvu_bioinstrumentation_studio') {
+  throw 'The production Tauri configuration must explicitly select wvu_bioinstrumentation_studio as the application binary.'
 }
 $frontendDistPath = [System.IO.Path]::GetFullPath((Join-Path $tauriRoot $tauriConfig.build.frontendDist))
 

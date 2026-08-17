@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 
 const configPath = resolve(process.cwd(), 'src-tauri', 'tauri.conf.json');
 const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
+  mainBinaryName?: string;
   build: { devUrl?: string; frontendDist?: string; beforeBuildCommand?: string };
 };
 
@@ -17,5 +18,9 @@ describe('production Tauri frontend configuration', () => {
     const frontendDist = resolve(dirname(configPath), config.build.frontendDist!);
     expect(existsSync(frontendDist)).toBe(true);
     expect(existsSync(resolve(frontendDist, 'index.html'))).toBe(true);
+  });
+
+  it('declares the Tauri application binary explicitly', () => {
+    expect(config.mainBinaryName).toBe('wvu_bioinstrumentation_studio');
   });
 });
