@@ -22,25 +22,25 @@ The distributed application bundles the Arduino command-line runtime and UNO R4 
 
 ### Board and firmware
 
-![Board selection and firmware controls](docs/images/board-and-firmware.png)
+![Board selection and firmware controls](https://raw.githubusercontent.com/danielduqueurrego/wvu-bioinstrumentation-studio/master/docs/images/board-and-firmware.png)
 
 Select the Arduino UNO R4 WiFi, verify the WVU firmware, or restore it with the bundled offline Arduino runtime when required.
 
 ### Project and lab selection
 
-![Project folder and course-lab selection](docs/images/project-and-lab-selection.png)
+![Project folder and course-lab selection](https://raw.githubusercontent.com/danielduqueurrego/wvu-bioinstrumentation-studio/master/docs/images/project-and-lab-selection.png)
 
 Choose the Project folder and assigned course lab. Lab definitions apply the required channels, sampling settings, ADC resolution, plot defaults, and supported display or calibration options.
 
 ### Session setup and calibration
 
-![Session setup, duration, and calibration controls](docs/images/session-setup-and-calibration.png)
+![Session setup, duration, and calibration controls](https://raw.githubusercontent.com/danielduqueurrego/wvu-bioinstrumentation-studio/master/docs/images/session-setup-and-calibration.png)
 
 Choose the data source and relative Output folder, set the recording duration, and select supported engineering-unit or calibration options. The effective recording path remains inside the selected Project folder.
 
 ### Live visualization
 
-![Live synchronized plot with time window and newest-value label](docs/images/live-plot.png)
+![Live synchronized plot with time window and newest-value label](https://raw.githubusercontent.com/danielduqueurrego/wvu-bioinstrumentation-studio/master/docs/images/live-plot.png)
 
 Live plots are display-only: changing plot groups, trace visibility, engineering units, or the synchronized time window does not change the raw acquisition. Multi-signal plots show a color-coded legend, and each visible trace displays its newest rounded value. The Plot time window applies to all live plots.
 
