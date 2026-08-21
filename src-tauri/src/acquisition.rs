@@ -76,7 +76,9 @@ impl FirmwareCapabilities {
             return None;
         }
         let supported_rates_hz = payload[6..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|bytes| u32::from(u16::from_le_bytes([bytes[0], bytes[1]])))
             .collect();
         Some(Self {
