@@ -1,0 +1,4 @@
+# The reference sketch is embedded verbatim by the desktop application and
+# verified against its release-manifest SHA-256. Keep its checkout bytes stable
+# on Windows as well as Unix hosts.
+firmware/reference_unor4wifi/reference_unor4wifi.ino text eol=lf
