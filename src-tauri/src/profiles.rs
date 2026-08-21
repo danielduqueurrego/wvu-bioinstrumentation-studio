@@ -18,6 +18,8 @@ pub const UNO_R4_WIFI_FQBN: &str = "arduino:renesas_uno:unor4wifi";
 pub const SUPPORTED_ANALOG_PINS: [&str; 6] = ["A0", "A1", "A2", "A3", "A4", "A5"];
 pub const SUPPORTED_DIGITAL_OUTPUT_PINS: [&str; 3] = ["D4", "D5", "D6"];
 pub const RECOMMENDED_SAMPLE_RATES_HZ: [u32; 5] = [100, 200, 250, 500, 1_000];
+const MAX_CATALOG_LOG_BYTES: u64 = 512 * 1024;
+const RETAINED_CATALOG_LOG_FILES: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -347,6 +349,8 @@ pub enum ProfileError {
     Validation(String),
     #[error("student mode may not perform this profile authoring action")]
     StudentMode,
+    #[error("the local lab catalog is unavailable; factory course labs remain available, but instructor changes are disabled until the catalog is repaired or reset: {0}")]
+    CatalogUnavailable(String),
 }
 
 impl AcquisitionProfile {
@@ -671,8 +675,11 @@ pub struct ProfileStore {
     root: PathBuf,
     runtime: Arc<Mutex<ProfileRuntime>>,
 }
+#[derive(Clone)]
 struct ProfileRuntime {
     mode: ProfileMode,
+    catalog_writable: bool,
+    catalog_load_error: Option<String>,
     /// Factory profiles are compiled into the application and never written to
     /// the local catalog. `profiles` holds them alongside local profiles only
     /// to make historical lookup straightforward; `factory_keys` prevents a
@@ -712,14 +719,17 @@ impl Default for ProfileStore {
             .unwrap_or_else(std::env::temp_dir)
             .join("WVU Bioinstrumentation Studio")
             .join("profiles");
-        Self::with_root(root).unwrap_or_else(|_| Self::factory_only(std::env::temp_dir()))
+        Self::with_root(root.clone())
+            .unwrap_or_else(|error| Self::factory_only(root, error.to_string()))
     }
 }
 impl ProfileStore {
     /// Last-resort read-only fallback for an unavailable local catalog. The
     /// class defaults remain available even if a user-data path is malformed
-    /// or temporarily inaccessible; this fallback never writes a catalog.
-    fn factory_only(root: PathBuf) -> Self {
+    /// or temporarily inaccessible. Crucially, this retains the intended
+    /// catalog location and rejects instructor writes rather than silently
+    /// redirecting them into a temporary directory.
+    fn factory_only(root: PathBuf, load_error: String) -> Self {
         let mut profiles = BTreeMap::new();
         let mut factory_keys = BTreeSet::new();
         for profile in built_in_profiles().unwrap_or_default() {
@@ -735,6 +745,8 @@ impl ProfileStore {
             root,
             runtime: Arc::new(Mutex::new(ProfileRuntime {
                 mode: ProfileMode::Student,
+                catalog_writable: false,
+                catalog_load_error: Some(load_error),
                 factory_keys,
                 profiles,
                 retired: BTreeSet::new(),
@@ -807,6 +819,8 @@ impl ProfileStore {
             root,
             runtime: Arc::new(Mutex::new(ProfileRuntime {
                 mode: ProfileMode::Student,
+                catalog_writable: true,
+                catalog_load_error: None,
                 factory_keys,
                 profiles,
                 retired,
@@ -830,8 +844,11 @@ impl ProfileStore {
         }
         let mut runtime = self.lock()?;
         runtime.mode = mode.clone();
+        let catalog_writable = runtime.catalog_writable;
         drop(runtime);
-        self.append_mode_log(&mode)?;
+        if catalog_writable {
+            self.append_mode_log_best_effort(&mode);
+        }
         Ok(mode)
     }
     pub fn list(&self) -> Result<Vec<AcquisitionProfile>, ProfileError> {
@@ -967,6 +984,7 @@ impl ProfileStore {
         request_id: String,
     ) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
+        self.require_catalog_writable()?;
         if !valid_operation_id(&request_id) {
             return Err(ProfileError::Validation(
                 "save request ID is invalid".into(),
@@ -978,11 +996,12 @@ impl ProfileStore {
                 ProfileError::Validation("saved lab revision is unavailable".into())
             });
         }
+        let mut next = runtime.clone();
         let requested_id = edited.profile_id.clone();
         let audit_base_version = base_version.clone();
         let allocated_version = match base_version {
             Some(base) => {
-                if runtime.active_versions.get(&requested_id) != Some(&base) {
+                if next.active_versions.get(&requested_id) != Some(&base) {
                     return Err(ProfileError::Validation(
                         "this lab changed since the editor opened; reload the latest version before saving"
                             .into(),
@@ -991,7 +1010,7 @@ impl ProfileStore {
                 next_patch_version(&base)?
             }
             None => {
-                if runtime.profiles.keys().any(|(id, _)| id == &requested_id) {
+                if next.profiles.keys().any(|(id, _)| id == &requested_id) {
                     return Err(ProfileError::Validation(
                         "lab ID already exists; use Edit to create a new revision".into(),
                     ));
@@ -1000,7 +1019,7 @@ impl ProfileStore {
             }
         };
         let key = (requested_id.clone(), allocated_version.clone());
-        if runtime.profiles.contains_key(&key) {
+        if next.profiles.contains_key(&key) {
             return Err(ProfileError::Validation(
                 "the requested lab revision already exists; reload before saving".into(),
             ));
@@ -1017,59 +1036,62 @@ impl ProfileStore {
         finalized.status = ProfileStatus::Locked;
         finalized.refresh_hash()?;
         finalized.validate()?;
-        runtime.profiles.insert(pkey(&finalized), finalized.clone());
-        runtime.active_versions.insert(
+        next.profiles.insert(pkey(&finalized), finalized.clone());
+        next.active_versions.insert(
             finalized.profile_id.clone(),
             finalized.profile_version.clone(),
         );
-        runtime.retired.remove(&pkey(&finalized));
-        runtime.completed_save_requests.insert(
+        next.retired.remove(&pkey(&finalized));
+        next.completed_save_requests.insert(
             request_id.clone(),
             (
                 finalized.profile_id.clone(),
                 finalized.profile_version.clone(),
             ),
         );
-        let persisted = self.persisted_state(&runtime);
-        drop(runtime);
+        let persisted = self.persisted_state(&next);
         self.persist_state(&persisted)?;
-        self.append_lab_write_log(
+        *runtime = next;
+        drop(runtime);
+        self.append_lab_write_log_best_effort(
             "save_new_version",
             &finalized.profile_id,
             audit_base_version.as_deref(),
             Some(&finalized.profile_version),
             &request_id,
-        )?;
+        );
         Ok(finalized)
     }
     pub fn retire(&self, profile_id: &str, profile_version: &str) -> Result<(), ProfileError> {
         self.require_instructor()?;
+        self.require_catalog_writable()?;
         let mut runtime = self.lock()?;
+        let mut next = runtime.clone();
         let key = (profile_id.into(), profile_version.into());
-        if runtime.factory_keys.contains(&key) {
+        if next.factory_keys.contains(&key) {
             return Err(ProfileError::Validation(
                 "shipped course defaults cannot be retired; use Restore course default to make one active"
                     .into(),
             ));
         }
-        runtime
-            .profiles
+        next.profiles
             .get(&key)
             .ok_or_else(|| ProfileError::Validation("profile not found".into()))?;
-        runtime.retired.insert(key);
-        if runtime.active_versions.get(profile_id) == Some(&profile_version.to_string()) {
-            runtime.active_versions.remove(profile_id);
+        next.retired.insert(key);
+        if next.active_versions.get(profile_id) == Some(&profile_version.to_string()) {
+            next.active_versions.remove(profile_id);
         }
-        let persisted = self.persisted_state(&runtime);
-        drop(runtime);
+        let persisted = self.persisted_state(&next);
         self.persist_state(&persisted)?;
-        self.append_lab_write_log(
+        *runtime = next;
+        drop(runtime);
+        self.append_lab_write_log_best_effort(
             "retire",
             profile_id,
             Some(profile_version),
             None,
             "explicit",
-        )?;
+        );
         Ok(())
     }
     pub fn restore_retired(
@@ -1078,37 +1100,39 @@ impl ProfileStore {
         profile_version: &str,
     ) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
+        self.require_catalog_writable()?;
         let key = (profile_id.to_string(), profile_version.to_string());
         let mut runtime = self.lock()?;
-        if runtime.factory_keys.contains(&key) {
+        let mut next = runtime.clone();
+        if next.factory_keys.contains(&key) {
             return Err(ProfileError::Validation(
                 "factory definitions are always available and do not need restoring".into(),
             ));
         }
-        let profile = runtime
+        let profile = next
             .profiles
             .get(&key)
             .filter(|profile| profile.status == ProfileStatus::Locked)
             .cloned()
             .ok_or_else(|| ProfileError::Validation("retired lab revision not found".into()))?;
-        if !runtime.retired.remove(&key) {
+        if !next.retired.remove(&key) {
             return Err(ProfileError::Validation(
                 "lab revision is not retired".into(),
             ));
         }
-        runtime
-            .active_versions
+        next.active_versions
             .insert(profile.profile_id.clone(), profile.profile_version.clone());
-        let persisted = self.persisted_state(&runtime);
-        drop(runtime);
+        let persisted = self.persisted_state(&next);
         self.persist_state(&persisted)?;
-        self.append_lab_write_log(
+        *runtime = next;
+        drop(runtime);
+        self.append_lab_write_log_best_effort(
             "restore_retired",
             profile_id,
             Some(profile_version),
             Some(profile_version),
             "explicit",
-        )?;
+        );
         Ok(profile)
     }
     pub fn restore_course_default(
@@ -1116,6 +1140,7 @@ impl ProfileStore {
         profile_id: &str,
     ) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
+        self.require_catalog_writable()?;
         let restored = built_in_profiles()?
             .into_iter()
             .find(|profile| profile.profile_id == profile_id)
@@ -1126,20 +1151,22 @@ impl ProfileStore {
         if runtime.active_versions.get(profile_id) == Some(&restored.profile_version) {
             return Ok(restored);
         }
-        runtime.active_versions.insert(
+        let mut next = runtime.clone();
+        next.active_versions.insert(
             restored.profile_id.clone(),
             restored.profile_version.clone(),
         );
-        let persisted = self.persisted_state(&runtime);
-        drop(runtime);
+        let persisted = self.persisted_state(&next);
         self.persist_state(&persisted)?;
-        self.append_lab_write_log(
+        *runtime = next;
+        drop(runtime);
+        self.append_lab_write_log_best_effort(
             "restore_factory_default",
             profile_id,
             None,
             Some(&restored.profile_version),
             "explicit",
-        )?;
+        );
         Ok(restored)
     }
     /// Explicitly activates one previously saved local revision. Reading or
@@ -1150,6 +1177,7 @@ impl ProfileStore {
         profile_version: &str,
     ) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
+        self.require_catalog_writable()?;
         let key = (profile_id.to_string(), profile_version.to_string());
         let mut runtime = self.lock()?;
         if runtime.factory_keys.contains(&key) {
@@ -1170,19 +1198,20 @@ impl ProfileStore {
         if runtime.active_versions.get(profile_id) == Some(&profile_version.to_string()) {
             return Ok(profile);
         }
-        runtime
-            .active_versions
+        let mut next = runtime.clone();
+        next.active_versions
             .insert(profile_id.to_string(), profile_version.to_string());
-        let persisted = self.persisted_state(&runtime);
-        drop(runtime);
+        let persisted = self.persisted_state(&next);
         self.persist_state(&persisted)?;
-        self.append_lab_write_log(
+        *runtime = next;
+        drop(runtime);
+        self.append_lab_write_log_best_effort(
             "set_active_version",
             profile_id,
             None,
             Some(profile_version),
             "explicit",
-        )?;
+        );
         Ok(profile)
     }
     /// Removes only local instructor/imported overrides. Factory definitions
@@ -1191,22 +1220,53 @@ impl ProfileStore {
     pub fn reset_local_customizations(&self) -> Result<(), ProfileError> {
         self.require_instructor()?;
         let mut runtime = self.lock()?;
-        let factory_keys = runtime.factory_keys.clone();
-        runtime.profiles.retain(|key, _| factory_keys.contains(key));
-        runtime.retired.clear();
-        runtime.active_versions = runtime
+        let mut next = runtime.clone();
+        let factory_keys = next.factory_keys.clone();
+        next.profiles.retain(|key, _| factory_keys.contains(key));
+        next.retired.clear();
+        next.active_versions = next
             .profiles
             .values()
             .map(|profile| (profile.profile_id.clone(), profile.profile_version.clone()))
             .collect();
-        runtime.completed_save_requests.clear();
-        let persisted = self.persisted_state(&runtime);
+        next.completed_save_requests.clear();
+        next.catalog_writable = true;
+        next.catalog_load_error = None;
+        let persisted = self.persisted_state(&next);
+        let state_path = self.root.join("lab_state.json");
+        let quarantined = if !runtime.catalog_writable && state_path.exists() {
+            let path = self.root.join(format!(
+                "lab_state.corrupt-{}.json",
+                Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+            ));
+            fs::rename(&state_path, &path).map_err(|source| ProfileError::Write {
+                path: path.display().to_string(),
+                source,
+            })?;
+            Some(path)
+        } else {
+            None
+        };
+        if let Err(error) = self.persist_state(&persisted) {
+            if let Some(path) = &quarantined {
+                let _ = fs::rename(path, &state_path);
+            }
+            return Err(error);
+        }
+        *runtime = next;
         drop(runtime);
-        self.persist_state(&persisted)?;
-        self.append_lab_write_log("reset_local_customizations", "all", None, None, "explicit")
+        self.append_lab_write_log_best_effort(
+            "reset_local_customizations",
+            "all",
+            None,
+            None,
+            "explicit",
+        );
+        Ok(())
     }
     pub fn import_profile(&self, path: &Path) -> Result<AcquisitionProfile, ProfileError> {
         self.require_instructor()?;
+        self.require_catalog_writable()?;
         let mut profile = load_profile(path)?;
         if profile.status != ProfileStatus::Locked {
             return Err(ProfileError::Validation(
@@ -1231,20 +1291,21 @@ impl ProfileStore {
         profile.integrity.canonical_hash.clear();
         profile.refresh_hash()?;
         profile.validate()?;
-        runtime.profiles.insert(key, profile.clone());
-        runtime
-            .active_versions
+        let mut next = runtime.clone();
+        next.profiles.insert(key, profile.clone());
+        next.active_versions
             .insert(profile.profile_id.clone(), profile.profile_version.clone());
-        let persisted = self.persisted_state(&runtime);
-        drop(runtime);
+        let persisted = self.persisted_state(&next);
         self.persist_state(&persisted)?;
-        self.append_lab_write_log(
+        *runtime = next;
+        drop(runtime);
+        self.append_lab_write_log_best_effort(
             "import",
             &profile.profile_id,
             None,
             Some(&profile.profile_version),
             "explicit",
-        )?;
+        );
         Ok(profile)
     }
     pub fn export_profile(
@@ -1280,6 +1341,19 @@ impl ProfileStore {
             Ok(())
         } else {
             Err(ProfileError::StudentMode)
+        }
+    }
+    fn require_catalog_writable(&self) -> Result<(), ProfileError> {
+        let runtime = self.lock()?;
+        if runtime.catalog_writable {
+            Ok(())
+        } else {
+            Err(ProfileError::CatalogUnavailable(
+                runtime
+                    .catalog_load_error
+                    .clone()
+                    .unwrap_or_else(|| "unknown catalog initialization failure".into()),
+            ))
         }
     }
     fn persisted_state(&self, runtime: &ProfileRuntime) -> PersistedLabState {
@@ -1322,26 +1396,76 @@ impl ProfileStore {
                 source,
             }
         })?;
-        fs::rename(&temporary, &path).map_err(|source| ProfileError::Write {
-            path: path.display().to_string(),
-            source,
-        })
-    }
-    fn append_mode_log(&self, mode: &ProfileMode) -> Result<(), ProfileError> {
-        fs::create_dir_all(&self.root).map_err(|source| ProfileError::Write {
-            path: self.root.display().to_string(),
-            source,
-        })?;
-        let path = self.root.join("mode_changes.log");
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|source| ProfileError::Write {
-                path: path.display().to_string(),
+        let backup = self.root.join("lab_state.json.backup");
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|source| ProfileError::Write {
+                path: backup.display().to_string(),
                 source,
             })?;
+        }
+        let had_previous = path.exists();
+        if had_previous {
+            fs::rename(&path, &backup).map_err(|source| ProfileError::Write {
+                path: backup.display().to_string(),
+                source,
+            })?;
+        }
+        if let Err(source) = fs::rename(&temporary, &path) {
+            if had_previous {
+                let _ = fs::rename(&backup, &path);
+            }
+            return Err(ProfileError::Write {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+        if had_previous {
+            if let Err(error) = fs::remove_file(&backup) {
+                // The new catalog is already installed at this commit point.
+                // Cleanup failure must not make the caller retain the old
+                // in-memory state while disk contains the new one.
+                crate::app_log::record(
+                    "WARN",
+                    &format!(
+                        "LAB_CATALOG_BACKUP_CLEANUP_FAILED path={} detail={error}",
+                        backup.display()
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+    fn append_mode_log_best_effort(&self, mode: &ProfileMode) {
+        if let Err(error) = self.append_mode_log(mode) {
+            crate::app_log::record(
+                "WARN",
+                &format!("LAB_CATALOG_AUDIT_LOG_FAILED operation=set_mode detail={error}"),
+            );
+        }
+    }
+    fn append_lab_write_log_best_effort(
+        &self,
+        operation: &str,
+        lab_id: &str,
+        base_version: Option<&str>,
+        new_version: Option<&str>,
+        request_id: &str,
+    ) {
+        if let Err(error) =
+            self.append_lab_write_log(operation, lab_id, base_version, new_version, request_id)
+        {
+            crate::app_log::record(
+                "WARN",
+                &format!(
+                    "LAB_CATALOG_AUDIT_LOG_FAILED operation={operation} lab_id={lab_id} detail={error}"
+                ),
+            );
+        }
+    }
+    fn append_mode_log(&self, mode: &ProfileMode) -> Result<(), ProfileError> {
+        let path = self.root.join("mode_changes.log");
+        use std::io::Write;
+        let mut file = self.open_catalog_log(&path)?;
         writeln!(file, "{}\t{:?}", Utc::now().to_rfc3339(), mode).map_err(|source| {
             ProfileError::Write {
                 path: path.display().to_string(),
@@ -1357,20 +1481,9 @@ impl ProfileStore {
         new_version: Option<&str>,
         request_id: &str,
     ) -> Result<(), ProfileError> {
-        fs::create_dir_all(&self.root).map_err(|source| ProfileError::Write {
-            path: self.root.display().to_string(),
-            source,
-        })?;
         let path = self.root.join("lab_write_audit.log");
         use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|source| ProfileError::Write {
-                path: path.display().to_string(),
-                source,
-            })?;
+        let mut file = self.open_catalog_log(&path)?;
         writeln!(
             file,
             "{}\tLAB_WRITE\t{}\t{}\t{}\t{}\trequest={}",
@@ -1386,11 +1499,59 @@ impl ProfileStore {
             source,
         })
     }
+    fn open_catalog_log(&self, path: &Path) -> Result<fs::File, ProfileError> {
+        fs::create_dir_all(&self.root).map_err(|source| ProfileError::Write {
+            path: self.root.display().to_string(),
+            source,
+        })?;
+        rotate_catalog_log(path)?;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|source| ProfileError::Write {
+                path: path.display().to_string(),
+                source,
+            })
+    }
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, ProfileRuntime>, ProfileError> {
         self.runtime
             .lock()
             .map_err(|_| ProfileError::Validation("profile store lock poisoned".into()))
     }
+}
+
+fn rotate_catalog_log(path: &Path) -> Result<(), ProfileError> {
+    let current_bytes = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if current_bytes < MAX_CATALOG_LOG_BYTES {
+        return Ok(());
+    }
+    let oldest = path.with_extension(RETAINED_CATALOG_LOG_FILES.to_string());
+    if oldest.exists() {
+        fs::remove_file(&oldest).map_err(|source| ProfileError::Write {
+            path: oldest.display().to_string(),
+            source,
+        })?;
+    }
+    for index in (1..RETAINED_CATALOG_LOG_FILES).rev() {
+        let from = path.with_extension(index.to_string());
+        let to = path.with_extension((index + 1).to_string());
+        if from.exists() {
+            fs::rename(&from, &to).map_err(|source| ProfileError::Write {
+                path: to.display().to_string(),
+                source,
+            })?;
+        }
+    }
+    if path.exists() {
+        fs::rename(path, path.with_extension("1")).map_err(|source| ProfileError::Write {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 fn pkey(profile: &AcquisitionProfile) -> (String, String) {
@@ -1493,6 +1654,76 @@ mod tests {
         assert!(profiles
             .iter()
             .all(|profile| profile.verify_integrity().is_ok()));
+    }
+
+    #[test]
+    fn unavailable_catalog_keeps_factory_labs_and_explicit_reset_recovers_writes() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = dir.path().join("profiles");
+        fs::create_dir_all(&root).unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join("lab_state.json"), b"{ invalid catalog")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let store = ProfileStore::factory_only(root.clone(), "invalid local catalog JSON".into());
+        assert_eq!(store.list().unwrap_or_default().len(), 5);
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        store
+            .reset_local_customizations()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(root.join("lab_state.json").is_file());
+        assert!(fs::read_dir(&root)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("lab_state.corrupt-")));
+        let reopened = ProfileStore::with_root(root).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(reopened.list().unwrap_or_default().len(), 5);
+    }
+
+    #[test]
+    fn failed_catalog_persistence_does_not_mutate_runtime_state() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = dir.path().join("profiles");
+        let store = ProfileStore::with_root(root.clone()).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut draft = store
+            .begin_lab_edit("wvu.bmeg420l.ecg.course.capture.v1")
+            .unwrap_or_else(|error| panic!("{error}"));
+        draft
+            .description
+            .push_str(" must not survive a failed write");
+
+        fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("{error}"));
+        fs::write(&root, b"not a directory").unwrap_or_else(|error| panic!("{error}"));
+        assert!(store
+            .save_lab_draft(draft, Some("1.0.0".into()), "save-fails-0001".into())
+            .is_err());
+
+        let entries = store.list_all().unwrap_or_default();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(
+            store
+                .get_locked("wvu.bmeg420l.ecg.course.capture.v1")
+                .unwrap_or_else(|error| panic!("{error}"))
+                .profile_version,
+            "1.0.0"
+        );
+    }
+
+    #[test]
+    fn catalog_audit_logs_rotate_when_they_reach_their_limit() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let path = dir.path().join("lab_write_audit.log");
+        fs::write(&path, vec![b'x'; MAX_CATALOG_LOG_BYTES as usize])
+            .unwrap_or_else(|error| panic!("{error}"));
+        rotate_catalog_log(&path).unwrap_or_else(|error| panic!("{error}"));
+        assert!(path.with_extension("1").is_file());
+        assert!(!path.exists());
     }
 
     #[test]

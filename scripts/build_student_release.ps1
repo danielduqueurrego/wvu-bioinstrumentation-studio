@@ -10,10 +10,30 @@ $runtimeRoot = Join-Path $tauriRoot 'resources'
 $runtimeArchive = Join-Path $runtimeRoot 'arduino-runtime.zip'
 $manifestPath = Join-Path $runtimeRoot 'arduino-runtime-manifest.json'
 $releaseManifestPath = Join-Path $projectRoot 'release\release-manifest.json'
+$referenceFirmwarePath = Join-Path $projectRoot 'firmware\reference_unor4wifi\reference_unor4wifi.ino'
 $iconSource = Join-Path $projectRoot 'assets\icon.svg'
 $tauriConfigPath = Join-Path $tauriRoot 'tauri.conf.json'
-$distRoot = Join-Path $projectRoot 'dist\WVU-Bioinstrumentation-Studio-1.0.0'
-$zipPath = Join-Path $projectRoot 'dist\WVU-Bioinstrumentation-Studio-1.0.0-Windows-x64.zip'
+$componentNoticePath = Join-Path $runtimeRoot 'licenses\BUNDLED_COMPONENTS.txt'
+$bossacLicensePath = Join-Path $runtimeRoot 'licenses\bossac-LICENSE.txt'
+$releaseManifest = Get-Content -LiteralPath $releaseManifestPath -Raw | ConvertFrom-Json
+$appVersion = [string]$releaseManifest.app_version
+if ($appVersion -notmatch '^\d+\.\d+\.\d+$') {
+  throw "Release manifest app_version is not semantic version text: $appVersion"
+}
+$releaseNotesPath = Join-Path $projectRoot "RELEASE_NOTES_$appVersion.md"
+$distRoot = Join-Path $projectRoot "dist\WVU-Bioinstrumentation-Studio-$appVersion"
+$zipPath = Join-Path $projectRoot "dist\WVU-Bioinstrumentation-Studio-$appVersion-Windows-x64.zip"
+
+function Invoke-NativeChecked {
+  param(
+    [Parameter(Mandatory = $true)][string]$Label,
+    [Parameter(Mandatory = $true)][scriptblock]$Action
+  )
+  & $Action
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Label failed with exit code $LASTEXITCODE. Release packaging stopped; no artifact from this run will be staged."
+  }
+}
 
 Set-Location $projectRoot
 $dirty = @(git status --short)
@@ -36,7 +56,11 @@ foreach ($required in @(
   $manifestPath,
   $releaseManifestPath,
   $iconSource,
-  $tauriConfigPath
+  $tauriConfigPath,
+  $referenceFirmwarePath,
+  $componentNoticePath,
+  $bossacLicensePath,
+  $releaseNotesPath
 )) {
   if (-not (Test-Path -LiteralPath $required)) {
     throw "Required pinned release asset is missing: $required"
@@ -44,6 +68,21 @@ foreach ($required in @(
 }
 
 $tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json
+if ($tauriConfig.version -ne $appVersion) {
+  throw "Tauri version $($tauriConfig.version) does not match release manifest $appVersion."
+}
+$packageMetadata = Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json
+if ($packageMetadata.version -ne $appVersion) {
+  throw "package.json version $($packageMetadata.version) does not match release manifest $appVersion."
+}
+$packageLockMetadata = Get-Content -LiteralPath (Join-Path $projectRoot 'package-lock.json') -Raw | ConvertFrom-Json -AsHashtable
+if ($packageLockMetadata['version'] -ne $appVersion -or $packageLockMetadata['packages']['']['version'] -ne $appVersion) {
+  throw 'package-lock.json root versions do not match the release manifest.'
+}
+$cargoManifestText = Get-Content -LiteralPath (Join-Path $tauriRoot 'Cargo.toml') -Raw
+if ($cargoManifestText -notmatch "(?m)^version\s*=\s*`"$([regex]::Escape($appVersion))`"\s*$") {
+  throw "Cargo.toml package version does not match release manifest $appVersion."
+}
 if ($tauriConfig.bundle.windows.nsis.installMode -ne 'perMachine') {
   throw 'The student NSIS installer must use the reviewed perMachine installation mode.'
 }
@@ -62,7 +101,14 @@ $runtimeManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Jso
 if ($runtimeManifest.arduino_cli -ne '1.5.2-rc.1' -or $runtimeManifest.renesas_uno_core -ne '1.6.0') {
   throw 'Unexpected Arduino runtime manifest. Update the reviewed release metadata before building.'
 }
-$releaseManifest = Get-Content -LiteralPath $releaseManifestPath -Raw | ConvertFrom-Json
+$expectedReferenceFirmwareSha256 = $releaseManifest.reference_firmware_source_sha256
+if ($expectedReferenceFirmwareSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+  throw 'Release manifest is missing the reviewed reference firmware SHA-256 digest.'
+}
+$referenceFirmwareHash = (Get-FileHash -LiteralPath $referenceFirmwarePath -Algorithm SHA256).Hash
+if (-not $referenceFirmwareHash.Equals($expectedReferenceFirmwareSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "Reference firmware source hash does not match the reviewed manifest: $referenceFirmwareHash"
+}
 $expectedRuntimeArchiveSha256 = $releaseManifest.arduino_runtime_archive_sha256
 if ($expectedRuntimeArchiveSha256 -notmatch '^[0-9a-fA-F]{64}$') {
   throw 'Release manifest is missing the reviewed Arduino runtime archive SHA-256 digest.'
@@ -90,21 +136,23 @@ try {
 } finally {
   $runtimeZip.Dispose()
 }
+& (Join-Path $projectRoot 'scripts\audit_bundled_runtime_notices.ps1') -ArchivePath $runtimeArchive
 
-& cargo fmt --manifest-path src-tauri\Cargo.toml -- --check
-& cargo check --manifest-path src-tauri\Cargo.toml
-& cargo test --manifest-path src-tauri\Cargo.toml
-& cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
-& npm run check
-& npm test
-& npm run build
+Invoke-NativeChecked 'cargo fmt' { cargo fmt --manifest-path src-tauri\Cargo.toml -- --check }
+Invoke-NativeChecked 'cargo check' { cargo check --manifest-path src-tauri\Cargo.toml }
+Invoke-NativeChecked 'cargo test' { cargo test --manifest-path src-tauri\Cargo.toml }
+Invoke-NativeChecked 'cargo clippy' { cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings }
+Invoke-NativeChecked 'npm run check' { npm run check }
+Invoke-NativeChecked 'npm run build' { npm run build }
+Invoke-NativeChecked 'npm test' { npm test }
 if (-not (Test-Path -LiteralPath $frontendDistPath) -or -not (Test-Path -LiteralPath (Join-Path $frontendDistPath 'index.html'))) {
   throw "Tauri frontendDist is not a built local frontend with index.html: $frontendDistPath"
 }
 # The Tauri Windows bundlers patch the same release executable. Build them
 # serially so MSI and NSIS cannot contend for that file on slower computers.
-& npm run tauri build
-& npm run tauri -- build --bundles msi
+$releaseBuildStartedUtc = [DateTime]::UtcNow
+Invoke-NativeChecked 'Tauri NSIS build' { npm run tauri build }
+Invoke-NativeChecked 'Tauri MSI build' { npm run tauri -- build --bundles msi }
 
 $releaseExe = Join-Path $tauriRoot 'target\release\wvu_bioinstrumentation_studio.exe'
 if (-not (Test-Path -LiteralPath $releaseExe)) {
@@ -114,22 +162,34 @@ Write-Host "Production frontend: $frontendDistPath"
 Write-Host "Production executable (built by Tauri): $releaseExe"
 Write-Host 'Manual release smoke test: launch the executable with no Vite dev server running; it must load bundled UI and never request localhost.'
 
-$nsis = Get-ChildItem -LiteralPath (Join-Path $tauriRoot 'target\release\bundle\nsis') -Filter '*-setup.exe' -File |
-  Sort-Object LastWriteTime -Descending | Select-Object -First 1
-$msi = Get-ChildItem -LiteralPath (Join-Path $tauriRoot 'target\release\bundle\msi') -Filter '*.msi' -File |
-  Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if (-not $nsis -or -not $msi) {
-  throw 'Tauri build completed without both NSIS and MSI installers.'
+function Get-CurrentBundleArtifact {
+  param(
+    [Parameter(Mandatory = $true)][string]$Directory,
+    [Parameter(Mandatory = $true)][string]$Filter,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+  $artifacts = @(
+    Get-ChildItem -LiteralPath $Directory -Filter $Filter -File -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTimeUtc -ge $releaseBuildStartedUtc }
+  )
+  if ($artifacts.Count -ne 1) {
+    throw "Expected exactly one $Label artifact produced by this run after $releaseBuildStartedUtc; found $($artifacts.Count). Refusing to stage a stale installer."
+  }
+  return $artifacts[0]
 }
+$nsis = Get-CurrentBundleArtifact (Join-Path $tauriRoot 'target\release\bundle\nsis') '*-setup.exe' 'NSIS'
+$msi = Get-CurrentBundleArtifact (Join-Path $tauriRoot 'target\release\bundle\msi') '*.msi' 'MSI'
 
 if (Test-Path -LiteralPath $distRoot) { Remove-Item -LiteralPath $distRoot -Recurse -Force }
 New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
-$setupName = 'WVU_Bioinstrumentation_Studio_1.0.0_x64-setup.exe'
-$msiName = 'WVU_Bioinstrumentation_Studio_1.0.0_x64.msi'
+$setupName = "WVU_Bioinstrumentation_Studio_${appVersion}_x64-setup.exe"
+$msiName = "WVU_Bioinstrumentation_Studio_${appVersion}_x64.msi"
 Copy-Item -LiteralPath $nsis.FullName -Destination (Join-Path $distRoot $setupName)
 Copy-Item -LiteralPath $msi.FullName -Destination (Join-Path $distRoot $msiName)
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\STUDENT_QUICK_START.md') -Destination $distRoot
-Copy-Item -LiteralPath (Join-Path $projectRoot 'RELEASE_NOTES_1.0.0.md') -Destination $distRoot
+Copy-Item -LiteralPath $releaseNotesPath -Destination $distRoot
+Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $distRoot
+Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\THIRD_PARTY_NOTICES.md') -Destination $distRoot
 
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
 $installerHashTargets = @(

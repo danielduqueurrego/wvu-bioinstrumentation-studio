@@ -13,8 +13,8 @@ cargo check --manifest-path src-tauri\Cargo.toml
 cargo test --manifest-path src-tauri\Cargo.toml
 cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
 npm run check
-npm test
 npm run build
+npm test
 ```
 
 ## Development and production
@@ -34,7 +34,11 @@ Use `npm run tauri build` for a production executable and installers. It runs th
 
 ## Bundled Arduino runtime
 
-The release build requires `src-tauri/resources/arduino-runtime.zip`, which is intentionally not tracked because it contains third-party binary tooling. Its version is pinned by `arduino-runtime-manifest.json`; the release script also verifies the reviewed archive SHA-256. A fresh clone can run source checks without the archive, but cannot make the student installer until a maintainer supplies the reviewed archive with its upstream notices and verifies the manifest. Do not download or substitute “latest” Arduino tooling during a release build.
+The release build requires `src-tauri/resources/arduino-runtime.zip`, which is intentionally not tracked because it contains third-party binary tooling. Its version is pinned by `arduino-runtime-manifest.json`; the release script verifies the reviewed archive SHA-256 and the reference-firmware SHA-256 before it stages artifacts. A fresh clone can run source checks without the archive, but cannot make the student installer until a maintainer supplies the reviewed archive with its upstream notices and verifies the manifest. Do not download or substitute “latest” Arduino tooling during a release build.
+
+Run `scripts/audit_bundled_runtime_notices.ps1` against the pinned archive before publishing an installer. It verifies the reviewed Arduino CLI license copy, the component-specific BOSSA license, required runtime components, and the retained LICENSE/COPYING/NOTICE inventory. A maintainer must still review upstream redistribution requirements when any bundled version changes.
+
+`scripts/build_student_release.ps1` stops on the first failed native command and stages only installers created by that invocation. Do not reuse or manually copy an older installer after a failed release build.
 
 ## Firmware
 

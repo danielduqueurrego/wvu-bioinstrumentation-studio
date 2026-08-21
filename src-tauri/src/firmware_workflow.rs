@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -32,6 +32,7 @@ const APPLICATION_PORT_POLL: Duration = Duration::from_millis(300);
 const NATIVE_USB_PID: u16 = 0x006d;
 const ESP32_BRIDGE_PID: u16 = 0x1002;
 const NATIVE_USB_MANUAL_RESET_TIMEOUT: Duration = Duration::from_secs(90);
+const RETAINED_FIRMWARE_JOB_LOGS: usize = 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -991,7 +992,60 @@ fn write_workflow_log(job: &FirmwareJobStatus) -> Result<String, std::io::Error>
         &path,
         serde_json::to_vec_pretty(&log).map_err(std::io::Error::other)?,
     )?;
+    // Firmware compile/upload output can be large. Retain recent diagnostics
+    // for support without indefinitely consuming a student's AppData folder.
+    let _ = prune_firmware_job_logs(&directory);
     Ok(path.display().to_string())
+}
+
+fn prune_firmware_job_logs(directory: &Path) -> Result<(), std::io::Error> {
+    let mut logs = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("firmware_job_")
+        })
+        .collect::<Vec<_>>();
+    logs.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    if logs.len() > RETAINED_FIRMWARE_JOB_LOGS {
+        let excess = logs.len() - RETAINED_FIRMWARE_JOB_LOGS;
+        for entry in logs.into_iter().take(excess) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+
+    let jobs = directory.join("jobs");
+    if !jobs.is_dir() {
+        return Ok(());
+    }
+    let mut workspaces = fs::read_dir(&jobs)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .collect::<Vec<_>>();
+    workspaces.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    if workspaces.len() > RETAINED_FIRMWARE_JOB_LOGS {
+        let excess = workspaces.len() - RETAINED_FIRMWARE_JOB_LOGS;
+        for entry in workspaces.into_iter().take(excess) {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn combined_output(log: &CommandLog) -> String {
@@ -1064,6 +1118,7 @@ fn internal_failure(details: impl Into<String>) -> FirmwareFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn board(port: &str, serial: Option<&str>) -> BoardInfo {
         BoardInfo {
@@ -1074,6 +1129,45 @@ mod tests {
             usb_vid: Some(0x2341),
             usb_pid: Some(0x1002),
         }
+    }
+
+    #[test]
+    fn firmware_job_retention_keeps_the_log_directory_bounded() {
+        let directory = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        for index in 0..(RETAINED_FIRMWARE_JOB_LOGS + 3) {
+            fs::write(
+                directory
+                    .path()
+                    .join(format!("firmware_job_{index}_test.json")),
+                b"{}",
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        }
+        let jobs = directory.path().join("jobs");
+        fs::create_dir_all(&jobs).unwrap_or_else(|error| panic!("{error}"));
+        for index in 0..(RETAINED_FIRMWARE_JOB_LOGS + 2) {
+            fs::create_dir_all(jobs.join(format!("job_{index}")))
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        prune_firmware_job_logs(directory.path()).unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            fs::read_dir(directory.path())
+                .unwrap_or_else(|error| panic!("{error}"))
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("firmware_job_"))
+                .count()
+                <= RETAINED_FIRMWARE_JOB_LOGS
+        );
+        assert!(
+            fs::read_dir(jobs)
+                .unwrap_or_else(|error| panic!("{error}"))
+                .filter_map(Result::ok)
+                .count()
+                <= RETAINED_FIRMWARE_JOB_LOGS
+        );
     }
 
     #[test]

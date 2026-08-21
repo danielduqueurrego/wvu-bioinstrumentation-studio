@@ -1,5 +1,5 @@
 /** Small pure helpers shared by the profile-aware Acquisition page and plot. */
-export type DisplayChannel = { id: string; label: string; csv_name: string };
+export type DisplayChannel = { id: string; label: string; csv_name: string; default_visible?: boolean };
 export type VisibleChannelMap = Record<string, boolean>;
 export type PlotGroup = { id: string; channelIds: string[] };
 export type PlotSeries = DisplayChannel & { color: string };
@@ -35,7 +35,7 @@ export function shouldShowPlotLegend(series: PlotSeries[]): boolean {
  * map directly rather than being reconciled back to "all visible" on each render.
  */
 export function initialTraceVisibility(channels: DisplayChannel[]): VisibleChannelMap {
-  return Object.fromEntries(channels.map((channel) => [channel.id, true]));
+  return Object.fromEntries(channels.map((channel) => [channel.id, channel.default_visible !== false]));
 }
 
 export function setTraceVisibility(

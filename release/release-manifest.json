@@ -1,9 +1,10 @@
 {
-  "app_version": "1.0.0",
+  "app_version": "1.0.1",
   "platform": "windows-x64",
   "arduino_cli_version": "1.5.2-rc.1",
   "arduino_core": "1.6.0",
   "firmware_protocol": "0.3",
   "reference_firmware_build": "0x00010003",
+  "reference_firmware_source_sha256": "6b1f3d277225e112b732f888023a7c459a7d6bae4ad9df0600f525222f195d5e",
   "arduino_runtime_archive_sha256": "4e068c540b485e8e7ceff29dac849db250b41efb56108b10edadfb033dc7d501"
 }

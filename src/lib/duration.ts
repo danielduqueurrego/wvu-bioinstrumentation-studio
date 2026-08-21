@@ -16,7 +16,3 @@ export function durationRequest(
     ? { mode: 'until_stopped' }
     : { mode: 'timed', seconds };
 }
-
-export function remainingTimeVisible(duration: RecordingDurationRequest): boolean {
-  return duration.mode === 'timed';
-}

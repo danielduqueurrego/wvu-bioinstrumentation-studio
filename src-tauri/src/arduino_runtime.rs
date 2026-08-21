@@ -95,12 +95,8 @@ pub fn prepare_from_archive(
     destination: &Path,
 ) -> Result<RuntimePaths, RuntimeError> {
     let source_manifest = read_manifest_file(manifest_path)?;
-    let destination_manifest = read_manifest(destination).ok();
-    if destination_manifest.as_ref() != Some(&source_manifest) {
-        if destination.exists() {
-            fs::remove_dir_all(destination)?;
-        }
-        extract_archive(archive, destination)?;
+    if !runtime_is_valid(destination, &source_manifest) {
+        replace_runtime_from_archive(archive, destination, &source_manifest)?;
     }
     let executable = destination.join("arduino-cli.exe");
     let data = destination.join("data");
@@ -136,6 +132,90 @@ pub fn prepare_from_archive(
         cli_version: source_manifest.arduino_cli,
         core_version: source_manifest.renesas_uno_core,
     })
+}
+
+/// A matching manifest alone is not enough: a prior first-run extraction may
+/// have been interrupted after that small file was written. Require the
+/// minimum executable/core/tool layout before treating an app-owned runtime as
+/// usable.
+fn runtime_is_valid(destination: &Path, expected_manifest: &RuntimeManifest) -> bool {
+    read_manifest(destination).ok().as_ref() == Some(expected_manifest)
+        && destination.join("arduino-cli.exe").is_file()
+        && destination
+            .join("data/packages/arduino/hardware/renesas_uno")
+            .is_dir()
+        && destination.join("data/packages/arduino/tools").is_dir()
+}
+
+/// Extract to a sibling staging directory and validate it before replacing the
+/// active runtime. If Windows refuses the final rename, restore the previous
+/// runtime rather than leaving the installation without usable tools.
+fn replace_runtime_from_archive(
+    archive: &Path,
+    destination: &Path,
+    expected_manifest: &RuntimeManifest,
+) -> Result<(), RuntimeError> {
+    let parent = destination.parent().ok_or(RuntimeError::InvalidBundle)?;
+    fs::create_dir_all(parent)?;
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(RuntimeError::InvalidBundle)?;
+    // Fixed sibling names make an interrupted replacement recoverable on the
+    // next launch. PID-suffixed backups could not be rediscovered after the
+    // process that created them exited unexpectedly.
+    let staging = parent.join(format!(".{destination_name}-staging"));
+    let backup = parent.join(format!(".{destination_name}-previous"));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    if backup.exists() {
+        if runtime_is_valid(&backup, expected_manifest) {
+            if destination.exists() {
+                if destination.is_dir() {
+                    fs::remove_dir_all(destination)?;
+                } else {
+                    fs::remove_file(destination)?;
+                }
+            }
+            fs::rename(&backup, destination)?;
+            return Ok(());
+        }
+        fs::remove_dir_all(&backup)?;
+    }
+
+    extract_archive(archive, &staging)?;
+    if !runtime_is_valid(&staging, expected_manifest) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(RuntimeError::InvalidBundle);
+    }
+
+    let had_existing_runtime = destination.exists();
+    if had_existing_runtime {
+        fs::rename(destination, &backup)?;
+    }
+    if let Err(error) = fs::rename(&staging, destination) {
+        if had_existing_runtime {
+            let _ = fs::rename(&backup, destination);
+        }
+        let _ = fs::remove_dir_all(&staging);
+        return Err(RuntimeError::Io(error));
+    }
+    if backup.exists() {
+        // The replacement has committed. A stale backup is harmless and will
+        // be recovered or removed on the next launch, so cleanup failure must
+        // not make a usable runtime appear unavailable.
+        if let Err(error) = fs::remove_dir_all(&backup) {
+            crate::app_log::record(
+                "WARN",
+                &format!(
+                    "ARDUINO_RUNTIME_BACKUP_CLEANUP_FAILED path={} detail={error}",
+                    backup.display()
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The pinned Arduino Renesas UNO core routes the C-library `_write` hook through
@@ -276,5 +356,93 @@ mod tests {
         assert!(fs::read_to_string(serial_usb)
             .unwrap_or_default()
             .contains("size_t write_raw(uint8_t *p, size_t len)"));
+    }
+
+    #[test]
+    fn matching_manifest_with_incomplete_runtime_is_repaired() {
+        let source = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let destination = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let manifest = r#"{"runtime_schema":1,"arduino_cli":"1.5.2-rc.1","renesas_uno_core":"1.6.0","bundle_revision":1}"#;
+        let manifest_path = source.path().join("arduino-runtime-manifest.json");
+        fs::write(&manifest_path, manifest).unwrap_or_else(|error| panic!("{error}"));
+        let archive_path = source.path().join("arduino-runtime.zip");
+        let mut archive = ZipWriter::new(
+            fs::File::create(&archive_path).unwrap_or_else(|error| panic!("{error}")),
+        );
+        let options = SimpleFileOptions::default();
+        for (name, bytes) in [
+            ("runtime-manifest.json", manifest.as_bytes()),
+            ("arduino-cli.exe", b"test".as_slice()),
+            ("data/packages/arduino/hardware/renesas_uno/1.6.0/.keep", b"".as_slice()),
+            (
+                "data/packages/arduino/hardware/renesas_uno/1.6.0/cores/arduino/usb/SerialUSB.h",
+                b"class SerialUSB {\n    virtual size_t write(const uint8_t *p, size_t len) override;\n};\n".as_slice(),
+            ),
+            ("data/packages/arduino/tools/.keep", b"".as_slice()),
+        ] {
+            archive.start_file(name, options).unwrap_or_else(|error| panic!("{error}"));
+            archive.write_all(bytes).unwrap_or_else(|error| panic!("{error}"));
+        }
+        archive.finish().unwrap_or_else(|error| panic!("{error}"));
+
+        let root = destination.path().join("runtime");
+        fs::create_dir_all(&root).unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join("runtime-manifest.json"), manifest)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!root.join("arduino-cli.exe").exists());
+
+        let prepared = prepare_from_archive(&archive_path, &manifest_path, &root)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(prepared.executable.is_file());
+        assert!(runtime_is_valid(
+            &root,
+            &read_manifest_file(&manifest_path).unwrap_or_else(|error| panic!("{error}"))
+        ));
+    }
+
+    #[test]
+    fn interrupted_runtime_replacement_restores_the_valid_previous_runtime() {
+        let source = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let destination = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let manifest = r#"{"runtime_schema":1,"arduino_cli":"1.5.2-rc.1","renesas_uno_core":"1.6.0","bundle_revision":1}"#;
+        let manifest_path = source.path().join("arduino-runtime-manifest.json");
+        fs::write(&manifest_path, manifest).unwrap_or_else(|error| panic!("{error}"));
+        let archive_path = source.path().join("arduino-runtime.zip");
+        let mut archive = ZipWriter::new(
+            fs::File::create(&archive_path).unwrap_or_else(|error| panic!("{error}")),
+        );
+        let options = SimpleFileOptions::default();
+        for (name, bytes) in [
+            ("runtime-manifest.json", manifest.as_bytes()),
+            ("arduino-cli.exe", b"test".as_slice()),
+            (
+                "data/packages/arduino/hardware/renesas_uno/1.6.0/cores/arduino/usb/SerialUSB.h",
+                b"class SerialUSB {\n    virtual size_t write(const uint8_t *p, size_t len) override;\n};\n".as_slice(),
+            ),
+            ("data/packages/arduino/tools/.keep", b"".as_slice()),
+        ] {
+            archive
+                .start_file(name, options)
+                .unwrap_or_else(|error| panic!("{error}"));
+            archive
+                .write_all(bytes)
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        archive.finish().unwrap_or_else(|error| panic!("{error}"));
+
+        let root = destination.path().join("runtime");
+        prepare_from_archive(&archive_path, &manifest_path, &root)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let backup = destination.path().join(".runtime-previous");
+        fs::rename(&root, &backup).unwrap_or_else(|error| panic!("{error}"));
+
+        let prepared = prepare_from_archive(&archive_path, &manifest_path, &root)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(prepared.executable.is_file());
+        assert!(runtime_is_valid(
+            &root,
+            &read_manifest_file(&manifest_path).unwrap_or_else(|error| panic!("{error}"))
+        ));
+        assert!(!backup.exists());
     }
 }

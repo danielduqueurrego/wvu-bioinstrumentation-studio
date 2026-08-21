@@ -6,6 +6,7 @@ const configPath = resolve(process.cwd(), 'src-tauri', 'tauri.conf.json');
 const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
   mainBinaryName?: string;
   build: { devUrl?: string; frontendDist?: string; beforeBuildCommand?: string };
+  app?: { security?: { csp?: string | null } };
 };
 
 describe('production Tauri frontend configuration', () => {
@@ -22,5 +23,12 @@ describe('production Tauri frontend configuration', () => {
 
   it('declares the Tauri application binary explicitly', () => {
     expect(config.mainBinaryName).toBe('wvu_bioinstrumentation_studio');
+  });
+
+  it('uses a restrictive production content-security policy', () => {
+    const csp = config.app?.security?.csp;
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).toContain("connect-src 'self' ipc: http://ipc.localhost");
+    expect(csp).not.toContain("script-src *");
   });
 });

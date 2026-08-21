@@ -1,0 +1,25 @@
+WVU Bioinstrumentation Studio bundled-component notice
+
+This directory accompanies the app's pinned offline Arduino runtime.
+
+Arduino CLI 1.5.2-rc.1
+  Source: https://github.com/arduino/arduino-cli/tree/v1.5.2-rc.1
+  License: GNU General Public License version 3
+  The runtime archive retains an exact GPLv3 license copy supplied by the
+  Arduino discovery tools. The release audit verifies that copy byte-for-byte
+  against the Arduino CLI v1.5.2-rc.1 license.
+
+Arduino BOSSA uploader 1.9.1-arduino5
+  Distribution source: Arduino package index and downloads.arduino.cc
+  Upstream source: https://github.com/arduino/BOSSA
+  License: BSD 3-Clause-style terms in bossac-LICENSE.txt
+
+Arduino Renesas UNO core 1.6.0 and bundled compiler/discovery tools
+  Their upstream license and notice files remain inside arduino-runtime.zip.
+
+Microsoft Edge WebView2 Runtime
+  The Windows installer uses Tauri's offline WebView2 installation mode.
+  Microsoft software-license terms remain applicable:
+  https://www.microsoft.com/software-download/retailLicenseTerms
+
+These notices do not replace or modify any upstream license.

@@ -8,6 +8,11 @@ use sha2::{Digest, Sha256};
 
 const REFERENCE_SOURCE: &[u8] =
     include_bytes!("../../firmware/reference_unor4wifi/reference_unor4wifi.ino");
+/// SHA-256 of the controlled source shipped with this application release.
+/// Updating the sketch requires an explicit provenance review and manifest
+/// update rather than a tautological "hash is stable" test.
+pub const REFERENCE_SOURCE_SHA256: &str =
+    "6b1f3d277225e112b732f888023a7c459a7d6bae4ad9df0600f525222f195d5e";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,11 +43,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reference_source_is_present_and_hash_is_stable() {
+    fn reference_source_matches_the_reviewed_sha256() {
         assert!(controlled_reference_source().starts_with(b"/*"));
         assert_eq!(
             source_hash(controlled_reference_source()),
-            source_hash(controlled_reference_source())
+            REFERENCE_SOURCE_SHA256
         );
     }
 

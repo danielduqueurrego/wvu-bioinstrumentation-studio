@@ -234,7 +234,7 @@
   // uPlot series derived from one authoritative map.
   $: if (plotProfileKey !== traceProfileKey) {
     traceProfileKey = plotProfileKey;
-    traceVisibility = Object.fromEntries(plotChannels.map((channel) => [channel.id, !('default_visible' in channel) || channel.default_visible !== false]));
+    traceVisibility = initialTraceVisibility(plotChannels);
     plotGroups = pulseoxProfile
       ? defaultPlotGroups(activeProfile?.category, plotChannels)
       : activeProfile?.plot_defaults?.groups?.length

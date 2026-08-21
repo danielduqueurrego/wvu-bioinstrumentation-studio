@@ -790,6 +790,40 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {
-            eprintln!("WVU Bioinstrumentation Studio failed to start: {error}")
+            app_log::record_startup_failure(&error.to_string());
+            eprintln!("WVU Bioinstrumentation Studio failed to start: {error}");
+            show_startup_failure_dialog(&error.to_string());
         });
 }
+
+#[cfg(windows)]
+fn show_startup_failure_dialog(error: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let message = format!(
+        "WVU Bioinstrumentation Studio could not start.\n\n{error}\n\nA diagnostic entry was written to %LOCALAPPDATA%\\WVU Bioinstrumentation Studio\\logs\\application.log."
+    );
+    let to_wide = |text: &str| {
+        OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let title = to_wide("WVU Bioinstrumentation Studio");
+    let message = to_wide(&message);
+    // This is only reached after Tauri failed before a window could be
+    // created, so a native message box is the only actionable UI available.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_startup_failure_dialog(_error: &str) {}

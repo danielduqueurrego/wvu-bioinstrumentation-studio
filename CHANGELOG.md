@@ -2,6 +2,21 @@
 
 All notable user-facing changes are documented here.
 
+## 1.0.1
+
+### Fixed
+
+- Stabilized long-running `Until stopped` acquisition on Arduino UNO R4 WiFi and retained precise serial/no-data diagnostics for genuine failures.
+- Removed the initial ADC settling transient from the live display without changing authoritative BMEG/CSV samples.
+- Changed live plot time labels to elapsed recording seconds starting at zero.
+- Ensured startup failures are written to the application log and shown in a native Windows error dialog instead of appearing as a brief console flash.
+- Made instructor lab-catalog writes transactional and allowed an explicit factory reset to recover from a malformed local catalog.
+
+### Maintenance
+
+- Added atomic, recoverable Arduino-runtime deployment and bounded application/catalog/firmware logs.
+- Strengthened release validation, CI coverage, firmware/runtime hash checks, and bundled third-party notices.
+
 ## 1.0.0
 
 ### Added
