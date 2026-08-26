@@ -9,12 +9,14 @@
 7. Choose duration, display units, and plot arrangement as instructed.
 8. Select **Connect, configure, and start recording**.
 9. Stop the recording when directed, or wait for a timed run to finish.
-10. Find the `.bmeg`, `.csv`, metadata, and any event sidecar in the shown Project/Output folder.
+10. Find the `.bmeg`, `.csv`, and metadata files in the shown Project/Output folder. Any recording markers are included in the metadata.
 
 The CSV contains raw counts and applicable derived voltage or engineering-unit columns. The raw BMEG data remain authoritative.
 
+Recording filenames identify the selected lab and run without internal development-phase labels.
+
 While recording, plot changes are display-only: the **Plot time window** applies to all plots from 0.5 to 30 seconds, the time axis shows elapsed recording seconds from 0, multi-signal legends identify waveform colors, and newest-value badges show the current rounded display value. You may rearrange plots, hide or show traces, change supported units, or use **Add marker** when instructed without changing the underlying recording.
 
-For pulse oximetry, the application records raw RED, DARK 1, IR, and DARK 2 measurements for both detectors. It does not calculate SpO2, heart rate, or other physiological results.
+For pulse oximetry, the firmware waits the configured settling interval after each RED, DARK 1, IR, or DARK 2 transition before recording the raw values for both detectors. It does not calculate SpO2, heart rate, or other physiological results.
 
 Teaching use only — not a medical device.

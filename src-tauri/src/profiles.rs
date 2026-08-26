@@ -602,8 +602,13 @@ impl AcquisitionProfile {
         }
         if self.required_firmware.protocol_major != PROTOCOL_MAJOR
             || self.required_firmware.protocol_minor_min > PROTOCOL_MINOR
-            || ![REFERENCE_FIRMWARE_BUILD, 0x0001_0002, 0x0001_0001]
-                .contains(&parse_hex(&self.required_firmware.build)?)
+            || ![
+                REFERENCE_FIRMWARE_BUILD,
+                0x0001_0003,
+                0x0001_0002,
+                0x0001_0001,
+            ]
+            .contains(&parse_hex(&self.required_firmware.build)?)
             || parse_hex(&self.required_firmware.device)? != REFERENCE_DEVICE_ID
         {
             return Err(ProfileError::Validation(

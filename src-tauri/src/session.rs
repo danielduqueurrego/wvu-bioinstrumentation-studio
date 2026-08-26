@@ -2453,19 +2453,8 @@ impl SessionController {
         fs::create_dir_all(output_dir)?;
         let stamp = Local::now().format("%Y%m%d_%H%M%S");
         for run in 1..=99 {
-            let name = match profile.profile.category.as_str() {
-                "development" => "Phase1_A0".to_string(),
-                category if category.starts_with("course_") => format!(
-                    "Phase4_{}",
-                    crate::profiles::safe_filename_component(
-                        category.trim_start_matches("course_")
-                    )
-                ),
-                category => format!(
-                    "Phase3A_{}",
-                    crate::profiles::safe_filename_component(category)
-                ),
-            };
+            let name =
+                crate::profiles::safe_filename_component(&profile.profile.export.signal_name);
             let base = output_dir.join(format!("{stamp}_{name}_Run{run:02}"));
             let bmeg = base.with_extension("bmeg");
             let csv = base.with_extension("csv");
@@ -3290,7 +3279,7 @@ impl SimulatorIo {
         };
         simulator.queue(
             MessageType::Hello,
-            vec![3, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
+            vec![4, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
         )?;
         simulator.queue(
             MessageType::Capabilities,
@@ -3812,7 +3801,7 @@ mod tests {
                 commands: FrameParser::default(),
                 answer_on_ping,
                 pings: 0,
-                hello_payload: vec![3, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
+                hello_payload: vec![4, 0, 1, 0, 0x34, 0x4f, 0x4e, 0x55, 1, 14, 6, 0],
             }
         }
 
@@ -3947,7 +3936,7 @@ mod tests {
     fn handshake_rejects_an_incompatible_firmware_identity() {
         let (session, mut acquisition) = handshake_session();
         let mut io = HandshakeMock::new(Some(1));
-        io.hello_payload[0] = 4;
+        io.hello_payload[0] = 5;
         assert!(session
             .wait_for_handshake_with_policy(
                 &mut io,
@@ -4790,6 +4779,27 @@ mod tests {
             Some("C:\\Users\\Student\\Documents\\BMEG 420L")
         );
         assert_eq!(metadata.output_folder.as_deref(), Some("Lab6\\Trial1"));
+    }
+
+    #[test]
+    fn recording_filenames_use_the_lab_export_name_without_phase_labels() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        for profile in built_in_profiles().unwrap_or_else(|error| panic!("{error}")) {
+            let expected = crate::profiles::safe_filename_component(&profile.export.signal_name);
+            let snapshot = profile.snapshot(true);
+            let (_, bmeg, csv, metadata) = session
+                .allocate_paths(dir.path(), &snapshot)
+                .unwrap_or_else(|error| panic!("{error}"));
+            for path in [bmeg, csv, metadata] {
+                let filename = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_else(|| panic!("invalid test filename"));
+                assert!(filename.contains(&expected));
+                assert!(!filename.to_ascii_lowercase().contains("phase"));
+            }
+        }
     }
 
     #[test]

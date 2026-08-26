@@ -2,6 +2,13 @@
 
 All notable user-facing changes are documented here.
 
+## 1.0.2
+
+### Fixed
+
+- Pulse-ox RED, DARK 1, IR, and DARK 2 measurements are now taken only after the configured phase-settling interval has elapsed.
+- Recording filenames now use the selected lab's stable export name and no longer contain development-phase labels.
+
 ## 1.0.1
 
 ### Fixed

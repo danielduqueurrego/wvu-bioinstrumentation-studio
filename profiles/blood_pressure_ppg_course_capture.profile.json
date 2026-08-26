@@ -9,7 +9,7 @@
   "description": "Three synchronized raw PPG and pressure-interface variables with an active-HIGH green LED during capture.",
   "target_board": "Arduino UNO R4 WiFi",
   "fqbn": "arduino:renesas_uno:unor4wifi",
-  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 3, "build": "0x00010003", "device": "0x554E4F34" },
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 3, "build": "0x00010004", "device": "0x554E4F34" },
   "acquisition": {
     "analog_pin": "A0", "adc_resolution_bits": 14, "sample_rate_hz": 200,
     "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
@@ -26,5 +26,5 @@
   "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "No blood-pressure, heart-rate, or calibration result is calculated by this application."] },
   "export": { "signal_name": "blood_pressure_ppg_course_capture", "include_profile_snapshot": true },
   "plot_defaults": { "groups": [{ "channel_ids": ["ppg"] }, { "channel_ids": ["mpxv"] }, { "channel_ids": ["xgzp"] }] },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "12b892f66dd83dfed4863ea8fc012031389779e17427cd516c74ee0bf1d2c967" }
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "2d350a66b511e5a5297e85c99e0c13554f3bc843f4b1aa63ae8cb19882779561" }
 }

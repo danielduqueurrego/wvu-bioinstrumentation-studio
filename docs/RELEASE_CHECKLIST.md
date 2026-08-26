@@ -13,7 +13,8 @@
 
 - Confirm board discovery, firmware verification, and firmware restore work without external console windows.
 - Record a short ECG session, a second session without restart, and a short multi-channel EMG session.
-- Confirm raw pulse-ox fields and safe LED behavior with the appropriate setup or simulator.
+- Confirm raw pulse-ox fields, safe LED behavior, and settle-before-sample timing with the appropriate hardware setup.
+- Confirm new BMEG, CSV, and metadata filenames identify the lab and contain no development-phase label.
 - Open Instructor Manage Labs and verify that reading/selecting labs creates no version.
 
 ## Installer and distribution

@@ -12,7 +12,7 @@ const REFERENCE_SOURCE: &[u8] =
 /// Updating the sketch requires an explicit provenance review and manifest
 /// update rather than a tautological "hash is stable" test.
 pub const REFERENCE_SOURCE_SHA256: &str =
-    "6b1f3d277225e112b732f888023a7c459a7d6bae4ad9df0600f525222f195d5e";
+    "b549d558477c2fc823c535301bda2786eb740b0448afe0abde1889767a82c63d";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,12 +57,19 @@ mod tests {
             .unwrap_or_else(|error| panic!("reference sketch is not UTF-8: {error}"));
 
         assert!(source.contains("PROTOCOL_MAJOR = 0, PROTOCOL_MINOR = 3"));
-        assert!(source.contains("FIRMWARE_BUILD = 0x00010003UL"));
+        assert!(source.contains("FIRMWARE_BUILD = 0x00010004UL"));
         assert!(source.contains("D4_GREEN = 4, D5_RED = 5, D6_IR = 6"));
         assert!(source.contains("void forceSafeOutputs()"));
         assert!(source.contains(
             "else if(frame[6]==PING){sendHello();sendCapabilities();sendFrame(PONG,nullptr,0);}"
         ));
+        assert!(source.contains(
+            "if(acquisitionMode==PULSEOX_4STATE){applyPulseState(pulseState);nextTickMicros=micros()+stateDwellUs;}"
+        ));
+        assert!(source
+            .contains("applyPulseState(pulseState);\n  nextTickMicros=micros()+stateDwellUs;"));
+        assert!(source.contains("if((int32_t)(now-nextTickMicros)>=0)acquirePulseState();"));
+        assert!(!source.contains("void acquirePulseState(){\n  applyPulseState(pulseState);"));
         assert!(!source.contains("DIAGNOSTIC_TRANSPORT_ONLY"));
         assert!(!source.contains("FspTimer.h"));
     }

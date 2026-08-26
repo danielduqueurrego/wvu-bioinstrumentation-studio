@@ -2,7 +2,7 @@
 
 ## Current reference
 
-The current WVU reference firmware uses binary USB protocol **0.3**, build `0x00010003`, and device ID `0x554E4F34`. USB CDC is configured for 921600 baud. Multibyte fields are little-endian.
+The current WVU reference firmware uses binary USB protocol **0.3**, build `0x00010004`, and device ID `0x554E4F34`. USB CDC is configured for 921600 baud. Multibyte fields are little-endian.
 
 Frames use the `BMEG` magic, protocol major/minor, message type, flags, payload length, packet sequence, payload, and CRC-16/CCITT-FALSE.
 
@@ -36,7 +36,7 @@ uint8   red_output_pin             // D4 through D6
 uint8   ir_output_pin              // D4 through D6, distinct
 ```
 
-The fixed phase order is RED ON, DARK 1, IR ON, DARK 2. Raw cycle fields are:
+The fixed phase order is RED ON, DARK 1, IR ON, DARK 2. The firmware waits the configured state dwell after each output transition before sampling both analog inputs. Raw cycle fields are:
 
 ```text
 red_TX,dark1_TX,ir_TX,dark2_TX,red_RX,dark1_RX,ir_RX,dark2_RX

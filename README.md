@@ -13,7 +13,7 @@ Teaching use only — not a medical device. Follow BMEG 420L lab instructions an
 - Display-only decimation for longer live windows while recorded BMEG and CSV data remain full-rate.
 - Live plot time axes use elapsed recording seconds, starting at 0 for the first accepted frame; they are not calendar timestamps.
 - Counts, volts, MPXV pressure conversion, and student-created local linear calibration for supported channels.
-- Project-folder and trial-folder organization with automatic raw BMEG, CSV, metadata, and event-sidecar output.
+- Project-folder and trial-folder organization with automatic raw BMEG, CSV, and metadata output; recording markers are preserved in metadata.
 - Instructor-managed, versioned course-lab definitions with factory defaults, import/export, and safe pin/rate/output configuration.
 
 The distributed application bundles the Arduino command-line runtime and UNO R4 core. Students do not need Arduino IDE or Arduino CLI for normal use.
@@ -90,9 +90,11 @@ More detail is in [Lab Configuration](docs/LAB_CONFIGURATION.md). Instructors sh
 
 Raw `.bmeg` data are authoritative. Each recording also produces metadata and a profile-aware CSV in the effective session folder. Raw counts are always retained; voltage and engineering-unit columns are derived from the recording-time settings.
 
+Generated filenames use the selected lab's export name, for example `ecg_course_capture`, followed by the run number. They do not use internal development-phase labels.
+
 Live plot windowing, trace visibility, legends, endpoint labels, and display decimation do not alter the recorded raw samples.
 
-Pulse oximetry preserves raw TX/RX measurements for RED, DARK 1, IR, and DARK 2. The application does not subtract ambient states, calculate SpO2, calculate heart rate, or perform physiological interpretation.
+Pulse oximetry applies each RED, DARK 1, IR, or DARK 2 state for its configured settling interval before sampling and preserves the resulting raw TX/RX measurements. The application does not subtract ambient states, calculate SpO2, calculate heart rate, or perform physiological interpretation.
 
 ## Building from source
 

@@ -18,7 +18,7 @@ static const uint8_t MAGIC[] = {'B','M','E','G'};
 static const uint8_t PROTOCOL_MAJOR = 0, PROTOCOL_MINOR = 3;
 static const uint16_t MAX_PAYLOAD = 1024;
 static const uint32_t CONTROLLED_SERIAL_BAUD = 921600UL;
-static const uint32_t FIRMWARE_BUILD = 0x00010003UL;
+static const uint32_t FIRMWARE_BUILD = 0x00010004UL;
 static const uint32_t DEVICE_ID = 0x554E4F34UL;
 static const uint32_t COMMAND_TIMEOUT_US = 5000000UL;
 static const uint8_t D4_GREEN = 4, D5_RED = 5, D6_IR = 6;
@@ -117,7 +117,11 @@ void handleFrame(const uint8_t* frame,uint16_t length){
     bool ok=payloadLength>=1 && ((p[0]==SIMULTANEOUS&&configureSimultaneous(p,payloadLength)) || (p[0]==PULSEOX_4STATE&&configurePulseox(p,payloadLength)));
     if(!ok){rejectConfiguration(3);return;} forceSafeOutputs();configured=true;sendFrame(CONFIG_ACK,nullptr,0);
   }else if(frame[6]==START){
-    if(!configured||payloadLength){sendError(4);return;} forceSafeOutputs();if(acquisitionMode==SIMULTANEOUS)applyActiveOutputs();acquiring=true;batchCount=0;pulseState=0;recordSequence=0;nextTickMicros=micros();lastCommandMicros=micros();sendStatus();
+    if(!configured||payloadLength){sendError(4);return;}
+    forceSafeOutputs();acquiring=true;batchCount=0;pulseState=0;recordSequence=0;lastCommandMicros=micros();
+    if(acquisitionMode==PULSEOX_4STATE){applyPulseState(pulseState);nextTickMicros=micros()+stateDwellUs;}
+    else{applyActiveOutputs();nextTickMicros=micros();}
+    sendStatus();
   }else if(frame[6]==STOP){acquiring=false;batchCount=0;forceSafeOutputs();sendStatus();
   }else if(frame[6]==PING){sendHello();sendCapabilities();sendFrame(PONG,nullptr,0);}
 }
@@ -144,12 +148,17 @@ void acquireSimultaneous(){
   batchCount++;recordSequence++;if(batchCount>=BATCH_RECORDS)sendBatch();
 }
 void acquirePulseState(){
-  applyPulseState(pulseState);
   uint64_t timestamp=extendedMicros();
   if(pulseState==0&&batchCount==0){batchFirstTimestamp=timestamp;batchFirstSequence=recordSequence;}
   uint16_t tx=(uint16_t)analogRead(analogPins[0]);uint16_t rx=(uint16_t)analogRead(analogPins[1]);
   batch[batchCount][pulseState]=tx;batch[batchCount][4+pulseState]=rx;pulseState++;
-  if(pulseState==4){pulseState=0;batchCount++;recordSequence++;if(batchCount>=BATCH_RECORDS)sendBatch();}
+  bool cycleComplete=pulseState==4;
+  if(cycleComplete){pulseState=0;batchCount++;recordSequence++;}
+  // Start the next phase immediately after sampling. The scheduler will not
+  // read it until the complete configured dwell has elapsed.
+  applyPulseState(pulseState);
+  nextTickMicros=micros()+stateDwellUs;
+  if(cycleComplete&&batchCount>=BATCH_RECORDS)sendBatch();
 }
 
 void setup(){Serial.begin(CONTROLLED_SERIAL_BAUD);pinMode(D4_GREEN,OUTPUT);pinMode(D5_RED,OUTPUT);pinMode(D6_IR,OUTPUT);forceSafeOutputs();analogReadResolution(12);lastCommandMicros=micros();sendHello();sendCapabilities();}
@@ -157,10 +166,14 @@ void loop(){
   readCommands();
   if(!acquiring){forceSafeOutputs();return;}
   if((uint32_t)(micros()-lastCommandMicros)>COMMAND_TIMEOUT_US){acquiring=false;batchCount=0;forceSafeOutputs();sendError(7);return;}
-  uint32_t now=micros();uint8_t serviced=0;
-  uint32_t interval=acquisitionMode==PULSEOX_4STATE?stateDwellUs:1000000UL/frameRateHz;
+  uint32_t now=micros();
+  if(acquisitionMode==PULSEOX_4STATE){
+    if((int32_t)(now-nextTickMicros)>=0)acquirePulseState();
+    return;
+  }
+  uint8_t serviced=0;uint32_t interval=1000000UL/frameRateHz;
   while((int32_t)(now-nextTickMicros)>=0 && serviced<3){
-    if(acquisitionMode==PULSEOX_4STATE)acquirePulseState();else acquireSimultaneous();
+    acquireSimultaneous();
     nextTickMicros+=interval;serviced++;
   }
   if((int32_t)(now-nextTickMicros)>=0){overflowObserved=true;nextTickMicros=now+interval;}
