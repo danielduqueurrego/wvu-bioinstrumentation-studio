@@ -1,8 +1,119 @@
 //! Shared ingestion path for serial hardware and the simulator.
 use crate::{
     protocol::{Frame, FrameParser, IntegrityMonitor, MessageType, SampleBatch},
-    recording::SynchronizedRecord,
+    recording::{AcquisitionTimingDiagnostics, SynchronizedRecord},
 };
+
+const TIMING_RESERVOIR_CAPACITY: usize = 65_536;
+const TIMING_INTERVAL_TOLERANCE_PERCENT: f64 = 5.0;
+
+#[derive(Default)]
+struct TimingAccumulator {
+    first_timestamp_us: Option<u64>,
+    previous_timestamp_us: Option<u64>,
+    last_timestamp_us: Option<u64>,
+    interval_count: u64,
+    minimum_interval_us: u64,
+    maximum_interval_us: u64,
+    intervals_outside_tolerance: u64,
+    reservoir: Vec<u64>,
+    reservoir_state: u64,
+}
+
+impl TimingAccumulator {
+    fn accepts(&self, timestamp_us: u64) -> bool {
+        self.previous_timestamp_us
+            .is_none_or(|previous| timestamp_us > previous)
+    }
+
+    fn observe(&mut self, timestamp_us: u64, nominal_period_us: u32) {
+        self.first_timestamp_us.get_or_insert(timestamp_us);
+        if let Some(previous) = self.previous_timestamp_us {
+            if timestamp_us <= previous {
+                return;
+            }
+            let interval = timestamp_us - previous;
+            self.interval_count += 1;
+            if self.minimum_interval_us == 0 || interval < self.minimum_interval_us {
+                self.minimum_interval_us = interval;
+            }
+            self.maximum_interval_us = self.maximum_interval_us.max(interval);
+            let tolerance =
+                (f64::from(nominal_period_us) * TIMING_INTERVAL_TOLERANCE_PERCENT / 100.0).max(1.0);
+            if (interval as f64 - f64::from(nominal_period_us)).abs() > tolerance {
+                self.intervals_outside_tolerance += 1;
+            }
+            self.observe_reservoir(interval);
+        }
+        self.previous_timestamp_us = Some(timestamp_us);
+        self.last_timestamp_us = Some(timestamp_us);
+    }
+
+    fn observe_reservoir(&mut self, interval: u64) {
+        if self.reservoir.len() < TIMING_RESERVOIR_CAPACITY {
+            self.reservoir.push(interval);
+            return;
+        }
+        // A deterministic fixed-size reservoir bounds memory for indefinite
+        // recordings while retaining an unbiased interval sample for p50/p99.
+        self.reservoir_state = self
+            .reservoir_state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let selected = self.reservoir_state % self.interval_count.max(1);
+        if selected < TIMING_RESERVOIR_CAPACITY as u64 {
+            self.reservoir[selected as usize] = interval;
+        }
+    }
+
+    fn measured_rate_hz(&self) -> f64 {
+        match (
+            self.first_timestamp_us,
+            self.last_timestamp_us,
+            self.interval_count,
+        ) {
+            (Some(first), Some(last), count) if last > first && count > 0 => {
+                count as f64 * 1_000_000.0 / (last - first) as f64
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn diagnostics(
+        &self,
+        requested_rate_hz: u32,
+        acquisition_queue_overflows: u64,
+        pulse_state_intervals_outside_tolerance: Option<[u32; 4]>,
+        pulse_state_maximum_error_us: Option<[u32; 4]>,
+    ) -> AcquisitionTimingDiagnostics {
+        let mut intervals = self.reservoir.clone();
+        intervals.sort_unstable();
+        let quantile = |fraction: f64| -> f64 {
+            if intervals.is_empty() {
+                return 0.0;
+            }
+            let index = ((intervals.len() as f64 * fraction).ceil() as usize)
+                .saturating_sub(1)
+                .min(intervals.len() - 1);
+            intervals[index] as f64
+        };
+        AcquisitionTimingDiagnostics {
+            requested_rate_hz,
+            measured_rate_hz: self.measured_rate_hz(),
+            interval_count: self.interval_count,
+            median_interval_us: quantile(0.5),
+            minimum_interval_us: self.minimum_interval_us,
+            maximum_interval_us: self.maximum_interval_us,
+            p99_interval_us: quantile(0.99),
+            interval_tolerance_percent: TIMING_INTERVAL_TOLERANCE_PERCENT,
+            intervals_outside_tolerance: self.intervals_outside_tolerance,
+            acquisition_queue_overflows,
+            timestamp_source: "firmware_per_record".into(),
+            pulse_state_intervals_outside_tolerance,
+            pulse_state_maximum_error_us,
+        }
+    }
+}
 use std::{
     sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
     thread,
@@ -63,7 +174,7 @@ pub struct FirmwareCapabilities {
 }
 
 impl FirmwareCapabilities {
-    /// v0.3 CAPABILITIES is:
+    /// v0.4 CAPABILITIES is:
     /// min ADC bits, max ADC bits, max analog channels, mode bits, output
     /// mask, rate count, then little-endian u16 rates.  Earlier capability
     /// payloads remain readable but cannot prove the current configuration limits.
@@ -113,8 +224,7 @@ pub struct AcquisitionController {
     monitor: IntegrityMonitor,
     sender: SyncSender<SynchronizedRecord>,
     pub sample_count: u64,
-    first_timestamp: Option<u64>,
-    last_timestamp: Option<u64>,
+    timing: TimingAccumulator,
     last_counts: Option<u16>,
     hello_seen: bool,
     capabilities_seen: bool,
@@ -130,6 +240,8 @@ pub struct AcquisitionController {
     firmware_board_id: Option<u32>,
     firmware_capabilities: Option<FirmwareCapabilities>,
     digital_output_mask: Option<u8>,
+    pulse_state_intervals_outside_tolerance: [u32; 4],
+    pulse_state_maximum_error_us: [u32; 4],
 }
 impl AcquisitionController {
     pub fn new(sender: SyncSender<SynchronizedRecord>) -> Self {
@@ -139,8 +251,7 @@ impl AcquisitionController {
             monitor: IntegrityMonitor::default(),
             sender,
             sample_count: 0,
-            first_timestamp: None,
-            last_timestamp: None,
+            timing: TimingAccumulator::default(),
             last_counts: None,
             hello_seen: false,
             capabilities_seen: false,
@@ -156,6 +267,8 @@ impl AcquisitionController {
             firmware_board_id: None,
             firmware_capabilities: None,
             digital_output_mask: None,
+            pulse_state_intervals_outside_tolerance: [0; 4],
+            pulse_state_maximum_error_us: [0; 4],
         }
     }
     pub fn configure(&mut self) -> Result<(), &'static str> {
@@ -223,6 +336,33 @@ impl AcquisitionController {
                 if frame.payload.len() >= 2 {
                     self.digital_output_mask = Some(frame.payload[1] & 0x07);
                 }
+                if frame.payload.len() >= 6 {
+                    self.monitor
+                        .observe_firmware_queue_overflows(u32::from_le_bytes([
+                            frame.payload[2],
+                            frame.payload[3],
+                            frame.payload[4],
+                            frame.payload[5],
+                        ]));
+                }
+                if frame.payload.len() >= 38 {
+                    for state in 0..4 {
+                        let violations = 6 + state * 4;
+                        let maximum_error = 22 + state * 4;
+                        self.pulse_state_intervals_outside_tolerance[state] = u32::from_le_bytes([
+                            frame.payload[violations],
+                            frame.payload[violations + 1],
+                            frame.payload[violations + 2],
+                            frame.payload[violations + 3],
+                        ]);
+                        self.pulse_state_maximum_error_us[state] = u32::from_le_bytes([
+                            frame.payload[maximum_error],
+                            frame.payload[maximum_error + 1],
+                            frame.payload[maximum_error + 2],
+                            frame.payload[maximum_error + 3],
+                        ]);
+                    }
+                }
             }
             MessageType::ErrorMessage => {
                 self.firmware_error_count += 1;
@@ -243,6 +383,7 @@ impl AcquisitionController {
             batch.first_sample_sequence,
             count as u32,
             batch.status_flags,
+            batch.acquisition_queue_overflows,
         );
         if self.state != AcquisitionState::Running {
             return;
@@ -251,16 +392,19 @@ impl AcquisitionController {
             let first = index * usize::from(batch.channel_count);
             let record = SynchronizedRecord {
                 sequence: batch.first_sample_sequence.wrapping_add(index as u32),
-                timestamp_us: batch.first_timestamp_us
-                    + u64::from(batch.sample_period_us) * index as u64,
+                timestamp_us: batch.timestamps_us[index],
                 status_flags: batch.status_flags,
                 counts: batch.samples[first..first + usize::from(batch.channel_count)].to_vec(),
             };
+            if !self.timing.accepts(record.timestamp_us) {
+                self.monitor.counters.invalid_frames += 1;
+                continue;
+            }
             match self.sender.try_send(record.clone()) {
                 Ok(()) => {
                     self.sample_count += 1;
-                    self.first_timestamp.get_or_insert(record.timestamp_us);
-                    self.last_timestamp = Some(record.timestamp_us);
+                    self.timing
+                        .observe(record.timestamp_us, batch.sample_period_us);
                     self.last_counts = record.counts.first().copied();
                 }
                 Err(TrySendError::Full(_)) => self.monitor.counters.host_channel_overflows += 1,
@@ -271,13 +415,7 @@ impl AcquisitionController {
         }
     }
     pub fn snapshot(&self) -> AcquisitionSnapshot {
-        let measured_rate_hz = match (self.first_timestamp, self.last_timestamp, self.sample_count)
-        {
-            (Some(first), Some(last), n) if last > first && n > 1 => {
-                (n - 1) as f64 * 1_000_000.0 / (last - first) as f64
-            }
-            _ => 0.0,
-        };
+        let measured_rate_hz = self.timing.measured_rate_hz();
         AcquisitionSnapshot {
             state: self.state,
             sample_count: self.sample_count,
@@ -300,6 +438,19 @@ impl AcquisitionController {
             digital_output_mask: self.digital_output_mask,
             skipped_noise_bytes: self.parser.stats.skipped_noise_bytes,
         }
+    }
+
+    pub fn timing_diagnostics(
+        &self,
+        requested_rate_hz: u32,
+        include_pulse_state_timing: bool,
+    ) -> AcquisitionTimingDiagnostics {
+        self.timing.diagnostics(
+            requested_rate_hz,
+            self.monitor.counters.firmware_overflows,
+            include_pulse_state_timing.then_some(self.pulse_state_intervals_outside_tolerance),
+            include_pulse_state_timing.then_some(self.pulse_state_maximum_error_us),
+        )
     }
 }
 pub fn simulator_stream(seconds: u32, sample_rate_hz: u32) -> Receiver<SynchronizedRecord> {
@@ -326,11 +477,14 @@ pub fn simulator_stream(seconds: u32, sample_rate_hz: u32) -> Receiver<Synchroni
                 .collect();
             let batch = SampleBatch {
                 first_sample_sequence: first,
-                first_timestamp_us: u64::from(first) * u64::from(period),
                 sample_period_us: period,
                 channel_count: 1,
+                timestamps_us: (0..take)
+                    .map(|index| u64::from(first + index) * u64::from(period))
+                    .collect(),
                 samples,
-                status_flags: 1,
+                status_flags: crate::protocol::SAMPLE_STATUS_ACQUIRING,
+                acquisition_queue_overflows: Some(0),
             };
             let payload = match batch.to_payload() {
                 Ok(p) => p,
@@ -374,11 +528,12 @@ mod tests {
         assert!(c.start().is_ok());
         let b = SampleBatch {
             first_sample_sequence: 0,
-            first_timestamp_us: 0,
             sample_period_us: 1000,
             channel_count: 1,
+            timestamps_us: vec![1_000, 2_015],
             samples: vec![10, 11],
-            status_flags: 1,
+            status_flags: crate::protocol::SAMPLE_STATUS_ACQUIRING,
+            acquisition_queue_overflows: Some(0),
         };
         let f = Frame {
             message_type: MessageType::SampleBatch,
@@ -387,7 +542,10 @@ mod tests {
             payload: b.to_payload().unwrap_or_default(),
         };
         c.ingest_bytes(&crate::protocol::encode_frame(&f).unwrap_or_default());
-        assert_eq!(rx.try_iter().count(), 2);
+        let records = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].timestamp_us, 1_000);
+        assert_eq!(records[1].timestamp_us, 2_015);
         c.stop();
         assert_eq!(c.state, AcquisitionState::Idle);
     }
@@ -411,6 +569,98 @@ mod tests {
         }
         let snapshot = c.snapshot();
         assert!(snapshot.hello_seen && snapshot.capabilities_seen && snapshot.pong_seen);
+    }
+
+    #[test]
+    fn timing_diagnostics_use_firmware_timestamps_and_report_interval_distribution() {
+        let (tx, rx) = sync_channel(16);
+        let mut controller = AcquisitionController::new(tx);
+        controller
+            .configure()
+            .unwrap_or_else(|error| panic!("{error}"));
+        controller.start().unwrap_or_else(|error| panic!("{error}"));
+        let batch = SampleBatch {
+            first_sample_sequence: 0,
+            sample_period_us: 4_000,
+            channel_count: 1,
+            timestamps_us: vec![4_000, 8_000, 12_000, 16_600, 20_600],
+            samples: vec![1, 2, 3, 4, 5],
+            status_flags: crate::protocol::SAMPLE_STATUS_ACQUIRING,
+            acquisition_queue_overflows: Some(0),
+        };
+        let frame = Frame {
+            message_type: MessageType::SampleBatch,
+            flags: 0,
+            sequence: 0,
+            payload: batch
+                .to_payload()
+                .unwrap_or_else(|error| panic!("{error:?}")),
+        };
+        controller.ingest_bytes(
+            &crate::protocol::encode_frame(&frame).unwrap_or_else(|error| panic!("{error:?}")),
+        );
+        assert_eq!(
+            rx.try_iter()
+                .map(|record| record.timestamp_us)
+                .collect::<Vec<_>>(),
+            [4_000, 8_000, 12_000, 16_600, 20_600]
+        );
+        let timing = controller.timing_diagnostics(250, false);
+        assert_eq!(timing.interval_count, 4);
+        assert_eq!(timing.minimum_interval_us, 4_000);
+        assert_eq!(timing.maximum_interval_us, 4_600);
+        assert_eq!(timing.median_interval_us, 4_000.0);
+        assert_eq!(timing.p99_interval_us, 4_600.0);
+        assert_eq!(timing.intervals_outside_tolerance, 1);
+    }
+
+    #[test]
+    fn sixty_second_pulseox_timestamps_meet_the_nominal_rate_without_batch_spikes() {
+        let mut timing = TimingAccumulator::default();
+        for cycle in 0..60 * 250u64 {
+            timing.observe((cycle + 1) * 4_000, 4_000);
+        }
+        let diagnostics = timing.diagnostics(250, 0, None, None);
+        assert!((diagnostics.measured_rate_hz - 250.0).abs() / 250.0 < 0.01);
+        assert_eq!(diagnostics.median_interval_us, 4_000.0);
+        assert_eq!(diagnostics.maximum_interval_us, 4_000);
+        assert_eq!(diagnostics.intervals_outside_tolerance, 0);
+    }
+
+    #[test]
+    fn extended_status_preserves_per_phase_timing_diagnostics() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        let mut payload = vec![0; 38];
+        payload[0] = 1;
+        payload[1] = 0x02;
+        payload[2..6].copy_from_slice(&3u32.to_le_bytes());
+        for (state, value) in [0u32, 1, 0, 2].into_iter().enumerate() {
+            let offset = 6 + state * 4;
+            payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (state, value) in [12u32, 61, 8, 74].into_iter().enumerate() {
+            let offset = 22 + state * 4;
+            payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let status = Frame {
+            message_type: MessageType::Status,
+            flags: 0,
+            sequence: 0,
+            payload,
+        };
+        controller.ingest_bytes(&crate::protocol::encode_frame(&status).unwrap_or_default());
+
+        let timing = controller.timing_diagnostics(250, true);
+        assert_eq!(timing.acquisition_queue_overflows, 3);
+        assert_eq!(
+            timing.pulse_state_intervals_outside_tolerance,
+            Some([0, 1, 0, 2])
+        );
+        assert_eq!(timing.pulse_state_maximum_error_us, Some([12, 61, 8, 74]));
+        let analog_timing = controller.timing_diagnostics(1_000, false);
+        assert_eq!(analog_timing.pulse_state_intervals_outside_tolerance, None);
+        assert_eq!(analog_timing.pulse_state_maximum_error_us, None);
     }
 
     #[test]

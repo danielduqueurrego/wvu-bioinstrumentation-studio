@@ -2,7 +2,7 @@
 
 ## Current reference
 
-The current WVU reference firmware uses binary USB protocol **0.3**, build `0x00010004`, and device ID `0x554E4F34`. USB CDC is configured for 921600 baud. Multibyte fields are little-endian.
+The current WVU reference firmware uses binary USB protocol **0.4**, build `0x00010006`, and device ID `0x554E4F34`. USB CDC is configured for 921600 baud. Multibyte fields are little-endian.
 
 Frames use the `BMEG` magic, protocol major/minor, message type, flags, payload length, packet sequence, payload, and CRC-16/CCITT-FALSE.
 
@@ -44,8 +44,42 @@ red_TX,dark1_TX,ir_TX,dark2_TX,red_RX,dark1_RX,ir_RX,dark2_RX
 
 RED and IR are never HIGH together.
 
+## Sample batches and measured timestamps
+
+Protocol 0.4 `SAMPLE_BATCH` payloads retain the original 20-byte batch header and set flag `0x0008` to identify explicit per-record timestamps:
+
+```text
+uint32  first_record_sequence
+uint64  first_timestamp_us
+uint32  nominal_period_us
+uint8   field_count
+uint8   record_count
+uint16  flags
+uint32  acquisition_queue_overflows
+uint64  timestamps_us[record_count]
+uint16  values[record_count][field_count]
+```
+
+`first_timestamp_us` must match the first explicit timestamp. Timestamps are monotonic 64-bit microseconds extended by the firmware across the underlying `micros()` wrap. For pulse-ox, each timestamp records completion of the DARK 2 measurements for that cycle. The nominal period describes the requested configuration; it is not substituted for measured timestamps.
+
+The firmware first finalizes records into a bounded raw-batch queue, then constructs protocol packets and CRCs outside the timing-critical sampling path. Serial transmission uses a second bounded queue, reported writable capacity, and partial writes. If backpressure fills the acquisition queue, the firmware drops the new batch, increments the cumulative `acquisition_queue_overflows` value, and reports the overflow flag rather than blocking acquisition or silently corrupting timing.
+
+Build `0x00010006` extends the protocol 0.4 `STATUS` payload while remaining parseable by older v0.4 hosts:
+
+```text
+uint8   acquiring
+uint8   output_mask
+uint32  acquisition_queue_overflows
+uint32  phase_intervals_outside_5_percent[4]  // RED, DARK 1, IR, DARK 2
+uint32  phase_maximum_absolute_error_us[4]    // RED, DARK 1, IR, DARK 2
+```
+
+The host accounts for the cumulative overflow value once even when it appears in both status and batch frames. For pulse-ox recordings it preserves the four per-state timing checks in final metadata. Pulse-state deadlines advance by the configured dwell on one absolute timeline; they are not recalculated from the completion time of ADC, bookkeeping, packet construction, or serial transmission.
+
+The desktop parser continues to accept legacy protocol 0.1–0.3 sample batches, whose record timestamps are expanded from their first timestamp and nominal period. New recordings require the current compatible reference firmware so their authoritative records use measured per-record timestamps.
+
 ## Safety and compatibility
 
 D4/D5/D6 are forced LOW at startup, idle, Stop, rejected configuration, protocol fault, and watchdog fault. Acquisition requires HELLO, CAPABILITIES, PONG, valid CRC, the expected firmware identity, successful CONFIGURE, and START.
 
-The recording reader retains compatibility with earlier single-channel and synchronized BMEG layouts. Existing files are not relabelled or rewritten.
+The recording reader retains compatibility with earlier single-channel and synchronized BMEG layouts. Existing files are not relabelled or rewritten. New metadata includes requested and measured rate, interval median/minimum/maximum/p99, the documented ±5% timing-tolerance count, timestamp source, and acquisition-queue overflows.

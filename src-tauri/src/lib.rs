@@ -34,6 +34,18 @@ struct StartProfileHardwareRequest {
     duration: recording::RecordingDuration,
     profile_id: String,
     bench_notice_acknowledged: bool,
+    recording_note: String,
+    calibration: Option<calibration::RecordingCalibration>,
+}
+
+#[derive(serde::Deserialize)]
+struct StartProfileSimulatorRequest {
+    project_folder: String,
+    output_folder: String,
+    duration: recording::RecordingDuration,
+    profile_id: String,
+    bench_notice_acknowledged: bool,
+    recording_note: String,
     calibration: Option<calibration::RecordingCalibration>,
 }
 
@@ -411,13 +423,17 @@ fn checked_recording_calibration(
 #[tauri::command]
 fn start_profile_simulator_recording(
     state: tauri::State<'_, AppState>,
-    project_folder: String,
-    output_folder: String,
-    duration: recording::RecordingDuration,
-    profile_id: String,
-    bench_notice_acknowledged: bool,
-    calibration: Option<calibration::RecordingCalibration>,
+    request: StartProfileSimulatorRequest,
 ) -> Result<session::SessionStatus, String> {
+    let StartProfileSimulatorRequest {
+        project_folder,
+        output_folder,
+        duration,
+        profile_id,
+        bench_notice_acknowledged,
+        recording_note,
+        calibration,
+    } = request;
     let destination =
         project_paths::resolve_recording_destination(&project_folder, &output_folder)?;
     let profile = state
@@ -440,6 +456,7 @@ fn start_profile_simulator_recording(
                 project_folder: destination.project_folder.to_string_lossy().into_owned(),
                 output_folder: destination.output_folder,
             }),
+            session::RecordingContext { recording_note },
         )
         .map_err(|error| error.to_string())
 }
@@ -456,6 +473,7 @@ fn start_profile_hardware_recording(
         duration,
         profile_id,
         bench_notice_acknowledged,
+        recording_note,
         calibration,
     } = request;
     app_log::record(
@@ -573,16 +591,21 @@ fn start_profile_hardware_recording(
     app_log::record("INFO", "SERIAL_OPEN_BEGIN");
     state
         .session
-        .start_serial_with_profile_calibration_and_path_context(
+        .start_serial_with_profile_and_options(
             profile.snapshot(bench_notice_acknowledged),
             port,
-            duration,
-            destination.effective_folder,
-            calibration,
-            Some(session::RecordingPathContext {
-                project_folder: destination.project_folder.to_string_lossy().into_owned(),
-                output_folder: destination.output_folder,
-            }),
+            session::RecordingStartOptions {
+                duration,
+                output_dir: destination.effective_folder,
+                calibration,
+                recording_path_context: Some(session::RecordingPathContext {
+                    project_folder: destination.project_folder.to_string_lossy().into_owned(),
+                    output_folder: destination.output_folder,
+                }),
+                recording_context: session::RecordingContext {
+                    recording_note,
+                },
+            },
         )
         .map_err(|error| {
             StartRecordingFailure::new(

@@ -112,6 +112,11 @@ pub struct RecordingMetadata {
     pub adc_bits: u8,
     pub requested_sample_rate_hz: u32,
     pub measured_sample_rate_hz: f64,
+    /// Final sidecars produced by protocol v0.4 include firmware-timestamped
+    /// interval statistics. Historical BMEG headers and sidecars deserialize
+    /// with this field absent.
+    #[serde(default)]
+    pub timing_diagnostics: Option<AcquisitionTimingDiagnostics>,
     pub total_samples: u64,
     pub integrity: IntegrityCounters,
     pub app_version: String,
@@ -124,6 +129,14 @@ pub struct RecordingMetadata {
     pub bmeg_filename: String,
     pub csv_filename: Option<String>,
     pub notes: String,
+    /// The operator's optional note, preserved byte-for-byte as UTF-8 text.
+    /// `notes` contains either this exact value or a profile-derived default.
+    #[serde(default)]
+    pub user_recording_note: Option<String>,
+    /// Explicit recording-safety facts. These values are never inferred from
+    /// the presence of a sensor or from a non-bench profile category.
+    #[serde(default)]
+    pub recording_safety: RecordingSafetyContext,
     /// User-selected destination provenance. This is optional so recordings made
     /// before the single-window Project folder workflow remain readable.
     #[serde(default)]
@@ -159,6 +172,50 @@ pub struct RecordingMetadata {
     /// remain ADC counts regardless of whether any of these conversions are selected.
     #[serde(default)]
     pub calibration: Option<RecordingCalibration>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AcquisitionTimingDiagnostics {
+    pub requested_rate_hz: u32,
+    pub measured_rate_hz: f64,
+    pub interval_count: u64,
+    pub median_interval_us: f64,
+    pub minimum_interval_us: u64,
+    pub maximum_interval_us: u64,
+    pub p99_interval_us: f64,
+    /// Intervals outside +/- this percentage of the nominal interval.
+    pub interval_tolerance_percent: f64,
+    pub intervals_outside_tolerance: u64,
+    pub acquisition_queue_overflows: u64,
+    pub timestamp_source: String,
+    /// Firmware-observed intervals outside +/-5% of the configured dwell,
+    /// indexed as RED, DARK 1, IR, DARK 2. Absent for simultaneous analog
+    /// captures and recordings made by earlier firmware.
+    #[serde(default)]
+    pub pulse_state_intervals_outside_tolerance: Option<[u32; 4]>,
+    /// Maximum absolute firmware-observed dwell error in microseconds for
+    /// RED, DARK 1, IR, and DARK 2 respectively.
+    #[serde(default)]
+    pub pulse_state_maximum_error_us: Option<[u32; 4]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecordingSafetyContext {
+    pub bench_only_profile: bool,
+    pub human_connection_authorized: bool,
+    pub bench_notice_acknowledged: bool,
+    pub medical_validation_status: String,
+}
+
+impl Default for RecordingSafetyContext {
+    fn default() -> Self {
+        Self {
+            bench_only_profile: false,
+            human_connection_authorized: false,
+            bench_notice_acknowledged: false,
+            medical_validation_status: "not_medical_device".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -667,6 +724,7 @@ mod tests {
             adc_bits: 12,
             requested_sample_rate_hz: 1000,
             measured_sample_rate_hz: 1000.0,
+            timing_diagnostics: None,
             total_samples: 1,
             integrity: IntegrityCounters::default(),
             app_version: "test".into(),
@@ -679,6 +737,8 @@ mod tests {
             bmeg_filename: "r.bmeg".into(),
             csv_filename: None,
             notes: "test".into(),
+            user_recording_note: None,
+            recording_safety: RecordingSafetyContext::default(),
             project_folder: None,
             output_folder: None,
             duration_mode: Some("timed".into()),
@@ -776,6 +836,7 @@ mod tests {
             adc_bits: 12,
             requested_sample_rate_hz: 1000,
             measured_sample_rate_hz: 1000.0,
+            timing_diagnostics: None,
             total_samples: 0,
             integrity: IntegrityCounters::default(),
             app_version: "test".into(),
@@ -788,6 +849,8 @@ mod tests {
             bmeg_filename: "r.bmeg".into(),
             csv_filename: None,
             notes: "test".into(),
+            user_recording_note: None,
+            recording_safety: RecordingSafetyContext::default(),
             project_folder: None,
             output_folder: None,
             duration_mode: Some("timed".into()),
@@ -812,6 +875,9 @@ mod tests {
             "initial_free_disk_bytes",
             "final_free_disk_bytes",
             "completion_status",
+            "timing_diagnostics",
+            "user_recording_note",
+            "recording_safety",
         ] {
             object.remove(name);
         }
@@ -847,6 +913,7 @@ mod tests {
             adc_bits: 12,
             requested_sample_rate_hz: 1000,
             measured_sample_rate_hz: 0.0,
+            timing_diagnostics: None,
             total_samples: 1,
             integrity: IntegrityCounters::default(),
             app_version: "test".into(),
@@ -859,6 +926,8 @@ mod tests {
             bmeg_filename: "profile.bmeg".into(),
             csv_filename: None,
             notes: "synthetic".into(),
+            user_recording_note: None,
+            recording_safety: RecordingSafetyContext::default(),
             project_folder: None,
             output_folder: None,
             duration_mode: Some("timed".into()),
@@ -974,6 +1043,14 @@ mod tests {
                 counts: vec![101, 102, 103, 104, 201, 202, 203, 204],
             })
             .unwrap_or_else(|e| panic!("{e}"));
+        pulse_writer
+            .write_record(&SynchronizedRecord {
+                sequence: 8,
+                timestamp_us: 32_750,
+                status_flags: 1,
+                counts: vec![111, 112, 113, 114, 211, 212, 213, 214],
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
         pulse_writer.finish().unwrap_or_else(|e| panic!("{e}"));
         export_bmeg_csv(&pulse_bmeg, &pulse_csv).unwrap_or_else(|e| panic!("{e}"));
         let pulse_text = std::fs::read_to_string(pulse_csv).unwrap_or_else(|e| panic!("{e}"));
@@ -984,6 +1061,25 @@ mod tests {
         assert_eq!(
             pulse_text.lines().nth(1),
             Some("7,28000,101,102,103,104,201,202,203,204")
+        );
+        assert_eq!(
+            pulse_text.lines().nth(2),
+            Some("8,32750,111,112,113,114,211,212,213,214")
+        );
+        let mut pulse_reader = BmegReader::open(&pulse_bmeg).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            pulse_reader
+                .next_record()
+                .unwrap_or_else(|e| panic!("{e}"))
+                .map(|record| record.timestamp_us),
+            Some(28_000)
+        );
+        assert_eq!(
+            pulse_reader
+                .next_record()
+                .unwrap_or_else(|e| panic!("{e}"))
+                .map(|record| record.timestamp_us),
+            Some(32_750)
         );
         metadata.profile_snapshot = None;
         assert!(metadata.profile_snapshot.is_none());
@@ -1015,6 +1111,7 @@ mod tests {
             adc_bits: 12,
             requested_sample_rate_hz: 1_000,
             measured_sample_rate_hz: 1_000.0,
+            timing_diagnostics: None,
             total_samples: 2,
             integrity: IntegrityCounters::default(),
             app_version: "test".into(),
@@ -1027,6 +1124,8 @@ mod tests {
             bmeg_filename: "validation.bmeg".into(),
             csv_filename: None,
             notes: "bench only".into(),
+            user_recording_note: None,
+            recording_safety: RecordingSafetyContext::default(),
             project_folder: None,
             output_folder: None,
             duration_mode: Some("timed".into()),

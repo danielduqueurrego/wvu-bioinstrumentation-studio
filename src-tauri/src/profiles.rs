@@ -604,6 +604,8 @@ impl AcquisitionProfile {
             || self.required_firmware.protocol_minor_min > PROTOCOL_MINOR
             || ![
                 REFERENCE_FIRMWARE_BUILD,
+                0x0001_0005,
+                0x0001_0004,
                 0x0001_0003,
                 0x0001_0002,
                 0x0001_0001,

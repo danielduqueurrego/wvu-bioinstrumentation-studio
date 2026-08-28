@@ -12,6 +12,7 @@ Teaching use only — not a medical device. Follow BMEG 420L lab instructions an
 - Color-coded legends for plots containing multiple visible signals, a synchronized 0.5–30 s live display window, and persistent newest-value labels in the selected display units.
 - Display-only decimation for longer live windows while recorded BMEG and CSV data remain full-rate.
 - Live plot time axes use elapsed recording seconds, starting at 0 for the first accepted frame; they are not calendar timestamps.
+- Firmware-measured timestamps are preserved for every synchronized record, including each completed pulse-ox cycle.
 - Counts, volts, MPXV pressure conversion, and student-created local linear calibration for supported channels.
 - Project-folder and trial-folder organization with automatic raw BMEG, CSV, and metadata output; recording markers are preserved in metadata.
 - Instructor-managed, versioned course-lab definitions with factory defaults, import/export, and safe pin/rate/output configuration.
@@ -94,7 +95,7 @@ Generated filenames use the selected lab's export name, for example `ecg_course_
 
 Live plot windowing, trace visibility, legends, endpoint labels, and display decimation do not alter the recorded raw samples.
 
-Pulse oximetry applies each RED, DARK 1, IR, or DARK 2 state for its configured settling interval before sampling and preserves the resulting raw TX/RX measurements. The application does not subtract ambient states, calculate SpO2, calculate heart rate, or perform physiological interpretation.
+Pulse oximetry schedules RED, DARK 1, IR, and DARK 2 on one absolute firmware timeline and preserves the resulting raw TX/RX measurements and actual cycle timestamps. Bounded acquisition and transmit queues keep packet construction and USB backpressure out of the sampling path and report overflow explicitly. The application does not subtract ambient states, calculate SpO2, calculate heart rate, or perform physiological interpretation.
 
 ## Building from source
 

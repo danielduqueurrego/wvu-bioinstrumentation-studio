@@ -9,7 +9,7 @@
   "description": "Four synchronized raw EMG and pressure/force-surrogate variables for the BMEG 420L force lab.",
   "target_board": "Arduino UNO R4 WiFi",
   "fqbn": "arduino:renesas_uno:unor4wifi",
-  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 3, "build": "0x00010004", "device": "0x554E4F34" },
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 4, "build": "0x00010006", "device": "0x554E4F34" },
   "acquisition": {
     "analog_pin": "A0", "adc_resolution_bits": 14, "sample_rate_hz": 1000,
     "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
@@ -26,5 +26,5 @@
   "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "Raw data only: no MVC, fatigue, RMS, envelope, or physiological interpretation is calculated here."] },
   "export": { "signal_name": "emg_force_course_capture", "include_profile_snapshot": true },
   "plot_defaults": { "groups": [{ "channel_ids": ["raw_emg"] }, { "channel_ids": ["rectified_emg"] }, { "channel_ids": ["emg_envelope"] }, { "channel_ids": ["pressure"] }] },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "81cb7a0eaa8f521a8d7b351e826c01174c2e658ef7bd71d3c571e010beb3b76b" }
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "cd0af7cf4a1ca25d8a5988f630825a30d7015aa6a40ef282af10f225e1ae60b8" }
 }

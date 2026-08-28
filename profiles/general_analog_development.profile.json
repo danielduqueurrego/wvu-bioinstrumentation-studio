@@ -9,7 +9,7 @@
   "description": "Flexible synchronized raw Arduino analog acquisition for teaching and debugging.",
   "target_board": "Arduino UNO R4 WiFi",
   "fqbn": "arduino:renesas_uno:unor4wifi",
-  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 3, "build": "0x00010004", "device": "0x554E4F34" },
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 4, "build": "0x00010006", "device": "0x554E4F34" },
   "acquisition": {
     "analog_pin": "A0", "adc_resolution_bits": 14, "sample_rate_hz": 1000,
     "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
@@ -20,5 +20,5 @@
   "safety": { "bench_only": true, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Use simulator, UNO alone, or a safe 0–5 V bench signal for development."] },
   "export": { "signal_name": "general_analog_raw", "include_profile_snapshot": true },
   "plot_defaults": { "groups": [{ "channel_ids": ["general_a0"] }] },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "3ea70ed8d3d68c97a659c93ea557a981cad14bcc7f8a78d866a1ab831b6d547c" }
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "2cfca936f3af638774a6a4239ff9a740ba5272b765cc22c33118498050c2b790" }
 }

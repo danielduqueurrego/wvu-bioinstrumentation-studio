@@ -3,8 +3,8 @@
   "platform": "windows-x64",
   "arduino_cli_version": "1.5.2-rc.1",
   "arduino_core": "1.6.0",
-  "firmware_protocol": "0.3",
-  "reference_firmware_build": "0x00010004",
-  "reference_firmware_source_sha256": "b549d558477c2fc823c535301bda2786eb740b0448afe0abde1889767a82c63d",
+  "firmware_protocol": "0.4",
+  "reference_firmware_build": "0x00010006",
+  "reference_firmware_source_sha256": "f3eb3fec0166189f66a8ddfeb058172a8d97a3c60d95d574b3234eecbd144aab",
   "arduino_runtime_archive_sha256": "4e068c540b485e8e7ceff29dac849db250b41efb56108b10edadfb033dc7d501"
 }

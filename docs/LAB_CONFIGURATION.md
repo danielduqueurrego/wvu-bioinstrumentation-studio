@@ -12,7 +12,9 @@ Course labs are versioned acquisition definitions. Every recording embeds a snap
 | Pulse Oximetry — TX + RX Raw Capture | A0 TX, A1 RX, D5 red, D6 IR | about 250 cycles/s | 14 bit | TX raw phases; RX raw phases |
 | General Analog — Development | 1–6 unique A0–A5 inputs | 1000 frames/s | 14 bit | one plot per selected input |
 
-The pulse-ox lab uses a fixed `RED → DARK 1 → IR → DARK 2` sequence with a 1000 µs nominal dwell. The firmware applies each phase, waits the complete configured dwell, and then samples TX and RX before advancing. RED and IR are never driven HIGH at the same time.
+The pulse-ox lab uses a fixed `RED → DARK 1 → IR → DARK 2` sequence with a 1000 µs nominal dwell. The firmware advances phase deadlines on one absolute schedule rather than scheduling from the end of ADC and bookkeeping work. RED and IR are never driven HIGH at the same time. Each completed cycle carries its measured timestamp; the requested cycle rate remains configuration metadata rather than a replacement for measured timing.
+
+Recording metadata preserves the selected profile's bench-only status, human-connection authorization, course-notice acknowledgement, and non-medical validation status. The acquisition screen does not ask students to classify the connected signal separately.
 
 ## Instructor revisions
 

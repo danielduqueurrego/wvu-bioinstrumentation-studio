@@ -33,6 +33,11 @@ export function hardwareStartInvokePayload<T>(request: T): { request: T } {
   return { request };
 }
 
+/** Keep the simulator command on the same one-argument Tauri IPC boundary. */
+export function simulatorStartInvokePayload<T>(request: T): { request: T } {
+  return { request };
+}
+
 const activeSessionStates = new Set([
   'Connecting',
   'Connected',

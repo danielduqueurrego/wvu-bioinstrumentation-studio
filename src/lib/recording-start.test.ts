@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { hardwareStartInvokePayload, recordingStartFailure, recordingStartReadiness, studentRecordingStartError } from './recording-start';
+import { hardwareStartInvokePayload, recordingStartFailure, recordingStartReadiness, simulatorStartInvokePayload, studentRecordingStartError } from './recording-start';
 
 const readyHardware = {
   source: 'hardware' as const,
@@ -56,4 +56,18 @@ describe('recording start readiness', () => {
     const request = { port: 'COM5', project_folder: 'C:\\Users\\Student\\Documents\\BMEG 420L' };
     expect(hardwareStartInvokePayload(request)).toEqual({ request });
   });
+
+  it('keeps the simulator Start request under the named Tauri command argument', () => {
+    const request = {
+      project_folder: 'C:\\Users\\Student\\Documents\\BMEG 420L',
+      output_folder: 'Test1',
+      duration: { mode: 'until_stopped' },
+      profile_id: 'general-analog',
+      bench_notice_acknowledged: true,
+      recording_note: 'Bench test',
+      calibration: null
+    };
+    expect(simulatorStartInvokePayload(request)).toEqual({ request });
+  });
+
 });

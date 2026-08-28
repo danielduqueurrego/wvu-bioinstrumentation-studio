@@ -13,7 +13,10 @@
 
 - Confirm board discovery, firmware verification, and firmware restore work without external console windows.
 - Record a short ECG session, a second session without restart, and a short multi-channel EMG session.
-- Confirm raw pulse-ox fields, safe LED behavior, and settle-before-sample timing with the appropriate hardware setup.
+- Confirm raw pulse-ox fields, safe LED behavior, absolute phase scheduling, measured per-cycle timestamps, and explicit acquisition-queue overflow accounting with the appropriate hardware setup.
+- At a 1000 µs pulse-state dwell, confirm a physical 60-second capture has a median cycle interval near 4000 µs, remains within 1% of 250 cycles/s, has no cycle interval outside ±5%, and has no cycle-index-modulo-10 timing pattern.
+- Confirm final metadata reports zero per-state intervals outside ±5% for RED, DARK 1, IR, and DARK 2; review each state's maximum absolute timing error.
+- Confirm final metadata timing diagnostics agree with the recorded timestamps and that optional recording notes are preserved exactly.
 - Confirm new BMEG, CSV, and metadata filenames identify the lab and contain no development-phase label.
 - Open Instructor Manage Labs and verify that reading/selecting labs creates no version.
 

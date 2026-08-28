@@ -4,11 +4,12 @@ use std::collections::VecDeque;
 
 pub const MAGIC: [u8; 4] = *b"BMEG";
 pub const PROTOCOL_MAJOR: u8 = 0;
-/// Protocol v0.3 adds instructor-configurable controlled output masks and remappable
-/// pulse-ox TX/RX and RED/IR resources while keeping the fixed four-state order.
-pub const PROTOCOL_MINOR: u8 = 3;
+/// Protocol v0.4 adds explicit timestamps for every synchronized record and a
+/// cumulative firmware acquisition-queue overflow count. The parser retains
+/// v0.1-v0.3 support for diagnostics and historical protocol fixtures.
+pub const PROTOCOL_MINOR: u8 = 4;
 pub const LEGACY_PROTOCOL_MINOR: u8 = 1;
-/// USB CDC configuration used by the controlled v0.3 firmware. This leaves
+/// USB CDC configuration used by the controlled v0.4 firmware. This leaves
 /// headroom for a six-channel 1 kHz logical-frame stream.
 pub const CONTROLLED_SERIAL_BAUD: u32 = 921_600;
 pub const HEADER_LEN: usize = 14;
@@ -17,8 +18,11 @@ pub const MAX_PAYLOAD_LEN: usize = 1024;
 
 /// Immutable identity expected from the controlled UNO R4 WiFi reference firmware.
 /// The matching values are encoded in `firmware/reference_unor4wifi`'s HELLO frame.
-pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0004;
+pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0006;
 pub const REFERENCE_DEVICE_ID: u32 = 0x554e_4f34;
+pub const SAMPLE_STATUS_ACQUIRING: u16 = 0x0001;
+pub const SAMPLE_STATUS_QUEUE_OVERFLOW: u16 = 0x0004;
+pub const SAMPLE_STATUS_EXPLICIT_TIMESTAMPS: u16 = 0x0008;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,11 +201,17 @@ impl FrameParser {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampleBatch {
     pub first_sample_sequence: u32,
-    pub first_timestamp_us: u64,
     pub sample_period_us: u32,
     pub channel_count: u8,
+    /// One firmware-measured timestamp per synchronized record. Protocol v0.4
+    /// carries these explicitly; legacy v0.1-v0.3 payloads are expanded here
+    /// solely so historical fixtures remain readable by the common API.
+    pub timestamps_us: Vec<u64>,
     pub samples: Vec<u16>,
     pub status_flags: u16,
+    /// Cumulative packet-queue overflow events reported by protocol v0.4.
+    /// Legacy batches have no cumulative counter and therefore use `None`.
+    pub acquisition_queue_overflows: Option<u32>,
 }
 impl SampleBatch {
     pub fn from_payload(payload: &[u8]) -> Result<Self, ProtocolError> {
@@ -213,11 +223,51 @@ impl SampleBatch {
         if channels == 0 || count == 0 {
             return Err(ProtocolError::InvalidPayload("zero channels or samples"));
         }
-        let expected = 20usize + usize::from(channels) * usize::from(count) * 2;
+        let status_flags = u16::from_le_bytes([payload[18], payload[19]]);
+        let explicit_timestamps = status_flags & SAMPLE_STATUS_EXPLICIT_TIMESTAMPS != 0;
+        let timestamp_bytes = if explicit_timestamps {
+            usize::from(count) * 8
+        } else {
+            0
+        };
+        let v4_header_bytes = if explicit_timestamps { 24 } else { 20 };
+        let expected =
+            v4_header_bytes + timestamp_bytes + usize::from(channels) * usize::from(count) * 2;
         if payload.len() != expected {
             return Err(ProtocolError::InvalidPayload("sample batch length"));
         }
-        let samples = payload[20..]
+        let first_timestamp_us = u64::from_le_bytes(
+            payload[4..12]
+                .try_into()
+                .map_err(|_| ProtocolError::InvalidPayload("timestamp"))?,
+        );
+        let sample_period_us = u32::from_le_bytes(
+            payload[12..16]
+                .try_into()
+                .map_err(|_| ProtocolError::InvalidPayload("period"))?,
+        );
+        let timestamps_us = if explicit_timestamps {
+            let timestamps = payload[24..24 + timestamp_bytes]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|bytes| u64::from_le_bytes(*bytes))
+                .collect::<Vec<_>>();
+            if timestamps.first().copied() != Some(first_timestamp_us)
+                || timestamps.windows(2).any(|pair| pair[1] <= pair[0])
+            {
+                return Err(ProtocolError::InvalidPayload(
+                    "sample timestamps must be strictly monotonic",
+                ));
+            }
+            timestamps
+        } else {
+            (0..u64::from(count))
+                .map(|index| first_timestamp_us + u64::from(sample_period_us) * index)
+                .collect()
+        };
+        let samples_offset = v4_header_bytes + timestamp_bytes;
+        let samples = payload[samples_offset..]
             .as_chunks::<2>()
             .0
             .iter()
@@ -229,19 +279,13 @@ impl SampleBatch {
                     .try_into()
                     .map_err(|_| ProtocolError::InvalidPayload("sequence"))?,
             ),
-            first_timestamp_us: u64::from_le_bytes(
-                payload[4..12]
-                    .try_into()
-                    .map_err(|_| ProtocolError::InvalidPayload("timestamp"))?,
-            ),
-            sample_period_us: u32::from_le_bytes(
-                payload[12..16]
-                    .try_into()
-                    .map_err(|_| ProtocolError::InvalidPayload("period"))?,
-            ),
+            sample_period_us,
             channel_count: channels,
+            timestamps_us,
             samples,
-            status_flags: u16::from_le_bytes([payload[18], payload[19]]),
+            status_flags,
+            acquisition_queue_overflows: explicit_timestamps
+                .then(|| u32::from_le_bytes([payload[20], payload[21], payload[22], payload[23]])),
         })
     }
     pub fn to_payload(&self) -> Result<Vec<u8>, ProtocolError> {
@@ -252,16 +296,31 @@ impl SampleBatch {
                 .len()
                 .is_multiple_of(usize::from(self.channel_count))
             || self.samples.len() / usize::from(self.channel_count) > u8::MAX as usize
+            || self.timestamps_us.len() != self.samples.len() / usize::from(self.channel_count)
+            || self.timestamps_us.is_empty()
+            || self.timestamps_us.windows(2).any(|pair| pair[1] <= pair[0])
         {
             return Err(ProtocolError::InvalidPayload("sample batch shape"));
         }
-        let mut output = Vec::with_capacity(20 + self.samples.len() * 2);
+        let mut output =
+            Vec::with_capacity(24 + self.timestamps_us.len() * 8 + self.samples.len() * 2);
         output.extend_from_slice(&self.first_sample_sequence.to_le_bytes());
-        output.extend_from_slice(&self.first_timestamp_us.to_le_bytes());
+        output.extend_from_slice(&self.timestamps_us[0].to_le_bytes());
         output.extend_from_slice(&self.sample_period_us.to_le_bytes());
         output.push(self.channel_count);
         output.push((self.samples.len() / usize::from(self.channel_count)) as u8);
-        output.extend_from_slice(&self.status_flags.to_le_bytes());
+        output.extend_from_slice(
+            &(self.status_flags | SAMPLE_STATUS_EXPLICIT_TIMESTAMPS).to_le_bytes(),
+        );
+        output.extend_from_slice(
+            &self
+                .acquisition_queue_overflows
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        for timestamp in &self.timestamps_us {
+            output.extend_from_slice(&timestamp.to_le_bytes());
+        }
         for sample in &self.samples {
             output.extend_from_slice(&sample.to_le_bytes());
         }
@@ -290,15 +349,32 @@ pub struct IntegrityCounters {
 pub struct IntegrityMonitor {
     packet_next: Option<u32>,
     sample_next: Option<u32>,
+    firmware_queue_overflows: Option<u32>,
     pub counters: IntegrityCounters,
 }
 impl IntegrityMonitor {
+    fn queue_overflow_delta(&mut self, current: u32) -> u64 {
+        let delta = self.firmware_queue_overflows.map_or(current, |previous| {
+            current.checked_sub(previous).unwrap_or(current)
+        });
+        self.firmware_queue_overflows = Some(current);
+        u64::from(delta)
+    }
+
     pub fn observe_frame(&mut self, frame: &Frame) {
         self.counters.received_packets += 1;
         self.observe_sequence(frame.sequence, false);
     }
-    pub fn observe_samples(&mut self, first: u32, count: u32, status_flags: u16) {
-        if status_flags & 0b100 != 0 {
+    pub fn observe_samples(
+        &mut self,
+        first: u32,
+        count: u32,
+        status_flags: u16,
+        acquisition_queue_overflows: Option<u32>,
+    ) {
+        if let Some(current) = acquisition_queue_overflows {
+            self.counters.firmware_overflows += self.queue_overflow_delta(current);
+        } else if status_flags & SAMPLE_STATUS_QUEUE_OVERFLOW != 0 {
             self.counters.firmware_overflows += 1;
         }
         if let Some(next) = self.sample_next {
@@ -311,6 +387,10 @@ impl IntegrityMonitor {
             );
         }
         self.sample_next = Some(first.wrapping_add(count));
+    }
+
+    pub fn observe_firmware_queue_overflows(&mut self, current: u32) {
+        self.counters.firmware_overflows += self.queue_overflow_delta(current);
     }
     fn observe_sequence(&mut self, sequence: u32, sample: bool) {
         let next = &mut self.packet_next;
@@ -380,11 +460,12 @@ mod tests {
     fn multichannel_batches_preserve_record_major_synchronized_fields() {
         let batch = SampleBatch {
             first_sample_sequence: u32::MAX - 1,
-            first_timestamp_us: 123,
             sample_period_us: 1_000,
             channel_count: 6,
+            timestamps_us: vec![123, 1_137],
             samples: vec![1, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16],
-            status_flags: 1,
+            status_flags: SAMPLE_STATUS_ACQUIRING,
+            acquisition_queue_overflows: Some(0),
         };
         let decoded = SampleBatch::from_payload(
             &batch
@@ -395,26 +476,66 @@ mod tests {
         assert_eq!(decoded.channel_count, 6);
         assert_eq!(decoded.samples[0..6], [1, 2, 3, 4, 5, 6]);
         assert_eq!(decoded.samples[6..12], [11, 12, 13, 14, 15, 16]);
+        assert_eq!(decoded.timestamps_us, [123, 1_137]);
     }
 
     #[test]
     fn twenty_record_eight_channel_batch_stays_within_the_controlled_payload_limit() {
         let batch = SampleBatch {
             first_sample_sequence: 10,
-            first_timestamp_us: 100,
             sample_period_us: 1_000,
             channel_count: 8,
+            timestamps_us: (0..20).map(|index| 100 + index * 1_000).collect(),
             samples: vec![123; 20 * 8],
-            status_flags: 1,
+            status_flags: SAMPLE_STATUS_ACQUIRING,
+            acquisition_queue_overflows: Some(2),
         };
         let payload = batch
             .to_payload()
             .unwrap_or_else(|error| panic!("{error:?}"));
-        assert_eq!(payload.len(), 20 + 20 * 8 * 2);
+        assert_eq!(payload.len(), 24 + 20 * 8 + 20 * 8 * 2);
         assert!(payload.len() <= 1_024);
         let decoded =
             SampleBatch::from_payload(&payload).unwrap_or_else(|error| panic!("{error:?}"));
         assert_eq!(decoded.samples.len(), 20 * 8);
+        assert_eq!(decoded.acquisition_queue_overflows, Some(2));
+    }
+
+    #[test]
+    fn legacy_uniform_batch_payloads_remain_parseable() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        payload.extend_from_slice(&10_000u64.to_le_bytes());
+        payload.extend_from_slice(&1_000u32.to_le_bytes());
+        payload.push(1);
+        payload.push(3);
+        payload.extend_from_slice(&SAMPLE_STATUS_ACQUIRING.to_le_bytes());
+        for sample in [11u16, 12, 13] {
+            payload.extend_from_slice(&sample.to_le_bytes());
+        }
+        let decoded =
+            SampleBatch::from_payload(&payload).unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(decoded.timestamps_us, [10_000, 11_000, 12_000]);
+        assert_eq!(decoded.acquisition_queue_overflows, None);
+    }
+
+    #[test]
+    fn cumulative_queue_overflow_counter_is_counted_once_across_batch_and_status() {
+        let mut monitor = IntegrityMonitor::default();
+        monitor.observe_samples(0, 10, SAMPLE_STATUS_QUEUE_OVERFLOW, Some(2));
+        monitor.observe_firmware_queue_overflows(2);
+        monitor.observe_samples(20, 10, SAMPLE_STATUS_QUEUE_OVERFLOW, Some(3));
+        assert_eq!(monitor.counters.firmware_overflows, 3);
+        assert_eq!(monitor.counters.missing_sample_sequences, 10);
+    }
+
+    #[test]
+    fn queue_overflow_counter_reset_at_start_does_not_create_a_wrapping_spike() {
+        let mut monitor = IntegrityMonitor::default();
+        monitor.observe_firmware_queue_overflows(4);
+        monitor.observe_firmware_queue_overflows(0);
+        monitor.observe_firmware_queue_overflows(2);
+        assert_eq!(monitor.counters.firmware_overflows, 6);
     }
 
     #[test]
@@ -531,8 +652,8 @@ mod tests {
         assert_eq!(m.counters.missing_packet_sequences, 1);
         assert_eq!(m.counters.duplicate_packets, 1);
         assert_eq!(m.counters.out_of_order_packets, 1);
-        m.observe_samples(1, 1, 0);
-        m.observe_samples(3, 1, 0);
+        m.observe_samples(1, 1, 0, None);
+        m.observe_samples(3, 1, 0, None);
         assert_eq!(m.counters.missing_sample_sequences, 1);
     }
     #[test]
@@ -540,8 +661,8 @@ mod tests {
         let mut m = IntegrityMonitor::default();
         m.observe_frame(&frame(u32::MAX));
         m.observe_frame(&frame(0));
-        m.observe_samples(u32::MAX, 1, 0);
-        m.observe_samples(0, 1, 0);
+        m.observe_samples(u32::MAX, 1, 0, None);
+        m.observe_samples(0, 1, 0, None);
         assert_eq!(m.counters.missing_packet_sequences, 0);
         assert_eq!(m.counters.missing_sample_sequences, 0);
     }

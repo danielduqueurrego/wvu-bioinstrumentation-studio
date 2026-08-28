@@ -9,7 +9,7 @@
   "description": "Synchronized raw capture of the conditioned ECG module output for the BMEG 420L course.",
   "target_board": "Arduino UNO R4 WiFi",
   "fqbn": "arduino:renesas_uno:unor4wifi",
-  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 3, "build": "0x00010004", "device": "0x554E4F34" },
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 4, "build": "0x00010006", "device": "0x554E4F34" },
   "acquisition": {
     "analog_pin": "A0", "adc_resolution_bits": 14, "sample_rate_hz": 1000,
     "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
@@ -20,5 +20,5 @@
   "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "Do not use this application for diagnosis or clinical decisions."] },
   "export": { "signal_name": "ecg_course_capture", "include_profile_snapshot": true },
   "plot_defaults": { "groups": [{ "channel_ids": ["ecg"] }] },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "3aaacfa3e24c3639e7dc5e9fe31836f9e2045c55b88da26733018243e54e7192" }
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "3c59886674d1b8467003e6900987fa5e2643eb9c15306241eb4fc9603d3cad6d" }
 }

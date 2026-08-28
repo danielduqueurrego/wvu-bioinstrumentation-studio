@@ -38,7 +38,7 @@
   } from '$lib/multichannel';
   import { reconcileBoardCache } from '$lib/board-cache';
   import { boardControls } from '$lib/board-controls';
-  import { hardwareStartInvokePayload, recordingStartFailure, recordingStartReadiness, type RecordingStartFailure, type RecordingStartReadiness } from '$lib/recording-start';
+  import { hardwareStartInvokePayload, recordingStartFailure, recordingStartReadiness, simulatorStartInvokePayload, type RecordingStartFailure, type RecordingStartReadiness } from '$lib/recording-start';
   import { effectiveRecordingFolder, relativeOutputFolderError } from '$lib/project-folder';
   import {
     DEFAULT_PLOT_TIME_WINDOW_SECONDS,
@@ -140,7 +140,7 @@
   let durationPreset = '60';
   let customSeconds = 60;
   let duration: Duration = { mode: 'timed', seconds: 60 };
-  let note = 'Simulator waveform; no human signal.';
+  let note = '';
   let adcReferenceV = 5;
   let mpxvSensorSupplyV = 5;
   let channelUnits: Record<string, DisplayUnit> = {};
@@ -194,11 +194,6 @@
   let traceProfileKey = '';
   let plotGroups: PlotGroup[] = [];
 
-  $: if (source === 'hardware') {
-    note = 'Arduino data source — follow the assigned lab instructions.';
-  } else {
-    note = 'Simulator — no Arduino data are being recorded.';
-  }
   $: timedSeconds = durationPreset === 'custom' ? Number(customSeconds) : Number(durationPreset);
   $: activeProfile = acquisitionProfiles.find((profile) => profile.profile_id === selectedProfileId);
   $: activeChannels = activeProfile?.acquisition.channels?.length
@@ -301,9 +296,11 @@
     projectFolder: Boolean(projectFolder),
     outputFolderError,
     durationValid: durationMode === 'until_stopped' || timedDurationValid,
-    acknowledgementSatisfied: !activeProfile?.safety.bench_only
+    acknowledgementSatisfied: (
+      !activeProfile?.safety.bench_only
       || !['ecg', 'emg'].includes(activeProfile.category)
       || benchNoticeAcknowledged
+    )
   });
   $: canStart = startReadiness.canStart;
   $: recoveryActions = connectionActions({
@@ -892,7 +889,15 @@
     statusMessage = startFeedback;
     try {
       session = source === 'simulator'
-        ? await invoke<SessionStatus>('start_profile_simulator_recording', { projectFolder, outputFolder: outputDirectory, duration, profileId: selectedProfileId, benchNoticeAcknowledged, calibration: currentRecordingCalibration })
+        ? await invoke<SessionStatus>('start_profile_simulator_recording', simulatorStartInvokePayload({
+            project_folder: projectFolder,
+            output_folder: outputDirectory,
+            duration,
+            profile_id: selectedProfileId,
+            bench_notice_acknowledged: benchNoticeAcknowledged,
+            recording_note: note,
+            calibration: currentRecordingCalibration
+          }))
         : await invoke<SessionStatus>('start_profile_hardware_recording', hardwareStartInvokePayload({
             port: selectedPort,
             project_folder: projectFolder,
@@ -900,6 +905,7 @@
             duration,
             profile_id: selectedProfileId,
             bench_notice_acknowledged: benchNoticeAcknowledged,
+            recording_note: note,
             calibration: currentRecordingCalibration
           }));
       startFeedback = source === 'hardware' ? 'Configuring recording…' : 'Starting recording…';
@@ -1116,7 +1122,7 @@
             <label>Analog pins <input value={activeProfile ? activeProfile.acquisition.acquisition_mode === 'pulseox_4state' ? `TX ${activeProfile.acquisition.analog_inputs?.tx ?? 'A0'}; RX ${activeProfile.acquisition.analog_inputs?.rx ?? 'A1'}` : activeChannels.map((channel) => channel.pin).join(', ') : '—'} readonly title="Protected by the selected profile" /></label>
             <label>ADC resolution <input value={activeProfile ? `${activeProfile.acquisition.adc_resolution_bits} bit` : '—'} readonly title="Protected by the selected profile" /></label>
             <label>Frame / cycle rate <input value={activeProfile ? `${activeProfile.acquisition.sample_rate_hz} ${pulseoxProfile ? 'cycles/s' : 'frames/s'}` : '—'} readonly title="Protected by the selected profile" /></label>
-            <label>Test note <input bind:value={note} readonly /></label>
+            <label>Recording note <input bind:value={note} maxlength="4096" placeholder="Optional note for this recording" disabled={session.state !== 'Disconnected'} /></label>
           </div>
           <p id="output-help" class="help">Effective destination: <strong>{effectiveOutputFolder || 'Choose a Project folder'}</strong>. Output folder is relative to Project folder; nested trial folders are allowed. Files use timestamped names and existing files are never overwritten.</p>
           {#if outputFolderError}<p class="error" role="alert">{outputFolderError}</p>{/if}

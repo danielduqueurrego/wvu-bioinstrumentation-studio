@@ -4,14 +4,15 @@ WVU Bioinstrumentation Studio is a Tauri desktop application with a Svelte/TypeS
 
 ```mermaid
 flowchart LR
-  UNO[UNO R4 WiFi] -->|USB binary protocol 0.3| Rust[Rust acquisition session]
+  UNO[UNO R4 WiFi] -->|USB binary protocol 0.4| Rust[Rust acquisition session]
   Rust --> BMEG[streaming BMEG/raw writer]
   Rust --> Display[bounded display snapshot]
   Display --> UI[Svelte + uPlot]
   BMEG --> CSV[CSV and metadata]
 ```
 
-- The firmware provides synchronized logical frames. Analog channels are read sequentially within a frame, not electrically simultaneously.
+- The firmware provides synchronized logical frames with measured per-record timestamps. Analog channels are read sequentially within a frame, not electrically simultaneously.
+- Pulse-ox phase deadlines advance on one absolute timeline. Bounded raw-batch and transmit queues plus partial-write service isolate sample deadlines from packet construction and USB serial backpressure. Queue overflow is explicit in protocol integrity counters.
 - The Rust session owns serial I/O, packet validation, CRC/sequence accounting, full-rate storage, and safe finalization.
 - The frontend polls bounded display snapshots at a limited rate; it does not receive one UI event per sample.
 - Lab definitions describe course acquisition, display defaults, supported conversion types, and required firmware capabilities. Factory definitions are immutable; local instructor revisions are explicit catalog records.

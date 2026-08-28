@@ -7,6 +7,10 @@ All notable user-facing changes are documented here.
 ### Fixed
 
 - Pulse-ox RED, DARK 1, IR, and DARK 2 measurements are now taken only after the configured phase-settling interval has elapsed.
+- Decoupled pulse-ox and simultaneous-analog sampling from packet construction and USB writes with bounded raw-batch and nonblocking transmit queues plus explicit overflow reporting.
+- Changed pulse-ox phase timing to one absolute schedule and added per-state ±5% timing diagnostics to recording metadata.
+- Preserved firmware-measured timestamps for every acquired record instead of reconstructing uniformly spaced timestamps on the host.
+- Added final recording timing diagnostics and profile-aware recording notes; profile safety provenance and medical-validation status remain explicit without an operator connection checkbox.
 - Recording filenames now use the selected lab's stable export name and no longer contain development-phase labels.
 
 ## 1.0.1
