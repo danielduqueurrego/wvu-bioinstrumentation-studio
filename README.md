@@ -101,6 +101,8 @@ Pulse oximetry schedules RED, DARK 1, IR, and DARK 2 on one absolute firmware ti
 
 Development requirements, commands, the bundled Arduino runtime, and the production-build distinction are documented in the [Developer Guide](docs/DEVELOPER_GUIDE.md). Use the Tauri production build pipeline; a plain Cargo release build is not a distributable application because it does not package the frontend assets.
 
+For continuing development on a new computer or with a new coding agent, see the [Maintainer and Agent Handoff](docs/AGENT_HANDOFF.md).
+
 ## Documentation
 
 - [Installation](docs/INSTALLATION.md)

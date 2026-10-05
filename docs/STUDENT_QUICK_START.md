@@ -19,4 +19,21 @@ While recording, plot changes are display-only: the **Plot time window** applies
 
 For pulse oximetry, the firmware waits the configured settling interval after each RED, DARK 1, IR, or DARK 2 transition before recording the raw values for both detectors. It does not calculate SpO2, heart rate, or other physiological results.
 
+## Instructor-provided lab installer
+
+If your instructor provides the Op Amp Lab installer, keep these two files in the same folder:
+
+- `install_op_amp_lab_profile.bat`
+- `install_op_amp_lab_profile.ps1`
+
+Close WVU Bioinstrumentation Studio, then double-click `install_op_amp_lab_profile.bat`. The installer window remains open so you can confirm whether installation succeeded.
+
+Alternatively, run the PowerShell installer directly from the folder containing it:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_op_amp_lab_profile.ps1
+```
+
+The script requires no administrator access. It installs **Op Amp Lab 2.0.1** only for the current Windows user, preserves other labs, and creates a backup before changing an existing catalog. The per-user catalog is stored under `%LOCALAPPDATA%\WVU Bioinstrumentation Studio\profiles`. Reopen the application after the script reports success.
+
 Teaching use only — not a medical device.

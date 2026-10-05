@@ -1,5 +1,7 @@
 # Developer Guide
 
+For resuming development after a computer reset or transferring work to another agent, start with the [Maintainer and Agent Handoff](AGENT_HANDOFF.md). It covers local assets, catalog recovery, pending work, and the current release baseline.
+
 ## Prerequisites
 
 Development is Windows-first. Install a current Node.js/npm environment, Rust stable with the Windows toolchain, and the Tauri prerequisites for Windows. An Arduino IDE is not required for the distributed application; developers who run hardware tools outside the app need the approved UNO R4 environment.
@@ -34,7 +36,7 @@ Use `npm run tauri build` for a production executable and installers. It runs th
 
 ## Bundled Arduino runtime
 
-The release build requires `src-tauri/resources/arduino-runtime.zip`, which is intentionally not tracked because it contains third-party binary tooling. Its version is pinned by `arduino-runtime-manifest.json`; the release script verifies the reviewed archive SHA-256 and the reference-firmware SHA-256 before it stages artifacts. A fresh clone can run source checks without the archive, but cannot make the student installer until a maintainer supplies the reviewed archive with its upstream notices and verifies the manifest. Do not download or substitute “latest” Arduino tooling during a release build.
+The release build requires `src-tauri/resources/arduino-runtime.zip`, which is intentionally not tracked because it contains third-party binary tooling. Its version is pinned by `arduino-runtime-manifest.json`; the release script verifies the reviewed archive SHA-256 and the reference-firmware SHA-256 before it stages artifacts. Tauri also validates resource existence during Cargo source checks. In CI, the workflow creates a disposable placeholder ZIP for those checks; a fresh local clone needs that same source-check preparation or the real archive. The placeholder cannot be used for firmware restore or student packaging. A maintainer must supply the reviewed real archive with its upstream notices and verify the manifest before building a student installer. Do not download or substitute “latest” Arduino tooling during a release build.
 
 Run `scripts/audit_bundled_runtime_notices.ps1` against the pinned archive before publishing an installer. It verifies the reviewed Arduino CLI license copy, the component-specific BOSSA license, required runtime components, and the retained LICENSE/COPYING/NOTICE inventory. A maintainer must still review upstream redistribution requirements when any bundled version changes.
 
