@@ -23,6 +23,7 @@ This section covers the `review-fixes` branch since 1.0.2, for maintainers. The 
 - A save failure after Stop is now reported as a fault with its stage; only a cancelled session ends quietly.
 - Elapsed and remaining time count from START, and `utc_start` is stamped just before START. Metadata adds `session_opened_utc` and `acquisition_started_utc`.
 - Windows is kept awake while a recording runs.
+- A final STOP whose write timed out, or that the board did not answer within 100 ms, is sent again (at most twice, within a bounded wait), so the outputs go LOW without waiting for the firmware's 5 s watchdog.
 - The storage guard reserves room for the recording's CSV. The Recording duration card shows the estimate.
 - Records of batches the firmware flagged after dropping a batch or skipping a sampling deadline are counted as `integrity.overrun_flagged_records`.
 - The BMEG header size is checked before the board is configured.
@@ -41,7 +42,11 @@ This section covers the `review-fixes` branch since 1.0.2, for maintainers. The 
 - "Reset board and retry" was retired, because it could not reach the native-USB firmware. Recovery is Retry connection, then Verify Firmware, then Restore WVU Firmware.
 - A failed Arduino-tools preparation shows **Repair Arduino tools**. Runtime extraction uses a cross-process lock and checks the extracted files, and the generated `arduino-cli.yaml` quotes its paths.
 - Firmware ERROR codes 1–7 get specific explanations. An unreadable CAPABILITIES payload fails the handshake.
-- `fault_origin` (verification, connection, recording, storage, or request) keeps a failed Verify from being described as a failed recording.
+- `fault_origin` (verification, connection, recording, storage, or request) keeps a failed Verify from being described as a failed recording, also right after a Simulator recording.
+- A Retry connection or hardware Start that finds other firmware on the verified port withdraws **Ready**, so Start is not offered again until Verify or Restore succeeds.
+- After a failed or canceled restore, the board that appears is selected but not verified, so the Board card keeps the restore's failure, log, and advice. Advanced details lists the last restore and its log.
+- A failed **Repair Arduino tools** that left the working tools in place no longer marks them failed or disables **Restore WVU Firmware**.
+- Closing the window during Verify or Retry connection closes it at once instead of announcing that a recording is being saved.
 - Restore logs record the source commit (`git_revision`) when one is available. Tool versions are recorded as "unavailable" when they cannot be read.
 
 ### Labs & files
@@ -69,6 +74,7 @@ This section covers the `review-fixes` branch since 1.0.2, for maintainers. The 
   - One active preset per channel.
   - Bad presets are skipped and reported.
   - Degenerate or non-finite fits are refused.
+  - A preset deleted in another window, or whose file was removed, leaves the list and its selection instead of being recorded; the list is read again when the window regains focus.
   - The XGZP fit window skips the first hardware sample by default and reports the Vref/Vs it used.
   - Manual points must be exactly two numbers per line.
   - Delete asks for confirmation.
@@ -89,6 +95,8 @@ This section covers the `review-fixes` branch since 1.0.2, for maintainers. The 
   - Changing the lab no longer loads the previous lab's calibrations.
   - A fault no longer locks setup, and the Simulator can start after a fault.
   - Verify handshakes no longer count as recordings (`recording_active`).
+  - A Start that the Project folder's drive refused (for example less than 250 MiB free) says **The recording could not start** and why, instead of "The recording was not saved completely".
+  - The Live signals **Lab outputs** line includes outputs that stored legacy labs define only through `led_outputs`.
   - Calibration inputs are validated.
   - Time-axis decimals follow the tick spacing, and newest-value badges are placed correctly on scaled displays.
   - Idle polling is throttled.

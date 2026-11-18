@@ -50,14 +50,17 @@ function belongsTo(selection: CalibrationSelection) {
 /**
  * Applies one `list_calibrations` response. Returns `undefined` (drop it)
  * when a newer request was sent or the lab or channel changed after this one
- * was sent. Otherwise only presets of the requested lab and channel are kept;
- * a preset this window just saved stays listed even if the file list has not
- * caught up yet. The selected preset stays selected only if it is still
- * listed (or is that just-saved preset).
+ * was sent. Otherwise the saved files are authoritative: only presets of the
+ * requested lab and channel are kept, and a preset that is no longer on disk
+ * (deleted in another window, or its file removed) is dropped, and with it
+ * its selection, so it cannot be frozen into a new recording. The only
+ * exception is the preset this window has just saved (`justSavedId`), kept
+ * while the file list catches up. The selected preset stays selected only if
+ * it is still listed.
  */
 export function applyCalibrationList(
   response: { requestId: number; selection: CalibrationSelection; stored: CalibrationPreset[] },
-  current: { latestRequestId: number; selection: CalibrationSelection; state: CalibrationListState }
+  current: { latestRequestId: number; selection: CalibrationSelection; state: CalibrationListState; justSavedId?: string }
 ): CalibrationListState | undefined {
   if (response.requestId !== current.latestRequestId) return undefined;
   if (
@@ -67,15 +70,12 @@ export function applyCalibrationList(
     return undefined;
   }
   const matches = belongsTo(response.selection);
-  const presets = mergeCalibrationPresets(
-    response.stored.filter(matches),
-    current.state.presets.filter(matches)
-  );
+  const justSaved = current.justSavedId
+    ? [...current.state.presets, ...(current.state.active ? [current.state.active] : [])]
+      .find((preset) => preset.calibration_id === current.justSavedId && matches(preset))
+    : undefined;
+  const presets = mergeCalibrationPresets(response.stored.filter(matches), justSaved ? [justSaved] : []);
   const listed = calibrationById(presets, current.state.selectedId);
   if (listed) return { presets, selectedId: listed.calibration_id, active: listed };
-  const active = current.state.active;
-  if (active && active.calibration_id === current.state.selectedId && matches(active)) {
-    return { presets: mergeCalibrationPresets(presets, [active]), selectedId: active.calibration_id, active };
-  }
   return { presets, selectedId: '', active: undefined };
 }

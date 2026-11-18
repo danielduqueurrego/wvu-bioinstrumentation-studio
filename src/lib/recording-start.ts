@@ -13,6 +13,12 @@ export type RecordingStartReadinessInput = {
   sessionActive?: boolean;
   /** Which operation raised a Faulted state (`SessionStatus.fault_origin`). */
   faultOrigin?: string | null;
+  /**
+   * A recording ran and ended (`SessionStatus.last_summary` is set). A
+   * storage fault without one refused the recording before START.
+   * Defaults to true.
+   */
+  recordingRan?: boolean;
   boardOperationBusy: boolean;
   startInFlight: boolean;
   activeProfile: boolean;
@@ -105,10 +111,12 @@ export function recordingStartReadiness(input: RecordingStartReadinessInput): Re
   // cleared (by Verify, or by Clear connection for a save or request fault).
   const blockingFault = input.sessionState === 'Faulted' && input.source === 'hardware';
   if (blockingFault && input.faultOrigin === 'storage') {
-    // A save problem is not a board problem; Verify Firmware would not help.
+    // A save or folder problem is not a board problem; Verify Firmware would not help.
     return {
       canStart: false,
-      message: 'The previous recording was not saved completely. Select Clear connection, then start a new recording.'
+      message: input.recordingRan ?? true
+        ? 'The previous recording was not saved completely. Select Clear connection, then start a new recording.'
+        : 'The recording could not start because of the Project folder or its drive. Check it, select Clear connection, then start again.'
     };
   }
   if (blockingFault && input.faultOrigin === 'request') {

@@ -42,6 +42,7 @@
 
   const yesNoUnknown = (value: boolean | undefined | null) => value === true ? 'yes' : value === false ? 'no' : 'unknown';
   const diagnostics = $derived(session.connection_diagnostics);
+  const lastRestore = $derived(firmwareWorkflow.last_restore);
 </script>
 
 <details class="advanced-details">
@@ -54,6 +55,11 @@
     <p>Firmware status: {firmwareCompatibility}</p>
     {#if firmwareWorkflow.verified_port}<p>Verified port: {firmwareWorkflow.verified_port}</p>{/if}
     {#if firmwareWorkflow.last_failure}<p>Last firmware failure: {firmwareWorkflow.last_failure.category} at {firmwareWorkflow.last_failure.stage}</p>{/if}
+    <!-- The last restore stays reachable even after a later Verify replaced the Board card's "Last firmware operation". -->
+    {#if lastRestore && !lastRestore.active}
+      <p>Last restore: job {lastRestore.id}, {lastRestore.stage}{lastRestore.failure ? ` (${lastRestore.failure.category} at ${lastRestore.failure.stage})` : ''}{lastRestore.completed_utc ? `, ${lastRestore.completed_utc}` : ''}</p>
+      {#if lastRestore.log_path}<p>Restore log: {lastRestore.log_path}</p>{/if}
+    {/if}
     {#if diagnostics?.firmware_build}<p>Firmware build: {diagnostics.firmware_build}</p>{/if}
     {#if diagnostics?.firmware_board_id}<p>Board ID: {diagnostics.firmware_board_id}</p>{/if}
     <p>Arduino tools: {firmwareEnvironment.cli_version ?? (arduinoToolsState === 'preparing' ? 'preparing' : 'not available')}</p>

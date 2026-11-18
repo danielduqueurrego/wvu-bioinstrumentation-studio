@@ -62,6 +62,15 @@ describe('lab editor normalization and save-time rules', () => {
     expect(resolvedDigitalOutputs({ ...draft.acquisition, digital_outputs: [] })).toEqual([]);
   });
 
+  it('resolves a stored legacy revision’s outputs as the board drives them', () => {
+    // A 1.0.2 edit that unchecked D4 kept `led_outputs` and wrote no
+    // `digital_outputs`; Rust still drives D4 HIGH while recording.
+    const stored = base();
+    stored.acquisition.led_outputs = { green: 'D4', red: null, ir: null };
+    delete stored.acquisition.digital_outputs;
+    expect(resolvedDigitalOutputs(stored.acquisition)).toEqual([{ pin: 'D4', label: 'Green LED', behavior: 'high_while_recording' }]);
+  });
+
   it('adds a channel with an unused ID and CSV name after a removal', () => {
     // Channels 1-3 existed and channel 2 was removed.
     const channels = [

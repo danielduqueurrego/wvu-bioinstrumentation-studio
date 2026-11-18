@@ -48,6 +48,15 @@ describe('recording start readiness', () => {
     expect(result.canStart).toBe(false);
     expect(result.message).toMatch(/not saved completely/i);
     expect(result.message).not.toMatch(/firmware/i);
+    expect(recordingStartReadiness({ ...readyHardware, sessionState: 'Faulted', faultOrigin: 'storage', recordingRan: true }).message).toBe(result.message);
+  });
+
+  it('does not call a recording the folder or drive refused before START "not saved"', () => {
+    const result = recordingStartReadiness({ ...readyHardware, sessionState: 'Faulted', faultOrigin: 'storage', recordingRan: false });
+    expect(result.canStart).toBe(false);
+    expect(result.message).toMatch(/could not start because of the Project folder/i);
+    expect(result.message).toMatch(/Clear connection/);
+    expect(result.message).not.toMatch(/saved|firmware/i);
   });
 
   it('does not send a student to firmware recovery after a refused recording request', () => {

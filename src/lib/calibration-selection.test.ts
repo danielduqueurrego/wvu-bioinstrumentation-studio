@@ -64,11 +64,33 @@ describe('calibration list for the selected lab', () => {
     const saved = preset('bp', 'xgzp', 'b-new', 'New');
     const next = applyCalibrationList(
       { requestId: 4, selection: bp, stored: [preset('bp', 'xgzp', 'b1', 'Old')] },
-      { latestRequestId: 4, selection: bp, state: { presets: [saved], selectedId: 'b-new', active: saved } }
+      { latestRequestId: 4, selection: bp, state: { presets: [saved], selectedId: 'b-new', active: saved }, justSavedId: 'b-new' }
     );
     expect(next?.presets.map((item) => item.calibration_id)).toEqual(['b-new', 'b1']);
     expect(next?.selectedId).toBe('b-new');
     expect(next?.active).toEqual(saved);
+  });
+
+  it('drops a preset deleted on disk (another window, or its file removed), with its selection', () => {
+    const deleted = preset('bp', 'xgzp', 'x', 'Deleted elsewhere');
+    const kept = preset('bp', 'xgzp', 'k', 'Kept');
+    // Selected in this window before another window deleted it.
+    const selected = applyCalibrationList(
+      { requestId: 7, selection: bp, stored: [kept] },
+      { latestRequestId: 7, selection: bp, state: { presets: [deleted, kept], selectedId: 'x', active: deleted } }
+    );
+    expect(selected).toEqual({ presets: [kept], selectedId: '', active: undefined });
+    // Only listed: it is not offered again either.
+    const listed = applyCalibrationList(
+      { requestId: 8, selection: bp, stored: [] },
+      { latestRequestId: 8, selection: bp, state: { presets: [deleted], selectedId: '', active: undefined } }
+    );
+    expect(listed).toEqual({ presets: [], selectedId: '', active: undefined });
+    // A just-saved marker for another preset does not keep it.
+    expect(applyCalibrationList(
+      { requestId: 9, selection: bp, stored: [] },
+      { latestRequestId: 9, selection: bp, state: { presets: [deleted], selectedId: 'x', active: deleted }, justSavedId: 'other' }
+    )).toEqual({ presets: [], selectedId: '', active: undefined });
   });
 
   it('prefers the stored copy of the selected preset and clears a deleted selection', () => {

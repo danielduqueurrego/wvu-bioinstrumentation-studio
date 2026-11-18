@@ -295,13 +295,24 @@ fn repair_tools(
     // Start, Verify, Retry connection, and Restore all run the tools being
     // replaced and all claim this lease, so none can run during the repair
     // (and a repair waits for none of them: it is refused instead).
+    // A failed repair says whether the tools already in use are still in
+    // place, so the page does not mark working tools as failed.
     let _lease = session
         .claim_serial(SerialOwner::ToolRepair)
-        .map_err(|error| arduino_runtime::ArduinoToolsFailure::busy(&error.to_string()))?;
+        .map_err(|error| {
+            arduino_runtime::ArduinoToolsFailure::busy(&error.to_string()).after_failed_repair()
+        })?;
     app_log::record("INFO", "ARDUINO_TOOLS_REPAIR_BEGIN");
     let status = arduino_runtime::repair_runtime(app).map_err(|error| {
-        app_log::record("WARN", &format!("ARDUINO_TOOLS_REPAIR_FAIL detail={error}"));
-        error.failure()
+        let failure = error.failure().after_failed_repair();
+        app_log::record(
+            "WARN",
+            &format!(
+                "ARDUINO_TOOLS_REPAIR_FAIL detail={error} previous_runtime_kept={}",
+                failure.previous_runtime_kept
+            ),
+        );
+        failure
     })?;
     probe_tool_versions();
     app_log::record("INFO", "ARDUINO_TOOLS_REPAIR_OK");
@@ -1174,12 +1185,18 @@ fn notify_close_blocked(window: &tauri::Window, reason: &'static str, message: &
 /// The page is told why the window stayed open. During a recording the
 /// recording is stopped and saved before the window closes, by exactly one
 /// thread no matter how many times close is clicked.
+///
+/// A Verify Firmware or Retry connection handshake is a board check, not a
+/// recording (`recording_active`), so the window closes normally during one:
+/// a handshake never sends START, so the outputs stay LOW, and process exit
+/// releases the port. A restore's verification step is covered by the
+/// firmware-job refusal above.
 fn handle_close_request(window: &tauri::Window, api: &tauri::CloseRequestApi) {
     let state = window.state::<AppState>();
     let decision = close_decision(
         state.firmware.has_active_job(),
         state.closing.load(Ordering::Acquire),
-        matches!(state.session.is_recording(), Ok(true)),
+        matches!(state.session.recording_active(), Ok(true)),
     );
     match decision {
         CloseDecision::Allow => {}
@@ -1231,7 +1248,7 @@ fn handle_close_request(window: &tauri::Window, api: &tauri::CloseRequestApi) {
                 // Normally already final once the worker is joined; this
                 // covers a worker handle that another caller was joining.
                 let settle_started = Instant::now();
-                while matches!(session.is_recording(), Ok(true))
+                while matches!(session.recording_active(), Ok(true))
                     && settle_started.elapsed() < CLOSE_SETTLE_LIMIT
                 {
                     std::thread::sleep(Duration::from_millis(50));

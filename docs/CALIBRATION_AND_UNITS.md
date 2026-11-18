@@ -48,6 +48,8 @@ Enter the output quantity and units. The blood-pressure lab's XGZP channel start
 
 Each channel has at most one active calibration. A selected linear calibration replaces the fixed MPXV equation on its channel. Deleting a saved calibration asks for confirmation first.
 
+The list follows the saved files. A preset deleted in another window of the application, or whose file was removed, disappears from the list (and is deselected) the next time the list is read: when a calibration is selected or saved, the channel changes, or the window regains focus while nothing is recording.
+
 ## Recording files
 
 Each recording produces three files in the effective session folder (Project folder plus Output folder). They are named `YYYYMMDD_HHMMSS_<lab export name>_RunNN` with the local time at which the session opened, for example `20261118_043539_blood_pressure_ppg_course_capture_Run01`:

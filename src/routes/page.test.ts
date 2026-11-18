@@ -431,9 +431,11 @@ const ACQUISITION_COMMANDS = ['start_profile_simulator_recording', 'start_profil
 /**
  * One UNO R4 WiFi on COM5; Verify Firmware proves (or disproves) the WVU
  * firmware. Like the backend (`retry_handshake` with the verification
- * origin), the read-only handshake clears the previous fault and passes the
- * session through Connecting and Connected with `recording_active: false`:
- * a board check, not a recording. A compatible board ends Disconnected. A
+ * origin), the read-only handshake clears the previous fault, names the
+ * board's port and board (but keeps `simulator`, which describes the last
+ * recording), and passes the session through Connecting and Connected with
+ * `recording_active: false`: a board check, not a recording. A compatible
+ * board ends Disconnected. A
  * board that does not answer leaves the session Faulted (verification,
  * port_open_no_bytes) and the firmware status verification_failed. A busy
  * port is never opened: the session faults with port_busy, the command
@@ -442,7 +444,7 @@ const ACQUISITION_COMMANDS = ['start_profile_simulator_recording', 'start_profil
 function withBoard(compatible: boolean, checkMs = 25, failure: 'port_open_no_bytes' | 'port_busy' = 'port_open_no_bytes') {
   backend.handlers.list_boards = () => [board];
   backend.handlers.verify_wvu_reference_firmware = async ({ port }) => {
-    const before = { ...session, last_error: null, fault_origin: null };
+    const before = { ...session, last_error: null, fault_origin: null, port: port as string, board: 'Arduino UNO R4 WiFi' };
     const pause = () => new Promise((done) => setTimeout(done, checkMs));
     const faulted = (category: string, lastError: string) => idleSession({
       ...before, state: 'Faulted', recording_active: false, fault_origin: 'verification', last_error: lastError,
@@ -807,6 +809,110 @@ describe('Acquisition page: board checks, Start feedback, and the recording layo
     expect(banner?.textContent).not.toMatch(/retry/i);
     expect(document.querySelector('#message-action-button')?.textContent?.trim()).toBe('Verify Firmware');
     expect(boardState()).toContain('Port busy');
+  });
+
+  it('reports a failed Verify after a Simulator recording as a board problem, not as that recording', async () => {
+    // The last recording ran on the simulator; its frames are still shown.
+    session = idleSession({ simulator: true, board: 'Simulator', port: 'SIM' });
+    withBoard(false);
+    await renderPage();
+    expect(session).toMatchObject({ state: 'Faulted', simulator: true, port: 'COM5', fault_origin: 'verification' });
+    // Simulator practice: the board problem stays in the Board card.
+    expect(document.querySelector('[data-problem]')).toBeNull();
+    expect(document.querySelector('[data-testid="recording-state"]')?.textContent).toBe('Ready');
+    expect(document.body.textContent).not.toMatch(/simulator recording (stopped|could not start)/i);
+    expect(document.querySelector('[data-testid="board-state"]')?.textContent).toContain('No WVU firmware');
+    document.querySelector<HTMLInputElement>('input[value="hardware"]')?.click();
+    await settle();
+    const banner = document.querySelector('[data-problem]');
+    expect(banner?.textContent).toContain('No WVU firmware detected on COM5');
+    expect(banner?.textContent).not.toMatch(/simulator/i);
+    expect(document.querySelector('#message-action-button')?.textContent?.trim()).toBe('Restore WVU Firmware');
+  });
+
+  it('says a recording the drive refused before START could not start, not that it was not saved', async () => {
+    withBoard(true);
+    await renderPage();
+    expect(sourceChecked()).toBe('hardware');
+    // The worker refused before START: no recording ran, so no summary.
+    session = idleSession({
+      state: 'Faulted', fault_origin: 'storage', port: 'COM5', last_summary: null,
+      last_error: 'storage: only 200 MiB free in C:\\BMEG 420L; recording requires at least 250 MiB',
+      connection_diagnostics: { failure_category: 'recording_storage_error', recommended_action: 'Backend text.' }
+    });
+    await settle(60);
+    const banner = document.querySelector('[data-problem]');
+    expect(banner?.textContent).toContain('The recording could not start');
+    expect(banner?.textContent).toContain('Only 200 MiB free in C:\\BMEG 420L; recording requires at least 250 MiB.');
+    expect(document.body.textContent).not.toMatch(/not saved completely|Files already saved/);
+    expect(document.querySelector('#message-action-button')?.textContent?.trim()).toBe('Clear connection');
+  });
+
+  it('shows the D4 output a stored legacy lab still drives while recording', async () => {
+    // A 1.0.2 revision that unchecked D4 kept `led_outputs` and has no `digital_outputs`.
+    const legacy = structuredClone(bp);
+    delete legacy.acquisition.digital_outputs;
+    backend.handlers.list_acquisition_profiles = () => [general, legacy];
+    session = idleSession({
+      state: 'Acquiring', recording_active: true, simulator: true, duration: { mode: 'until_stopped' },
+      digital_output_mask: 1, display_origin_timestamp_us: 1_000_000, profile: { bench_notice_acknowledged: false, profile: legacy }
+    });
+    await renderPage();
+    const outputs = [...document.querySelectorAll('.metric-grid span')].find((span) => span.textContent?.startsWith('Lab outputs'));
+    expect(outputs?.textContent).toContain('D4 Green LED — HIGH');
+  });
+
+  it('keeps a failed restore on the Board card instead of verifying the board that appeared', async () => {
+    const job = { id: 4, kind: 'restore_reference', stage: 'uploading', active: true, message: 'Writing the WVU firmware to the board.', original_port: 'COM34' };
+    firmwareStatus = { compatibility: 'upload_in_progress', job, verified_port: null };
+    await renderPage();
+    // The upload failed; the board is now listed on another port, in upload mode.
+    const failure = {
+      category: 'upload_failed', stage: 'uploading', title: 'Upload failed', explanation: 'No device found on COM9.',
+      recommended_action: 'Press RESET twice.', technical_details: 'bossac: No device found on COM9'
+    };
+    const finished = { ...job, stage: 'failed', active: false, failure, log_path: 'C:\\logs\\firmware_job_4.json', completed_utc: '2026-11-18T10:00:00Z' };
+    backend.handlers.list_boards = () => [{ ...board, port: 'COM9', usb_pid: 0x1002 }];
+    backend.handlers.verify_wvu_reference_firmware = () => { throw new Error('the board must not be verified now'); };
+    firmwareStatus = { compatibility: 'verification_failed', job: null, last_restore: finished, last_failure: failure, verified_port: null };
+    for (let round = 0; round < 40 && !backend.calls.some((call) => call.command === 'list_boards' && round > 0); round += 1) await settle(50);
+    await settle(50);
+    expect(backend.calls.filter((call) => call.command === 'list_boards').length).toBeGreaterThan(1);
+    expect(backend.calls.some((call) => call.command === 'verify_wvu_reference_firmware')).toBe(false);
+    const card = document.querySelector('[aria-labelledby="last-firmware-operation-title"]');
+    expect(card?.textContent).toContain('Restore failed');
+    expect(card?.textContent).toContain('C:\\logs\\firmware_job_4.json');
+    // Recovery stays available.
+    expect(buttonNamed('Restore WVU Firmware')?.disabled).toBe(false);
+    expect(buttonNamed('Verify Firmware')?.disabled).toBe(false);
+  });
+
+  it('keeps Restore available when a failed Repair kept the Arduino tools already in use', async () => {
+    backend.handlers.list_boards = () => [board];
+    // The last restore could not compile; Verify is not part of this test.
+    backend.handlers.verify_wvu_reference_firmware = () => { throw new Error('not checked'); };
+    firmwareStatus = {
+      compatibility: 'verification_failed', job: null, verified_port: null,
+      last_failure: { category: 'compile_failed', stage: 'compiling', title: 'Compile failed', explanation: 'The sketch did not compile.', recommended_action: 'Repair.', technical_details: 'gcc' }
+    };
+    backend.handlers.repair_arduino_runtime = () => {
+      throw {
+        title: 'Arduino tools could not be prepared', explanation: 'Windows could not write the Arduino tools to this computer.',
+        recommended_action: 'Close any other copy, then select Repair Arduino tools.', technical_details: 'Access is denied. (os error 5)',
+        repairable: true, previous_runtime_kept: true
+      };
+    };
+    await renderPage();
+    await settle(60);
+    expect(buttonNamed('Restore WVU Firmware')?.disabled).toBe(false);
+    const repair = buttonNamed('Repair Arduino tools');
+    expect(repair?.disabled).toBe(false);
+    repair?.click();
+    await settle();
+    expect(backend.calls.some((call) => call.command === 'repair_arduino_runtime')).toBe(true);
+    expect(infoLine()).toContain('the tools already in place were kept');
+    expect(document.querySelector('.tools-warning')).toBeNull();
+    expect(buttonNamed('Restore WVU Firmware')?.disabled).toBe(false);
   });
 
   it('shows an Arduino-tools problem once: in the Board card for Simulator practice, in the banner for Hardware', async () => {

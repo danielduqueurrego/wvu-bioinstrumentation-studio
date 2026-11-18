@@ -21,7 +21,7 @@
   import { recordingResultView } from '$lib/recording-result';
   import { shouldAutoSelectHardware } from '$lib/source-select';
   import { revealIfHidden, scrollToAndFocus } from '$lib/page-navigation';
-  import { faultConcernsSource, problemBanner, type NextAction } from '$lib/messages';
+  import { faultConcernsSource, problemBanner, simulatorRecordingFault, type NextAction } from '$lib/messages';
   import { CHECKLIST_TARGETS, readinessChecklist, type ChecklistTarget } from '$lib/readiness';
   import { initialCardState, openCard, recordingDisclosure, withModeDefaults, type CardOpenState } from '$lib/setup-cards';
   import {
@@ -37,7 +37,8 @@
   import { markerElapsedSeconds, markerFeedback, placeMarkers, type RecordingMarker } from '$lib/markers';
   import type { LabProfile } from '$lib/labs';
   import { connectionActions } from '$lib/connection-actions';
-  import { commandErrorDetail, commandErrorRepairable, formatCommandError } from '$lib/errors';
+  import { commandErrorDetail, commandErrorKeptPreviousTools, commandErrorRepairable, formatCommandError } from '$lib/errors';
+  import { resolvedDigitalOutputs } from '$lib/lab-authoring';
   import { firmwareStepAnnouncement, firmwareStepIndex } from '$lib/firmware-job';
   import { durationRequest, type RecordingDurationRequest } from '$lib/duration';
   import {
@@ -420,6 +421,7 @@
     sessionState: session.state,
     sessionActive: isActive,
     faultOrigin: session.fault_origin,
+    recordingRan: Boolean(session.last_summary),
     boardOperationBusy,
     startInFlight,
     activeProfile: Boolean(activeProfile),
@@ -485,7 +487,10 @@
     faultOrigin: session.fault_origin,
     failureCategory: session.connection_diagnostics?.failure_category,
     lastError: session.last_error,
-    simulatorSession: session.simulator,
+    // Not `session.simulator` alone: a later Verify or Retry connection keeps
+    // that flag (the watermark needs it) but is a board check.
+    simulatorSession: simulatorRecordingFault(session),
+    recordingRan: Boolean(session.last_summary),
     source,
     port: selectedPort
   };
@@ -882,6 +887,13 @@
       );
       await refreshEnvironmentSummary();
     } catch (error) {
+      if (commandErrorKeptPreviousTools(error)) {
+        // The backend checked that the tools already in use are still in
+        // place, so their state (and Restore) stays as it was.
+        arduinoToolsDetail = commandErrorDetail(error);
+        statusMessage = `The Arduino tools were not repaired; the tools already in place were kept. ${formatCommandError(error)}`;
+        return;
+      }
       arduinoToolsFailed(formatCommandError(error), commandErrorDetail(error), commandErrorRepairable(error));
       statusMessage = 'The Arduino tools were not repaired. The Board card explains what to do next.';
       return;
@@ -927,8 +939,15 @@
     }
   }
 
-  /** Returns true when the refresh also verified a newly selected board. */
-  async function refreshBoards(reason: 'startup' | 'manual' | 'transition' = 'manual'): Promise<boolean> {
+  /**
+   * Returns true when the refresh also verified a newly selected board.
+   * `verifyNewSelection: false` selects such a board without verifying it
+   * (see `reconcileBoardCache`).
+   */
+  async function refreshBoards(
+    reason: 'startup' | 'manual' | 'transition' = 'manual',
+    { verifyNewSelection = true }: { verifyNewSelection?: boolean } = {}
+  ): Promise<boolean> {
     if (boardScanInFlight || (reason === 'manual' && !boardControlState.canRefreshBoards)) return false;
     boardScanInFlight = true;
     boardScanStatus = 'scanning';
@@ -938,7 +957,7 @@
       await runOperation(
           { title: 'Detecting Arduino boards…', stage: reason === 'startup' ? 'Looking for a connected Arduino UNO R4 WiFi.' : 'Refreshing the list of connected Arduino boards.', cancelable: false },
         async () => {
-          const scan = reconcileBoardCache(selectedPort, await invoke<Board[]>('list_boards'));
+          const scan = reconcileBoardCache(selectedPort, await invoke<Board[]>('list_boards'), { verifyNewSelection });
           boards = scan.boards;
           boardScanLastCompleted = new Date().toLocaleTimeString();
           boardScanStatus = 'complete';
@@ -1087,8 +1106,11 @@
     const finishedFailure = finishedJob?.failure ?? firmwareWorkflow.last_failure;
     // A native-USB restore intentionally returns on a different COM port
     // from the ESP32 bridge used for upload. Refresh exactly once after a
-    // terminal firmware job so the selected board cannot remain stale.
-    await refreshBoards('transition');
+    // terminal firmware job so the selected board cannot remain stale. Only
+    // a completed restore verifies a newly selected board: after a failure
+    // or cancel, the Board card keeps the restore's own failure, log, and
+    // advice (Verify and Restore stay available).
+    await refreshBoards('transition', { verifyNewSelection: finishedJob?.stage === 'complete' });
     // Refresh the independent acquisition state immediately as well; it
     // must not wait for a route change or retain a stale Faulted snapshot.
     await pollSession();
@@ -1417,6 +1439,8 @@
         try {
           const result = await invoke<HandshakeRetryResult>('retry_hardware_handshake', { port });
           await pollSession();
+          // A handshake that found other firmware withdraws Ready (`verified_port`).
+          await refreshFirmwareCompatibility();
           statusMessage = result.handshake_succeeded
             ? firmwareReadyOnSelectedPort
               ? `Connection confirmed on ${port}. Select Start recording for a new session.`
@@ -1663,7 +1687,7 @@
     teachingNotice={liveFirst}
     arduino={`${session.board || 'Not connected'}${session.port ? ` (${session.port})` : ''}`}
     storage={formatStorage(freeBytes)}
-    digitalOutputs={plotProfile?.acquisition.digital_outputs ?? []}
+    digitalOutputs={plotProfile ? resolvedDigitalOutputs(plotProfile.acquisition) : []}
     outputMask={session.digital_output_mask}
     bind:paused={plotPaused}
     recording={isActive}

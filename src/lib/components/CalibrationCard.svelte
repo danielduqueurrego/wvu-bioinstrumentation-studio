@@ -75,6 +75,9 @@
   let savedCalibrations = $state<CalibrationPreset[]>([]);
   // Only the newest `list_calibrations` response is applied (see `refresh`).
   let requestCounter = 0;
+  // The preset `applySaved` just saved: kept listed until its refresh
+  // returns. Any other preset missing from the files is dropped.
+  let justSavedId = '';
 
   const xgzp = $derived(channelId === 'xgzp');
   const unitFor = (preset: CalibrationPreset): DisplayUnit => preset.output_units.trim().toLowerCase() === 'mmhg' ? 'mmhg' : 'calibrated';
@@ -104,7 +107,8 @@
         {
           latestRequestId: requestCounter,
           selection: { profileId, channelId },
-          state: { presets: savedCalibrations, selectedId: selectedCalibrationId, active: activeCalibration }
+          state: { presets: savedCalibrations, selectedId: selectedCalibrationId, active: activeCalibration },
+          justSavedId
         }
       );
       if (!next) return;
@@ -128,7 +132,22 @@
     activeCalibration = calibration;
     savedCalibrations = mergeCalibrationPresets(savedCalibrations, [calibration]);
     channelUnits = { ...channelUnits, [calibration.channel_id]: unitFor(calibration) };
-    await refresh(calibration.profile_id, calibration.channel_id);
+    justSavedId = calibration.calibration_id;
+    try {
+      await refresh(calibration.profile_id, calibration.channel_id);
+    } finally {
+      if (justSavedId === calibration.calibration_id) justSavedId = '';
+    }
+  }
+
+  /**
+   * Another app window, or an instructor removing a preset file, can change
+   * the saved presets; returning to this window reads them again, so a
+   * deleted preset is not recorded. Not while a recording runs: its
+   * calibration is already frozen.
+   */
+  function refreshAfterFocus() {
+    if (!locked && profileId && channelId) void refresh(profileId, channelId);
   }
 
   async function selectChannel(next: string) {
@@ -182,6 +201,8 @@
     channelUnits = { ...channelUnits, [forChannelId]: unit as DisplayUnit };
   }
 </script>
+
+<svelte:window onfocus={refreshAfterFocus} />
 
 <div class="studio-form">
   <p class="help">Raw ADC counts remain authoritative in BMEG. These settings control only live display and derived CSV columns, and are frozen into each new recording’s metadata.</p>

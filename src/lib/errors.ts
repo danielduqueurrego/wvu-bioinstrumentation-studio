@@ -59,6 +59,15 @@ export function commandErrorRepairable(error: unknown): boolean {
   return structuredFailure(error)?.repairable !== false;
 }
 
+/**
+ * Whether a failed Repair Arduino tools left the tools already in use in
+ * place (`ArduinoToolsFailure.previous_runtime_kept`). Only an explicit
+ * `true` says so; anything else is treated as tools that need attention.
+ */
+export function commandErrorKeptPreviousTools(error: unknown): boolean {
+  return structuredFailure(error)?.previous_runtime_kept === true;
+}
+
 /** The technical detail of a structured failure, for Advanced details only. */
 export function commandErrorDetail(error: unknown): string {
   const failure = structuredFailure(error);

@@ -314,12 +314,47 @@ export type FaultInput = {
   failureCategory?: string | null;
   /** `SessionStatus.last_error`: student text for a refused request. */
   lastError?: string | null;
-  /** The faulted session ran the simulator (`SessionStatus.simulator`). */
+  /**
+   * The fault came from a Simulator recording (`simulatorRecordingFault`),
+   * not from a later board check.
+   */
   simulatorSession: boolean;
+  /**
+   * A recording ran and ended (`SessionStatus.last_summary` is set). A
+   * storage fault without one is a folder or drive refusal before START:
+   * nothing was recorded, so nothing was "not saved".
+   */
+  recordingRan: boolean;
   /** The Source chosen for the next recording. */
   source: 'hardware' | 'simulator';
   /** The selected COM port, named in board headlines. */
   port?: string;
+};
+
+/** Rust `start_profile_simulator` names the simulator session's port this. */
+export const SIMULATOR_PORT = 'SIM';
+
+/**
+ * Whether the session's fault was raised by a Simulator recording.
+ * `SessionStatus.simulator` describes the last recording and is not reset
+ * by Verify Firmware, Retry connection, or a restore's verification (the
+ * SIMULATED DATA watermark still needs it), but each of those replaces
+ * `port` with the board's COM port. A Verify (`verification`) is never a
+ * simulator fault.
+ */
+export function simulatorRecordingFault(session: { simulator: boolean; port: string; fault_origin?: string | null }): boolean {
+  return session.simulator && session.port === SIMULATOR_PORT && session.fault_origin !== 'verification';
+}
+
+/**
+ * A storage fault raised before START: the Project folder or its drive
+ * refused the recording (too little free space, a folder or file that could
+ * not be created). Nothing was recorded.
+ */
+export const STORAGE_REFUSED_BEFORE_START: PlainMessage = {
+  headline: 'The recording could not start',
+  sentence: 'Check that the Project folder’s drive is connected and has free space (or choose another folder), then clear the connection. Nothing was recorded.',
+  nextAction: 'clear_connection'
 };
 
 /**
@@ -370,10 +405,13 @@ function noWvuFirmware(id: string, port: string | undefined, severity: ProblemSe
  * practice, which owns no board and clears the fault when it starts, so the
  * Board card reports it instead of the banner. A recording, save, or
  * request fault always matters: it describes the student's own recording.
+ * A Verify is always a board check, even after a Simulator recording.
  */
 export function faultConcernsSource(fault: FaultInput): boolean {
-  if (fault.source === 'hardware' || fault.simulatorSession) return true;
-  return fault.faultOrigin !== 'verification' && fault.faultOrigin !== 'connection';
+  if (fault.source === 'hardware') return true;
+  if (fault.faultOrigin === 'verification') return false;
+  if (fault.simulatorSession) return true;
+  return fault.faultOrigin !== 'connection';
 }
 
 /**
@@ -396,10 +434,23 @@ export function faultBanner(input: FaultInput): ProblemBanner {
     return { id, severity: 'error', headline: request.headline, sentence: detail ? `${sentenceOf(detail)} ${request.sentence}` : request.sentence, nextAction: 'clear_connection' };
   }
   if (origin === 'storage' || category === 'recording_storage_error') {
+    if (!input.recordingRan) {
+      // Refused before START: say why (for example the free space) and that nothing was recorded.
+      const refused = STORAGE_REFUSED_BEFORE_START;
+      const detail = storageDetail(input.lastError);
+      return {
+        id: `${id}:before-start`,
+        severity: 'error',
+        headline: refused.headline,
+        sentence: detail ? `${sentenceOf(detail)} ${refused.sentence}` : refused.sentence,
+        nextAction: 'clear_connection'
+      };
+    }
     const storage = FAULT_ORIGIN_MESSAGES.storage;
     return { id, severity: 'error', headline: storage.headline, sentence: storage.sentence, nextAction: 'clear_connection' };
   }
-  if (input.simulatorSession) {
+  // A Verify (including a restore's) is a board check even after a Simulator recording.
+  if (input.simulatorSession && origin !== 'verification') {
     return {
       id,
       severity: 'error',
@@ -438,6 +489,15 @@ export function faultBanner(input: FaultInput): ProblemBanner {
 function sentenceOf(text: string): string {
   const trimmed = text.trim();
   return /[.!?…]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+/**
+ * `last_error` of a storage refusal without the Rust error-kind prefix
+ * ("storage: only 200 MiB free …" → "Only 200 MiB free …").
+ */
+function storageDetail(lastError: string | null | undefined): string {
+  const detail = (lastError ?? '').trim().replace(/^(storage|recording|save):\s*/i, '');
+  return detail ? detail[0].toUpperCase() + detail.slice(1) : '';
 }
 
 export type ProblemInput = {

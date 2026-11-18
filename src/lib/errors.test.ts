@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { commandErrorDetail, commandErrorRepairable, formatCommandError } from './errors';
+import { commandErrorDetail, commandErrorKeptPreviousTools, commandErrorRepairable, formatCommandError } from './errors';
 
 const portBusy = {
   category: 'port_busy',
@@ -61,6 +61,19 @@ describe('Arduino tools repairability', () => {
     expect(commandErrorRepairable({ title: 'Arduino tools need attention' })).toBe(true);
     expect(commandErrorRepairable('Arduino tool repair task failed')).toBe(true);
     expect(commandErrorRepairable(undefined)).toBe(true);
+  });
+});
+
+describe('a failed Repair that kept the tools in use', () => {
+  it('is recognized only from an explicit backend answer', () => {
+    const failure = { title: 'Arduino tools could not be prepared', explanation: 'Windows could not write the Arduino tools to this computer.', repairable: true };
+    expect(commandErrorKeptPreviousTools({ ...failure, previous_runtime_kept: true })).toBe(true);
+    expect(commandErrorKeptPreviousTools(JSON.stringify({ ...failure, previous_runtime_kept: true }))).toBe(true);
+    expect(commandErrorKeptPreviousTools({ ...failure, previous_runtime_kept: false })).toBe(false);
+    // Older builds, task errors, and plain strings do not claim it.
+    expect(commandErrorKeptPreviousTools(failure)).toBe(false);
+    expect(commandErrorKeptPreviousTools('Arduino tool repair task failed')).toBe(false);
+    expect(commandErrorKeptPreviousTools(undefined)).toBe(false);
   });
 });
 

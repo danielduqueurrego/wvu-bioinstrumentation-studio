@@ -31,7 +31,7 @@ If **Start recording** cannot be used, the checklist in the recording bar names 
 
 Advanced details records the start stage and technical detail for instructor troubleshooting.
 
-**Not enough free space.** If the Recording duration card reports that a timed recording and its CSV will not fit on the drive, **Start recording** still works, but the recording stops early to protect the drive. Free some space, choose another Project folder, or shorten the recording first. Start is refused only when less than 250 MiB is free.
+**Not enough free space.** If the Recording duration card reports that a timed recording and its CSV will not fit on the drive, **Start recording** still works, but the recording stops early to protect the drive. Free some space, choose another Project folder, or shorten the recording first. Start is refused only when less than 250 MiB is free. The message then says **The recording could not start** and gives the free space; nothing was recorded. Free space or choose another folder, then select **Clear connection**.
 
 ## The previous Arduino connection needs to be cleared
 
@@ -73,6 +73,7 @@ If the message under the recording bar says **The Arduino tools need attention**
 - **What Repair does.** It extracts the offline Arduino tools included with the application again; nothing is downloaded. It is unavailable while a recording or board operation is running; finish or stop that first.
 - **Automatic check.** The app also checks the prepared tools at every start and extracts them again if a file is missing or its size changed, for example after an antivirus scan. This check compares each file's presence and size, not its content.
 - **Where the tools are.** They are kept in `%LOCALAPPDATA%\WVU-BMEG\rt`, outside the installation folder, so reinstalling alone does not replace them; use Repair first.
+- **If Repair fails.** When the tools already in place are still complete (for example another program held a file, so nothing was replaced), they are kept and **Restore WVU Firmware** stays available; the information line says why the repair failed. Otherwise the Board card asks for Repair again.
 - **If the tools are missing.** If the app or Repair reports that the included tools are missing or incomplete, reinstall the course distribution. Repair is not offered then, because it cannot help. Share Advanced details or the diagnostic log with the instructor.
 
 Simulator recordings still work while the tools need attention.

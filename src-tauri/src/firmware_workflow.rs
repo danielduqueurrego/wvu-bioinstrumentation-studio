@@ -13,7 +13,10 @@ use crate::{
         controlled_reference_source, source_hash, FirmwareIdentity, FirmwareVerificationKind,
     },
     serial_lease::{SerialLease, SerialOwner},
-    session::{ConnectionFailureCategory, FaultOrigin, SessionController, SessionError},
+    session::{
+        ConnectionDiagnostics, ConnectionFailureCategory, FaultOrigin, SessionController,
+        SessionError,
+    },
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -285,6 +288,33 @@ impl WorkflowRuntime {
         self.last_restore = Some(job);
     }
 
+    /// A Retry connection or hardware Start handshake on the verified port
+    /// that proved the board runs other firmware withdraws readiness, as a
+    /// failed Verify does: the Board card no longer says Ready and Start is
+    /// refused until Verify or Restore proves the WVU firmware again. The
+    /// last failure (a Verify or restore result) is left as it was.
+    fn withdraw_disproved_readiness(&mut self, diagnostics: &ConnectionDiagnostics) {
+        if self.active_job.is_some()
+            || !diagnostics
+                .failure_category
+                .as_ref()
+                .is_some_and(disproves_reference_firmware)
+        {
+            return;
+        }
+        if self.acquisition_allowed(&diagnostics.selected_port) {
+            crate::app_log::record(
+                "WARN",
+                &format!(
+                    "FIRMWARE_READINESS_WITHDRAWN port={} category={:?}",
+                    diagnostics.selected_port, diagnostics.failure_category
+                ),
+            );
+            self.compatibility = FirmwareCompatibility::VerificationFailed;
+            self.verified_port = None;
+        }
+    }
+
     /// Applies a completed Verify Firmware handshake on `port`. A firmware
     /// job owns the board's firmware status, so nothing changes while one is
     /// active (the serial lease already prevents that overlap).
@@ -321,7 +351,11 @@ impl FirmwareWorkflow {
     }
 
     pub fn status(&self) -> Result<FirmwareWorkflowStatus, FirmwareFailure> {
-        let runtime = self.lock_state()?;
+        let diagnostics = self.session_diagnostics();
+        let mut runtime = self.lock_state()?;
+        if let Some(diagnostics) = diagnostics.as_ref() {
+            runtime.withdraw_disproved_readiness(diagnostics);
+        }
         Ok(FirmwareWorkflowStatus {
             compatibility: runtime.compatibility,
             job: runtime.active_job.clone(),
@@ -523,7 +557,22 @@ impl FirmwareWorkflow {
     }
 
     pub fn is_acquisition_allowed(&self, port: &str) -> Result<bool, FirmwareFailure> {
-        Ok(self.lock_state()?.acquisition_allowed(port))
+        let diagnostics = self.session_diagnostics();
+        let mut runtime = self.lock_state()?;
+        if let Some(diagnostics) = diagnostics.as_ref() {
+            runtime.withdraw_disproved_readiness(diagnostics);
+        }
+        Ok(runtime.acquisition_allowed(port))
+    }
+
+    /// The session's latest connection diagnostics (from Retry connection, a
+    /// hardware Start, or Verify). Read before the workflow lock is taken, so
+    /// the two locks are never held together.
+    fn session_diagnostics(&self) -> Option<ConnectionDiagnostics> {
+        self.session
+            .status()
+            .ok()
+            .and_then(|status| status.connection_diagnostics)
     }
 
     /// Claims the shared serial lease, or explains which operation holds it.
@@ -1223,6 +1272,19 @@ fn wait_for_esp32_bridge_port(
     ))
 }
 
+/// Handshake results that prove the board is not running the controlled WVU
+/// firmware (the frontend's Restore categories, except a lab the firmware
+/// cannot run, which depends on the lab rather than the board).
+fn disproves_reference_firmware(category: &ConnectionFailureCategory) -> bool {
+    matches!(
+        category,
+        ConnectionFailureCategory::NonProtocolBytes
+            | ConnectionFailureCategory::WrongProtocolVersion
+            | ConnectionFailureCategory::MissingFirmwareIdentity
+            | ConnectionFailureCategory::IncompatibleFirmwareIdentity
+    )
+}
+
 fn verification_from_handshake(
     declared_kind: FirmwareVerificationKind,
     diagnostics: &crate::session::ConnectionDiagnostics,
@@ -1748,6 +1810,86 @@ mod tests {
         runtime.begin_job(job);
         assert_eq!(runtime.verified_port, None);
         assert!(!runtime.acquisition_allowed("COM12"));
+    }
+
+    fn failed_handshake(port: &str, category: ConnectionFailureCategory) -> ConnectionDiagnostics {
+        ConnectionDiagnostics {
+            selected_port: port.into(),
+            failure_category: Some(category),
+            ..verified_diagnostics()
+        }
+    }
+
+    #[test]
+    fn a_handshake_that_finds_other_firmware_on_the_verified_port_withdraws_readiness() {
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        let verify = |port: &str| {
+            workflow
+                .lock_state()
+                .unwrap_or_else(|error| panic!("{error:?}"))
+                .record_verification(port, true, None);
+        };
+        let allowed = |port: &str| {
+            workflow
+                .is_acquisition_allowed(port)
+                .unwrap_or_else(|error| panic!("{error:?}"))
+        };
+        verify("COM12");
+        // Problems that say nothing about the firmware, or concern another
+        // port, leave readiness alone.
+        for diagnostics in [
+            failed_handshake("COM12", ConnectionFailureCategory::PortBusy),
+            failed_handshake("COM12", ConnectionFailureCategory::HandshakeIncomplete),
+            failed_handshake(
+                "COM12",
+                ConnectionFailureCategory::LabNotSupportedByFirmware,
+            ),
+            failed_handshake(
+                "COM13",
+                ConnectionFailureCategory::IncompatibleFirmwareIdentity,
+            ),
+        ] {
+            workflow
+                .session
+                .replace_connection_diagnostics_for_test(diagnostics);
+            assert!(allowed("COM12"));
+        }
+        for category in [
+            ConnectionFailureCategory::NonProtocolBytes,
+            ConnectionFailureCategory::WrongProtocolVersion,
+            ConnectionFailureCategory::MissingFirmwareIdentity,
+            ConnectionFailureCategory::IncompatibleFirmwareIdentity,
+        ] {
+            verify("COM12");
+            workflow
+                .session
+                .replace_connection_diagnostics_for_test(failed_handshake(
+                    "com12",
+                    category.clone(),
+                ));
+            let status = workflow
+                .status()
+                .unwrap_or_else(|error| panic!("{error:?}"));
+            assert_eq!(status.verified_port, None, "{category:?}");
+            assert_eq!(
+                status.compatibility,
+                FirmwareCompatibility::VerificationFailed
+            );
+            assert!(!allowed("COM12"));
+        }
+        // A firmware job owns the firmware status while it runs.
+        verify("COM12");
+        {
+            let mut runtime = workflow
+                .lock_state()
+                .unwrap_or_else(|error| panic!("{error:?}"));
+            runtime.active_job = Some(restore_job(&workflow, "COM12"));
+            runtime.withdraw_disproved_readiness(&failed_handshake(
+                "COM12",
+                ConnectionFailureCategory::IncompatibleFirmwareIdentity,
+            ));
+            assert_eq!(runtime.verified_port.as_deref(), Some("COM12"));
+        }
     }
 
     #[test]

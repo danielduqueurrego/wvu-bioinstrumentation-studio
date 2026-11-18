@@ -12,6 +12,9 @@ import {
   faultConcernsSource,
   firmwareFailureMessage,
   problemBanner,
+  SIMULATOR_PORT,
+  simulatorRecordingFault,
+  STORAGE_REFUSED_BEFORE_START,
   type ProblemInput
 } from './messages';
 
@@ -43,7 +46,7 @@ describe('plain-language mapping covers every backend code', () => {
   });
 
   it('gives every entry a headline, a full sentence, and no raw codes', () => {
-    for (const table of [CONNECTION_FAILURE_MESSAGES, FAULT_ORIGIN_MESSAGES, FIRMWARE_FAILURE_MESSAGES]) {
+    for (const table of [CONNECTION_FAILURE_MESSAGES, FAULT_ORIGIN_MESSAGES, FIRMWARE_FAILURE_MESSAGES, { storage_refused_before_start: STORAGE_REFUSED_BEFORE_START }]) {
       for (const [code, message] of Object.entries(table)) {
         expect(message.headline.trim(), code).not.toBe('');
         expect(message.sentence, code).toMatch(/[.!?]$/);
@@ -67,13 +70,36 @@ describe('plain-language mapping covers every backend code', () => {
 });
 
 const fault = (overrides: Partial<Parameters<typeof faultBanner>[0]> = {}) =>
-  faultBanner({ faultOrigin: 'recording', failureCategory: null, lastError: 'x', simulatorSession: false, source: 'hardware', ...overrides });
+  faultBanner({ faultOrigin: 'recording', failureCategory: null, lastError: 'x', simulatorSession: false, recordingRan: true, source: 'hardware', ...overrides });
 
 describe('fault banner next action', () => {
   it('clears a save problem instead of sending the student to firmware recovery', () => {
     const banner = fault({ faultOrigin: 'storage', failureCategory: 'recording_storage_error' });
+    expect(banner.headline).toBe('The recording was not saved completely');
     expect(banner.nextAction).toBe('clear_connection');
     expect(banner.sentence).not.toMatch(/firmware/i);
+  });
+
+  it('says a recording the folder or drive refused before START could not start, and why', () => {
+    for (const source of ['hardware', 'simulator'] as const) {
+      for (const failureCategory of ['recording_storage_error', null]) {
+        const banner = fault({
+          faultOrigin: 'storage', failureCategory, recordingRan: false, source, simulatorSession: source === 'simulator',
+          lastError: 'storage: only 200 MiB free in E:\\BMEG; recording requires at least 250 MiB'
+        });
+        expect(banner.headline).toBe('The recording could not start');
+        expect(banner.sentence).toContain('Only 200 MiB free in E:\\BMEG; recording requires at least 250 MiB.');
+        expect(banner.sentence).toContain('Nothing was recorded.');
+        expect(banner.sentence).not.toMatch(/saved completely|already saved|firmware/i);
+        expect(banner.nextAction).toBe('clear_connection');
+      }
+    }
+    // Without a detail the plain sentence stands alone.
+    expect(fault({ faultOrigin: 'storage', recordingRan: false, lastError: null }).sentence).toBe(STORAGE_REFUSED_BEFORE_START.sentence);
+    // A save that failed after a recording keeps its own text and id.
+    const saved = fault({ faultOrigin: 'storage', failureCategory: 'recording_storage_error', recordingRan: true });
+    expect(saved.id).toBe('fault:storage:recording_storage_error');
+    expect(fault({ faultOrigin: 'storage', failureCategory: 'recording_storage_error', recordingRan: false }).id).not.toBe(saved.id);
   });
 
   it('shows the backend’s student text for a refused request', () => {
@@ -165,6 +191,32 @@ describe('fault banner next action', () => {
     const banner = fault({ simulatorSession: true, faultOrigin: 'recording' });
     expect(banner.headline).toMatch(/simulator/i);
     expect(banner.nextAction).toBe('clear_connection');
+    expect(fault({ simulatorSession: true, faultOrigin: 'connection', source: 'simulator' }).headline).toBe('The simulator recording could not start');
+  });
+
+  it('describes a failed Verify after a Simulator recording as a board problem, never as the simulator recording', () => {
+    for (const source of ['hardware', 'simulator'] as const) {
+      const banner = fault({ simulatorSession: true, faultOrigin: 'verification', failureCategory: 'non_protocol_bytes', source, port: 'COM5' });
+      expect(banner.headline).not.toMatch(/simulator/i);
+      expect(banner.nextAction).toBe('restore_firmware');
+      const silent = fault({ simulatorSession: true, faultOrigin: 'verification', failureCategory: 'port_open_no_bytes', source, port: 'COM5' });
+      expect(silent.headline).toBe('No WVU firmware detected on COM5');
+      const busy = fault({ simulatorSession: true, faultOrigin: 'verification', failureCategory: 'port_busy', source, port: 'COM5' });
+      expect(busy.headline).toBe('Another program is using the board');
+      expect(busy.nextAction).toBe('verify_firmware');
+    }
+  });
+
+  it('names a fault a Simulator recording raised, not a later board check that kept the simulator flag', () => {
+    expect(simulatorRecordingFault({ simulator: true, port: 'SIM', fault_origin: 'connection' })).toBe(true);
+    expect(simulatorRecordingFault({ simulator: true, port: 'SIM', fault_origin: 'recording' })).toBe(true);
+    // Verify, Retry connection, and a restore's verification set the board's COM port.
+    expect(simulatorRecordingFault({ simulator: true, port: 'COM5', fault_origin: 'connection' })).toBe(false);
+    expect(simulatorRecordingFault({ simulator: true, port: 'SIM', fault_origin: 'verification' })).toBe(false);
+    expect(simulatorRecordingFault({ simulator: false, port: 'COM5', fault_origin: 'recording' })).toBe(false);
+    // The backend's simulator session uses the same port name.
+    const session = readFileSync(resolve(process.cwd(), 'src-tauri', 'src', 'session.rs'), 'utf8');
+    expect(session).toMatch(new RegExp(`begin_session\\(\\s*true,\\s*"Simulator",\\s*"${SIMULATOR_PORT}",`));
   });
 
   it('uses the category text and keeps one id per problem', () => {
@@ -177,7 +229,7 @@ describe('fault banner next action', () => {
 const quiet: ProblemInput = {
   sessionState: 'Disconnected',
   active: false,
-  fault: { simulatorSession: false, source: 'simulator' },
+  fault: { simulatorSession: false, recordingRan: false, source: 'simulator' },
   arduinoTools: { state: 'ready', problem: '', repairable: true },
   board: { source: 'simulator', selectedPort: '', firmwareReady: false, compatibility: 'unknown', firmwareJobActive: false }
 };
@@ -191,7 +243,7 @@ describe('problem banner priority', () => {
     const banner = problemBanner({
       ...quiet,
       sessionState: 'Faulted',
-      fault: { faultOrigin: 'recording', failureCategory: 'no_data_timeout', simulatorSession: false, source: 'hardware' },
+      fault: { faultOrigin: 'recording', failureCategory: 'no_data_timeout', simulatorSession: false, recordingRan: true, source: 'hardware' },
       arduinoTools: { state: 'failed', problem: 'Broken', repairable: true },
       catalogNotice: 'Local labs could not be loaded.'
     });
@@ -208,12 +260,16 @@ describe('problem banner priority', () => {
     expect(problemBanner({ ...quiet, arduinoTools: { state: 'failed', problem: 'Arduino tools missing.', repairable: false } })).toBeUndefined();
     expect(problemBanner({ ...quiet, board: { ...quiet.board, selectedPort: 'COM5', compatibility: 'wvu_protocol_incompatible' } })).toBeUndefined();
     // A failed board check does not concern Simulator practice either …
-    const verification = { faultOrigin: 'verification', failureCategory: 'port_open_no_bytes', simulatorSession: false, source: 'simulator' as const };
+    const verification = { faultOrigin: 'verification', failureCategory: 'port_open_no_bytes', simulatorSession: false, recordingRan: false, source: 'simulator' as const };
     expect(faultConcernsSource(verification)).toBe(false);
     expect(problemBanner({ ...quiet, sessionState: 'Faulted', fault: verification })).toBeUndefined();
+    // … even right after a Simulator recording …
+    expect(faultConcernsSource({ ...verification, simulatorSession: true, recordingRan: true })).toBe(false);
+    expect(problemBanner({ ...quiet, sessionState: 'Faulted', fault: { ...verification, simulatorSession: true } })).toBeUndefined();
     // … but the student's own recording fault, or a simulator fault, does.
     expect(faultConcernsSource({ ...verification, faultOrigin: 'recording' })).toBe(true);
-    expect(faultConcernsSource({ ...verification, simulatorSession: true })).toBe(true);
+    expect(faultConcernsSource({ ...verification, faultOrigin: 'connection', simulatorSession: true })).toBe(true);
+    expect(faultConcernsSource({ ...verification, faultOrigin: 'connection' })).toBe(false);
     expect(problemBanner({ ...quiet, sessionState: 'Faulted', fault: { ...verification, source: 'hardware' } })?.id).toBe('fault:verification:port_open_no_bytes');
   });
 

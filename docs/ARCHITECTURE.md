@@ -75,10 +75,15 @@ A fault sets `last_error` together with `fault_origin`:
 | `verification` | Verify Firmware, including a restore's verification |
 | `connection` | Retry connection, or a hardware Start that failed before START |
 | `recording` | Acquisition ended by a serial, firmware, or session failure |
-| `storage` | The folder or files could not be used or saved |
+| `storage` | The folder or files could not be used (refused before START) or saved |
 | `request` | The request was refused before START |
 
-The message center chooses its text and its single next action from this field, so a failed Verify is never described as a recording that ended.
+The message center chooses its text and its single next action from this field, so a failed Verify is never described as a recording that ended. Two further distinctions are made on the page, without new fields:
+
+- A `storage` fault with no `last_summary` was raised before START (for example less than 250 MiB free). It is shown as "The recording could not start" with the reason from `last_error`; "not saved completely" is kept for a save that failed after a recording.
+- `simulator` describes the last recording and is not reset by Verify, Retry connection, or a restore's verification (the SIMULATED DATA watermark needs it). A fault counts as a simulator recording's fault only while `port` is still `SIM` and the origin is not `verification`.
+
+Closing the window uses the same `recording_active` test: during a Verify or Retry handshake the window closes normally, and only a recording is stopped and saved first.
 
 A hardware Start after a fault waits until Verify or **Clear connection** clears it. A Simulator Start does not wait.
 
@@ -86,7 +91,8 @@ A hardware Start after a fault waits until Verify or **Clear connection** clears
 
 Firmware readiness is bound to a port:
 
-- `verified_port` is set by a successful Verify (or the verification at the end of a Restore). Any failed verification and the start of any firmware job clear it.
+- `verified_port` is set by a successful Verify (or the verification at the end of a Restore). Any failed verification and the start of any firmware job clear it. So does a Retry connection or hardware Start handshake on that port whose `failure_category` proves other firmware (`non_protocol_bytes`, `wrong_protocol_version`, `missing_firmware_identity`, `incompatible_firmware_identity`); the workflow applies it when its status or Start readiness is next read.
+- After a failed or canceled restore, the page refreshes the board list and follows a board that appeared on another port, but does not verify it, so the Board card keeps the restore's failure, log path, and advice. Advanced details always shows the last restore's result and log path.
 - A hardware Start requires a compatible result on the selected port, and that port must equal `verified_port`.
 - A Verify that cannot open the port reports `PortBusy` and keeps the previous compatibility result.
 
@@ -111,7 +117,7 @@ A recording runs on one worker thread:
 4. **Open the raw file.** It creates `<name>.bmeg.part` (`create_new`, so an existing file is never truncated).
 5. **START.** It sends START and waits for a STATUS with `acquiring = 1`.
 6. **Capture.** The capture loop reads frames, writes validated records, and checks free space every 15 s. It PINGs every second and enforces the seven-second no-data safeguard. Sample batches (and the overflow and timing counters of STATUS frames) that arrive before the START STATUS are ignored because they belong to an earlier run, and an ERROR from an earlier session is logged, not counted.
-7. **Stop.** STOP is always sent. The worker then waits up to 300 ms for a STATUS newer than STOP and drains the tail.
+7. **Stop.** STOP is always sent. The worker then waits up to 300 ms for a STATUS newer than STOP and drains the tail. A STOP whose write timed out, or that is unanswered after 100 ms, is sent again (at most twice, each extending the wait by up to 100 ms).
 8. **Finalize.** The recording is always finalized, whatever ended it: a user Stop, the timed end, window close, disconnect, the storage guard, or a fault.
 
 While a recording runs, a Windows power request (`PowerSetRequest`, `PowerRequestSystemRequired`) keeps the PC from sleeping. It is held from the worker's start through finalization.
@@ -171,4 +177,4 @@ The page's decisions live in pure TypeScript modules in `src/lib/`, tested by th
 
 - Lab definitions describe course acquisition, display defaults, supported conversion types, allowed duration modes, and required firmware capabilities. Factory definitions in `profiles/` are immutable. Local instructor revisions are explicit records in a catalog file that is written atomically under a cross-process lock.
 - Start sends the lab's `profile_version`. The backend refuses to start if the active revision changed after the page loaded it, and the Lab Manager is disabled while recording.
-- The Arduino runtime ships inside the installer and is extracted under a cross-process lock to `%LOCALAPPDATA%\WVU-BMEG\rt`. The extracted files are checked at startup, and Repair Arduino tools re-extracts them. Production CLI processes are launched by Rust with hidden Windows console creation and no shell.
+- The Arduino runtime ships inside the installer and is extracted under a cross-process lock to `%LOCALAPPDATA%\WVU-BMEG\rt`. The extracted files are checked at startup, and Repair Arduino tools re-extracts them. A failed Repair reports `previous_runtime_kept` after checking that the tools already in use are still complete on disk; the page then keeps their state, so Restore stays available. Production CLI processes are launched by Rust with hidden Windows console creation and no shell.

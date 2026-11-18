@@ -24,4 +24,13 @@ describe('root board cache reconciliation', () => {
     expect(cleared).toMatchObject({ selectedPort: '', selectionCleared: true });
     expect(cleared.verificationPort).toBeUndefined();
   });
+
+  it('selects the board that appeared after a failed restore without verifying it', () => {
+    // COM34 went into upload mode and came back as COM9: the selection
+    // follows it, but no Verify replaces the restore's failure.
+    const result = reconcileBoardCache('COM34', [{ ...uno, port: 'COM9' }], { verifyNewSelection: false });
+    expect(result).toMatchObject({ selectedPort: 'COM9', selectionCleared: true });
+    expect(result.verificationPort).toBeUndefined();
+    expect(reconcileBoardCache('COM34', [{ ...uno, port: 'COM35' }]).verificationPort).toBe('COM35');
+  });
 });

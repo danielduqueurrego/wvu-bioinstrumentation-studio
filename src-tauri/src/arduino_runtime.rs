@@ -88,6 +88,11 @@ pub struct ArduinoToolsFailure {
     /// Whether Repair Arduino tools (extracting the included tools again) can
     /// fix this. A missing or damaged installation needs a reinstall instead.
     pub repairable: bool,
+    /// Set by a failed Repair: the tools this run was already using are still
+    /// in place on disk (the repair was refused, or failed before or while
+    /// swapping and was rolled back), so firmware operations keep working.
+    /// False when that is unknown or not the case.
+    pub previous_runtime_kept: bool,
 }
 
 impl ArduinoToolsFailure {
@@ -104,7 +109,15 @@ impl ArduinoToolsFailure {
             recommended_action: recommended_action.into(),
             technical_details: technical_details.into(),
             repairable,
+            previous_runtime_kept: false,
         }
+    }
+
+    /// Records whether the tools in use before a failed Repair are still in
+    /// place (see `active_runtime_intact`).
+    pub fn after_failed_repair(mut self) -> Self {
+        self.previous_runtime_kept = active_runtime_intact();
+        self
     }
 
     /// A preparation or repair task that could not run or did not return.
@@ -169,6 +182,34 @@ impl RuntimeError {
 
 pub fn active_runtime() -> Option<&'static RuntimePaths> {
     ACTIVE_RUNTIME.get()
+}
+
+/// Whether the tools this run prepared are still in place on disk: their
+/// manifest still names the same versions, and the CLI, its configuration,
+/// and the UNO R4 core and tools are present. A failed Repair can leave them
+/// untouched (refused, or failed before the swap), restore them (rollback),
+/// or lose them (a rollback that also failed); this checks the folder itself.
+pub fn active_runtime_intact() -> bool {
+    ACTIVE_RUNTIME.get().is_some_and(runtime_paths_intact)
+}
+
+fn runtime_paths_intact(paths: &RuntimePaths) -> bool {
+    let root = &paths.root;
+    let data = root.join("data");
+    let Ok(manifest) = read_manifest(root) else {
+        return false;
+    };
+    manifest.arduino_cli == paths.cli_version
+        && manifest.renesas_uno_core == paths.core_version
+        && paths.executable.is_file()
+        && data.join("packages/arduino/tools").is_dir()
+        // Preparation finished: the native-USB shim is applied and the CLI
+        // configuration names this runtime's own folders.
+        && fs::read_to_string(native_usb_core_header(root, &manifest))
+            .is_ok_and(|header| header.contains(NATIVE_USB_SHIM_SIGNATURE))
+        && fs::read_to_string(&paths.config_file).is_ok_and(|config| {
+            config == cli_config_text(&data, &root.join("downloads"), &root.join("sketchbook"))
+        })
 }
 
 /// Held by an Arduino CLI command for as long as its tools run. A Repair in
@@ -779,12 +820,9 @@ fn apply_native_usb_core_compatibility_patch(
     if manifest.renesas_uno_core != "1.6.0" {
         return Err(RuntimeError::InvalidBundle);
     }
-    let header = destination
-        .join("data/packages/arduino/hardware/renesas_uno")
-        .join(&manifest.renesas_uno_core)
-        .join("cores/arduino/usb/SerialUSB.h");
+    let header = native_usb_core_header(destination, manifest);
     let source = fs::read_to_string(&header).map_err(|_| RuntimeError::InvalidBundle)?;
-    if source.contains("size_t write_raw(uint8_t *p, size_t len)") {
+    if source.contains(NATIVE_USB_SHIM_SIGNATURE) {
         return Ok(());
     }
     let marker = "    virtual size_t write(const uint8_t *p, size_t len) override;";
@@ -801,6 +839,16 @@ fn apply_native_usb_core_compatibility_patch(
     );
     fs::write(header, source.replacen(marker, &replacement, 1))?;
     Ok(())
+}
+
+/// The member the compatibility shim adds to `SerialUSB`.
+const NATIVE_USB_SHIM_SIGNATURE: &str = "size_t write_raw(uint8_t *p, size_t len)";
+
+fn native_usb_core_header(destination: &Path, manifest: &RuntimeManifest) -> PathBuf {
+    destination
+        .join("data/packages/arduino/hardware/renesas_uno")
+        .join(&manifest.renesas_uno_core)
+        .join("cores/arduino/usb/SerialUSB.h")
 }
 
 fn read_manifest(root: &Path) -> Result<RuntimeManifest, RuntimeError> {
@@ -1123,6 +1171,50 @@ mod tests {
         assert!(!error.failure().repairable);
         assert!(root.join("arduino-cli.exe").is_file());
         assert!(root.join(BOSSAC).is_file());
+    }
+
+    #[test]
+    fn a_failed_repair_reports_whether_the_tools_in_use_are_still_in_place() {
+        let source = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let destination = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let (archive_path, manifest_path) = write_runtime_archive(source.path());
+        let root = destination.path().join("runtime");
+        let prepared = prepare_from_archive(&archive_path, &manifest_path, &root)
+            .unwrap_or_else(|error| panic!("{error}"));
+        // A repair that failed before or during the swap left them in place.
+        assert!(runtime_paths_intact(&prepared));
+        // A rollback that also failed leaves no runtime folder at all.
+        let moved = destination.path().join(".runtime-previous");
+        fs::rename(&root, &moved).unwrap_or_else(|error| panic!("{error}"));
+        assert!(!runtime_paths_intact(&prepared));
+        fs::rename(&moved, &root).unwrap_or_else(|error| panic!("{error}"));
+        assert!(runtime_paths_intact(&prepared));
+        // A swap that failed after extraction: the archive's own config, or
+        // a core without the native-USB shim, is not a usable runtime.
+        let config = fs::read(&prepared.config_file).unwrap_or_else(|error| panic!("{error}"));
+        fs::write(&prepared.config_file, b"directories: {}\n")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!runtime_paths_intact(&prepared));
+        fs::write(&prepared.config_file, config).unwrap_or_else(|error| panic!("{error}"));
+        let header = root.join(SERIAL_USB_HEADER);
+        let patched = fs::read(&header).unwrap_or_else(|error| panic!("{error}"));
+        fs::write(&header, b"class SerialUSB {};\n").unwrap_or_else(|error| panic!("{error}"));
+        assert!(!runtime_paths_intact(&prepared));
+        fs::write(&header, patched).unwrap_or_else(|error| panic!("{error}"));
+        assert!(runtime_paths_intact(&prepared));
+        // Other tool versions in the folder are not the tools in use.
+        fs::write(
+            root.join("runtime-manifest.json"),
+            MANIFEST.replace("1.5.2-rc.1", "1.6.0"),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!runtime_paths_intact(&prepared));
+        // Only a failed Repair reports it; preparation failures never do.
+        assert!(!RuntimeError::Busy.failure().previous_runtime_kept);
+        // The page reads it by this name (`commandErrorKeptPreviousTools`).
+        let serialized = serde_json::to_value(RuntimeError::Busy.failure())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(serialized["previous_runtime_kept"], false);
     }
 
     #[test]

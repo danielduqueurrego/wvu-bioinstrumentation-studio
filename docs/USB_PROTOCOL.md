@@ -202,6 +202,7 @@ The desktop follows the same sequence for Start, Verify Firmware, and Retry conn
 6. **STOP.**
    1. The desktop sends STOP. The firmware closes the partial batch, stops, drives D4/D5/D6 LOW, and sends STATUS (`acquiring = 0`) after all queued batches.
    2. The desktop reads for up to 300 ms until a STATUS newer than STOP reports `acquiring = 0` and output mask 0. Every batch received before it, including the recording's tail, is saved.
+   3. If the STOP write timed out (a transient Windows CDC write timeout), or no such STATUS has arrived 100 ms after the last STOP, the desktop sends STOP again, at most twice. Each resend extends the wait by up to 100 ms. The firmware ignores command sequence numbers and answers a repeated STOP like the first, so outputs go LOW without waiting for the 5 s watchdog.
 
 If START may have reached the board but its STATUS did not arrive, the desktop sends a best-effort STOP. It removes the `.bmeg.part` file if that file holds no records.
 

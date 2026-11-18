@@ -62,6 +62,14 @@ const RECORDING_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// sends that STATUS only after its final partial batch and every queued
 /// batch, so receiving it also proves the recording's tail was read.
 const STOP_STATUS_TIMEOUT: Duration = Duration::from_millis(300);
+/// Within that wait, STOP is sent again when its write timed out (the same
+/// transient Windows CDC write timeout tolerated for PINGs) or when no
+/// confirming STATUS has arrived this long after the last STOP. Without it a
+/// lost STOP would leave D4–D6 driven until the firmware's 5 s watchdog.
+const STOP_RESEND_INTERVAL: Duration = Duration::from_millis(100);
+/// At most this many extra STOPs. Each one extends the wait so its STATUS has
+/// `STOP_RESEND_INTERVAL` to arrive, which keeps the whole wait bounded.
+const MAX_STOP_RESENDS: u8 = 2;
 /// OneDrive, Windows Search, and antivirus scanners briefly open files that
 /// were just closed. A bounded retry turns those sharing violations into a
 /// short delay instead of a lost rename.
@@ -979,6 +987,44 @@ fn may_defer_ping_failure(
         && consecutive_failures <= MAX_DEFERRED_PING_FAILURES
 }
 
+/// The outcome of one final STOP write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinalStopAttempt {
+    /// Written and flushed; its STATUS may still be on the way.
+    Sent,
+    /// The write or flush hit the transient Windows CDC timeout
+    /// (`TimedOut`/`WouldBlock`) that a PING may also hit; the port is
+    /// probably still usable.
+    TransientWriteFailure,
+    /// Any other failure: the port is probably gone, or the frame could not
+    /// be encoded. Sending again would not help.
+    Failed,
+}
+
+impl FinalStopAttempt {
+    /// Whether STOP should be sent again now, `since_last` after the last
+    /// attempt, while no confirming STATUS has arrived.
+    fn resend_due(self, since_last: Duration) -> bool {
+        match self {
+            Self::TransientWriteFailure => true,
+            Self::Sent => since_last >= STOP_RESEND_INTERVAL,
+            Self::Failed => false,
+        }
+    }
+}
+
+/// The STOP-path counterpart of the PING timeout `may_defer_ping_failure`
+/// tolerates: a STOP write or flush that Windows timed out.
+fn is_transient_stop_write_failure(failure: &SerialTerminalFailure) -> bool {
+    matches!(
+        failure.stage,
+        SerialFailureStage::StopWrite | SerialFailureStage::StopFlush
+    ) && matches!(
+        failure.error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
 #[derive(Debug)]
 enum CaptureCommandError {
     Protocol(String),
@@ -1176,6 +1222,13 @@ impl SessionController {
 
     pub fn is_recording(&self) -> Result<bool, SessionError> {
         Ok(is_active_state(self.lock_runtime()?.state))
+    }
+
+    /// True only while a Start owns the session (`SessionStatus::recording_active`).
+    /// A Verify, Retry connection, or restore-verification handshake passes
+    /// through the same states but is a board check, not a recording.
+    pub fn recording_active(&self) -> Result<bool, SessionError> {
+        Ok(recording_owns_session(&*self.lock_runtime()?))
     }
 
     /// Adds a bounded user annotation to the active logical-record stream. It is recorded in the
@@ -1438,6 +1491,17 @@ impl SessionController {
         let controller = self.clone();
         self.spawn_worker(lease, move || controller.capture_serial_worker(request))?;
         self.status()
+    }
+
+    /// Leaves `diagnostics` as the latest handshake result, as a failed Retry
+    /// connection or hardware Start does.
+    #[cfg(test)]
+    pub(crate) fn replace_connection_diagnostics_for_test(
+        &self,
+        diagnostics: ConnectionDiagnostics,
+    ) {
+        self.set_connection_diagnostics(diagnostics)
+            .unwrap_or_else(|error| panic!("{error}"));
     }
 
     /// Synchronous entry point used by the controlled acceptance harness and tests.
@@ -2454,26 +2518,10 @@ impl SessionController {
         self.note_runtime_error("STOP_REASON", self.commit_terminal_stop_reason(reason));
 
         let stop_status_baseline = acquisition.snapshot().status_count;
-        let stop_sent = match self.send_capture_command(io, MessageType::Stop, 4, vec![]) {
-            Ok(()) => true,
-            Err(CaptureCommandError::Serial(error)) => {
-                self.record_serial_cleanup_failure(
-                    &error,
-                    &source,
-                    started,
-                    started_utc,
-                    &progress,
-                );
-                false
-            }
-            Err(CaptureCommandError::Protocol(detail)) => {
-                crate::app_log::record(
-                    "WARN",
-                    &format!("SERIAL_CLEANUP_ERROR stage=STOP_PROTOCOL detail={detail}"),
-                );
-                false
-            }
-        };
+        let mut stop_attempt = self.send_final_stop(io, &source, started, started_utc, &progress);
+        let mut stop_sent = stop_attempt == FinalStopAttempt::Sent;
+        let mut last_stop_attempt = Instant::now();
+        let mut stop_resends = 0u8;
         // Read until the firmware's STATUS sent after this STOP arrives (or
         // the bounded deadline passes). It follows the final partial batch and
         // every queued batch, so the recording's tail is drained too. An
@@ -2481,8 +2529,28 @@ impl SessionController {
         // START.
         let host_failure_before_stop = host_failure.is_some();
         let mut stop_confirmed = false;
-        let stop_status_deadline = Instant::now() + STOP_STATUS_TIMEOUT;
+        let mut stop_status_deadline = Instant::now() + STOP_STATUS_TIMEOUT;
         while terminal_error.is_none() && Instant::now() < stop_status_deadline {
+            // A STOP lost to a transient write timeout, or not yet answered,
+            // is sent again (at most MAX_STOP_RESENDS times). The firmware
+            // treats a repeated STOP like the first: outputs LOW, then STATUS.
+            if stop_resends < MAX_STOP_RESENDS
+                && stop_attempt.resend_due(last_stop_attempt.elapsed())
+            {
+                stop_resends += 1;
+                crate::app_log::record(
+                    "WARN",
+                    &format!(
+                        "STOP_RESEND attempt={stop_resends} previous={stop_attempt:?} elapsed_ms={}",
+                        last_stop_attempt.elapsed().as_millis()
+                    ),
+                );
+                stop_attempt = self.send_final_stop(io, &source, started, started_utc, &progress);
+                stop_sent |= stop_attempt == FinalStopAttempt::Sent;
+                last_stop_attempt = Instant::now();
+                stop_status_deadline =
+                    stop_status_deadline.max(last_stop_attempt + STOP_RESEND_INTERVAL);
+            }
             match io.read(&mut buffer) {
                 Ok(n) if n > 0 => {
                     acquisition.ingest_bytes(&buffer[..n]);
@@ -2545,7 +2613,7 @@ impl SessionController {
         crate::app_log::record(
             if stop_confirmed { "INFO" } else { "WARN" },
             &format!(
-                "STOP_CONFIRMATION confirmed={stop_confirmed} stop_sent={stop_sent} records_written={records_written}"
+                "STOP_CONFIRMATION confirmed={stop_confirmed} stop_sent={stop_sent} stop_resends={stop_resends} records_written={records_written}"
             ),
         );
         let mut snapshot = acquisition.snapshot();
@@ -3327,6 +3395,36 @@ impl SessionController {
         Ok(())
     }
 
+    /// Sends the recording's final STOP and classifies the outcome for the
+    /// bounded post-STOP wait (see `FinalStopAttempt::resend_due`).
+    fn send_final_stop<T: Write>(
+        &self,
+        io: &mut T,
+        source: &str,
+        started: Instant,
+        started_utc: DateTime<Utc>,
+        progress: &CaptureProgress,
+    ) -> FinalStopAttempt {
+        match self.send_capture_command(io, MessageType::Stop, 4, vec![]) {
+            Ok(()) => FinalStopAttempt::Sent,
+            Err(CaptureCommandError::Serial(error)) => {
+                self.record_serial_cleanup_failure(&error, source, started, started_utc, progress);
+                if is_transient_stop_write_failure(&error) {
+                    FinalStopAttempt::TransientWriteFailure
+                } else {
+                    FinalStopAttempt::Failed
+                }
+            }
+            Err(CaptureCommandError::Protocol(detail)) => {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("SERIAL_CLEANUP_ERROR stage=STOP_PROTOCOL detail={detail}"),
+                );
+                FinalStopAttempt::Failed
+            }
+        }
+    }
+
     fn record_serial_cleanup_failure(
         &self,
         error: &SerialTerminalFailure,
@@ -3828,7 +3926,7 @@ impl SessionController {
         };
         SessionStatus {
             state: runtime.state,
-            recording_active: is_active_state(runtime.state) && !runtime.handshake_check,
+            recording_active: recording_owns_session(runtime),
             board: runtime.board.clone(),
             port: runtime.port.clone(),
             protocol_version: runtime.protocol_version.clone(),
@@ -3937,6 +4035,11 @@ impl SessionController {
             .lock()
             .map_err(|_| SessionError::State("session lock poisoned"))
     }
+}
+
+/// A Start owns the session: an active state that is not a handshake check.
+fn recording_owns_session(runtime: &SessionRuntime) -> bool {
+    is_active_state(runtime.state) && !runtime.handshake_check
 }
 
 /// A session (a recording, or a handshake check) owns the serial transport.
@@ -5673,6 +5776,13 @@ mod tests {
             let status = session.status().unwrap_or_else(|error| panic!("{error}"));
             assert_eq!(status.state, state);
             assert!(!status.recording_active, "{state:?} during a board check");
+            // The window-close policy asks the same question.
+            assert!(!session
+                .recording_active()
+                .unwrap_or_else(|error| panic!("{error}")));
+            assert!(session
+                .is_recording()
+                .unwrap_or_else(|error| panic!("{error}")));
             session
                 .runtime
                 .lock()
@@ -5680,6 +5790,9 @@ mod tests {
                 .handshake_check = false;
             let status = session.status().unwrap_or_else(|error| panic!("{error}"));
             assert!(status.recording_active, "{state:?} during a recording");
+            assert!(session
+                .recording_active()
+                .unwrap_or_else(|error| panic!("{error}")));
         }
         session
             .runtime
@@ -5692,6 +5805,9 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{error}"))
                 .recording_active
         );
+        assert!(!session
+            .recording_active()
+            .unwrap_or_else(|error| panic!("{error}")));
     }
 
     #[test]
@@ -7733,6 +7849,158 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// How a test transport mishandles the recording's final STOP.
+    #[derive(Clone, Copy, PartialEq)]
+    enum LostStop {
+        /// The first final STOP write times out, as a Windows CDC write can.
+        FirstWriteTimesOut,
+        /// The first final STOP is written but never reaches the board.
+        FirstDropped,
+        /// Every final STOP write times out.
+        EveryWriteTimesOut,
+    }
+
+    /// Forwards everything to `StopAfterSamples` except the final STOP (a
+    /// STOP after START; the idle-safe STOP before CONFIGURE is untouched),
+    /// which it mishandles according to `mode`.
+    struct FlakyFinalStop {
+        inner: StopAfterSamples,
+        mode: LostStop,
+        commands: FrameParser,
+        started: bool,
+        final_stop_attempts: usize,
+    }
+
+    impl Read for FlakyFinalStop {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Write for FlakyFinalStop {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let mut final_stop = false;
+            for frame in self.commands.push(buffer) {
+                self.started |= frame.message_type == MessageType::Start;
+                final_stop |= self.started && frame.message_type == MessageType::Stop;
+            }
+            if final_stop {
+                self.final_stop_attempts += 1;
+                let mishandle =
+                    self.mode == LostStop::EveryWriteTimesOut || self.final_stop_attempts == 1;
+                if mishandle && self.mode == LostStop::FirstDropped {
+                    return Ok(buffer.len());
+                }
+                if mishandle {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "The semaphore timeout period has expired. (os error 121)",
+                    ));
+                }
+            }
+            self.inner.write(buffer)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    fn run_capture_with_flaky_final_stop(
+        session: &SessionController,
+        output_dir: &Path,
+        mode: LostStop,
+    ) -> (Result<(), SessionError>, FlakyFinalStop) {
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        begin_simulated_session(session, &profile, RecordingDuration::UntilStopped);
+        let inner = SimulatorIo::new(&profile, RecordingDuration::UntilStopped)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut transport = FlakyFinalStop {
+            inner: StopAfterSamples::new(inner, session.cancel.clone(), 60),
+            mode,
+            commands: FrameParser::default(),
+            started: false,
+            final_stop_attempts: 0,
+        };
+        let result = session.capture_transport(
+            &mut transport,
+            simulator_request(&profile, RecordingDuration::UntilStopped, output_dir),
+        );
+        (result, transport)
+    }
+
+    #[test]
+    fn a_lost_or_timed_out_final_stop_is_sent_again_until_the_board_confirms() {
+        for mode in [LostStop::FirstWriteTimesOut, LostStop::FirstDropped] {
+            let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let session = SessionController::default();
+            let (result, transport) = run_capture_with_flaky_final_stop(&session, dir.path(), mode);
+            result.unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(transport.final_stop_attempts, 2);
+            // The board stopped and confirmed every output LOW.
+            assert!(!transport.inner.inner.active);
+            let summary = last_summary(&session);
+            assert_eq!(summary.final_digital_output_mask, Some(0));
+            assert_eq!(summary.stop_reason, StopReason::User);
+            assert_eq!(summary.completion_status, "complete");
+            assert_eq!(
+                summary.samples,
+                u64::from(transport.inner.inner.sample_sequence)
+            );
+        }
+    }
+
+    #[test]
+    fn final_stop_resends_are_bounded_and_the_recording_is_still_saved() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        let started = Instant::now();
+        let (result, transport) =
+            run_capture_with_flaky_final_stop(&session, dir.path(), LostStop::EveryWriteTimesOut);
+        result.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            transport.final_stop_attempts,
+            1 + usize::from(MAX_STOP_RESENDS)
+        );
+        let summary = last_summary(&session);
+        // Unconfirmed: the outputs are not reported as LOW.
+        assert_eq!(summary.final_digital_output_mask, None);
+        assert_eq!(summary.completion_status, "complete");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Disconnected);
+    }
+
+    #[test]
+    fn only_a_transient_stop_write_failure_is_retried() {
+        let timeout = |stage, kind| {
+            is_transient_stop_write_failure(&SerialTerminalFailure::new(
+                stage,
+                std::io::Error::new(kind, "mock"),
+            ))
+        };
+        assert!(timeout(
+            SerialFailureStage::StopWrite,
+            std::io::ErrorKind::TimedOut
+        ));
+        assert!(timeout(
+            SerialFailureStage::StopFlush,
+            std::io::ErrorKind::WouldBlock
+        ));
+        assert!(!timeout(
+            SerialFailureStage::StopWrite,
+            std::io::ErrorKind::BrokenPipe
+        ));
+        assert!(!timeout(
+            SerialFailureStage::PingWrite,
+            std::io::ErrorKind::TimedOut
+        ));
+        assert!(FinalStopAttempt::TransientWriteFailure.resend_due(Duration::ZERO));
+        assert!(!FinalStopAttempt::Sent.resend_due(STOP_RESEND_INTERVAL / 2));
+        assert!(FinalStopAttempt::Sent.resend_due(STOP_RESEND_INTERVAL));
+        assert!(!FinalStopAttempt::Failed.resend_due(Duration::from_secs(1)));
     }
 
     #[test]

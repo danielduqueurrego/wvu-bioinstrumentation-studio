@@ -247,12 +247,15 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 - Timestamp filtering and decimation always include the exact newest frame. Display changes, including Pause display, must not issue acquisition commands.
 - Multi-signal legends appear only with at least two visible signals in that plot. Endpoint values appear for each visible trace in its selected unit. Plot exceptions are isolated and logged as `PLOT_RENDER_FAIL`.
 - The time axis is elapsed recording seconds, not a calendar date. Hardware startup warmup is display-only; the initial raw sample remains in the recording.
+- The Live signals "Lab outputs" line lists the outputs the board is driven with (`resolvedDigitalOutputs`, which mirrors Rust's `resolved_digital_outputs`), so a stored legacy revision with only `led_outputs` still shows its D4.
 
 **Board and firmware**
 
 - Board Refresh, Verify, and Restore availability is independent of acquisition firmware readiness; Restore is a recovery path for unknown or outdated firmware.
-- Start readiness for Hardware is bound to `verified_port`: it requires a compatible board and a port match, and never consults the last restore. Any failure or job start clears it.
+- Start readiness for Hardware is bound to `verified_port`: it requires a compatible board and a port match, and never consults the last restore. Any failure or job start clears it, including a Retry connection or hardware Start handshake on that port that proves other firmware (`non_protocol_bytes`, `wrong_protocol_version`, `missing_firmware_identity`, `incompatible_firmware_identity`; applied when the workflow status or Start readiness is next read).
 - Verify never uploads firmware. A Verify that cannot open the port reports `PortBusy` and keeps the previous compatibility.
+- After a failed or canceled restore, the board refresh follows a board that appeared on another port but does not verify it, so the Board card keeps the restore's failure and log. Advanced details always lists the last restore's result and log path. A student-initiated Verify still replaces the card.
+- A failed Repair Arduino tools reports `previous_runtime_kept` (the tools in use are still complete on disk); the page then keeps the tools' state, so Restore stays available.
 - "Reset board and retry" is retired; recovery is Retry connection, then Verify Firmware, then Restore WVU Firmware.
 - Cancel is refused once a restore reaches `Uploading`, and the window cannot close during a firmware job.
 - Restore is refused while more than one UNO R4 is connected.
@@ -262,8 +265,8 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 
 - One serial-ownership lease (`serial_lease.rs`) serializes recordings, Verify, Retry, Restore, and tool repair. It is released by `Drop` on every path, so failed operations release serial ownership and busy state.
 - Long board operations run in `spawn_blocking`; Tauri command argument names and serde payload names stay aligned with their frontend callers.
-- `recording_active` is true only while a Start owns the session. Verify, Retry, and restore-verification handshakes are not recordings.
-- `fault_origin` says which operation raised `last_error`.
+- `recording_active` is true only while a Start owns the session. Verify, Retry, and restore-verification handshakes are not recordings. The window-close policy uses the same test (`SessionController::recording_active`): closing during a Verify or Retry closes normally; only a recording is stopped and saved first.
+- `fault_origin` says which operation raised `last_error`. The page treats a `storage` fault without `last_summary` as a refusal before START ("could not start", with `last_error`), not as a recording that was not saved. `simulator` keeps describing the last recording after a board check, so a fault is a simulator recording's only while `port` is `SIM` and the origin is not `verification`.
 - `SessionError::Cancelled` is the only quiet worker ending; any other failure after Stop faults with its stage.
 
 **Capture protocol**
@@ -273,7 +276,7 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 - Samples that cease for seven seconds trigger a diagnosed fault, not an automatic restart.
 - The host sends an **idle-safe STOP before every CONFIGURE**, so a board left acquiring is quiesced and its outputs go LOW before reconfiguration.
 - Frames and ERRORs from before the START STATUS are not counted against the new recording.
-- After STOP, the host waits up to 300 ms for a **STATUS newer than STOP** (`acquiring = 0`, mask 0) and drains the tail. A mask that is already 0 proves nothing for labs without outputs.
+- After STOP, the host waits up to 300 ms for a **STATUS newer than STOP** (`acquiring = 0`, mask 0) and drains the tail. A mask that is already 0 proves nothing for labs without outputs. A STOP whose write timed out (`TimedOut`/`WouldBlock`), or that is unanswered after 100 ms, is resent at most twice; each resend extends the wait by up to 100 ms. Other write failures are not retried.
 
 **Files and storage**
 
@@ -286,7 +289,7 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 
 - The firmware uses RA4M1 native USB CDC. The compile recipe deliberately omits `NO_USB`, and `arduino_runtime.rs` adds the version-pinned `SerialUSB::write_raw` compatibility shim in the app-owned extracted core. Do not revert to the ESP32 bridge or patch an unrelated Arduino IDE installation.
 - Pulse-ox phase deadlines advance absolutely with `nextTickMicros += stateDwellUs`. ADC and record creation are isolated from frame encoding, CRC, and serial transmission by bounded queues and partial writes. Host recording retains actual per-record timestamps and per-state timing checks.
-- MPXV uses `(Vout / Vsupply - 0.04) / 0.009` kPa and `kPa * 7.5006` mmHg. EMG pressure supports counts, volts, kPa, and mmHg. XGZP uses its selected local linear calibration, with at most one active preset per channel. Pulse ox remains raw-only, with no ambient subtraction or physiological computations.
+- MPXV uses `(Vout / Vsupply - 0.04) / 0.009` kPa and `kPa * 7.5006` mmHg. EMG pressure supports counts, volts, kPa, and mmHg. XGZP uses its selected local linear calibration, with at most one active preset per channel. The preset list follows the saved files (a preset deleted elsewhere is dropped with its selection; only the one this window just saved is kept while the list catches up), and it is read again when the window regains focus outside a recording. Pulse ox remains raw-only, with no ambient subtraction or physiological computations.
 - Tool-version provenance is best effort: versions are cached, and a failed query records `"unavailable"` instead of failing a recording or restore. Restore logs record `git_revision` from the `GIT_COMMIT` embedded at build time, or `null`.
 - `WVU_STUDIO_DEV_LOCAL_DATA` relocates the extracted runtime **in debug builds only**; release builds ignore it.
 - Preserve hidden subprocess creation (`CREATE_NO_WINDOW`), the GUI Windows subsystem, offline runtime deployment, precise Advanced details, serial ownership cleanup, and transactional catalog writes.

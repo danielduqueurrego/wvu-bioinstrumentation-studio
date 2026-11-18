@@ -20,7 +20,7 @@ function render(initial: { banner?: ProblemBanner; info?: string; actionDisabled
   return { component, actions, state };
 }
 
-const noData = faultBanner({ faultOrigin: 'recording', failureCategory: 'no_data_timeout', simulatorSession: false, source: 'hardware' });
+const noData = faultBanner({ faultOrigin: 'recording', failureCategory: 'no_data_timeout', simulatorSession: false, recordingRan: true, source: 'hardware' });
 
 afterEach(() => {
   document.body.replaceChildren();
@@ -67,7 +67,7 @@ describe('MessageCenter', () => {
   });
 
   it('offers a quieter second action beside the first one', () => {
-    const silent = faultBanner({ faultOrigin: 'verification', failureCategory: 'port_open_no_bytes', simulatorSession: false, source: 'hardware', port: 'COM5' });
+    const silent = faultBanner({ faultOrigin: 'verification', failureCategory: 'port_open_no_bytes', simulatorSession: false, recordingRan: false, source: 'hardware', port: 'COM5' });
     const center = render({ banner: silent });
     expect(document.querySelector('#message-action-button')?.textContent?.trim()).toBe('Restore WVU Firmware');
     const secondary = document.querySelector<HTMLButtonElement>('#message-secondary-button');
