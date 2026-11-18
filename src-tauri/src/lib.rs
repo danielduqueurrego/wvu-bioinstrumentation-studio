@@ -222,8 +222,12 @@ struct RecentPoint {
     status_flags: u16,
 }
 
+/// `cli_path` is a development override only. A release build ignores it
+/// here (and `discover` would refuse it too): the webview never chooses an
+/// executable to run. The UI calls this without arguments.
 #[tauri::command]
 async fn list_boards(cli_path: Option<String>) -> Result<Vec<arduino_cli::BoardInfo>, String> {
+    let cli_path = cli_path.filter(|_| cfg!(debug_assertions));
     tauri::async_runtime::spawn_blocking(move || {
         let override_path = cli_path.as_deref().map(PathBuf::from);
         let cli = arduino_cli::ArduinoCli::discover(override_path.as_deref())
@@ -370,7 +374,7 @@ fn open_explorer_selecting(_file: &std::path::Path) -> Result<(), String> {
 /// issue from a serial/protocol session failure.
 #[tauri::command]
 fn record_frontend_plot_error(stage: String, detail: String) {
-    let stage = stage.replace(['\r', '\n'], " ");
+    let stage: String = stage.replace(['\r', '\n'], " ").chars().take(64).collect();
     let detail: String = detail
         .replace(['\r', '\n'], " ")
         .chars()
@@ -673,7 +677,14 @@ fn checked_recording_calibration(
     calibration: calibration::RecordingCalibration,
 ) -> Result<calibration::RecordingCalibration, String> {
     calibration.validate().map_err(|error| error.to_string())?;
+    let mut calibrated_channels = std::collections::BTreeSet::new();
     for preset in &calibration.active_calibrations {
+        // Readers pick the first preset for a channel, so a second one would
+        // be silently ignored (for example a fixed MPXV formula and a linear
+        // fit on one channel).
+        if !calibrated_channels.insert(preset.channel_id.as_str()) {
+            return Err("a channel can have only one active calibration".into());
+        }
         if preset.profile_id != profile.profile_id {
             return Err("a calibration can be used only with the profile that created it".into());
         }
@@ -1450,6 +1461,31 @@ mod tests {
         let other = calibration_start_failure(&foreign, error);
         assert_eq!(other.code, "calibration");
         assert!(other.user_message.contains("selected calibration"));
+    }
+
+    #[test]
+    fn a_channel_may_have_only_one_active_calibration() {
+        let blood_pressure = profiles::built_in_profiles()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_blood_pressure")
+            .unwrap_or_else(|| panic!("missing Blood Pressure lab"));
+        let fixed = calibration::fixed_mpxv_calibration(
+            blood_pressure.profile_id.clone(),
+            "mpxv".into(),
+            5.0,
+            5.0,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let mut single = calibration::RecordingCalibration::default();
+        single.active_calibrations.push(fixed.clone());
+        assert!(checked_recording_calibration(&blood_pressure, single.clone()).is_ok());
+        let mut duplicate = single;
+        duplicate.active_calibrations.push(fixed);
+        let error = checked_recording_calibration(&blood_pressure, duplicate)
+            .err()
+            .unwrap_or_else(|| panic!("two calibrations on one channel must be refused"));
+        assert!(error.contains("only one active calibration"), "{error}");
     }
 
     #[test]

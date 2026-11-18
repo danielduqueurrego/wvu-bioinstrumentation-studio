@@ -326,6 +326,11 @@ fn prepare_with(
             expected_files.as_deref(),
             mode,
         )?;
+    } else {
+        // The active runtime is valid, so a backup or staging copy left by an
+        // earlier replacement (for example when antivirus blocked its
+        // cleanup) is no longer needed for recovery.
+        remove_stale_replacement_copies(destination);
     }
     let executable = destination.join("arduino-cli.exe");
     let data = destination.join("data");
@@ -616,6 +621,47 @@ fn inspect_runtime(
     })
 }
 
+/// Best effort, under the preparation lock and only while the active runtime
+/// is valid: removes the `.{name}-previous` and `.{name}-staging` siblings
+/// that `replace_runtime_from_archive` uses. Each can hold a full toolchain.
+fn remove_stale_replacement_copies(destination: &Path) {
+    let (Some(parent), Some(name)) = (
+        destination.parent(),
+        destination.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return;
+    };
+    for leftover in [
+        parent.join(format!(".{name}-previous")),
+        parent.join(format!(".{name}-staging")),
+    ] {
+        if !leftover.exists() {
+            continue;
+        }
+        let removed = if leftover.is_dir() {
+            fs::remove_dir_all(&leftover)
+        } else {
+            fs::remove_file(&leftover)
+        };
+        match removed {
+            Ok(()) => crate::app_log::record(
+                "INFO",
+                &format!(
+                    "ARDUINO_RUNTIME_STALE_COPY_REMOVED path={}",
+                    leftover.display()
+                ),
+            ),
+            Err(error) => crate::app_log::record(
+                "WARN",
+                &format!(
+                    "ARDUINO_RUNTIME_STALE_COPY_CLEANUP_FAILED path={} detail={error}",
+                    leftover.display()
+                ),
+            ),
+        }
+    }
+}
+
 /// Extract to a sibling staging directory and validate it before replacing the
 /// active runtime. If Windows refuses the final rename, restore the previous
 /// runtime rather than leaving the installation without usable tools.
@@ -699,9 +745,10 @@ fn replace_runtime_from_archive(
         return Err(RuntimeError::Io(error));
     }
     if backup.exists() {
-        // The replacement has committed. A stale backup is harmless and will
-        // be recovered or removed on the next launch, so cleanup failure must
-        // not make a usable runtime appear unavailable.
+        // The replacement has committed. A stale backup is harmless and is
+        // removed on the next launch that finds the runtime valid
+        // (`remove_stale_replacement_copies`), so cleanup failure must not
+        // make a usable runtime appear unavailable.
         if let Err(error) = fs::remove_dir_all(&backup) {
             crate::app_log::record(
                 "WARN",
@@ -1099,6 +1146,29 @@ mod tests {
             Some(&entries(&archive_path))
         ));
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn a_stale_backup_beside_a_valid_runtime_is_removed() {
+        let source = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let destination = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let (archive_path, manifest_path) = write_runtime_archive(source.path());
+        let root = destination.path().join("runtime");
+        prepare_from_archive(&archive_path, &manifest_path, &root)
+            .unwrap_or_else(|error| panic!("{error}"));
+        // An earlier replacement whose cleanup failed left both behind.
+        let backup = destination.path().join(".runtime-previous");
+        let staging = destination.path().join(".runtime-staging");
+        for leftover in [&backup, &staging] {
+            fs::create_dir_all(leftover.join("data")).unwrap_or_else(|error| panic!("{error}"));
+            fs::write(leftover.join("data/tool.bin"), b"old tool")
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        let prepared = prepare_from_archive(&archive_path, &manifest_path, &root)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(prepared.executable.is_file());
+        assert!(!backup.exists());
+        assert!(!staging.exists());
     }
 
     #[test]

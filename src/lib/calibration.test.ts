@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  acceptsLinearCalibration,
   calibrationById,
   countsToVoltsForAdc,
   displayedValue,
@@ -8,6 +9,7 @@ import {
   mpxvKpa,
   mpxvMmhg,
   mergeCalibrationPresets,
+  newCalibrationId,
   reconcileChannelUnits,
   recordingCalibrationFor,
   supportedDisplayUnits,
@@ -174,5 +176,47 @@ describe('the recording calibration snapshot', () => {
     expect(isFixedMpxvChannel('course_emg_force', { id: 'pressure' })).toBe(true);
     expect(isFixedMpxvChannel('course_general', { id: 'pressure' })).toBe(false);
     expect(isFixedMpxvChannel(undefined, { id: 'a0', allowed_conversions: ['mpxv_pressure'] })).toBe(true);
+  });
+
+  it('follows a lab’s declared conversions even when a channel reuses a course ID', () => {
+    // An instructor channel named 'mpxv' that allows only counts/volts.
+    expect(isFixedMpxvChannel('development', { id: 'mpxv', allowed_conversions: ['counts_volts'] })).toBe(false);
+    expect(supportedDisplayUnits('development', 'mpxv', false, ['counts_volts'])).toEqual(['counts', 'volts']);
+    expect(supportedDisplayUnits('development', 'xgzp', true, ['counts_volts'])).toEqual(['counts', 'volts']);
+    expect(acceptsLinearCalibration({ id: 'xgzp', allowed_conversions: ['counts_volts'] })).toBe(false);
+    expect(acceptsLinearCalibration({ id: 'load', allowed_conversions: ['linear_calibration'] })).toBe(true);
+    // A legacy lab snapshot without the list keeps the course-ID rules.
+    expect(acceptsLinearCalibration({ id: 'xgzp' })).toBe(true);
+    expect(supportedDisplayUnits('course_blood_pressure', 'mpxv', false)).toEqual(['counts', 'volts', 'kpa', 'mmhg']);
+  });
+
+  it('gives a channel at most one active calibration', () => {
+    const both = {
+      profile_id: 'team.lab', category: 'development',
+      acquisition: { channels: [{ id: 'mpxv', allowed_conversions: ['mpxv_pressure', 'linear_calibration'] }] }
+    };
+    const linear = {
+      schema_version: 1, calibration_id: 'cal.mpxv.1.000000', profile_id: 'team.lab', channel_id: 'mpxv', calibration_type: 'linear' as const,
+      input_quantity: 'volts', output_quantity: 'pressure', output_units: 'mmHg', parameters: { slope: 2, offset: 1 },
+      created_at: '2026-11-18T00:00:00Z', label: 'Team'
+    };
+    expect(recordingCalibrationFor(both, linear, 5, 5, {}).active_calibrations).toEqual([linear]);
+    expect(recordingCalibrationFor(both, undefined, 5, 5, {}).active_calibrations.map((preset) => preset.calibration_id))
+      .toEqual(['builtin.mpxv.mpxv']);
+  });
+});
+
+describe('a new calibration ID', () => {
+  // Mirrors `calibration::safe_component` (the preset file name).
+  const safe = (id: string) => id.length > 0 && id.length <= 120 && !id.includes('..') && /^[A-Za-z0-9._-]+$/.test(id);
+
+  it('is short and file-name safe whatever the channel ID', () => {
+    const id = newCalibrationId('xgzp', 1_763_424_000_000, 0.5);
+    expect(id).toBe(`cal.xgzp.1763424000000.${Math.floor(0.5 * 36 ** 6).toString(36)}`);
+    expect(safe(id)).toBe(true);
+    for (const channel of ['a..b', 'x'.repeat(500), 'Ünïcode ch@nnel', '', '.', 'ends.']) {
+      expect(safe(newCalibrationId(channel, Date.now(), Math.random())), channel).toBe(true);
+    }
+    expect(newCalibrationId('xgzp', 1, 0)).not.toBe(newCalibrationId('xgzp', 1, 0.5));
   });
 });

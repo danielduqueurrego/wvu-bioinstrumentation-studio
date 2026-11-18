@@ -55,6 +55,7 @@
   }: Props = $props();
 
   const instructor = $derived(operatingMode === 'instructor_authoring');
+  // Mirrors the backend's legacy-category gate (`requires_bench_acknowledgement`).
   const benchOnly = $derived(Boolean(profile?.safety.bench_only && ['ecg', 'emg'].includes(profile.category)));
 </script>
 

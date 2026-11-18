@@ -24,6 +24,12 @@ export type Integrity = {
   missing_packet_sequences: number; duplicate_packets: number; out_of_order_packets: number;
   missing_sample_sequences: number; duplicate_sample_sequences: number; out_of_order_sample_sequences: number;
   firmware_overflows: number; host_channel_overflows: number; reconnects: number; disconnect_events: number;
+  /**
+   * Records in batches the firmware flagged (0x0004) after skipping sampling
+   * deadlines or dropping a batch. Not part of `firmware_overflows`. Absent
+   * from older backends.
+   */
+  overrun_flagged_records?: number;
 };
 
 export const emptyIntegrity: Integrity = {

@@ -120,6 +120,9 @@ pub struct ParserStats {
     pub invalid_frames: u64,
     pub unsupported_versions: u64,
     pub skipped_noise_bytes: u64,
+    /// Protocol minor version of the most recent accepted frame. The parser
+    /// accepts v0.1-v0.4, so diagnostics report what the board actually sent.
+    pub last_protocol_minor: Option<u8>,
 }
 #[derive(Default)]
 pub struct FrameParser {
@@ -185,6 +188,7 @@ impl FrameParser {
                 sequence: u32::from_le_bytes(sequence_bytes),
                 payload: raw[14..14 + length].to_vec(),
             };
+            self.stats.last_protocol_minor = Some(raw[5]);
             self.drain(total);
             frames.push(frame);
         }
@@ -344,6 +348,16 @@ pub struct IntegrityCounters {
     pub host_channel_overflows: u64,
     pub reconnects: u64,
     pub disconnect_events: u64,
+    /// Records in received sample batches that carry
+    /// `SAMPLE_STATUS_QUEUE_OVERFLOW`. The controlled firmware sets that flag
+    /// on the next batch after it skipped one or more sampling deadlines (no
+    /// record and no sequence gap) or dropped a full batch. Skipped deadlines
+    /// appear in no other counter, so this is counted separately and never
+    /// added to `firmware_overflows`, which would double count real queue
+    /// overflows. Every record of such a batch stores the flag in its BMEG
+    /// status field. Metadata written before this field existed reads as 0.
+    #[serde(default)]
+    pub overrun_flagged_records: u64,
 }
 #[derive(Default)]
 pub struct IntegrityMonitor {
@@ -376,6 +390,9 @@ impl IntegrityMonitor {
             self.counters.firmware_overflows += self.queue_overflow_delta(current);
         } else if status_flags & SAMPLE_STATUS_QUEUE_OVERFLOW != 0 {
             self.counters.firmware_overflows += 1;
+        }
+        if status_flags & SAMPLE_STATUS_QUEUE_OVERFLOW != 0 {
+            self.counters.overrun_flagged_records += u64::from(count);
         }
         if let Some(next) = self.sample_next {
             observe_sequence_delta(
@@ -536,6 +553,57 @@ mod tests {
         monitor.observe_samples(20, 10, SAMPLE_STATUS_QUEUE_OVERFLOW, Some(3));
         assert_eq!(monitor.counters.firmware_overflows, 3);
         assert_eq!(monitor.counters.missing_sample_sequences, 10);
+    }
+
+    #[test]
+    fn skipped_deadline_flags_are_counted_separately_from_queue_overflows() {
+        let mut monitor = IntegrityMonitor::default();
+        // A skipped deadline sets the flag without changing the cumulative
+        // queue-overflow counter or leaving a sequence gap.
+        monitor.observe_samples(0, 10, SAMPLE_STATUS_ACQUIRING, Some(0));
+        monitor.observe_samples(
+            10,
+            10,
+            SAMPLE_STATUS_ACQUIRING | SAMPLE_STATUS_QUEUE_OVERFLOW,
+            Some(0),
+        );
+        monitor.observe_samples(20, 4, SAMPLE_STATUS_ACQUIRING, Some(0));
+        assert_eq!(monitor.counters.overrun_flagged_records, 10);
+        assert_eq!(monitor.counters.firmware_overflows, 0);
+        assert_eq!(monitor.counters.missing_sample_sequences, 0);
+    }
+
+    #[test]
+    fn integrity_counters_written_before_the_flag_counter_still_read() {
+        let legacy = serde_json::to_value(IntegrityCounters::default())
+            .map(|mut value| {
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("overrun_flagged_records");
+                }
+                value
+            })
+            .unwrap_or_else(|error| panic!("{error}"));
+        let counters: IntegrityCounters =
+            serde_json::from_value(legacy).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(counters.overrun_flagged_records, 0);
+    }
+
+    #[test]
+    fn parser_reports_the_protocol_minor_version_it_accepted() {
+        let mut legacy = encode_frame(&frame(1)).unwrap_or_default();
+        legacy[5] = LEGACY_PROTOCOL_MINOR;
+        let crc_at = legacy.len() - CRC_LEN;
+        let crc = crc16_ccitt_false(&legacy[..crc_at]).to_le_bytes();
+        legacy[crc_at..].copy_from_slice(&crc);
+        let mut parser = FrameParser::default();
+        assert_eq!(parser.stats.last_protocol_minor, None);
+        assert_eq!(parser.push(&legacy).len(), 1);
+        assert_eq!(
+            parser.stats.last_protocol_minor,
+            Some(LEGACY_PROTOCOL_MINOR)
+        );
+        parser.push(&encode_frame(&frame(2)).unwrap_or_default());
+        assert_eq!(parser.stats.last_protocol_minor, Some(PROTOCOL_MINOR));
     }
 
     #[test]

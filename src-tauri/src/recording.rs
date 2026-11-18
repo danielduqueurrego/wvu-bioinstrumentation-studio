@@ -337,7 +337,14 @@ impl BmegWriter {
     ) -> Result<Self, RecordingError> {
         let header = encode_header(metadata, layout)?;
         let header_len = u16::try_from(header.len()).map_err(|_| RecordingError::HeaderTooLarge)?;
-        let mut writer = BufWriter::new(File::create(path)?);
+        // `create_new` reserves the name atomically: if another recording
+        // (for example a second copy of the app) created this file after the
+        // name was chosen, this fails instead of truncating or sharing it.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let mut writer = BufWriter::new(file);
         writer.write_all(BMEG_MAGIC)?;
         writer.write_all(&header_len.to_le_bytes())?;
         writer.write_all(&header)?;
@@ -917,6 +924,44 @@ fn csv_field(value: &str) -> String {
         value.to_owned()
     }
 }
+/// Moves a finished file to its final name, failing with `AlreadyExists`
+/// instead of replacing a file that is already there (`fs::rename` replaces
+/// on Windows). Both paths are in the same folder.
+pub fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+        let wide = |path: &Path| {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let (source, destination) = (wide(from), wide(to));
+        // SAFETY: both arguments are NUL-terminated UTF-16 paths that outlive
+        // the call. Without MOVEFILE_REPLACE_EXISTING an existing destination
+        // makes the call fail (ERROR_ALREADY_EXISTS) and changes nothing.
+        let moved = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::hard_link(from, to)?;
+        std::fs::remove_file(from)
+    }
+}
+
 pub fn write_csv(path: &Path, samples: &[RawSample]) -> Result<(), RecordingError> {
     let mut writer = BufWriter::new(File::create(path)?);
     writer.write_all(b"sample_sequence,timestamp_us,counts,volts\n")?;
@@ -1384,6 +1429,41 @@ mod tests {
             csv_error: None,
             finalize_error: None,
         }
+    }
+
+    #[test]
+    fn a_recording_never_truncates_or_replaces_an_existing_file() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let metadata = layout_test_metadata(None, "0.4");
+        let taken = dir.path().join("taken.bmeg.part");
+        std::fs::write(&taken, b"another recording").unwrap_or_else(|e| panic!("{e}"));
+        let refused = BmegWriter::create_synchronized(&taken, &metadata, 1);
+        assert!(matches!(
+            refused,
+            Err(RecordingError::Io(ref error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            std::fs::read(&taken).unwrap_or_default(),
+            b"another recording"
+        );
+
+        let finished = dir.path().join("mine.bmeg.part");
+        BmegWriter::create_synchronized(&finished, &metadata, 1)
+            .and_then(BmegWriter::finish)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let destination = dir.path().join("final.bmeg");
+        std::fs::write(&destination, b"kept").unwrap_or_else(|e| panic!("{e}"));
+        let error = move_without_replacing(&finished, &destination)
+            .err()
+            .unwrap_or_else(|| panic!("an existing file was replaced"));
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap_or_default(), b"kept");
+        assert!(finished.is_file());
+
+        std::fs::remove_file(&destination).unwrap_or_else(|e| panic!("{e}"));
+        move_without_replacing(&finished, &destination).unwrap_or_else(|e| panic!("{e}"));
+        assert!(destination.is_file());
+        assert!(!finished.exists());
     }
 
     fn ecg_with_protocol_minimum(minor: u8) -> ProfileSnapshot {

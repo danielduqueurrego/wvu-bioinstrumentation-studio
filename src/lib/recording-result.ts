@@ -139,12 +139,16 @@ export function qualityLine(integrity: Integrity | undefined): { text: string; o
   const missing = integrity.missing_sample_sequences;
   const disordered = integrity.duplicate_sample_sequences + integrity.out_of_order_sample_sequences;
   const overflows = integrity.firmware_overflows + integrity.host_channel_overflows;
+  // Batches the board flagged after skipping a sampling deadline: no sample
+  // is missing from the sequence, but time was skipped before them.
+  const flagged = integrity.overrun_flagged_records ?? 0;
   const disconnects = integrity.disconnect_events;
   const problems = [
     missing ? plural(missing, 'missing sample', 'missing samples') : '',
     damaged ? plural(damaged, 'damaged packet', 'damaged packets') : '',
     disordered ? plural(disordered, 'repeated or out-of-order sample', 'repeated or out-of-order samples') : '',
     overflows ? plural(overflows, 'buffer overflow', 'buffer overflows') : '',
+    flagged ? plural(flagged, 'sample flagged for a timing overrun', 'samples flagged for a timing overrun') : '',
     disconnects ? plural(disconnects, 'disconnection', 'disconnections') : ''
   ].filter(Boolean);
   return problems.length

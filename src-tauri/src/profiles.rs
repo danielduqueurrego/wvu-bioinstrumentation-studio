@@ -812,6 +812,11 @@ impl AcquisitionProfile {
     /// only when an instructor saves a new revision of it).
     pub fn validate_for_authoring(&self) -> Result<(), ProfileError> {
         self.validate()?;
+        if !canonical_semver(&self.profile_version) {
+            return Err(ProfileError::Validation(
+                "lab version must be MAJOR.MINOR.PATCH numbers without leading zeros".into(),
+            ));
+        }
         self.check_text_bounds()?;
         let outputs = self.acquisition.resolved_digital_outputs();
         match self.acquisition.acquisition_mode {
@@ -979,6 +984,13 @@ impl AcquisitionProfile {
             profile: self.clone(),
         }
     }
+    /// A legacy-category gate: only a bench-only lab whose category is the
+    /// pre-course "ecg" or "emg" (an older or imported lab) needs the explicit
+    /// bench acknowledgement before Start. Current course labs use
+    /// `course_*` categories and carry their notices in `safety.notices`;
+    /// General Analog and Op Amp are bench-only `development` labs and do not
+    /// need it. Basing this on `bench_only` alone would change Start for
+    /// those labs. The frontend mirrors this rule (LabCard, +page.svelte).
     pub fn requires_bench_acknowledgement(&self) -> bool {
         self.safety.bench_only && matches!(self.category.as_str(), "ecg" | "emg")
     }
@@ -1645,6 +1657,41 @@ fn write_catalog_atomically(root: &Path, bytes: &[u8]) -> Result<(), ProfileErro
     Ok(())
 }
 
+/// Writes `bytes` to a uniquely named temporary sibling of `destination`,
+/// flushes it to disk, then atomically replaces `destination`. A failure
+/// leaves any previous `destination` unchanged and removes the temporary.
+fn write_file_atomically(destination: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("destination has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let temporary = destination.with_file_name(format!(
+        ".{name}.{}-{nanos}-{}.tmp",
+        std::process::id(),
+        CATALOG_TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temporary, destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Atomically replaces `destination` with `source`, retrying briefly while
 /// another program (for example antivirus) has the file open.
 fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -1793,7 +1840,11 @@ fn next_revision_version(
             "lab version must be MAJOR.MINOR.PATCH".into(),
         ));
     }
-    let (major, minor, base_patch) = version_key(base);
+    let (major, minor, base_patch) = version_key(base).ok_or_else(|| {
+        ProfileError::Validation(
+            "this lab's version number is too large to create a new revision; duplicate it as a new lab instead".into(),
+        )
+    })?;
     let highest = runtime
         .profiles
         .keys()
@@ -1801,7 +1852,7 @@ fn next_revision_version(
         .chain(runtime.retired.iter().cloned())
         .chain(runtime.skipped.iter().filter_map(SkippedEntry::key))
         .filter(|(id, version)| id == profile_id && valid_semver(version))
-        .map(|(_, version)| version_key(&version))
+        .filter_map(|(_, version)| version_key(&version))
         .filter(|(existing_major, existing_minor, _)| {
             *existing_major == major && *existing_minor == minor
         })
@@ -2474,6 +2525,11 @@ impl ProfileStore {
         );
         Ok(profile)
     }
+    /// Writes one stored revision to a file the user chose (the Save dialog
+    /// confirmed any overwrite). Export only reads the catalog, so it is
+    /// allowed in either mode; Lab Manager is where the UI offers it. The
+    /// file is written to a temporary sibling and then moved into place, so
+    /// an interrupted export never leaves a truncated `.lab.json`.
     pub fn export_profile(
         &self,
         profile_id: &str,
@@ -2495,11 +2551,10 @@ impl ProfileStore {
                 "invalid profile export destination".into(),
             ));
         }
-        fs::write(destination, serde_json::to_vec_pretty(&profile)?).map_err(|source| {
-            ProfileError::Write {
-                path: destination.display().to_string(),
-                source,
-            }
+        let bytes = serde_json::to_vec_pretty(&profile)?;
+        write_file_atomically(destination, &bytes).map_err(|source| ProfileError::Write {
+            path: destination.display().to_string(),
+            source,
         })
     }
     fn require_instructor(&self) -> Result<(), ProfileError> {
@@ -2762,6 +2817,8 @@ fn valid_operation_id(value: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
+/// The load-time version rule. Stored labs are never rejected by the
+/// stricter `canonical_semver`, which applies only to versions written now.
 fn valid_semver(value: &str) -> bool {
     let fields: Vec<_> = value.split('.').collect();
     fields.len() == 3
@@ -2769,16 +2826,22 @@ fn valid_semver(value: &str) -> bool {
             .iter()
             .all(|field| !field.is_empty() && field.chars().all(|c| c.is_ascii_digit()))
 }
-fn version_key(value: &str) -> (u64, u64, u64) {
-    let parts: Vec<u64> = value
-        .split('.')
-        .map(|part| part.parse::<u64>().unwrap_or(0))
-        .collect();
-    (
-        parts.first().copied().unwrap_or(0),
-        parts.get(1).copied().unwrap_or(0),
-        parts.get(2).copied().unwrap_or(0),
-    )
+/// A version saved or imported now: MAJOR.MINOR.PATCH with no leading zeros
+/// and every number within u64, so it orders exactly as it reads ("1.0.01"
+/// would otherwise be a second key for 1.0.1).
+fn canonical_semver(value: &str) -> bool {
+    valid_semver(value)
+        && value
+            .split('.')
+            .all(|field| (field == "0" || !field.starts_with('0')) && field.parse::<u64>().is_ok())
+}
+/// Numeric ordering key, or `None` when a field does not fit in u64 (only a
+/// legacy stored version can be that large). Such a version is never treated
+/// as 0.0.0 or used as the base of a new revision number.
+fn version_key(value: &str) -> Option<(u64, u64, u64)> {
+    let mut fields = value.split('.').map(|field| field.parse::<u64>().ok());
+    let key = (fields.next()??, fields.next()??, fields.next()??);
+    fields.next().is_none().then_some(key)
 }
 fn validate_plot_defaults(
     defaults: &PlotDefaults,
@@ -4298,6 +4361,56 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("the lab is already installed"));
         assert!(own.to_string().contains("already installed"), "{own}");
+    }
+
+    #[test]
+    fn export_replaces_the_chosen_file_atomically_and_leaves_no_temporary() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let author = instructor_store(&dir.path().join("author"));
+        let exports = dir.path().join("exports");
+        fs::create_dir_all(&exports).unwrap_or_else(|error| panic!("{error}"));
+        let package = exports.join("ecg.lab.json");
+        fs::write(&package, b"an older export").unwrap_or_else(|error| panic!("{error}"));
+        let version = author
+            .get_locked(ECG_ID)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .profile_version;
+        author
+            .export_profile(ECG_ID, &version, &package)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let exported: AcquisitionProfile =
+            serde_json::from_slice(&fs::read(&package).unwrap_or_else(|error| panic!("{error}")))
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(exported.profile_id, ECG_ID);
+        let names = fs::read_dir(&exports)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["ecg.lab.json".to_owned()]);
+    }
+
+    #[test]
+    fn versions_written_now_are_canonical_while_stored_ones_still_load() {
+        assert!(canonical_semver("1.0.1"));
+        assert!(canonical_semver("0.10.0"));
+        assert!(!canonical_semver("1.0.01"));
+        assert!(!canonical_semver("18446744073709551616.0.0"));
+        assert_eq!(version_key("1.0.01"), Some((1, 0, 1)));
+        // An oversized field is unknown, never silently 0.
+        assert_eq!(version_key("18446744073709551616.0.0"), None);
+
+        let mut lab = built_in_profiles()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .into_iter()
+            .find(|profile| profile.profile_id == ECG_ID)
+            .unwrap_or_else(|| panic!("missing ECG lab"));
+        for version in ["1.0.01", "18446744073709551616.0.0"] {
+            lab.profile_version = version.into();
+            lab.refresh_hash().unwrap_or_else(|error| panic!("{error}"));
+            assert!(lab.validate().is_ok(), "{version} must stay loadable");
+            assert!(lab.validate_for_authoring().is_err(), "{version}");
+        }
     }
 
     /// A pulse-ox revision as the v1.0.2 editor saved it: an unused

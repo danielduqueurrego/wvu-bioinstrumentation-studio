@@ -5,7 +5,7 @@
  * newest request and still matches the current lab and channel, and only
  * presets of that lab and channel are kept.
  */
-import { calibrationById, mergeCalibrationPresets, type CalibrationPreset } from './calibration';
+import { acceptsLinearCalibration, calibrationById, mergeCalibrationPresets, type CalibrationPreset } from './calibration';
 import type { LabProfile } from './labs';
 
 /** Timed presets offered when a lab does not list its own. */
@@ -13,11 +13,13 @@ export const DEFAULT_TIMED_PRESETS_SECONDS = [10, 30, 60, 300, 600];
 
 type CalibratableChannel = { id: string; allowed_conversions?: string[] };
 
-/** Channels that accept a saved local linear calibration. */
+/**
+ * Channels that accept a saved local linear calibration: those whose lab
+ * allows `linear_calibration` (the 'xgzp' ID decides only for a legacy lab
+ * that lists no conversions).
+ */
 export function linearCalibrationChannels<T extends CalibratableChannel>(channels: T[]): T[] {
-  return channels.filter((channel) =>
-    channel.allowed_conversions?.includes('linear_calibration') || channel.id === 'xgzp'
-  );
+  return channels.filter(acceptsLinearCalibration);
 }
 
 /** Keeps `current` when the lab still offers it, else the lab's first one. */

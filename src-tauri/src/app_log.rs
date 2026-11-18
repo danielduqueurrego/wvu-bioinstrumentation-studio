@@ -7,7 +7,13 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
 };
+
+/// Serializes rotation and appends within this process. Without it, the main
+/// thread and a session worker crossing the size limit together could both
+/// rotate, and one rename would overwrite the segment the other just made.
+static LOG_WRITE: Mutex<()> = Mutex::new(());
 
 const APP_DATA_FOLDER: &str = "WVU Bioinstrumentation Studio";
 const LOG_FILE: &str = "application.log";
@@ -33,6 +39,8 @@ pub fn record(level: &str, event: &str) {
 }
 
 fn append_at(path: &Path, level: &str, event: &str) -> std::io::Result<()> {
+    // A panic while logging must not stop later diagnostics.
+    let _serialized = LOG_WRITE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

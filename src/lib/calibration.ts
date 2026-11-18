@@ -68,6 +68,17 @@ export function mergeCalibrationPresets(
   );
 }
 
+/**
+ * A channel's conversion capability comes from its lab's
+ * `allowed_conversions`. The fixed channel IDs ('mpxv', 'xgzp', and EMG
+ * 'pressure') decide only for a legacy lab snapshot that lists none, so an
+ * instructor channel that happens to use one of those IDs keeps exactly the
+ * conversions its lab allows.
+ */
+function listsConversions(allowedConversions: string[] | undefined): allowedConversions is string[] {
+  return Array.isArray(allowedConversions) && allowedConversions.length > 0;
+}
+
 export function supportedDisplayUnits(
   category: string | undefined,
   channelId: string,
@@ -83,9 +94,28 @@ export function supportedDisplayUnits(
       : 'calibrated';
     return hasLinearCalibration ? ['counts', 'volts', calibratedUnit] : ['counts', 'volts'];
   }
+  if (listsConversions(allowedConversions)) return ['counts', 'volts'];
   if (channelId === 'mpxv') return ['counts', 'volts', 'kpa', 'mmhg'];
   if (channelId === 'xgzp') return hasLinearCalibration ? ['counts', 'volts', 'mmhg'] : ['counts', 'volts'];
   return ['counts', 'volts'];
+}
+
+/** Channels that accept a saved local linear calibration. */
+export function acceptsLinearCalibration(channel: { id: string; allowed_conversions?: string[] }): boolean {
+  return listsConversions(channel.allowed_conversions)
+    ? channel.allowed_conversions.includes('linear_calibration')
+    : channel.id === 'xgzp';
+}
+
+/**
+ * A short calibration ID that always satisfies the backend's preset filename
+ * rule (at most 120 of `[A-Za-z0-9._-]`, no `..`), whatever the lab ID. The
+ * lab and channel are stored as separate preset fields.
+ */
+export function newCalibrationId(channelId: string, now = Date.now(), random = Math.random()): string {
+  const channel = channelId.toLowerCase().replace(/[^a-z0-9_-]/g, '_').slice(0, 40) || 'channel';
+  const suffix = Math.floor(Math.min(Math.max(random, 0), 0.999999) * 36 ** 6).toString(36).padStart(6, '0');
+  return `cal.${channel}.${Math.max(0, Math.trunc(now))}.${suffix}`;
 }
 
 export function displayUnitLabel(
@@ -194,15 +224,16 @@ export function fixedMpxvCalibration(profileId: string, channelId: string, senso
 
 /** A channel converted with the fixed MPXV transfer equation (it needs the sensor supply Vs). */
 export function isFixedMpxvChannel(category: string | undefined, channel: { id: string; allowed_conversions?: string[] }): boolean {
-  return Boolean(channel.allowed_conversions?.includes('mpxv_pressure'))
-    || channel.id === 'mpxv'
-    || (category === 'course_emg_force' && channel.id === 'pressure');
+  if (listsConversions(channel.allowed_conversions)) return channel.allowed_conversions.includes('mpxv_pressure');
+  return channel.id === 'mpxv' || (category === 'course_emg_force' && channel.id === 'pressure');
 }
 
 /**
  * The calibration snapshot the live display uses and the next Start freezes
  * into the recording: Vref, Vs, the display units, the fixed MPXV equation
  * for each MPXV channel of the lab, and the selected linear calibration.
+ * A channel has at most one active preset (the backend refuses more): the
+ * selected linear calibration replaces the fixed equation on its channel.
  */
 export function recordingCalibrationFor(
   profile: { profile_id: string; category: string; acquisition: { channels?: Array<{ id: string; allowed_conversions?: string[] }> } } | undefined,
@@ -214,6 +245,7 @@ export function recordingCalibrationFor(
   const fixed = profile
     ? (profile.acquisition.channels ?? [])
       .filter((channel) => isFixedMpxvChannel(profile.category, channel))
+      .filter((channel) => channel.id !== linearCalibration?.channel_id)
       .map((channel) => fixedMpxvCalibration(profile.profile_id, channel.id, mpxvSupplyV, adcReferenceV))
     : [];
   return {

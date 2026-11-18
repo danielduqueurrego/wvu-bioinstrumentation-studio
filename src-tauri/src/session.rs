@@ -185,7 +185,16 @@ trait RecordingStorage: Send + Sync {
         writer.finish()
     }
 
+    /// Moves a finished temporary file to its final name. It never replaces
+    /// an existing file: the recording's names were only checked as free
+    /// when they were chosen.
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        crate::recording::move_without_replacing(from, to)
+    }
+
+    /// Replaces a file this recording already wrote (the metadata sidecar,
+    /// rewritten with the CSV result).
+    fn replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         fs::rename(from, to)
     }
 
@@ -870,30 +879,49 @@ struct FinalizeOutcome {
     failures: Vec<FinalizeFailure>,
 }
 
+/// Explains the ERROR codes the controlled reference firmware sends
+/// (`firmware/reference_unor4wifi`). Every code except 4 ends acquisition and
+/// drives D4/D5/D6 LOW; code 4 refuses START, so acquisition never began.
+/// Payload bytes after the code (none today) are appended in hexadecimal, at
+/// most [`FIRMWARE_ERROR_DETAIL_MAX_EXTRA_BYTES`] of them: a garbled or
+/// non-reference ERROR may carry up to `MAX_PAYLOAD_LEN` bytes, and this text
+/// is shown to students and stored in the metadata and the log.
 fn firmware_error_detail(code: Option<u8>, payload: Option<&[u8]>) -> String {
-    match code {
-        Some(7) => "firmware ERROR 7: host-command watchdog expired; acquisition stopped".into(),
-        Some(8) => {
-            let Some(payload) = payload.filter(|bytes| bytes.len() >= 16) else {
-                return "firmware ERROR 8: ADC conversion deadline expired; acquisition entered its safe fault state".into();
-            };
-            let stage = payload[1];
-            let channel = payload[2];
-            let fsp_error = payload[3];
-            let starts = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-            let completions =
-                u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
-            let timeouts =
-                u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
-            format!(
-                "firmware ERROR 8: ADC conversion deadline expired; stage={stage} channel=A{channel} fsp_error={fsp_error} adc_starts={starts} adc_completions={completions} adc_timeouts={timeouts}; acquisition entered its safe fault state"
-            )
+    let explanation = match code {
+        Some(1) => "the board rejected a command whose header had an unsupported protocol version or length; acquisition stopped and the outputs were set LOW. Select Verify Firmware; if the versions differ, use Restore WVU Firmware",
+        Some(2) => "a command reached the board damaged (CRC mismatch); acquisition stopped and the outputs were set LOW. Check the USB cable, then start a new recording",
+        Some(3) => "the board rejected this lab's configuration (channels, rate, ADC resolution, or outputs); the outputs were set LOW. Select Verify Firmware; if it passes, ask the instructor to check the lab settings",
+        Some(4) => "the board refused START because it had not accepted a configuration; no acquisition began. Start the recording again",
+        Some(5) => "the board's command input buffer overflowed; acquisition stopped and the outputs were set LOW. Close other programs that use the port, then start a new recording",
+        Some(6) => "the board received a command larger than the protocol allows; acquisition stopped and the outputs were set LOW. Close other programs that use the port, then start a new recording",
+        Some(7) => "host-command watchdog expired: the board received no command for 5 s, so it stopped acquisition and set the outputs LOW. This usually means the computer paused or slept; start a new recording",
+        Some(_) => "this error code is not used by the WVU reference firmware; the recording was ended. Select Verify Firmware, and use Restore WVU Firmware if it fails",
+        None => {
+            return "firmware sent ERROR_MESSAGE without an error code; the recording was ended".into();
         }
-        Some(9) => "firmware ERROR 9: ADC driver operation failed; acquisition entered its safe fault state".into(),
-        Some(code) => format!("firmware ERROR {code}: acquisition stopped"),
-        None => "firmware sent ERROR_MESSAGE without an error code".into(),
-    }
+    };
+    let code = code.unwrap_or_default();
+    let extra = payload
+        .filter(|bytes| bytes.len() > 1)
+        .map(|bytes| {
+            let extra = &bytes[1..];
+            let shown = extra.len().min(FIRMWARE_ERROR_DETAIL_MAX_EXTRA_BYTES);
+            let hex = extra[..shown]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            match extra.len() - shown {
+                0 => format!(" (payload={hex})"),
+                1 => format!(" (payload={hex}, +1 more byte)"),
+                more => format!(" (payload={hex}, +{more} more bytes)"),
+            }
+        })
+        .unwrap_or_default();
+    format!("firmware ERROR {code}: {explanation}{extra}")
 }
+
+/// Payload bytes after an ERROR code that `firmware_error_detail` shows.
+const FIRMWARE_ERROR_DETAIL_MAX_EXTRA_BYTES: usize = 16;
 
 fn no_data_timeout_detail(elapsed: Duration) -> String {
     format!(
@@ -1687,8 +1715,15 @@ impl SessionController {
         {
             // A fresh attempt replaces the previous fault; its diagnostics are
             // replaced below as well. The states it passes through are a board
-            // check, never reported as a recording.
+            // check, never reported as a recording. The state is checked again
+            // and changed under one lock (as `begin_session` does), so nothing
+            // can begin between the check and `Connecting`.
             let mut runtime = self.lock_runtime()?;
+            if is_active_state(runtime.state) {
+                return Err(SessionError::State(
+                    "cannot retry a handshake while a recording or connection is active",
+                ));
+            }
             runtime.state = SessionState::Connecting;
             runtime.handshake_check = true;
             runtime.last_error = None;
@@ -2550,10 +2585,12 @@ impl SessionController {
         } else if recording_failure_detail.is_some() {
             "recording_write_error"
         } else {
+            // A Disconnect click is recorded as `User` (a complete recording,
+            // like Stop). `Disconnect` means the board was proven removed.
             match reason {
                 StopReason::User => "user_stop",
                 StopReason::TimedComplete => "timed_complete",
-                StopReason::Disconnect => "disconnect_request",
+                StopReason::Disconnect => "device_disconnected",
                 StopReason::StorageGuard => "storage_guard",
                 StopReason::ApplicationClose => "application_close",
                 StopReason::Fault => "fault",
@@ -2820,7 +2857,7 @@ impl SessionController {
         // A file whose final flush failed may end in a partial record; it
         // keeps its `.part` name so it is never mistaken for a finished BMEG.
         if data_flushed {
-            match self.rename_with_retry(&paths.temporary_bmeg, &paths.bmeg) {
+            match self.rename_with_retry(&paths.temporary_bmeg, &paths.bmeg, false) {
                 Ok(()) => raw_path = paths.bmeg.clone(),
                 Err(error) => failures.push(FinalizeFailure::new(
                     FinalizeStage::Rename,
@@ -2842,8 +2879,9 @@ impl SessionController {
         meta.csv_error = None;
         meta.finalize_error = finalize_error_text(plan.recording_failure.as_deref(), &failures);
         // The sidecar is written before the CSV so a CSV failure (for example
-        // a full disk) can never leave the recording without metadata.
-        let first_metadata = self.write_metadata(&paths.metadata, meta);
+        // a full disk) can never leave the recording without metadata. It
+        // never replaces a file that already has the sidecar's name.
+        let first_metadata = self.write_metadata(&paths.metadata, meta, false);
 
         let mut csv_written = false;
         let csv_error = if data_flushed {
@@ -2882,7 +2920,12 @@ impl SessionController {
         };
         meta.csv_error = csv_error.clone();
         meta.finalize_error = finalize_error_text(plan.recording_failure.as_deref(), &failures);
-        let metadata_written = match (first_metadata, self.write_metadata(&paths.metadata, meta)) {
+        // Only the sidecar this recording wrote above may be replaced.
+        let replace_own_sidecar = first_metadata.is_ok();
+        let metadata_written = match (
+            first_metadata,
+            self.write_metadata(&paths.metadata, meta, replace_own_sidecar),
+        ) {
             (_, Ok(())) => true,
             (Ok(()), Err(error)) => {
                 failures.push(FinalizeFailure::new(
@@ -2923,17 +2966,23 @@ impl SessionController {
     /// Writes the sidecar to a temporary sibling, fsyncs it, and renames it
     /// into place, so rewriting it with the CSV result can never destroy a
     /// valid sidecar that was already written (for example on a full disk).
-    fn write_metadata(&self, path: &Path, meta: &RecordingMetadata) -> Result<(), String> {
+    fn write_metadata(
+        &self,
+        path: &Path,
+        meta: &RecordingMetadata,
+        replace: bool,
+    ) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(meta).map_err(|error| error.to_string())?;
         let temporary = sibling_with_suffix(path, ".part");
         if let Err(error) = self.storage.write_durably(&temporary, &bytes) {
             let _ = fs::remove_file(&temporary);
             return Err(describe_io_error(&error));
         }
-        self.rename_with_retry(&temporary, path).map_err(|error| {
-            let _ = fs::remove_file(&temporary);
-            describe_io_error(&error)
-        })
+        self.rename_with_retry(&temporary, path, replace)
+            .map_err(|error| {
+                let _ = fs::remove_file(&temporary);
+                describe_io_error(&error)
+            })
     }
 
     /// Exports to a temporary sibling and renames it only when the row count
@@ -2947,14 +2996,14 @@ impl SessionController {
     ) -> Result<(), String> {
         let temporary = sibling_with_suffix(csv, ".part");
         let result = match self.storage.export_csv(raw_path, &temporary) {
-            Ok(rows) if rows == expected_rows => {
-                self.rename_with_retry(&temporary, csv).map_err(|error| {
+            Ok(rows) if rows == expected_rows => self
+                .rename_with_retry(&temporary, csv, false)
+                .map_err(|error| {
                     format!(
                         "the exported CSV could not be renamed: {}",
                         describe_io_error(&error)
                     )
-                })
-            }
+                }),
             Ok(rows) => Err(format!(
                 "the CSV has {rows} rows but the raw recording has {expected_rows} records"
             )),
@@ -2968,13 +3017,23 @@ impl SessionController {
 
     /// Bounded retry with exponential backoff for transient sharing
     /// violations (OneDrive, indexer, antivirus) on a just-closed file.
-    fn rename_with_retry(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+    /// Without `replace`, an existing destination is never overwritten, and
+    /// that refusal is final rather than retried.
+    fn rename_with_retry(&self, from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
         let attempts = self.timing.rename_attempts.max(1);
         let mut backoff = self.timing.rename_initial_backoff;
         let mut attempt = 1;
         loop {
-            match self.storage.rename(from, to) {
+            let result = if replace {
+                self.storage.replace(from, to)
+            } else {
+                self.storage.rename(from, to)
+            };
+            match result {
                 Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(error)
+                }
                 Err(error) if attempt < attempts => {
                     crate::app_log::record(
                         "WARN",
@@ -3118,12 +3177,15 @@ impl SessionController {
                         Some(category.clone()),
                     )?;
                     return Err(SessionError::Protocol(format!(
-                        "handshake reached protocol v{}.{} on {} but firmware identity was not accepted: build={:?}, device={:?}. {}",
+                        "handshake reached protocol v{}.{} on {} but firmware identity was not accepted: build={:?}, device={:?}, capabilities_readable={}. {}",
                         crate::protocol::PROTOCOL_MAJOR,
-                        crate::protocol::PROTOCOL_MINOR,
+                        snapshot
+                            .protocol_minor
+                            .unwrap_or(crate::protocol::PROTOCOL_MINOR),
                         self.status()?.port,
                         snapshot.firmware_build,
                         snapshot.firmware_board_id,
+                        snapshot.firmware_capabilities.is_some(),
                         recommended_action(&category),
                     )));
                 }
@@ -3704,15 +3766,11 @@ impl SessionController {
         diagnostics.hello_received = snapshot.hello_seen;
         diagnostics.capabilities_received = snapshot.capabilities_seen;
         diagnostics.pong_received = snapshot.pong_seen;
-        diagnostics.protocol_version = if snapshot.integrity.received_packets > 0 {
-            Some(format!(
-                "{}.{}",
-                crate::protocol::PROTOCOL_MAJOR,
-                crate::protocol::PROTOCOL_MINOR
-            ))
-        } else {
-            None
-        };
+        // The version the board's frames actually carried; the parser also
+        // accepts legacy v0.1-v0.3 frames.
+        diagnostics.protocol_version = snapshot
+            .protocol_minor
+            .map(|minor| format!("{}.{minor}", crate::protocol::PROTOCOL_MAJOR));
         diagnostics.firmware_build = snapshot.firmware_build;
         diagnostics.firmware_board_id = snapshot.firmware_board_id;
         diagnostics.firmware_capabilities = snapshot.firmware_capabilities.clone();
@@ -4617,10 +4675,12 @@ fn validate_firmware_capabilities(
     output_mask: u8,
 ) -> Result<(), SessionError> {
     let Some(capabilities) = capabilities else {
-        // Legacy CAPABILITIES packets did not carry enough detail to make a
-        // Resource claim. The existing conservative configuration
-        // checks above remain in effect for backward reader compatibility.
-        return Ok(());
+        // Only the reference identity is accepted, and it always sends a
+        // parseable v0.4 CAPABILITIES payload. A payload that cannot be read
+        // proves nothing about the board's limits, so it fails the check.
+        return Err(SessionError::State(
+            "connected firmware did not report readable capabilities; use Verify Firmware or Restore WVU Firmware",
+        ));
     };
     if !capabilities.supports_mode(required_mode) {
         return Err(SessionError::State(
@@ -4771,7 +4831,12 @@ fn firmware_identity_failure_category(
         (Some(build), Some(device))
             if build == REFERENCE_FIRMWARE_BUILD && device == REFERENCE_DEVICE_ID =>
         {
-            None
+            // The reference firmware always sends a parseable v0.4
+            // CAPABILITIES payload; one that cannot be read is not it.
+            snapshot
+                .firmware_capabilities
+                .is_none()
+                .then_some(ConnectionFailureCategory::IncompatibleFirmwareIdentity)
         }
         (None, _) | (_, None) => Some(ConnectionFailureCategory::MissingFirmwareIdentity),
         _ => Some(ConnectionFailureCategory::IncompatibleFirmwareIdentity),
@@ -5778,6 +5843,7 @@ mod tests {
         /// before any byte reaches the board.
         ping_write_timeouts: u32,
         hello_payload: Vec<u8>,
+        capabilities_payload: Vec<u8>,
     }
 
     impl HandshakeMock {
@@ -5794,13 +5860,21 @@ mod tests {
                     &[1, 14, 6, 0],
                 ]
                 .concat(),
+                // The reference firmware's v0.4 CAPABILITIES payload.
+                capabilities_payload: vec![
+                    12, 14, 6, 0x03, 0x07, 5, 100, 0, 200, 0, 250, 0, 244, 1, 232, 3,
+                ],
             }
         }
 
         fn queue_identity(&mut self) -> std::io::Result<()> {
             for (sequence, message_type, payload) in [
                 (0, MessageType::Hello, self.hello_payload.clone()),
-                (1, MessageType::Capabilities, vec![12, 1, 6, 0]),
+                (
+                    1,
+                    MessageType::Capabilities,
+                    self.capabilities_payload.clone(),
+                ),
                 (2, MessageType::Pong, vec![]),
             ] {
                 let bytes = encode_frame(&Frame {
@@ -5903,6 +5977,44 @@ mod tests {
         assert!(diagnostics.capabilities_received);
         assert!(diagnostics.pong_received);
         assert_eq!(diagnostics.failure_category, None);
+        assert_eq!(diagnostics.protocol_version.as_deref(), Some("0.4"));
+    }
+
+    #[test]
+    fn handshake_rejects_capabilities_that_cannot_be_read() {
+        let (session, mut acquisition) = handshake_session();
+        let mut io = HandshakeMock::new(Some(1));
+        // A pre-v0.4 layout: the identity is the reference one, but the
+        // board's limits cannot be proven.
+        io.capabilities_payload = vec![12, 1, 6, 0];
+        let error = session
+            .wait_for_handshake_with_policy(
+                &mut io,
+                &mut acquisition,
+                Duration::ZERO,
+                Duration::from_millis(100),
+                1,
+                Duration::from_millis(1),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("an unreadable CAPABILITIES payload was accepted"));
+        assert!(error.to_string().contains("capabilities_readable=false"));
+        let diagnostics = session
+            .status()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .connection_diagnostics
+            .unwrap_or_else(|| panic!("missing diagnostics"));
+        assert!(diagnostics.capabilities_received);
+        assert_eq!(
+            diagnostics.failure_category,
+            Some(ConnectionFailureCategory::IncompatibleFirmwareIdentity)
+        );
+    }
+
+    #[test]
+    fn configuration_is_refused_without_readable_capabilities() {
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        assert!(configure_payload(&profile.profile.acquisition, None).is_err());
     }
 
     #[test]
@@ -6607,16 +6719,63 @@ mod tests {
     }
 
     #[test]
-    fn adc_timeout_error_retains_firmware_diagnostic_counters() {
-        let payload = [8, 4, 3, 20, 44, 0, 0, 0, 43, 0, 0, 0, 1, 0, 0, 0];
-        let detail = firmware_error_detail(Some(8), Some(&payload));
-        assert!(detail.contains("ADC conversion deadline expired"));
-        assert!(detail.contains("stage=4"));
-        assert!(detail.contains("channel=A3"));
-        assert!(detail.contains("fsp_error=20"));
-        assert!(detail.contains("adc_starts=44"));
-        assert!(detail.contains("adc_completions=43"));
-        assert!(detail.contains("adc_timeouts=1"));
+    fn every_reference_firmware_error_code_has_its_own_explanation() {
+        let generic = firmware_error_detail(Some(200), None);
+        assert!(generic.contains("not used by the WVU reference firmware"));
+        let mut explanations = std::collections::BTreeSet::new();
+        for code in 1..=7u8 {
+            let detail = firmware_error_detail(Some(code), Some(&[code]));
+            assert!(
+                detail.starts_with(&format!("firmware ERROR {code}: ")),
+                "{detail}"
+            );
+            assert!(!detail.contains("payload="), "{detail}");
+            assert!(
+                !detail.contains("not used by the WVU reference firmware"),
+                "{detail}"
+            );
+            assert!(explanations.insert(detail.split_once(": ").map(|(_, text)| text.to_owned())));
+        }
+        assert!(firmware_error_detail(Some(3), None).contains("rejected this lab's configuration"));
+        assert!(firmware_error_detail(Some(4), None).contains("no acquisition began"));
+        // The removed ADC experiment's codes are no longer decoded.
+        assert!(firmware_error_detail(Some(8), Some(&[8, 4, 3]))
+            .contains("not used by the WVU reference firmware"));
+        assert!(firmware_error_detail(Some(8), Some(&[8, 4, 3])).ends_with("(payload=0403)"));
+
+        // A long (garbled or non-reference) payload is shown only in part.
+        let mut long = vec![9u8];
+        long.extend(std::iter::repeat_n(
+            0xabu8,
+            crate::protocol::MAX_PAYLOAD_LEN - 1,
+        ));
+        let detail = firmware_error_detail(Some(9), Some(&long));
+        let shown = "ab".repeat(FIRMWARE_ERROR_DETAIL_MAX_EXTRA_BYTES);
+        let hidden = crate::protocol::MAX_PAYLOAD_LEN - 1 - FIRMWARE_ERROR_DETAIL_MAX_EXTRA_BYTES;
+        assert!(
+            detail.ends_with(&format!("(payload={shown}, +{hidden} more bytes)")),
+            "{detail}"
+        );
+        assert!(detail.len() < 400, "{}", detail.len());
+        // Exactly the limit is shown in full; one more byte is counted.
+        let mut limit = vec![9u8];
+        limit.extend(std::iter::repeat_n(
+            0x01u8,
+            FIRMWARE_ERROR_DETAIL_MAX_EXTRA_BYTES,
+        ));
+        assert!(
+            firmware_error_detail(Some(9), Some(&limit)).ends_with(&format!(
+                "(payload={})",
+                "01".repeat(FIRMWARE_ERROR_DETAIL_MAX_EXTRA_BYTES)
+            ))
+        );
+        limit.push(0x02);
+        assert!(
+            firmware_error_detail(Some(9), Some(&limit)).ends_with(&format!(
+                "(payload={}, +1 more byte)",
+                "01".repeat(FIRMWARE_ERROR_DETAIL_MAX_EXTRA_BYTES)
+            ))
+        );
     }
 
     #[test]
@@ -6974,6 +7133,17 @@ mod tests {
         }
     }
 
+    /// What the reference firmware advertises in CAPABILITIES.
+    fn reference_capabilities() -> FirmwareCapabilities {
+        FirmwareCapabilities {
+            supported_adc_resolutions: vec![12, 14],
+            max_analog_channels: 6,
+            supported_modes: 0x03,
+            supported_digital_output_mask: 0x07,
+            supported_rates_hz: vec![100, 200, 250, 500, 1_000],
+        }
+    }
+
     #[test]
     fn course_configuration_payloads_bind_channel_maps_and_leds() {
         let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
@@ -6983,14 +7153,23 @@ mod tests {
                 .find(|profile| profile.category == category)
                 .unwrap_or_else(|| panic!("missing {category}"))
         };
-        let emg = configure_payload(&lookup("course_emg_force").acquisition, None)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let emg = configure_payload(
+            &lookup("course_emg_force").acquisition,
+            Some(&reference_capabilities()),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(emg, vec![0, 14, 232, 3, 0, 0, 4, 0, 1, 2, 3, 0]);
-        let bp = configure_payload(&lookup("course_blood_pressure").acquisition, None)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let bp = configure_payload(
+            &lookup("course_blood_pressure").acquisition,
+            Some(&reference_capabilities()),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(bp, vec![0, 14, 200, 0, 0, 0, 3, 0, 1, 2, 1]);
-        let pulseox = configure_payload(&lookup("course_pulseox").acquisition, None)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let pulseox = configure_payload(
+            &lookup("course_pulseox").acquisition,
+            Some(&reference_capabilities()),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(pulseox, vec![1, 14, 232, 3, 0, 0, 2, 0, 1, 5, 6]);
     }
 
@@ -7189,8 +7368,11 @@ mod tests {
             let mut simulator =
                 SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
                     .unwrap_or_else(|error| panic!("{error}"));
-            let configure = configure_payload(&profile.profile.acquisition, None)
-                .unwrap_or_else(|error| panic!("{error}"));
+            let configure = configure_payload(
+                &profile.profile.acquisition,
+                Some(&reference_capabilities()),
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
             simulator
                 .write_all(
                     &encode_frame(&Frame {
@@ -7420,7 +7602,7 @@ mod tests {
                     "injected sharing violation",
                 ));
             }
-            fs::rename(from, to)
+            crate::recording::move_without_replacing(from, to)
         }
 
         fn export_csv(&self, bmeg: &Path, csv: &Path) -> Result<u64, RecordingError> {

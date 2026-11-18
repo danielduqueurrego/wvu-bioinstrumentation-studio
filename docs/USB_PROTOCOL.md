@@ -8,7 +8,7 @@ Frames use the `BMEG` magic, protocol major/minor, message type, flags, payload 
 
 ## Capabilities
 
-The firmware reports supported ADC resolutions (12 and 14 bit), a maximum of six simultaneous analog channels, acquisition-mode support, controlled outputs D4/D5/D6, and supported rates (100, 200, 250, 500, and 1000 Hz). The desktop validates the active lab against these capabilities before it sends CONFIGURE.
+The firmware reports supported ADC resolutions (12 and 14 bit), a maximum of six simultaneous analog channels, acquisition-mode support, controlled outputs D4/D5/D6, and supported rates (100, 200, 250, 500, and 1000 Hz). The desktop validates the active lab against these capabilities before it sends CONFIGURE. A CAPABILITIES payload that cannot be parsed in this layout fails the handshake (and Verify Firmware) as an incompatible firmware, because it cannot prove the board's limits.
 
 ## Simultaneous analog configuration
 
@@ -64,6 +64,8 @@ uint16  values[record_count][field_count]
 
 The firmware first finalizes records into a bounded raw-batch queue, then constructs protocol packets and CRCs outside the timing-critical sampling path. Serial transmission uses a second bounded queue, reported writable capacity, and partial writes. If backpressure fills the acquisition queue, the firmware drops the new batch, increments the cumulative `acquisition_queue_overflows` value, and reports the overflow flag rather than blocking acquisition or silently corrupting timing.
 
+Batch flag `0x0004` has two meanings. It is set on the next stored batch after the firmware either dropped a batch (also counted in `acquisition_queue_overflows`) or found that one or more sampling deadlines had already passed and skipped them. A skipped deadline produces no record and no sequence gap, and it does not change `acquisition_queue_overflows`. The host therefore counts the records of flagged batches separately as `integrity.overrun_flagged_records` in the session summary and metadata. That count is never added to `firmware_overflows`, which counts each dropped batch once. Every record of a flagged batch also keeps the flag in its BMEG status field, and the skipped interval appears in the ±5% timing-tolerance count.
+
 Build `0x00010006` extends the protocol 0.4 `STATUS` payload while remaining parseable by older v0.4 hosts:
 
 ```text
@@ -77,6 +79,22 @@ uint32  phase_maximum_absolute_error_us[4]    // RED, DARK 1, IR, DARK 2
 The host accounts for the cumulative overflow value once even when it appears in both status and batch frames. For pulse-ox recordings it preserves the four per-state timing checks in final metadata. Pulse-state deadlines advance by the configured dwell on one absolute timeline; they are not recalculated from the completion time of ADC, bookkeeping, packet construction, or serial transmission.
 
 The desktop parser continues to accept legacy protocol 0.1–0.3 sample batches, whose record timestamps are expanded from their first timestamp and nominal period. New recordings require the current compatible reference firmware so their authoritative records use measured per-record timestamps.
+
+## Firmware ERROR codes
+
+`ERROR_MESSAGE` (type `0x0A`) carries a one-byte code. The controlled reference firmware sends only these codes:
+
+| Code | Cause | Effect |
+| --- | --- | --- |
+| 1 | Command header has an unsupported protocol version, or its length does not match | Acquisition stops; configuration cleared; D4/D5/D6 LOW |
+| 2 | Command CRC mismatch | Acquisition stops; configuration cleared; D4/D5/D6 LOW |
+| 3 | CONFIGURE rejected (mode, channels, pins, ADC bits, rate, dwell, or outputs) | Any acquisition stops; configuration cleared; D4/D5/D6 LOW; no CONFIG_ACK |
+| 4 | START without an accepted configuration, or START with a payload | START refused; acquisition never began |
+| 5 | Command input buffer overflow | Acquisition stops; configuration cleared; D4/D5/D6 LOW |
+| 6 | Command payload length above the protocol maximum | Acquisition stops; configuration cleared; D4/D5/D6 LOW |
+| 7 | Host-command watchdog: no command for 5 s while acquiring | Acquisition stops after the final partial batch; D4/D5/D6 LOW |
+
+The host fails a pending CONFIGURE or START wait as soon as a new ERROR arrives (an ERROR received before the handshake finished is logged, not counted against the new recording) and describes each code with its likely cause and next step. Any other code is reported as not used by the reference firmware.
 
 ## Safety and compatibility
 

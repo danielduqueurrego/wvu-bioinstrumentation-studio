@@ -61,6 +61,11 @@ describe('Finished-recording card', () => {
     expect(line.ok).toBe(false);
     expect(line.text).toBe('Check data quality: 3 missing samples · 1 damaged packet · 1 buffer overflow.');
     expect(qualityLine(undefined).ok).toBe(true);
+    // Skipped sampling deadlines leave no sequence gap; the board flags them.
+    expect(qualityLine({ ...emptyIntegrity, overrun_flagged_records: 10 })).toEqual({
+      text: 'Check data quality: 10 samples flagged for a timing overrun.',
+      ok: false
+    });
   });
 
   it('describes every stop reason in plain words, never as a raw code', () => {

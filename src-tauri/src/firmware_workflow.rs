@@ -472,7 +472,11 @@ impl FirmwareWorkflow {
         let _lease = self.claim_serial(SerialOwner::Verify, FirmwareJobStage::VerifyingFirmware)?;
         let boards = detected_boards(&port, FirmwareJobStage::VerifyingFirmware)?;
         let board = board_on_port(&boards, &port, FirmwareJobStage::VerifyingFirmware)?;
-        if self.session.is_recording().map_err(session_failure)? {
+        if self
+            .session
+            .is_recording()
+            .map_err(session_failure(FirmwareJobStage::VerifyingFirmware))?
+        {
             return Err(FirmwareFailure::new(
                 FirmwareErrorCategory::PortBusy,
                 FirmwareJobStage::VerifyingFirmware,
@@ -483,7 +487,7 @@ impl FirmwareWorkflow {
         let result = self
             .session
             .retry_handshake(&board.port, FaultOrigin::Verification)
-            .map_err(session_failure)?;
+            .map_err(session_failure(FirmwareJobStage::VerifyingFirmware))?;
         if !result.diagnostics.port_opened {
             let detail = self
                 .session
@@ -503,7 +507,7 @@ impl FirmwareWorkflow {
         if verification.compatible {
             self.session
                 .prepare_for_new_recording()
-                .map_err(session_failure)?;
+                .map_err(session_failure(FirmwareJobStage::VerifyingFirmware))?;
         }
         let failure = (!verification.compatible).then(|| {
             FirmwareFailure::new(
@@ -585,7 +589,9 @@ impl FirmwareWorkflow {
             FirmwareJobStage::ClosingSerialSession,
             "Closing any idle acquisition session before restoring the controlled reference.",
         )?;
-        self.session.disconnect().map_err(session_failure)?;
+        self.session
+            .disconnect()
+            .map_err(session_failure(FirmwareJobStage::ClosingSerialSession))?;
         self.set_stage(
             job_id,
             FirmwareJobStage::Compiling,
@@ -594,6 +600,15 @@ impl FirmwareWorkflow {
         let cli = required_cli(FirmwareJobStage::Compiling)?;
         require_core(&cli, FirmwareJobStage::Compiling)?;
         let reference_dir = job_directory(job_id).join("reference_unor4wifi");
+        // Job IDs restart at 1 on every launch, so this folder may hold an
+        // earlier job's sketch. Arduino CLI compiles every source file in it,
+        // while `source_hash` covers only the .ino; start from an empty
+        // folder so the compiled sketch is exactly the controlled source.
+        match fs::remove_dir_all(&reference_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_failure(FirmwareJobStage::Compiling, error)),
+        }
         fs::create_dir_all(&reference_dir)
             .map_err(|error| io_failure(FirmwareJobStage::Compiling, error))?;
         let source_path = reference_dir.join("reference_unor4wifi.ino");
@@ -758,7 +773,7 @@ impl FirmwareWorkflow {
         let result = self
             .session
             .retry_handshake(&board.port, FaultOrigin::Verification)
-            .map_err(session_failure)?;
+            .map_err(session_failure(FirmwareJobStage::VerifyingFirmware))?;
         let verification = verification_from_handshake(
             FirmwareVerificationKind::WvuProtocolReference,
             &result.diagnostics,
@@ -781,12 +796,16 @@ impl FirmwareWorkflow {
         }
         self.session
             .prepare_for_new_recording()
-            .map_err(session_failure)?;
+            .map_err(session_failure(FirmwareJobStage::VerifyingFirmware))?;
         self.finish_success(job_id, FirmwareCompatibility::WvuProtocolCompatible)
     }
 
     fn ensure_upload_is_safe(&self, stage: FirmwareJobStage) -> Result<(), FirmwareFailure> {
-        if self.session.is_recording().map_err(session_failure)? {
+        if self
+            .session
+            .is_recording()
+            .map_err(session_failure(stage))?
+        {
             return Err(FirmwareFailure::new(
                 FirmwareErrorCategory::PortBusy,
                 stage,
@@ -1379,16 +1398,20 @@ fn failure_copy(category: FirmwareErrorCategory) -> (&'static str, &'static str)
     }
 }
 
-fn session_failure(error: SessionError) -> FirmwareFailure {
-    if matches!(error, SessionError::Busy(_)) {
-        return busy_failure(FirmwareJobStage::ClosingSerialSession, error);
+/// Maps a session error at `stage` (the step that called the session, so a
+/// failure during verification is not reported as closing the session).
+fn session_failure(stage: FirmwareJobStage) -> impl FnOnce(SessionError) -> FirmwareFailure {
+    move |error| {
+        if matches!(error, SessionError::Busy(_)) {
+            return busy_failure(stage, error);
+        }
+        FirmwareFailure::new(
+            FirmwareErrorCategory::PortBusy,
+            stage,
+            error.to_string(),
+            error.to_string(),
+        )
     }
-    FirmwareFailure::new(
-        FirmwareErrorCategory::PortBusy,
-        FirmwareJobStage::ClosingSerialSession,
-        error.to_string(),
-        error.to_string(),
-    )
 }
 
 /// Another operation in this application owns the board. Waiting, not

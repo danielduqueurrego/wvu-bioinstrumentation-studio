@@ -114,10 +114,7 @@ impl TimingAccumulator {
         }
     }
 }
-use std::{
-    sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
-    thread,
-};
+use std::sync::mpsc::{SyncSender, TrySendError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub enum AcquisitionState {
@@ -129,7 +126,6 @@ pub enum AcquisitionState {
     /// previous run.
     Starting,
     Running,
-    Stopping,
     Disconnected,
 }
 #[derive(Clone, Debug, serde::Serialize)]
@@ -170,6 +166,8 @@ pub struct AcquisitionSnapshot {
     pub firmware_capabilities: Option<FirmwareCapabilities>,
     pub digital_output_mask: Option<u8>,
     pub skipped_noise_bytes: u64,
+    /// Protocol minor version of the most recent accepted frame.
+    pub protocol_minor: Option<u8>,
 }
 
 /// Capability information advertised by the controlled firmware.  The host
@@ -334,9 +332,6 @@ impl AcquisitionController {
         self.expected_field_count = Some(field_count);
     }
     pub fn stop(&mut self) {
-        if self.state == AcquisitionState::Running {
-            self.state = AcquisitionState::Stopping;
-        }
         self.state = AcquisitionState::Idle;
     }
     pub fn ingest_bytes(&mut self, bytes: &[u8]) {
@@ -520,6 +515,7 @@ impl AcquisitionController {
             firmware_capabilities: self.firmware_capabilities.clone(),
             digital_output_mask: self.digital_output_mask,
             skipped_noise_bytes: self.parser.stats.skipped_noise_bytes,
+            protocol_minor: self.parser.stats.last_protocol_minor,
         }
     }
 
@@ -540,72 +536,10 @@ impl AcquisitionController {
         )
     }
 }
-pub fn simulator_stream(seconds: u32, sample_rate_hz: u32) -> Receiver<SynchronizedRecord> {
-    // Ten seconds at 1000 samples/s fits below this fixed bound; no unbounded queue is used.
-    let (out_tx, out_rx) = sync_channel(16_384);
-    thread::spawn(move || {
-        let (sample_tx, sample_rx) = sync_channel(16_384);
-        let mut controller = AcquisitionController::new(sample_tx);
-        if controller.configure().is_err() || controller.start().is_err() {
-            return;
-        }
-        let period = 1_000_000 / sample_rate_hz;
-        let total = seconds.saturating_mul(sample_rate_hz);
-        let mut packet_sequence = 0u32;
-        let mut first = 0u32;
-        while first < total {
-            let take = (total - first).min(20);
-            let samples = (0..take)
-                .map(|i| {
-                    let phase =
-                        (first + i) as f64 * std::f64::consts::TAU * 2.0 / sample_rate_hz as f64;
-                    (2048.0 + phase.sin() * 1200.0).clamp(0.0, 4095.0) as u16
-                })
-                .collect();
-            let batch = SampleBatch {
-                first_sample_sequence: first,
-                sample_period_us: period,
-                channel_count: 1,
-                timestamps_us: (0..take)
-                    .map(|index| u64::from(first + index) * u64::from(period))
-                    .collect(),
-                samples,
-                status_flags: crate::protocol::SAMPLE_STATUS_ACQUIRING,
-                acquisition_queue_overflows: Some(0),
-            };
-            let payload = match batch.to_payload() {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            let frame = Frame {
-                message_type: MessageType::SampleBatch,
-                flags: 0,
-                sequence: packet_sequence,
-                payload,
-            };
-            let encoded = match crate::protocol::encode_frame(&frame) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            for fragment in encoded.chunks(7) {
-                controller.ingest_bytes(fragment);
-            }
-            packet_sequence = packet_sequence.wrapping_add(1);
-            first += take;
-        }
-        controller.stop();
-        for sample in sample_rx.try_iter() {
-            if out_tx.send(sample).is_err() {
-                break;
-            }
-        }
-    });
-    out_rx
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::sync_channel;
     #[test]
     fn simulator_uses_protocol_path_and_state_transitions() {
         let (tx, rx) = sync_channel(64);

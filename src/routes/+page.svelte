@@ -407,6 +407,9 @@
   // Repair replaces the tools a recording or board operation is using, so it
   // waits until none is running (the backend refuses it as well).
   $: canRepairArduinoTools = !isActive && !boardOperationBusy;
+  // Mirrors `requires_bench_acknowledgement`: a legacy-category gate for
+  // bench-only "ecg"/"emg" labs (older or imported). Current course labs use
+  // `course_*` categories and carry their notices in `safety.notices`.
   $: acknowledgementSatisfied = !activeProfile?.safety.bench_only
     || !['ecg', 'emg'].includes(activeProfile.category)
     || benchNoticeAcknowledged;
@@ -1704,6 +1707,7 @@
   channelLabel={activeChannels.find((channel) => channel.id === calibrationChannelId)?.label ?? ''}
   recordingPath={lastRecordingPath}
   recordingSeconds={session.last_summary?.board_elapsed_seconds ?? 0}
+  hardwareRecording={Boolean(session.last_summary) && !session.simulator}
   {adcReferenceError}
   {mpxvSupplyError}
   {appliedAdcReferenceV}

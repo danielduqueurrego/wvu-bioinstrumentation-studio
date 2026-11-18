@@ -2,7 +2,8 @@
   import { untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import Modal from './Modal.svelte';
-  import { xgzpFitRequestPayload, type CalibrationPreset } from '$lib/calibration';
+  import { newCalibrationId, xgzpFitRequestPayload, type CalibrationPreset } from '$lib/calibration';
+  import { HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS } from '$lib/live-display';
   import {
     calibrationOutput,
     defaultCalibrationLabel,
@@ -27,6 +28,12 @@
     /** The last finished recording (`SessionSummary`), for the XGZP fit. */
     recordingPath: string;
     recordingSeconds: number;
+    /**
+     * The last recording came from the board. Its first frame is the ADC
+     * settling sample the live plot hides, so the fit interval starts after
+     * it by default. The raw sample stays in the recording.
+     */
+    hardwareRecording?: boolean;
     adcReferenceError: string;
     mpxvSupplyError: string;
     appliedAdcReferenceV: number;
@@ -44,6 +51,7 @@
     channelLabel,
     recordingPath,
     recordingSeconds,
+    hardwareRecording = false,
     adcReferenceError,
     mpxvSupplyError,
     appliedAdcReferenceV,
@@ -88,7 +96,8 @@
     fit = undefined;
     error = '';
     if (recordingSeconds > 0) {
-      startSeconds = 0;
+      const warmup = HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS;
+      startSeconds = hardwareRecording && recordingSeconds > warmup ? warmup : 0;
       endSeconds = Math.max(0.1, recordingSeconds);
     }
     if (!bpXgzp) method = 'manual_points';
@@ -170,7 +179,7 @@
       : {};
     const calibration: CalibrationPreset = {
       schema_version: 1,
-      calibration_id: `${profile.profile_id}.${channelId}.${Date.now()}`.replace(/[^a-zA-Z0-9._-]/g, '_').toLowerCase(),
+      calibration_id: newCalibrationId(channelId),
       profile_id: profile.profile_id,
       channel_id: channelId,
       calibration_type: 'linear',
@@ -201,7 +210,7 @@
       <div class="choice-row">{#if bpXgzp}<label class="choice"><input type="radio" bind:group={method} value="xgzp_recording" /> Use completed synchronized BP recording</label>{/if}<label class="choice"><input type="radio" bind:group={method} value="manual_points" /> Enter manual linear points</label></div>
     </fieldset>
     {#if method === 'xgzp_recording'}
-      <p class="help">The completed recording provides A1 MPXV as the reference and A2 XGZP as the fitted input. Select a stable interval in seconds.</p>
+      <p class="help">The completed recording provides A1 MPXV as the reference and A2 XGZP as the fitted input. Select a stable interval in seconds.{#if hardwareRecording} The default start skips the first {HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS} s, the startup settling sample the live plot hides; the recording itself keeps it.{/if}</p>
       <div class="control-grid"><label>Start (seconds)<input type="number" min="0" step="0.1" bind:value={startSeconds} /></label><label>End (seconds)<input type="number" min="0.1" step="0.1" bind:value={endSeconds} /></label></div>
     {:else}
       <label>Manual points: channel volts, reference engineering value (one pair per line)<textarea rows="5" bind:value={manualPoints} spellcheck="false" placeholder={'0.80, 20\n1.20, 60\n1.60, 100'}></textarea></label>

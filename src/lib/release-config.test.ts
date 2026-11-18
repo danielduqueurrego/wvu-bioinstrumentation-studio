@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 const configPath = resolve(process.cwd(), 'src-tauri', 'tauri.conf.json');
@@ -35,5 +35,40 @@ describe('production Tauri frontend configuration', () => {
     expect(csp).toContain("default-src 'self'");
     expect(csp).toContain("connect-src 'self' ipc: http://ipc.localhost");
     expect(csp).not.toContain("script-src *");
+    // The asset protocol is not enabled or used, so images come only from
+    // the bundle or inline data.
+    expect(csp).toContain("img-src 'self' data:;");
+    expect(csp).not.toContain('asset:');
+  });
+
+  it('grants only the dialog commands the frontend uses', () => {
+    // open (Project folder, lab import), save (lab export), and confirm,
+    // which plugin-dialog 2.x sends as its `message` command.
+    const capability = JSON.parse(
+      readFileSync(resolve(dirname(configPath), 'capabilities', 'default.json'), 'utf8')
+    ) as { permissions: string[] };
+    const dialog = capability.permissions.filter((permission) => permission.startsWith('dialog:'));
+    expect(dialog.sort()).toEqual(['dialog:allow-message', 'dialog:allow-open', 'dialog:allow-save']);
+  });
+
+  it('never uses the browser dialogs that plugin-dialog replaces', () => {
+    // plugin-dialog's init script turns window.confirm into an async function
+    // that sends an unregistered command: its Promise is always truthy, so
+    // `if (!window.confirm(...)) return;` would never cancel. Use the
+    // plugin's confirm/message instead.
+    const offenders: string[] = [];
+    const visit = (folder: string) => {
+      for (const entry of readdirSync(folder, { withFileTypes: true })) {
+        const path = resolve(folder, entry.name);
+        if (entry.isDirectory()) visit(path);
+        else if (/\.(svelte|ts)$/.test(entry.name) && !/\.test\.ts$/.test(entry.name)) {
+          // A bare confirm( is the plugin's, imported; alert( and prompt( have no import.
+          const text = readFileSync(path, 'utf8');
+          if (/\b(?:window|globalThis|self)\.(?:alert|confirm|prompt)\s*\(|(?<![\w.$])(?:alert|prompt)\s*\(/.test(text)) offenders.push(path);
+        }
+      }
+    };
+    visit(resolve(process.cwd(), 'src'));
+    expect(offenders).toEqual([]);
   });
 });

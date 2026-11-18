@@ -178,7 +178,10 @@ pub fn fit_linear(points: &[CalibrationPoint]) -> Result<LinearFit, CalibrationE
         .iter()
         .map(|point| (point.input_voltage - mean_x).powi(2))
         .sum::<f64>();
-    if ss_xx.abs() <= f64::EPSILON {
+    // Relative to the inputs' magnitude: a spread lost in rounding is no
+    // spread at all, whatever the voltage level.
+    let scale = mean_x.abs().max(1.0);
+    if ss_xx.is_nan() || ss_xx <= f64::EPSILON * n * scale * scale {
         return Err(CalibrationError::ZeroInputVariance);
     }
     let ss_xy = points
@@ -200,6 +203,12 @@ pub fn fit_linear(points: &[CalibrationPoint]) -> Result<LinearFit, CalibrationE
     } else {
         1.0 - ss_residual / ss_total
     };
+    // Finite inputs can still overflow (for example reference values near
+    // 1e200). A non-finite result would serialize as null and could not be
+    // saved, so it is refused here with a clear error.
+    if !slope.is_finite() || !offset.is_finite() || !r_squared.is_finite() {
+        return Err(CalibrationError::NonFinite);
+    }
     Ok(LinearFit {
         slope,
         offset,
@@ -591,6 +600,25 @@ mod tests {
             },
         ])
         .is_err());
+    }
+
+    #[test]
+    fn linear_fit_refuses_overflowing_results_and_spreads_lost_in_rounding() {
+        let point = |input_voltage: f64, reference_value: f64| CalibrationPoint {
+            input_voltage,
+            reference_value,
+        };
+        assert!(matches!(
+            fit_linear(&[point(1.0, 1e200), point(2.0, -1e200), point(3.0, 1e200)]),
+            Err(CalibrationError::NonFinite)
+        ));
+        // Two points a few nanovolts apart at 5 V are not a measurable spread.
+        assert!(matches!(
+            fit_linear(&[point(5.0, 0.0), point(5.0 + 2e-9, 100.0)]),
+            Err(CalibrationError::ZeroInputVariance)
+        ));
+        // One ADC step (about 0.3 mV at 14 bits and 5 V) still fits.
+        assert!(fit_linear(&[point(5.0, 0.0), point(5.0 + 3e-4, 100.0)]).is_ok());
     }
 
     #[test]

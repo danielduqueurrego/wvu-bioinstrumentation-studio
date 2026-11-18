@@ -1,8 +1,10 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { open, save } from '@tauri-apps/plugin-dialog';
-  import { estimatedPulseOxCycleRate, labConfigurationIssues, newChannel, normalizeEditorDraft, pulseOxCycleRateHz, pulseOxDraft, pulseOxOutput, SIMULTANEOUS_RATES_HZ } from '$lib/lab-authoring';
+  // Not the browser's confirm: plugin-dialog replaces it with an async
+  // function whose Promise is always truthy, so a negated check never cancels.
+  import { confirm, open, save } from '@tauri-apps/plugin-dialog';
+  import { estimatedPulseOxCycleRate, labConfigurationIssues, newChannel, normalizeEditorDraft, PULSEOX_PHASE_ORDER, pulseOxCycleRateHz, pulseOxDraft, pulseOxOutput, SIMULTANEOUS_RATES_HZ } from '$lib/lab-authoring';
   import { beginEditSession, beginNewLabSession, labSaveErrorMessage, labSourceLabel, resetConfirmationText, resetOutcomeText, saveArguments, type CatalogStatus, type LabResetOutcome } from '$lib/lab-catalog';
   import type { LabChannel as Channel, LabDigitalOutput as DigitalOutput, LabListEntry as LabEntry, LabPlotGroup as PlotGroup, LabProfile } from '$lib/labs';
   import Modal from './Modal.svelte';
@@ -84,8 +86,18 @@
     saving = false;
   }
 
-  function closeManager() {
-    if (draft && !window.confirm('Discard unsaved lab changes? No lab version has been created.')) return;
+  /** A native Yes/No question; false unless the instructor chose the action. */
+  async function confirmAction(message: string, okLabel: string, cancelLabel: string): Promise<boolean> {
+    try {
+      return await confirm(message, { title: 'Manage Labs', kind: 'warning', okLabel, cancelLabel });
+    } catch (reason) {
+      error = `Could not ask for confirmation, so nothing was changed: ${String(reason)}`;
+      return false;
+    }
+  }
+
+  async function closeManager() {
+    if (draft && !(await confirmAction('Discard unsaved lab changes? No lab version has been created.', 'Discard changes', 'Keep editing'))) return;
     visible = false;
     discardDraft();
   }
@@ -262,7 +274,9 @@
       const consequence = factory
         ? `Students will use the shipped course default ${factory.profile.profile_version} instead.`
         : 'Students will not see this lab until another revision is made active.';
-      if (!window.confirm(`Retire ${entry.profile.display_name} ${entry.profile.profile_version}, the active revision? ${consequence} Existing recordings keep their snapshots.`)) return;
+      if (!(await confirmAction(`Retire ${entry.profile.display_name} ${entry.profile.profile_version}, the active revision? ${consequence} Existing recordings keep their snapshots.`, 'Retire revision', 'Cancel'))) return;
+      // A recording may have started while the question was open.
+      if (blockedWhileRecording()) return;
     }
     try {
       await invoke('retire_profile', { profileId: entry.profile.profile_id, profileVersion: entry.profile.profile_version });
@@ -329,7 +343,8 @@
     try {
       skippedLabs = (await invoke<CatalogStatus>('get_catalog_status')).skipped_labs?.length ?? 0;
     } catch { /* the confirmation then counts only the listed revisions */ }
-    if (!window.confirm(resetConfirmationText(localRevisions, skippedLabs))) return;
+    if (!(await confirmAction(resetConfirmationText(localRevisions, skippedLabs), 'Reset local labs', 'Cancel'))) return;
+    if (blockedWhileRecording()) return;
     try {
       const outcome = await invoke<LabResetOutcome | null>('reset_local_lab_customizations');
       await refresh();
@@ -362,7 +377,7 @@
           <section class="subpanel"><div class="manager-heading"><h3>Analog channel editor</h3><button type="button" onclick={addChannel} disabled={draftChannels.length >= 6}>Add channel</button></div><p class="help">Each enabled channel needs a unique pin, ID, and CSV field. CSV fields use only letters, digits, and underscores, and must stay distinct from the generated _V and pressure columns. WVU firmware supports A0–A5 and 1–6 synchronized channels.</p><div class="channel-grid header" aria-hidden="true"><span>Pin</span><span>Channel ID</span><span>Label</span><span>CSV field</span><span>Calibration capability</span><span>Visible</span><span>Plot</span><span>Remove</span></div>{#each draftChannels as channel, index}<div class="channel-grid" role="group" aria-label={`Channel ${index + 1}`}><select aria-label={`Channel ${index + 1} pin`} value={channel.pin} onchange={(event) => updateChannel(index, 'pin', event.currentTarget.value)}>{#each analogPins as pin}<option value={pin}>{pin}</option>{/each}</select><input aria-label={`Channel ${index + 1} ID`} value={channel.id} oninput={(event) => updateChannel(index, 'id', event.currentTarget.value)} /><input aria-label={`Channel ${index + 1} label`} value={channel.label} oninput={(event) => updateChannel(index, 'label', event.currentTarget.value)} /><input aria-label={`Channel ${index + 1} CSV field`} value={channel.csv_name} oninput={(event) => updateChannel(index, 'csv_name', event.currentTarget.value)} /><select aria-label={`Channel ${index + 1} calibration capability`} value={channel.allowed_conversions?.includes('mpxv_pressure') ? 'mpxv_pressure' : channel.allowed_conversions?.includes('linear_calibration') ? 'linear_calibration' : 'counts_volts'} onchange={(event) => updateChannel(index, 'allowed_conversions', [event.currentTarget.value])}><option value="counts_volts">Counts / Volts only</option><option value="mpxv_pressure">MPXV pressure</option><option value="linear_calibration">Generic linear calibration</option></select><input type="checkbox" aria-label={`Channel ${index + 1} visible by default`} checked={channel.default_visible !== false} onchange={(event) => updateChannel(index, 'default_visible', event.currentTarget.checked)} /><select aria-label={`Channel ${index + 1} plot`} value={String(Math.max(0, (draft.plot_defaults?.groups ?? []).findIndex((group) => group.channel_ids.includes(channel.id))) + 1)} onchange={(event) => setPlotNumber(channel.id, event.currentTarget.value)}>{#each draftChannels as _, groupIndex}<option value={String(groupIndex + 1)}>Plot {groupIndex + 1}</option>{/each}</select><button type="button" aria-label={`Remove channel ${index + 1}`} onclick={() => removeChannel(index)} disabled={draftChannels.length <= 1}>Remove</button></div>{/each}</section>
           <section class="subpanel"><h3>Digital outputs</h3><p class="help">D4 can be HIGH while recording. D5/D6 stay LOW in simultaneous labs so RED and IR are never accidentally enabled.</p><div class="output-grid">{#each digitalPins as pin}<label class="choice"><input type="checkbox" checked={Boolean(draft.acquisition.digital_outputs?.some((output) => output.pin === pin))} onchange={(event) => setSimultaneousOutput(pin, event.currentTarget.checked)} /> {pin} {pin === 'D4' ? 'Green LED — HIGH while recording' : 'controlled output — Always LOW'}</label>{/each}</div></section>
         {:else if pulseox}
-          <section class="subpanel"><h3>Pulse oximetry — fixed 4-state phase</h3><p class="warning">Phase order is fixed: <strong>RED ON → DARK 1 → IR ON → DARK 2</strong>. RED and IR are independently remappable but never HIGH simultaneously.</p><div class="editor-grid"><label>TX analog pin<select value={draft.acquisition.analog_inputs?.tx ?? 'A0'} onchange={(event) => setPulseInput('tx', event.currentTarget.value)}>{#each analogPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>RX analog pin<select value={draft.acquisition.analog_inputs?.rx ?? 'A1'} onchange={(event) => setPulseInput('rx', event.currentTarget.value)}>{#each analogPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>RED output<select value={pulseOxOutput(draft.acquisition.digital_outputs, 'red')?.pin ?? 'D5'} onchange={(event) => setPulseOutput('red', event.currentTarget.value)}>{#each digitalPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>IR output<select value={pulseOxOutput(draft.acquisition.digital_outputs, 'ir')?.pin ?? 'D6'} onchange={(event) => setPulseOutput('ir', event.currentTarget.value)}>{#each digitalPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>State dwell (µs)<input type="number" min="250" max="5000" value={draft.acquisition.state_dwell_us} oninput={(event) => setPulseDwell(event.currentTarget.value)} /></label><span class="estimate"><strong>Estimated cycle rate</strong>{estimatedPulseRate} cycles/s (nominal; measured timing is recorded separately)</span></div><p class="help">Raw fields are automatically preserved: cycle_index, t_us, red_TX, dark1_TX, ir_TX, dark2_TX, red_RX, dark1_RX, ir_RX, dark2_RX.</p></section>
+          <section class="subpanel"><h3>Pulse oximetry — fixed 4-state phase</h3><p class="warning">Phase order is fixed: <strong>{PULSEOX_PHASE_ORDER.join(' → ')}</strong>. RED and IR are independently remappable but never HIGH simultaneously.</p><div class="editor-grid"><label>TX analog pin<select value={draft.acquisition.analog_inputs?.tx ?? 'A0'} onchange={(event) => setPulseInput('tx', event.currentTarget.value)}>{#each analogPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>RX analog pin<select value={draft.acquisition.analog_inputs?.rx ?? 'A1'} onchange={(event) => setPulseInput('rx', event.currentTarget.value)}>{#each analogPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>RED output<select value={pulseOxOutput(draft.acquisition.digital_outputs, 'red')?.pin ?? 'D5'} onchange={(event) => setPulseOutput('red', event.currentTarget.value)}>{#each digitalPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>IR output<select value={pulseOxOutput(draft.acquisition.digital_outputs, 'ir')?.pin ?? 'D6'} onchange={(event) => setPulseOutput('ir', event.currentTarget.value)}>{#each digitalPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>State dwell (µs)<input type="number" min="250" max="5000" value={draft.acquisition.state_dwell_us} oninput={(event) => setPulseDwell(event.currentTarget.value)} /></label><span class="estimate"><strong>Estimated cycle rate</strong>{estimatedPulseRate} cycles/s (nominal; measured timing is recorded separately)</span></div><p class="help">Raw fields are automatically preserved: cycle_index, t_us, red_TX, dark1_TX, ir_TX, dark2_TX, red_RX, dark1_RX, ir_RX, dark2_RX.</p></section>
         {/if}
         <section class="subpanel"><h3>Save-time summary</h3><p class="help">Mode: {draft.acquisition.acquisition_mode === 'pulseox_4state' ? 'Pulse Oximetry — 4-State' : 'Simultaneous Analog'} · Channels: {pulseox ? 'TX + RX' : draftChannels.length} · Rate: {draft.acquisition.sample_rate_hz} Hz · ADC: {draft.acquisition.adc_resolution_bits} bit · Outputs: {outputSummary}</p><p class="help">Firmware compatibility: the connected firmware advertises its limits during the normal handshake. The shipped WVU firmware supports up to six analog channels, 12/14-bit ADC, 100–1000 Hz simultaneous frames, and the fixed four-state pulse-ox workflow. Save is allowed offline; Start blocks if the connected board cannot advertise or configure the requested resources.</p><div class="actions"><button class="gold" type="button" onclick={saveDraft} disabled={saving}>{saving ? 'Saving…' : 'Save changes as new version'}</button><button type="button" onclick={discardDraft} disabled={saving}>Discard draft</button></div></section>
       {/if}
