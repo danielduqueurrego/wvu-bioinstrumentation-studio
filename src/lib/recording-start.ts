@@ -3,6 +3,8 @@ export type RecordingStartReadinessInput = {
   selectedBoard: boolean;
   firmwareReady: boolean;
   sessionState: string;
+  /** Which operation raised a Faulted state (`SessionStatus.fault_origin`). */
+  faultOrigin?: string | null;
   boardOperationBusy: boolean;
   startInFlight: boolean;
   activeProfile: boolean;
@@ -62,6 +64,20 @@ export function recordingStartReadiness(input: RecordingStartReadinessInput): Re
     return {
       canStart: false,
       message: 'A recording or connection is already active. Stop it before starting another recording.'
+    };
+  }
+  if (input.sessionState === 'Faulted' && input.faultOrigin === 'storage') {
+    // A save problem is not a board problem; Verify Firmware would not help.
+    return {
+      canStart: false,
+      message: 'The previous recording was not saved completely. Select Disconnect to clear the message, then start a new recording.'
+    };
+  }
+  if (input.sessionState === 'Faulted' && input.faultOrigin === 'request') {
+    // The request was refused before anything reached the board.
+    return {
+      canStart: false,
+      message: 'The previous recording did not start. Select Disconnect to clear the message, then start a new recording.'
     };
   }
   if (input.sessionState === 'Faulted') {

@@ -12,7 +12,8 @@ use crate::{
     reference_firmware::{
         controlled_reference_source, source_hash, FirmwareIdentity, FirmwareVerificationKind,
     },
-    session::{ResetTarget, SessionController},
+    serial_lease::{SerialLease, SerialOwner},
+    session::{ConnectionFailureCategory, FaultOrigin, SessionController, SessionError},
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -21,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -29,6 +30,7 @@ use std::{
 
 const APPLICATION_PORT_TIMEOUT: Duration = Duration::from_secs(15);
 const APPLICATION_PORT_POLL: Duration = Duration::from_millis(300);
+const ARDUINO_USB_VID: u16 = 0x2341;
 const NATIVE_USB_PID: u16 = 0x006d;
 const ESP32_BRIDGE_PID: u16 = 0x1002;
 const NATIVE_USB_MANUAL_RESET_TIMEOUT: Duration = Duration::from_secs(90);
@@ -67,6 +69,17 @@ pub enum FirmwareJobStage {
     Canceled,
 }
 
+impl FirmwareJobStage {
+    /// From the upload onward the board is being written (or has just been
+    /// written and is being checked), so a restore can no longer be canceled.
+    pub fn is_past_cancel_point(self) -> bool {
+        matches!(
+            self,
+            Self::Uploading | Self::WaitingForApplicationPort | Self::VerifyingFirmware
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FirmwareErrorCategory {
@@ -83,6 +96,10 @@ pub enum FirmwareErrorCategory {
     ProtocolVerificationFailed,
     WrongFirmwareIdentity,
     Canceled,
+    /// Cancel was refused because the board is being written.
+    UploadCannotBeCanceled,
+    /// An Arduino CLI command missed its deadline and its tools were stopped.
+    ToolTimedOut,
     InternalError,
 }
 
@@ -112,6 +129,26 @@ impl FirmwareFailure {
             recommended_action: recommended_action.into(),
             technical_details: technical_details.into(),
         }
+    }
+
+    fn with_recommended_action(mut self, recommended_action: &str) -> Self {
+        self.recommended_action = recommended_action.into();
+        self
+    }
+
+    /// A command's worker task could not run or did not return normally.
+    pub fn task_failure(details: impl Into<String>) -> Self {
+        internal_failure(details)
+    }
+}
+
+impl std::fmt::Display for FirmwareFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {} ({})",
+            self.title, self.explanation, self.technical_details
+        )
     }
 }
 
@@ -174,6 +211,9 @@ pub struct FirmwareWorkflowStatus {
     pub job: Option<FirmwareJobStatus>,
     pub last_restore: Option<FirmwareJobStatus>,
     pub last_failure: Option<FirmwareFailure>,
+    /// The port on which compatible WVU firmware was last proven (by Verify
+    /// Firmware or a completed restore). Hardware Start is allowed only there.
+    pub verified_port: Option<String>,
 }
 
 #[derive(Clone)]
@@ -190,18 +230,86 @@ struct WorkflowRuntime {
     active_job: Option<FirmwareJobStatus>,
     last_restore: Option<FirmwareJobStatus>,
     last_failure: Option<FirmwareFailure>,
+    /// Where compatibility was last proven; cleared by a failed verify, a job
+    /// start, or a job failure.
+    verified_port: Option<String>,
+}
+
+impl WorkflowRuntime {
+    fn new() -> Self {
+        Self {
+            compatibility: FirmwareCompatibility::Unknown,
+            active_job: None,
+            last_restore: None,
+            last_failure: None,
+            verified_port: None,
+        }
+    }
+
+    /// Readiness is bound to the port where compatible firmware was proven.
+    /// A failed restore on another port does not matter once Verify succeeds.
+    fn acquisition_allowed(&self, port: &str) -> bool {
+        self.compatibility == FirmwareCompatibility::WvuProtocolCompatible
+            && self
+                .verified_port
+                .as_deref()
+                .is_some_and(|verified| verified.eq_ignore_ascii_case(port))
+    }
+
+    fn begin_job(&mut self, job: FirmwareJobStatus) {
+        self.active_job = Some(job);
+        self.last_failure = None;
+        self.compatibility = FirmwareCompatibility::UploadInProgress;
+        self.verified_port = None;
+    }
+
+    fn finish_job_success(&mut self, job: FirmwareJobStatus, compatibility: FirmwareCompatibility) {
+        self.active_job = None;
+        self.compatibility = compatibility;
+        // The restore verified the board where it returned after the upload.
+        self.verified_port = (compatibility == FirmwareCompatibility::WvuProtocolCompatible)
+            .then(|| job.final_port.clone())
+            .flatten();
+        self.last_restore = Some(job);
+    }
+
+    fn finish_job_failure(&mut self, job: FirmwareJobStatus, failure: FirmwareFailure) {
+        self.active_job = None;
+        self.last_failure = Some(failure);
+        self.compatibility = FirmwareCompatibility::VerificationFailed;
+        self.verified_port = None;
+        self.last_restore = Some(job);
+    }
+
+    /// Applies a completed Verify Firmware handshake on `port`. A firmware
+    /// job owns the board's firmware status, so nothing changes while one is
+    /// active (the serial lease already prevents that overlap).
+    fn record_verification(
+        &mut self,
+        port: &str,
+        compatible: bool,
+        failure: Option<FirmwareFailure>,
+    ) {
+        if self.active_job.is_some() {
+            return;
+        }
+        if compatible {
+            self.compatibility = FirmwareCompatibility::WvuProtocolCompatible;
+            self.verified_port = Some(port.to_owned());
+            self.last_failure = None;
+        } else {
+            self.compatibility = FirmwareCompatibility::VerificationFailed;
+            self.verified_port = None;
+            self.last_failure = failure;
+        }
+    }
 }
 
 impl FirmwareWorkflow {
     pub fn new(session: SessionController) -> Self {
         Self {
             session,
-            state: Arc::new(Mutex::new(WorkflowRuntime {
-                compatibility: FirmwareCompatibility::Unknown,
-                active_job: None,
-                last_restore: None,
-                last_failure: None,
-            })),
+            state: Arc::new(Mutex::new(WorkflowRuntime::new())),
             cancel: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
             next_job_id: Arc::new(AtomicU64::new(1)),
@@ -215,6 +323,7 @@ impl FirmwareWorkflow {
             job: runtime.active_job.clone(),
             last_restore: runtime.last_restore.clone(),
             last_failure: runtime.last_failure.clone(),
+            verified_port: runtime.verified_port.clone(),
         })
     }
 
@@ -234,12 +343,24 @@ impl FirmwareWorkflow {
             }
         };
         let cli_path = Some(cli.executable().display().to_string());
-        let cli_version = cli.version().ok().map(|log| log.stdout.trim().to_owned());
-        let uno_r4_core_version = cli.uno_r4_core_version().ok();
+        // Reuse the per-run version cache; probe individually only to explain
+        // which part is missing when the cached probe fails.
+        let (cli_version, uno_r4_core_version) = match crate::arduino_cli::cached_tool_versions() {
+            Ok(versions) => (
+                Some(versions.arduino_cli_version),
+                Some(versions.uno_r4_core_version),
+            ),
+            Err(_) => (
+                cli.version().ok().map(|log| log.stdout.trim().to_owned()),
+                cli.uno_r4_core_version().ok(),
+            ),
+        };
+        // Students only ever get the offline tools included with the app, so
+        // the remedy is Repair (re-extract) or a reinstall, never a download.
         let problem = if cli_version.is_none() {
-            Some("Arduino CLI is present but did not return a version.".into())
+            Some("The Arduino tools did not start correctly. Select Repair Arduino tools. If that does not help, reinstall WVU Bioinstrumentation Studio or contact your instructor.".into())
         } else if uno_r4_core_version.is_none() {
-            Some("Arduino UNO R4 core is not installed. Run `arduino-cli core install arduino:renesas_uno`.".into())
+            Some("The Arduino UNO R4 tools are incomplete. Select Repair Arduino tools. If that does not help, reinstall WVU Bioinstrumentation Studio or contact your instructor.".into())
         } else {
             None
         };
@@ -268,7 +389,14 @@ impl FirmwareWorkflow {
                 "confirmation=false",
             ));
         }
-        let board = self.selected_board(&request.port, FirmwareJobStage::Preparing)?;
+        // The job owns the port and session from here until its worker ends.
+        let lease = self.claim_serial(SerialOwner::FirmwareJob, FirmwareJobStage::Preparing)?;
+        let boards = detected_boards(&request.port, FirmwareJobStage::Preparing)?;
+        let board = board_on_port(&boards, &request.port, FirmwareJobStage::Preparing)?;
+        // The native-USB path finds the board again only as "the one upload
+        // port" and "the one native port", so a second UNO could be written
+        // or verified instead of the confirmed one.
+        ensure_single_uno_for_restore(&boards, &uno_usb_serial_ports())?;
         self.ensure_upload_is_safe(FirmwareJobStage::Preparing)?;
         let job = self.new_job(
             FirmwareJobKind::RestoreReference,
@@ -276,26 +404,70 @@ impl FirmwareWorkflow {
             Some(board.port.clone()),
             board.serial_number.clone(),
         );
-        self.start_worker(job.clone(), move |workflow| {
+        self.start_worker(lease, job.clone(), move |workflow| {
             workflow.restore_reference(job.id, board)
         })?;
         Ok(job)
     }
 
+    /// Cancels a restore before the upload starts. From the upload onward the
+    /// request is refused: stopping a flash part-way would only leave the
+    /// board without working firmware.
+    ///
+    /// The stage check and the cancel flag are set under the state lock, and
+    /// the worker enters the upload under the same lock
+    /// (`enter_upload_stage`), so a cancel is either applied before the upload
+    /// begins or refused.
     pub fn cancel_active_job(&self) -> Result<FirmwareWorkflowStatus, FirmwareFailure> {
-        if self.lock_state()?.active_job.is_none() {
-            return self.status();
+        {
+            let mut runtime = self.lock_state()?;
+            let Some(job) = runtime.active_job.as_mut() else {
+                drop(runtime);
+                return self.status();
+            };
+            if job.stage.is_past_cancel_point() {
+                return Err(FirmwareFailure::new(
+                    FirmwareErrorCategory::UploadCannotBeCanceled,
+                    job.stage,
+                    "The WVU firmware is being written to the board, so the restore cannot be canceled now.",
+                    format!("cancel refused at stage {:?}", job.stage),
+                ));
+            }
+            self.cancel.store(true, Ordering::Release);
+            job.message = "Cancel requested; stopping the Arduino tools.".into();
         }
-        self.cancel.store(true, Ordering::Release);
-        self.set_message("Cancel requested; terminating the current Arduino CLI process.")?;
         self.status()
     }
 
+    /// True while a firmware job runs. The window must not close then.
+    ///
+    /// Both signals must agree: the job is published as active and its
+    /// worker still holds the FirmwareJob lease. The lease is released when
+    /// the worker ends, even by a panic, so a job that somehow could not clear
+    /// its own status never keeps the window open forever.
+    pub fn has_active_job(&self) -> bool {
+        let published = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active_job
+            .is_some();
+        published && self.session.serial_ownership().current() == SerialOwner::FirmwareJob
+    }
+
+    /// Read-only Verify Firmware: a handshake that never uploads.
+    ///
+    /// It refuses while another operation owns the board (and so never
+    /// changes compatibility during a restore). A port that cannot be opened
+    /// is reported as busy (or as no longer connected) and leaves the previous
+    /// compatibility unchanged, because the board was not examined.
     pub fn verify_existing_reference(
         &self,
         port: String,
     ) -> Result<FirmwareVerification, FirmwareFailure> {
-        let board = self.selected_board(&port, FirmwareJobStage::VerifyingFirmware)?;
+        let _lease = self.claim_serial(SerialOwner::Verify, FirmwareJobStage::VerifyingFirmware)?;
+        let boards = detected_boards(&port, FirmwareJobStage::VerifyingFirmware)?;
+        let board = board_on_port(&boards, &port, FirmwareJobStage::VerifyingFirmware)?;
         if self.session.is_recording().map_err(session_failure)? {
             return Err(FirmwareFailure::new(
                 FirmwareErrorCategory::PortBusy,
@@ -306,11 +478,19 @@ impl FirmwareWorkflow {
         }
         let result = self
             .session
-            .retry_handshake(ResetTarget {
-                port: board.port.clone(),
-                serial_number: board.serial_number.clone(),
-            })
+            .retry_handshake(&board.port, FaultOrigin::Verification)
             .map_err(session_failure)?;
+        if !result.diagnostics.port_opened {
+            let detail = self
+                .session
+                .status()
+                .ok()
+                .and_then(|status| status.last_error)
+                .unwrap_or_else(|| "serial port open failed".into());
+            let failure = unopened_port_failure(&board.port, &result.diagnostics, detail);
+            self.lock_state()?.last_failure = Some(failure.clone());
+            return Err(failure);
+        }
         let verification = verification_from_handshake(
             FirmwareVerificationKind::WvuProtocolReference,
             &result.diagnostics,
@@ -321,36 +501,42 @@ impl FirmwareWorkflow {
                 .prepare_for_new_recording()
                 .map_err(session_failure)?;
         }
-        let mut runtime = self.lock_state()?;
-        runtime.compatibility = if verification.compatible {
-            FirmwareCompatibility::WvuProtocolCompatible
-        } else {
-            FirmwareCompatibility::VerificationFailed
-        };
-        if !verification.compatible {
-            runtime.last_failure = Some(FirmwareFailure::new(
+        let failure = (!verification.compatible).then(|| {
+            FirmwareFailure::new(
                 FirmwareErrorCategory::ProtocolVerificationFailed,
                 FirmwareJobStage::VerifyingFirmware,
                 verification.explanation.clone(),
                 format!("diagnostics: {:?}", result.diagnostics.failure_category),
-            ));
-        }
+            )
+        });
+        self.lock_state()?
+            .record_verification(&board.port, verification.compatible, failure);
         Ok(verification)
     }
 
     pub fn is_acquisition_allowed(&self, port: &str) -> Result<bool, FirmwareFailure> {
-        let runtime = self.lock_state()?;
-        Ok(
-            runtime.compatibility == FirmwareCompatibility::WvuProtocolCompatible
-                && runtime
-                    .last_restore
-                    .as_ref()
-                    .and_then(|job| job.final_port.as_ref().or(job.original_port.as_ref()))
-                    .is_none_or(|known| known.eq_ignore_ascii_case(port)),
-        )
+        Ok(self.lock_state()?.acquisition_allowed(port))
     }
 
-    fn start_worker<F>(&self, job: FirmwareJobStatus, work: F) -> Result<(), FirmwareFailure>
+    /// Claims the shared serial lease, or explains which operation holds it.
+    fn claim_serial(
+        &self,
+        owner: SerialOwner,
+        stage: FirmwareJobStage,
+    ) -> Result<SerialLease, FirmwareFailure> {
+        self.session
+            .claim_serial(owner)
+            .map_err(|error| busy_failure(stage, error))
+    }
+
+    /// Runs `work` on the firmware worker, which owns `lease` until it has
+    /// published the job result (or unwound from a panic).
+    fn start_worker<F>(
+        &self,
+        lease: SerialLease,
+        job: FirmwareJobStatus,
+        work: F,
+    ) -> Result<(), FirmwareFailure>
     where
         F: FnOnce(FirmwareWorkflow) -> Result<(), FirmwareFailure> + Send + 'static,
     {
@@ -359,30 +545,28 @@ impl FirmwareWorkflow {
                 .worker
                 .lock()
                 .map_err(|_| internal_failure("firmware worker lock poisoned"))?;
-            if worker.as_ref().is_some_and(|handle| !handle.is_finished()) {
-                return Err(FirmwareFailure::new(
-                    FirmwareErrorCategory::InternalError,
-                    FirmwareJobStage::Preparing,
-                    "Another firmware compile or upload is already active.",
-                    "one active firmware job is allowed",
-                ));
-            }
+            // Every job worker holds the lease until it returns, and the
+            // caller holds it now, so a previous worker is already exiting.
             if let Some(previous) = worker.take() {
                 let _ = previous.join();
             }
         }
         self.cancel.store(false, Ordering::Release);
-        {
-            let mut runtime = self.lock_state()?;
-            runtime.active_job = Some(job.clone());
-            runtime.last_failure = None;
-            runtime.compatibility = FirmwareCompatibility::UploadInProgress;
-        }
+        self.lock_state()?.begin_job(job.clone());
         let controller = self.clone();
         let handle = thread::spawn(move || {
-            if let Err(failure) = work(controller.clone()) {
+            let _lease = lease;
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(controller.clone())))
+                    .unwrap_or_else(|_| {
+                        Err(internal_failure("firmware worker stopped unexpectedly"))
+                    });
+            if let Err(failure) = outcome {
                 let _ = controller.finish_failure(job.id, failure);
             }
+            // The job must never stay published as active once its worker
+            // ends, or Verify would be ignored and Cancel would keep showing.
+            controller.abandon_job_if_active(job.id);
         });
         *self
             .worker
@@ -500,13 +684,11 @@ impl FirmwareWorkflow {
             FirmwareJobStage::WaitingForBootloader,
             "Waiting for Arduino CLI bootloader/upload transition.",
         )?;
-        self.set_stage(
-            job_id,
-            FirmwareJobStage::Uploading,
-            "Uploading the WVU reference firmware to the selected UNO R4 WiFi.",
-        )?;
+        // Past this point the restore cannot be canceled; the upload is
+        // bounded by its own timeout instead.
+        self.enter_upload_stage(job_id)?;
         let log = cli
-            .upload_input(&binary_path, &upload_board.port, &self.cancel)
+            .upload_input(&binary_path, &upload_board.port)
             .map_err(|error| {
                 cli_failure(
                     FirmwareJobStage::Uploading,
@@ -559,12 +741,10 @@ impl FirmwareWorkflow {
             FirmwareJobStage::VerifyingFirmware,
             "Verifying HELLO, CAPABILITIES, PONG, CRC, and controlled firmware identity.",
         )?;
+        // The job's own lease covers this handshake.
         let result = self
             .session
-            .retry_handshake(ResetTarget {
-                port: board.port.clone(),
-                serial_number: board.serial_number.clone(),
-            })
+            .retry_handshake(&board.port, FaultOrigin::Verification)
             .map_err(session_failure)?;
         let verification = verification_from_handshake(
             FirmwareVerificationKind::WvuProtocolReference,
@@ -590,43 +770,6 @@ impl FirmwareWorkflow {
             .prepare_for_new_recording()
             .map_err(session_failure)?;
         self.finish_success(job_id, FirmwareCompatibility::WvuProtocolCompatible)
-    }
-
-    fn selected_board(
-        &self,
-        port: &str,
-        stage: FirmwareJobStage,
-    ) -> Result<BoardInfo, FirmwareFailure> {
-        if port.trim().is_empty() || port.contains('\0') {
-            return Err(FirmwareFailure::new(
-                FirmwareErrorCategory::BoardNotFound,
-                stage,
-                "Select a detected Arduino UNO R4 WiFi port.",
-                "empty or NUL-containing port",
-            ));
-        }
-        let cli = required_cli(stage)?;
-        let matches: Vec<_> = cli
-            .boards()
-            .map_err(|error| cli_failure(stage, FirmwareErrorCategory::BoardNotFound, error))?
-            .into_iter()
-            .filter(|board| board.port.eq_ignore_ascii_case(port))
-            .collect();
-        match matches.as_slice() {
-            [board] => Ok(board.clone()),
-            [] => Err(FirmwareFailure::new(
-                FirmwareErrorCategory::BoardNotFound,
-                stage,
-                "The selected COM port is not a currently detected UNO R4 WiFi.",
-                port,
-            )),
-            _ => Err(FirmwareFailure::new(
-                FirmwareErrorCategory::AmbiguousBoard,
-                stage,
-                "Multiple supported board identities matched the selected port.",
-                port,
-            )),
-        }
     }
 
     fn ensure_upload_is_safe(&self, stage: FirmwareJobStage) -> Result<(), FirmwareFailure> {
@@ -683,11 +826,27 @@ impl FirmwareWorkflow {
         })
     }
 
-    fn set_message(&self, message: &str) -> Result<(), FirmwareFailure> {
+    /// Moves the job to Uploading unless a cancel arrived first. See
+    /// `cancel_active_job`: both run under the state lock.
+    fn enter_upload_stage(&self, job_id: u64) -> Result<(), FirmwareFailure> {
         let mut runtime = self.lock_state()?;
-        if let Some(job) = runtime.active_job.as_mut() {
-            job.message = message.into();
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(FirmwareFailure::new(
+                FirmwareErrorCategory::Canceled,
+                FirmwareJobStage::Canceled,
+                "Firmware restore was canceled before the upload started.",
+                "cancel requested before upload",
+            ));
         }
+        let job = runtime
+            .active_job
+            .as_mut()
+            .ok_or_else(|| internal_failure("firmware job was not active"))?;
+        if job.id != job_id {
+            return Err(internal_failure("firmware job identity changed"));
+        }
+        job.stage = FirmwareJobStage::Uploading;
+        job.message = "Writing the WVU firmware to the board. Do not unplug the board.".into();
         Ok(())
     }
 
@@ -722,9 +881,7 @@ impl FirmwareWorkflow {
         job.log_path = write_workflow_log(&job).ok();
         let mut runtime = self.lock_state()?;
         verify_active_job(&runtime, job_id)?;
-        runtime.active_job = None;
-        runtime.compatibility = compatibility;
-        runtime.last_restore = Some(job);
+        runtime.finish_job_success(job, compatibility);
         Ok(())
     }
 
@@ -744,10 +901,7 @@ impl FirmwareWorkflow {
         job.log_path = write_workflow_log(&job).ok();
         let mut runtime = self.lock_state()?;
         verify_active_job(&runtime, job_id)?;
-        runtime.active_job = None;
-        runtime.last_failure = Some(failure);
-        runtime.compatibility = FirmwareCompatibility::VerificationFailed;
-        runtime.last_restore = Some(job);
+        runtime.finish_job_failure(job, failure);
         Ok(())
     }
 
@@ -763,11 +917,140 @@ impl FirmwareWorkflow {
         Ok(job.clone())
     }
 
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, WorkflowRuntime>, FirmwareFailure> {
-        self.state
-            .lock()
-            .map_err(|_| internal_failure("firmware state lock poisoned"))
+    /// Last resort after a job worker ends: if the job is still published as
+    /// active (its own finish could not run), record it as failed.
+    fn abandon_job_if_active(&self, job_id: u64) {
+        let mut runtime = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(mut job) = runtime.active_job.clone().filter(|job| job.id == job_id) else {
+            return;
+        };
+        let failure = internal_failure("firmware worker ended without publishing a result");
+        job.stage = FirmwareJobStage::Failed;
+        job.active = false;
+        job.completed_utc = Some(Utc::now());
+        job.message = failure.explanation.clone();
+        job.failure = Some(failure.clone());
+        runtime.finish_job_failure(job, failure);
     }
+
+    /// The runtime holds plain status values that every update writes whole,
+    /// so a panic elsewhere while the lock was held leaves it usable. Status,
+    /// Verify, and job completion keep working instead of failing forever.
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, WorkflowRuntime>, FirmwareFailure> {
+        Ok(self.state.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// The UNO R4 WiFi boards Arduino CLI reports now, after checking `port`.
+fn detected_boards(port: &str, stage: FirmwareJobStage) -> Result<Vec<BoardInfo>, FirmwareFailure> {
+    if port.trim().is_empty() || port.contains('\0') {
+        return Err(FirmwareFailure::new(
+            FirmwareErrorCategory::BoardNotFound,
+            stage,
+            "Select a detected Arduino UNO R4 WiFi port.",
+            "empty or NUL-containing port",
+        ));
+    }
+    required_cli(stage)?
+        .boards()
+        .map_err(|error| cli_failure(stage, FirmwareErrorCategory::BoardNotFound, error))
+}
+
+fn board_on_port(
+    boards: &[BoardInfo],
+    port: &str,
+    stage: FirmwareJobStage,
+) -> Result<BoardInfo, FirmwareFailure> {
+    let matches: Vec<_> = boards
+        .iter()
+        .filter(|board| board.port.eq_ignore_ascii_case(port))
+        .collect();
+    match matches.as_slice() {
+        [board] => Ok((*board).clone()),
+        [] => Err(FirmwareFailure::new(
+            FirmwareErrorCategory::BoardNotFound,
+            stage,
+            "The selected COM port is not a currently detected UNO R4 WiFi.",
+            port,
+        )),
+        _ => Err(FirmwareFailure::new(
+            FirmwareErrorCategory::AmbiguousBoard,
+            stage,
+            "Multiple supported board identities matched the selected port.",
+            port,
+        )),
+    }
+}
+
+/// A USB serial port the operating system lists: name, USB VID, and USB PID.
+type UsbSerialPort = (String, u16, u16);
+
+/// Operating-system USB serial ports. Read-only enumeration; nothing is opened.
+fn uno_usb_serial_ports() -> Vec<UsbSerialPort> {
+    serialport::available_ports()
+        .map(|ports| {
+            ports
+                .into_iter()
+                .filter_map(|port| match port.port_type {
+                    serialport::SerialPortType::UsbPort(usb) => {
+                        Some((port.port_name, usb.vid, usb.pid))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every port that belongs to an Arduino UNO R4 WiFi in either USB mode:
+/// each board Arduino CLI identifies as one (whatever its PID), plus each
+/// Arduino USB serial port with the native WVU PID (0x006D) or the ESP32
+/// upload-bridge PID (0x1002). One physical board shows exactly one of them.
+fn connected_uno_r4_ports(
+    cli_boards: &[BoardInfo],
+    usb_ports: &[UsbSerialPort],
+) -> std::collections::BTreeSet<String> {
+    cli_boards
+        .iter()
+        .filter(|board| board.fqbn == UNO_R4_WIFI_FQBN)
+        .map(|board| board.port.to_ascii_uppercase())
+        .chain(
+            usb_ports
+                .iter()
+                .filter(|(_, vid, pid)| {
+                    *vid == ARDUINO_USB_VID && matches!(*pid, NATIVE_USB_PID | ESP32_BRIDGE_PID)
+                })
+                .map(|(port, _, _)| port.to_ascii_uppercase()),
+        )
+        .collect()
+}
+
+/// Restore WVU Firmware works on exactly one connected UNO R4 WiFi. During a
+/// native-USB restore the board changes PID, COM port, and USB serial number,
+/// so it is found again only as "the one upload port" and then "the one
+/// native port"; with two boards attached the wrong one could be written or
+/// verified. Refuse before anything is touched.
+fn ensure_single_uno_for_restore(
+    cli_boards: &[BoardInfo],
+    usb_ports: &[UsbSerialPort],
+) -> Result<(), FirmwareFailure> {
+    let ports = connected_uno_r4_ports(cli_boards, usb_ports);
+    if ports.len() <= 1 {
+        return Ok(());
+    }
+    let listed = ports.iter().cloned().collect::<Vec<_>>().join(", ");
+    Err(FirmwareFailure::new(
+        FirmwareErrorCategory::AmbiguousBoard,
+        FirmwareJobStage::Preparing,
+        format!(
+            "{} Arduino UNO R4 WiFi boards are connected ({listed}). Restore WVU Firmware updates one board at a time.",
+            ports.len()
+        ),
+        format!("UNO R4 WiFi ports present before restore: {listed}"),
+    )
+    .with_recommended_action(
+        "Disconnect the other UNO boards so only the board to restore is connected. Then select Refresh Board and Restore WVU Firmware again.",
+    ))
 }
 
 fn verify_active_job(runtime: &WorkflowRuntime, job_id: u64) -> Result<(), FirmwareFailure> {
@@ -796,7 +1079,7 @@ fn require_core(cli: &ArduinoCli, stage: FirmwareJobStage) -> Result<(), Firmwar
         FirmwareFailure::new(
             FirmwareErrorCategory::CoreMissing,
             stage,
-            "The included Arduino UNO R4 tools are incomplete. Reinstall the application or contact your instructor.",
+            "The included Arduino UNO R4 tools are incomplete.",
             error.to_string(),
         )
     })
@@ -972,13 +1255,17 @@ fn write_workflow_log(job: &FirmwareJobStatus) -> Result<String, std::io::Error>
         job.id,
         job.started_utc.format("%Y%m%d_%H%M%S")
     ));
-    let cli = ArduinoCli::discover(None).ok();
-    let arduino_cli_version = cli
+    // Versions come from the per-run cache or the runtime manifest; writing a
+    // log (often right after a failure) never starts more tool processes.
+    let known = crate::arduino_cli::known_tool_versions();
+    let runtime = crate::arduino_runtime::active_runtime();
+    let arduino_cli_version = known
         .as_ref()
-        .and_then(|item| item.version().ok().map(|log| log.stdout.trim().to_owned()));
-    let uno_r4_core_version = cli
-        .as_ref()
-        .and_then(|item| item.uno_r4_core_version().ok());
+        .map(|versions| versions.arduino_cli_version.clone())
+        .or_else(|| runtime.map(|paths| paths.cli_version.clone()));
+    let uno_r4_core_version = known
+        .map(|versions| versions.uno_r4_core_version)
+        .or_else(|| runtime.map(|paths| paths.core_version.clone()));
     let log = FirmwareWorkflowLog {
         app_name: "WVU Bioinstrumentation Studio",
         app_version: env!("CARGO_PKG_VERSION"),
@@ -1059,30 +1346,76 @@ fn combined_output(log: &CommandLog) -> String {
 
 fn failure_copy(category: FirmwareErrorCategory) -> (&'static str, &'static str) {
     match category {
-        FirmwareErrorCategory::ArduinoCliMissing => ("Arduino tools unavailable", "Restart the application. If the problem continues, reinstall WVU Bioinstrumentation Studio or contact your instructor."),
-        FirmwareErrorCategory::CoreMissing => ("Arduino tools incomplete", "Reinstall WVU Bioinstrumentation Studio or contact your instructor."),
+        FirmwareErrorCategory::ArduinoCliMissing => ("Arduino tools unavailable", "Select Repair Arduino tools. If that does not help, restart the application, reinstall WVU Bioinstrumentation Studio, or contact your instructor."),
+        FirmwareErrorCategory::CoreMissing => ("Arduino tools incomplete", "Select Repair Arduino tools. If that does not help, reinstall WVU Bioinstrumentation Studio or contact your instructor."),
         FirmwareErrorCategory::ConfirmationRequired => ("Confirmation required", "Confirm that you want to restore the WVU firmware."),
         FirmwareErrorCategory::CompileFailed => ("Firmware preparation failed", "Review the advanced details and contact your instructor if the problem continues."),
-        FirmwareErrorCategory::PortBusy => ("Serial port is busy", "Stop/finalize acquisition and close other serial programs, then retry."),
-        FirmwareErrorCategory::BoardNotFound => ("Board not found", "Refresh boards and select the connected UNO R4 WiFi."),
-        FirmwareErrorCategory::AmbiguousBoard => ("Board identity is ambiguous", "Disconnect other matching boards and retry with the board serial shown."),
-        FirmwareErrorCategory::UploadFailed => ("Upload failed", "Review Arduino CLI output and ensure no other program owns the selected COM port."),
-        FirmwareErrorCategory::ApplicationPortNotFound => ("Application port did not return", "Refresh boards after upload. Do not assume the old COM number."),
+        FirmwareErrorCategory::PortBusy => ("Serial port is busy", "Stop any recording, close Arduino IDE, Serial Monitor, or Arduino Cloud Agent, then try again."),
+        FirmwareErrorCategory::BoardNotFound => ("Board not found", "Select Refresh Board and choose the connected UNO R4 WiFi."),
+        FirmwareErrorCategory::AmbiguousBoard => ("More than one board found", "Unplug the other Arduino boards, then select Refresh Board."),
+        FirmwareErrorCategory::UploadFailed => ("Upload failed", "Close Arduino IDE, Serial Monitor, or Arduino Cloud Agent, press the board Reset button twice, then try Restore WVU Firmware again."),
+        FirmwareErrorCategory::ApplicationPortNotFound => ("Board did not return after the upload", "Select Refresh Board; the COM number may have changed. Then select Verify Firmware."),
         FirmwareErrorCategory::ManualResetRequired => ("Board reset needed", "While Restore WVU Firmware is open, press the board Reset button twice to switch safely to the upload interface."),
         FirmwareErrorCategory::ProtocolVerificationFailed => ("Firmware verification failed", "Use Restore WVU Firmware before using Acquisition."),
         FirmwareErrorCategory::WrongFirmwareIdentity => ("Firmware update required", "Use Restore WVU Firmware before using Acquisition."),
         FirmwareErrorCategory::Canceled => ("Operation canceled", "Reconnect the board if needed, then restore the WVU firmware again."),
+        FirmwareErrorCategory::UploadCannotBeCanceled => ("The board is being written", "Wait for the restore to finish. Do not unplug the board."),
+        FirmwareErrorCategory::ToolTimedOut => ("Arduino tools stopped responding", "Unplug the board and plug it back in, select Refresh Board, then try again. If it keeps happening, restart the application."),
         FirmwareErrorCategory::InternalError => ("Firmware workflow error", "Copy diagnostics and contact the instructor/developer."),
     }
 }
 
-fn session_failure(error: crate::session::SessionError) -> FirmwareFailure {
+fn session_failure(error: SessionError) -> FirmwareFailure {
+    if matches!(error, SessionError::Busy(_)) {
+        return busy_failure(FirmwareJobStage::ClosingSerialSession, error);
+    }
     FirmwareFailure::new(
         FirmwareErrorCategory::PortBusy,
         FirmwareJobStage::ClosingSerialSession,
         error.to_string(),
         error.to_string(),
     )
+}
+
+/// Another operation in this application owns the board. Waiting, not
+/// closing other programs, is the remedy.
+fn busy_failure(stage: FirmwareJobStage, error: SessionError) -> FirmwareFailure {
+    let message = error.to_string();
+    FirmwareFailure::new(
+        FirmwareErrorCategory::PortBusy,
+        stage,
+        message.clone(),
+        format!("serial lease refused: {message}"),
+    )
+    .with_recommended_action("Wait for the current operation to finish, then try again.")
+}
+
+/// Verify could not open the port, so the board was not examined. Windows
+/// reports a busy port and a removed board alike; the handshake's read-only
+/// enumeration (its failure category) tells them apart.
+fn unopened_port_failure(
+    port: &str,
+    diagnostics: &crate::session::ConnectionDiagnostics,
+    technical_details: String,
+) -> FirmwareFailure {
+    if diagnostics.failure_category == Some(ConnectionFailureCategory::DeviceDisconnected) {
+        FirmwareFailure::new(
+            FirmwareErrorCategory::BoardNotFound,
+            FirmwareJobStage::VerifyingFirmware,
+            format!("{port} is no longer connected. The board may have been unplugged or moved to another USB port."),
+            technical_details,
+        )
+    } else {
+        FirmwareFailure::new(
+            FirmwareErrorCategory::PortBusy,
+            FirmwareJobStage::VerifyingFirmware,
+            format!("{port} could not be opened. Another program is probably using it, so the firmware was not checked."),
+            technical_details,
+        )
+        .with_recommended_action(
+            "Close Arduino IDE, Serial Monitor, or Arduino Cloud Agent, then select Verify Firmware again.",
+        )
+    }
 }
 
 fn io_failure(stage: FirmwareJobStage, error: std::io::Error) -> FirmwareFailure {
@@ -1103,6 +1436,23 @@ fn cli_failure(
         .command_log()
         .map(combined_output)
         .unwrap_or_else(|| error.to_string());
+    if matches!(error, crate::arduino_cli::CliError::TimedOut { .. }) {
+        let failure = FirmwareFailure::new(
+            FirmwareErrorCategory::ToolTimedOut,
+            stage,
+            error.to_string(),
+            details,
+        );
+        // A stopped upload may have left the board part-way written; the
+        // double reset puts it back into upload mode for a new restore.
+        return if stage == FirmwareJobStage::Uploading {
+            failure.with_recommended_action(
+                "Unplug the board and plug it back in. Then select Refresh Board, press the board Reset button twice, and select Restore WVU Firmware again.",
+            )
+        } else {
+            failure
+        };
+    }
     FirmwareFailure::new(category, stage, error.to_string(), details)
 }
 
@@ -1172,7 +1522,29 @@ mod tests {
 
     #[test]
     fn controlled_identity_requires_all_protocol_evidence() {
-        let diagnostics = crate::session::ConnectionDiagnostics {
+        let diagnostics = verified_diagnostics();
+        assert!(
+            verification_from_handshake(
+                FirmwareVerificationKind::WvuProtocolReference,
+                &diagnostics,
+                true
+            )
+            .compatible
+        );
+        let mut wrong = diagnostics;
+        wrong.firmware_build = Some(9);
+        assert!(
+            !verification_from_handshake(
+                FirmwareVerificationKind::WvuProtocolReference,
+                &wrong,
+                true
+            )
+            .compatible
+        );
+    }
+
+    fn verified_diagnostics() -> crate::session::ConnectionDiagnostics {
+        crate::session::ConnectionDiagnostics {
             selected_port: "COM12".into(),
             board: "UNO".into(),
             fqbn: UNO_R4_WIFI_FQBN.into(),
@@ -1214,25 +1586,7 @@ mod tests {
             same_serial_present_after_error: None,
             uno_r4_present_after_error: None,
             port_enumeration_error: None,
-        };
-        assert!(
-            verification_from_handshake(
-                FirmwareVerificationKind::WvuProtocolReference,
-                &diagnostics,
-                true
-            )
-            .compatible
-        );
-        let mut wrong = diagnostics;
-        wrong.firmware_build = Some(9);
-        assert!(
-            !verification_from_handshake(
-                FirmwareVerificationKind::WvuProtocolReference,
-                &wrong,
-                true
-            )
-            .compatible
-        );
+        }
     }
 
     #[test]
@@ -1271,6 +1625,408 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("expected an ambiguous-board failure"));
         assert_eq!(error.category, FirmwareErrorCategory::AmbiguousBoard);
+    }
+
+    fn restore_job(workflow: &FirmwareWorkflow, port: &str) -> FirmwareJobStatus {
+        workflow.new_job(
+            FirmwareJobKind::RestoreReference,
+            None,
+            Some(port.into()),
+            None,
+        )
+    }
+
+    fn failure(category: FirmwareErrorCategory) -> FirmwareFailure {
+        FirmwareFailure::new(category, FirmwareJobStage::Failed, "test", "test")
+    }
+
+    #[test]
+    fn a_failed_restore_on_one_port_does_not_block_a_board_verified_on_another() {
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        let mut runtime = workflow
+            .lock_state()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        let job = restore_job(&workflow, "COM9");
+        runtime.begin_job(job.clone());
+        assert!(!runtime.acquisition_allowed("COM9"));
+        runtime.finish_job_failure(job, failure(FirmwareErrorCategory::UploadFailed));
+        assert!(!runtime.acquisition_allowed("COM9"));
+
+        runtime.record_verification("COM12", true, None);
+        assert!(runtime.acquisition_allowed("COM12"));
+        assert!(runtime.acquisition_allowed("com12"));
+        // The failed restore stays visible as history without binding Start.
+        assert!(runtime.last_restore.is_some());
+        assert!(!runtime.acquisition_allowed("COM9"));
+    }
+
+    #[test]
+    fn start_is_refused_on_a_port_other_than_the_verified_one() {
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        let mut runtime = workflow
+            .lock_state()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        assert!(!runtime.acquisition_allowed("COM12"));
+        runtime.record_verification("COM12", true, None);
+        assert_eq!(runtime.verified_port.as_deref(), Some("COM12"));
+        assert!(!runtime.acquisition_allowed("COM13"));
+        assert!(runtime.acquisition_allowed("COM12"));
+    }
+
+    #[test]
+    fn failed_verification_and_job_start_clear_the_verified_port() {
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        let mut runtime = workflow
+            .lock_state()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        runtime.record_verification("COM12", true, None);
+        runtime.record_verification(
+            "COM12",
+            false,
+            Some(failure(FirmwareErrorCategory::ProtocolVerificationFailed)),
+        );
+        assert_eq!(runtime.verified_port, None);
+        assert_eq!(
+            runtime.compatibility,
+            FirmwareCompatibility::VerificationFailed
+        );
+        assert!(runtime.last_failure.is_some());
+        assert!(!runtime.acquisition_allowed("COM12"));
+
+        runtime.record_verification("COM12", true, None);
+        assert!(runtime.last_failure.is_none());
+        let job = restore_job(&workflow, "COM12");
+        runtime.begin_job(job);
+        assert_eq!(runtime.verified_port, None);
+        assert!(!runtime.acquisition_allowed("COM12"));
+    }
+
+    #[test]
+    fn a_successful_restore_proves_the_port_where_the_board_returned() {
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        let mut runtime = workflow
+            .lock_state()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        let mut job = restore_job(&workflow, "COM34");
+        runtime.begin_job(job.clone());
+        job.final_port = Some("COM35".into());
+        runtime.finish_job_success(job, FirmwareCompatibility::WvuProtocolCompatible);
+        assert_eq!(runtime.verified_port.as_deref(), Some("COM35"));
+        assert!(runtime.acquisition_allowed("COM35"));
+        assert!(!runtime.acquisition_allowed("COM34"));
+    }
+
+    #[test]
+    fn verification_never_changes_compatibility_while_a_job_is_active() {
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        let mut runtime = workflow
+            .lock_state()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        runtime.begin_job(restore_job(&workflow, "COM12"));
+        runtime.record_verification("COM12", true, None);
+        assert_eq!(
+            runtime.compatibility,
+            FirmwareCompatibility::UploadInProgress
+        );
+        assert_eq!(runtime.verified_port, None);
+        assert!(!runtime.acquisition_allowed("COM12"));
+    }
+
+    #[test]
+    fn verify_and_restore_are_refused_while_another_operation_owns_the_board() {
+        let session = SessionController::default();
+        let workflow = FirmwareWorkflow::new(session.clone());
+        {
+            let mut runtime = workflow
+                .lock_state()
+                .unwrap_or_else(|error| panic!("{error:?}"));
+            runtime.record_verification("COM12", true, None);
+        }
+        let _job = session
+            .serial_ownership()
+            .try_claim(SerialOwner::FirmwareJob)
+            .unwrap_or_else(|busy| panic!("{busy}"));
+        let refused = workflow
+            .verify_existing_reference("COM12".into())
+            .err()
+            .unwrap_or_else(|| panic!("Verify must wait for the restore"));
+        assert_eq!(refused.category, FirmwareErrorCategory::PortBusy);
+        assert!(refused.explanation.contains("being restored"));
+        let status = workflow
+            .status()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(
+            status.compatibility,
+            FirmwareCompatibility::WvuProtocolCompatible
+        );
+        assert_eq!(status.verified_port.as_deref(), Some("COM12"));
+
+        let restore = workflow
+            .start_restore_reference(RestoreReferenceRequest {
+                port: "COM12".into(),
+                confirmation: true,
+            })
+            .err()
+            .unwrap_or_else(|| panic!("a second job must be refused"));
+        assert_eq!(restore.category, FirmwareErrorCategory::PortBusy);
+        assert!(workflow
+            .status()
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .job
+            .is_none());
+    }
+
+    #[test]
+    fn an_unopened_port_is_busy_unless_the_board_is_gone() {
+        let mut diagnostics = crate::session::ConnectionDiagnostics {
+            port_opened: false,
+            failure_category: Some(ConnectionFailureCategory::PortBusy),
+            ..verified_diagnostics()
+        };
+        let busy = unopened_port_failure("COM12", &diagnostics, "Access is denied.".into());
+        assert_eq!(busy.category, FirmwareErrorCategory::PortBusy);
+        assert!(busy.recommended_action.contains("Arduino IDE"));
+        assert!(busy.recommended_action.contains("Verify Firmware"));
+        assert!(!busy.recommended_action.contains("Restore"));
+
+        diagnostics.failure_category = Some(ConnectionFailureCategory::DeviceDisconnected);
+        let gone = unopened_port_failure("COM12", &diagnostics, "not found".into());
+        assert_eq!(gone.category, FirmwareErrorCategory::BoardNotFound);
+        assert!(gone.recommended_action.contains("Refresh Board"));
+    }
+
+    #[test]
+    fn firmware_failures_serialize_with_student_facing_fields() {
+        let value = serde_json::to_value(failure(FirmwareErrorCategory::PortBusy))
+            .unwrap_or_else(|error| panic!("{error}"));
+        for field in ["category", "title", "explanation", "recommended_action"] {
+            assert!(value.get(field).is_some(), "{field}");
+        }
+        assert_eq!(value["category"], "port_busy");
+    }
+
+    #[test]
+    fn cancel_is_refused_once_the_board_is_being_written() {
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        // With no job, cancel is a harmless status read.
+        assert!(workflow
+            .cancel_active_job()
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .job
+            .is_none());
+        let job = restore_job(&workflow, "COM12");
+        let _lease = workflow
+            .session
+            .serial_ownership()
+            .try_claim(SerialOwner::FirmwareJob)
+            .unwrap_or_else(|busy| panic!("{busy}"));
+        workflow
+            .lock_state()
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .begin_job(job.clone());
+        assert!(workflow.has_active_job());
+
+        // Before the upload a cancel is accepted, and the worker then
+        // refuses to start writing the board.
+        workflow
+            .set_stage(job.id, FirmwareJobStage::Compiling, "compiling")
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        workflow
+            .cancel_active_job()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        assert!(workflow.cancel.load(Ordering::Acquire));
+        let canceled = workflow
+            .enter_upload_stage(job.id)
+            .err()
+            .unwrap_or_else(|| panic!("a canceled restore must not upload"));
+        assert_eq!(canceled.category, FirmwareErrorCategory::Canceled);
+        assert_eq!(
+            workflow
+                .status()
+                .unwrap_or_else(|error| panic!("{error:?}"))
+                .job
+                .map(|job| job.stage),
+            Some(FirmwareJobStage::Compiling)
+        );
+
+        // From the upload onward a cancel is refused and changes nothing.
+        workflow.cancel.store(false, Ordering::Release);
+        workflow
+            .enter_upload_stage(job.id)
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        for stage in [
+            FirmwareJobStage::Uploading,
+            FirmwareJobStage::WaitingForApplicationPort,
+            FirmwareJobStage::VerifyingFirmware,
+        ] {
+            workflow
+                .set_stage(job.id, stage, "writing")
+                .unwrap_or_else(|error| panic!("{error:?}"));
+            let refused = workflow
+                .cancel_active_job()
+                .err()
+                .unwrap_or_else(|| panic!("cancel must be refused at {stage:?}"));
+            assert_eq!(
+                refused.category,
+                FirmwareErrorCategory::UploadCannotBeCanceled
+            );
+            assert_eq!(refused.stage, stage);
+            assert!(refused.recommended_action.contains("Do not unplug"));
+            assert!(!workflow.cancel.load(Ordering::Acquire));
+        }
+        assert!(!FirmwareJobStage::WaitingForBootloader.is_past_cancel_point());
+        assert!(!FirmwareJobStage::Compiling.is_past_cancel_point());
+    }
+
+    fn native_board(port: &str) -> BoardInfo {
+        BoardInfo {
+            usb_pid: Some(NATIVE_USB_PID),
+            ..board(port, None)
+        }
+    }
+
+    #[test]
+    fn restore_is_refused_while_more_than_one_uno_is_connected() {
+        let native = native_board("COM34");
+        let bridge = board("COM12", Some("ESP32"));
+        // One board, seen by both Arduino CLI and Windows, is one board.
+        assert!(ensure_single_uno_for_restore(
+            std::slice::from_ref(&native),
+            &[("com34".into(), ARDUINO_USB_VID, NATIVE_USB_PID)]
+        )
+        .is_ok());
+        assert!(ensure_single_uno_for_restore(std::slice::from_ref(&bridge), &[]).is_ok());
+
+        // A native-USB board and a bridge-mode board: the F-2 case.
+        let refused = ensure_single_uno_for_restore(&[native.clone(), bridge.clone()], &[])
+            .err()
+            .unwrap_or_else(|| panic!("two UNO boards must be refused"));
+        assert_eq!(refused.category, FirmwareErrorCategory::AmbiguousBoard);
+        assert_eq!(refused.stage, FirmwareJobStage::Preparing);
+        assert!(refused.recommended_action.starts_with(
+            "Disconnect the other UNO boards so only the board to restore is connected."
+        ));
+        assert!(refused.explanation.contains("COM12, COM34"));
+
+        // Two native or two bridge boards are refused as well.
+        assert!(
+            ensure_single_uno_for_restore(&[native.clone(), native_board("COM35")], &[]).is_err()
+        );
+        assert!(ensure_single_uno_for_restore(
+            &[bridge.clone(), board("COM13", Some("ESP32-B"))],
+            &[]
+        )
+        .is_err());
+        // A second UNO that only Windows lists (any of the two PIDs) counts.
+        for pid in [NATIVE_USB_PID, ESP32_BRIDGE_PID] {
+            assert!(ensure_single_uno_for_restore(
+                std::slice::from_ref(&native),
+                &[("COM40".into(), ARDUINO_USB_VID, pid)]
+            )
+            .is_err());
+        }
+        // Other USB serial devices do not.
+        assert!(ensure_single_uno_for_restore(
+            &[native],
+            &[
+                ("COM5".into(), 0x0403, 0x6001),
+                ("COM6".into(), ARDUINO_USB_VID, 0x0069),
+            ]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_tool_timeout_is_reported_with_its_own_category() {
+        let timed_out = || crate::arduino_cli::CliError::TimedOut {
+            log: Box::new(CommandLog {
+                command: vec!["arduino-cli".into(), "upload".into()],
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_ms: 180_000,
+                canceled: false,
+                timed_out: true,
+            }),
+            timeout_seconds: 180,
+        };
+        let upload = cli_failure(
+            FirmwareJobStage::Uploading,
+            FirmwareErrorCategory::UploadFailed,
+            timed_out(),
+        );
+        assert_eq!(upload.category, FirmwareErrorCategory::ToolTimedOut);
+        assert!(upload.explanation.contains("180 seconds"));
+        assert!(upload.recommended_action.contains("Reset button twice"));
+        let scan = cli_failure(
+            FirmwareJobStage::Preparing,
+            FirmwareErrorCategory::BoardNotFound,
+            timed_out(),
+        );
+        assert_eq!(scan.category, FirmwareErrorCategory::ToolTimedOut);
+        assert!(scan.recommended_action.contains("Refresh Board"));
+    }
+
+    #[test]
+    fn tool_problems_never_suggest_a_network_command() {
+        for category in [
+            FirmwareErrorCategory::ArduinoCliMissing,
+            FirmwareErrorCategory::CoreMissing,
+        ] {
+            let (_, action) = failure_copy(category);
+            assert!(action.contains("Repair Arduino tools"), "{action}");
+            assert!(!action.contains("arduino-cli"), "{action}");
+        }
+    }
+
+    #[test]
+    fn a_job_whose_worker_ended_never_blocks_close_or_verify() {
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        let job = restore_job(&workflow, "COM12");
+        let lease = workflow
+            .session
+            .serial_ownership()
+            .try_claim(SerialOwner::FirmwareJob)
+            .unwrap_or_else(|busy| panic!("{busy}"));
+        workflow
+            .lock_state()
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .begin_job(job.clone());
+        assert!(workflow.has_active_job());
+
+        // A panic while the state lock is held poisons it.
+        let poisoner = workflow.clone();
+        let panicked = thread::spawn(move || {
+            let _guard = poisoner.state.lock();
+            panic!("simulated failure while the firmware state was locked");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(workflow.state.is_poisoned());
+
+        // The worker's lease is gone once it unwinds: closing is allowed even
+        // though the job is still published.
+        drop(lease);
+        assert!(!workflow.has_active_job());
+
+        // The worker's last-resort cleanup still clears the job, and status
+        // and Verify keep working on the poisoned lock.
+        workflow.abandon_job_if_active(job.id);
+        let status = workflow
+            .status()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        assert!(status.job.is_none());
+        assert_eq!(
+            status.last_restore.map(|restore| restore.stage),
+            Some(FirmwareJobStage::Failed)
+        );
+        workflow
+            .lock_state()
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .record_verification("COM12", true, None);
+        assert!(workflow
+            .is_acquisition_allowed("COM12")
+            .unwrap_or_else(|error| panic!("{error:?}")));
     }
 
     #[test]

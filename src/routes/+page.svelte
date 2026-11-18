@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { confirm, open } from '@tauri-apps/plugin-dialog';
   import LivePlot from '$lib/components/LivePlot.svelte';
   import LabManager from '$lib/components/LabManager.svelte';
   import type { LabProfile } from '$lib/labs';
   import OperatingModeControl from '$lib/components/OperatingModeControl.svelte';
   import { connectionActions } from '$lib/connection-actions';
+  import { commandErrorDetail, commandErrorRepairable, formatCommandError } from '$lib/errors';
+  import { FIRMWARE_WRITE_NOTICE, firmwareJobView } from '$lib/firmware-job';
   import { durationRequest, isTimedDurationValid, type RecordingDurationRequest } from '$lib/duration';
   import {
     displayUnitLabel,
@@ -75,7 +78,8 @@
     duration?: Duration; elapsed_seconds: number; remaining_seconds?: number;
     available_disk_bytes?: number; storage_warning?: string; stop_reason?: string;
     connection_diagnostics?: ConnectionDiagnostics;
-    last_error?: string; last_summary?: Summary; calibration?: RecordingCalibration;
+    last_error?: string; fault_origin?: FaultOrigin | null;
+    last_summary?: Summary; calibration?: RecordingCalibration;
     digital_output_mask?: number;
     display_origin_timestamp_us?: number;
   };
@@ -96,13 +100,22 @@
     same_serial_present_after_error?: boolean; uno_r4_present_after_error?: boolean;
     port_enumeration_error?: string;
   };
-  type ResetRetryResult = {
-    original_port: string; final_port?: string; handshake_succeeded: boolean;
-    diagnostics: ConnectionDiagnostics;
-  };
+  type FaultOrigin = 'verification' | 'connection' | 'recording' | 'storage' | 'request';
   type HandshakeRetryResult = { handshake_succeeded: boolean; diagnostics: ConnectionDiagnostics };
-  type FirmwareJob = { kind: string; stage: string; active: boolean; message: string };
-  type FirmwareWorkflowStatus = { compatibility: string; job?: FirmwareJob };
+  type FirmwareFailure = {
+    category: string; stage: string; title: string; explanation: string;
+    recommended_action: string; technical_details: string;
+  };
+  type FirmwareJob = {
+    id: number; kind: string; stage: string; active: boolean; message: string;
+    original_port?: string | null; final_port?: string | null;
+    failure?: FirmwareFailure | null; log_path?: string | null;
+  };
+  type FirmwareWorkflowStatus = {
+    compatibility: string; job?: FirmwareJob | null;
+    last_restore?: FirmwareJob | null; last_failure?: FirmwareFailure | null;
+    verified_port?: string | null;
+  };
   type FirmwareVerification = { declared_kind: string; compatible: boolean; protocol_version?: string; identity?: { protocol_version: string; firmware_build: number; device_id: number }; bytes_received?: number; valid_frames?: number; crc_failures?: number; explanation: string };
   type FirmwareEnvironment = { cli_path?: string; cli_version?: string; uno_r4_core_version?: string; expected_fqbn: string; boards: Board[]; ready: boolean; problem?: string };
   type ArduinoRuntimeStatus = { ready: boolean; cli_version: string; core_version: string; message: string };
@@ -127,7 +140,6 @@
   let plotTimeWindowInput = String(DEFAULT_PLOT_TIME_WINDOW_SECONDS);
   let boards: Board[] = [];
   let selectedPort = '';
-  let selectedBoardUsesNativeUsb = false;
   let boardScanStatus: 'idle' | 'scanning' | 'complete' | 'error' = 'idle';
   let boardScanLastCompleted = '';
   let boardScanError = '';
@@ -176,13 +188,25 @@
   let startInFlight = false;
   let displayedSummaryPath = '';
   let startReadiness: RecordingStartReadiness = { canStart: false };
-  let arduinoToolsReady = false;
+  // Preparing until the first check finishes; Needs attention (with the
+  // problem text and Repair Arduino tools) if preparation or the check fails.
+  let arduinoToolsState: 'preparing' | 'ready' | 'failed' = 'preparing';
+  let arduinoToolsProblem = '';
+  let arduinoToolsDetail = '';
+  // False when the tools are missing or damaged: only a reinstall helps.
+  let arduinoToolsRepairable = true;
+  // Why the window did not close (for example during a firmware restore).
+  let closeBlockedNotice = '';
   let session: SessionStatus = {
     state: 'Disconnected', board: '', port: '', protocol_version: '0.1', simulator: false,
     samples: 0, packets: 0, measured_rate_hz: 0, integrity: emptyIntegrity,
     elapsed_seconds: 0
   };
-  let polling = false;
+  // The session status read in progress, if any (see `pollSession`).
+  let pollInFlight: Promise<void> | undefined;
+  // Session state seen by the previous poll, so a fault message is set once
+  // when the session becomes Faulted instead of on every 40 ms poll.
+  let lastPolledState = 'Disconnected';
   let firmwareCompatibility = 'unknown';
   let firmwareWorkflow: FirmwareWorkflowStatus = { compatibility: 'unknown' };
   let acquisitionProfiles: AcquisitionProfile[] = [];
@@ -278,19 +302,30 @@
   // therefore still permit board selection, retry, and firmware restoration.
   $: boardOperationBusy = boardScanInFlight
     || Boolean(activeOperation)
-    || firmwareWorkflow.job?.active === true;
+    || firmwareWorkflow.job?.active === true
+    || startInFlight;
+  // Start is allowed only on the port where compatible firmware was proven,
+  // matching the backend's `is_acquisition_allowed`.
+  $: firmwareReadyOnSelectedPort = firmwareCompatibility === 'wvu_protocol_compatible'
+    && Boolean(selectedPort)
+    && (firmwareWorkflow.verified_port ?? '').toUpperCase() === selectedPort.toUpperCase();
   $: boardControlState = boardControls({
     selectedBoard: Boolean(selectedPort),
     recordingActive: isActive,
     boardOperationBusy,
-    arduinoToolsReady,
+    arduinoToolsReady: arduinoToolsState === 'ready',
     firmwareStatus: firmwareCompatibility
   });
+  $: firmwareJobDisplay = firmwareJobView(firmwareWorkflow.job);
+  // Repair replaces the tools a recording or board operation is using, so it
+  // waits until none is running (the backend refuses it as well).
+  $: canRepairArduinoTools = !isActive && !boardOperationBusy;
   $: startReadiness = recordingStartReadiness({
     source,
     selectedBoard: Boolean(selectedPort),
-    firmwareReady: firmwareCompatibility === 'wvu_protocol_compatible',
+    firmwareReady: firmwareReadyOnSelectedPort,
     sessionState: session.state,
+    faultOrigin: session.fault_origin,
     boardOperationBusy,
     startInFlight,
     activeProfile: Boolean(activeProfile),
@@ -310,11 +345,8 @@
     selectedPort,
     failureCategory: session.connection_diagnostics?.failure_category
   });
-  // The controlled native-USB reference uses the RA4M1 CDC port (PID 0x006D).
-  // Arduino CLI cannot safely perform its regular 1200-bps touch through that
-  // port. Restore WVU Firmware provides the explicit double-Reset fallback.
-  $: selectedBoardUsesNativeUsb = boards.find((board) => board.port === selectedPort)?.usb_pid === 0x006d;
-  $: canReset = recoveryActions.canReset && !selectedBoardUsesNativeUsb;
+  // Recovery is Retry connection, then Verify Firmware, then Restore WVU
+  // Firmware (which handles the native-USB double reset).
   $: canRetryHandshake = recoveryActions.canRetryHandshake;
   // BMEG records stream continuously. This deliberately conservative estimate includes
   // the profile-defined raw fields plus a CSV of the same session; it is guidance,
@@ -361,16 +393,25 @@
     }
   }
 
+  const TOOLS_CHECK_FAILED = 'The Arduino tools could not be checked. Select Repair Arduino tools. If that does not help, restart the application or contact your instructor.';
+
+  function arduinoToolsFailed(problem: string, detail = '', repairable = true) {
+    arduinoToolsState = 'failed';
+    arduinoToolsProblem = problem;
+    arduinoToolsDetail = detail;
+    arduinoToolsRepairable = repairable;
+    firmwareEnvironment = { expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false, problem };
+  }
+
   async function refreshEnvironmentSummary() {
     try {
       firmwareEnvironment = await invoke<FirmwareEnvironment>('firmware_environment');
-      arduinoToolsReady = firmwareEnvironment.ready;
-    } catch (error) {
-      firmwareEnvironment = {
-        expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false,
-        problem: 'Arduino tools could not be prepared. Reinstall the application or ask your instructor for help.'
-      };
-      arduinoToolsReady = false;
+      arduinoToolsState = firmwareEnvironment.ready ? 'ready' : 'failed';
+      arduinoToolsProblem = firmwareEnvironment.ready ? '' : firmwareEnvironment.problem ?? TOOLS_CHECK_FAILED;
+      arduinoToolsDetail = '';
+      arduinoToolsRepairable = true;
+    } catch {
+      arduinoToolsFailed(TOOLS_CHECK_FAILED);
     }
   }
 
@@ -380,21 +421,40 @@
         { title: 'Preparing Arduino tools…', stage: 'Setting up the included offline Arduino tools for this computer.', cancelable: false },
         () => invoke<ArduinoRuntimeStatus>('prepare_arduino_runtime')
       );
-      arduinoToolsReady = runtime.ready;
-      if (!runtime.ready) {
-        firmwareEnvironment = {
-          expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false,
-          problem: 'Arduino tools are not ready. Reinstall the application or ask your instructor for help.'
-        };
+      if (runtime.ready) {
+        arduinoToolsState = 'ready';
+        arduinoToolsProblem = '';
+        arduinoToolsDetail = '';
+      } else {
+        arduinoToolsFailed(TOOLS_CHECK_FAILED);
       }
     } catch (error) {
-      arduinoToolsReady = false;
-      firmwareEnvironment = {
-        expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false,
-        problem: 'Arduino tools could not be prepared. Reinstall the application or ask your instructor for help.'
-      };
-      statusMessage = `Arduino tools need attention. ${String(error)}`;
+      // An `ArduinoToolsFailure`: title, explanation, and Repair or reinstall.
+      arduinoToolsFailed(formatCommandError(error), commandErrorDetail(error), commandErrorRepairable(error));
+      statusMessage = `Arduino tools need attention. ${arduinoToolsProblem}`;
     }
+  }
+
+  /** Extracts the included offline tools again; nothing is downloaded. */
+  async function repairArduinoTools() {
+    if (!canRepairArduinoTools) return;
+    try {
+      await runOperation(
+        { title: 'Repairing Arduino tools…', stage: 'Extracting the included offline Arduino tools again. This can take a few minutes.', cancelable: false },
+        () => invoke<ArduinoRuntimeStatus>('repair_arduino_runtime')
+      );
+      await refreshEnvironmentSummary();
+    } catch (error) {
+      arduinoToolsFailed(formatCommandError(error), commandErrorDetail(error), commandErrorRepairable(error));
+      statusMessage = `Arduino tools were not repaired. ${arduinoToolsProblem}`;
+      return;
+    }
+    if (arduinoToolsState !== 'ready') {
+      statusMessage = `Arduino tools still need attention. ${arduinoToolsProblem}`;
+      return;
+    }
+    await refreshBoards('startup');
+    statusMessage = `Arduino tools were repaired. ${statusMessage}`;
   }
 
   async function verifySelectedFirmware(
@@ -415,7 +475,10 @@
           return verification;
         } catch (error) {
           await refreshFirmwareCompatibility();
-          statusMessage = 'The Arduino could not be verified. Refresh Board, then try Restore WVU Firmware if the problem continues.';
+          await pollSession();
+          // For example "Serial port is busy … close Arduino IDE … Verify
+          // Firmware again"; the previous firmware status is unchanged.
+          statusMessage = formatCommandError(error);
           return undefined;
         }
       }
@@ -451,9 +514,29 @@
     }
   }
 
-  async function pollSession() {
-    if (polling) return;
-    polling = true;
+  /** The 40 ms timer skips a tick while a status read is still running. */
+  function pollSessionTick() {
+    if (!pollInFlight) void pollSession();
+  }
+
+  /**
+   * Reads a fresh session status. A command that changed the session awaits
+   * this and then sets its own message: a read that started before the
+   * command finished is waited for first, so it cannot overwrite that message
+   * afterwards with a stale or generic one.
+   */
+  async function pollSession(): Promise<void> {
+    while (pollInFlight) await pollInFlight;
+    const poll = readSessionStatus();
+    pollInFlight = poll;
+    try {
+      await poll;
+    } finally {
+      if (pollInFlight === poll) pollInFlight = undefined;
+    }
+  }
+
+  async function readSessionStatus() {
     try {
       session = await invoke<SessionStatus>('get_session_status');
       samples = await invoke<Point[]>('get_recent_display_data', {
@@ -461,17 +544,22 @@
         maxPoints: MAX_RENDERED_DISPLAY_POINTS
       });
       displayRevision += 1;
-      if (session.state === 'Faulted' && session.last_error) {
-        statusMessage = 'The Arduino connection needs attention. Verify the firmware or refresh the board before starting a new recording.';
+      // Only on the transition into Faulted, so a more specific message (for
+      // example a firmware restore result) is not overwritten every poll.
+      if (session.state === 'Faulted' && session.last_error && lastPolledState !== 'Faulted') {
+        statusMessage = session.fault_origin === 'storage'
+          ? 'The recording was not saved completely. Check the Project folder before starting a new recording.'
+          : session.fault_origin === 'request'
+            ? recordingFaultMessage()
+            : 'The Arduino connection needs attention. Verify the firmware or refresh the board before starting a new recording.';
       }
+      lastPolledState = session.state;
       if (session.last_summary && session.last_summary.bmeg_path !== displayedSummaryPath) {
         displayedSummaryPath = session.last_summary.bmeg_path;
         statusMessage = `${session.last_summary.recording_status}: ${session.last_summary.samples} validated samples at ${session.last_summary.measured_rate_hz.toFixed(3)} Hz.`;
       }
     } catch (error) {
       statusMessage = 'The recording status could not be updated. Try reconnecting the Arduino.';
-    } finally {
-      polling = false;
     }
   }
 
@@ -481,6 +569,9 @@
       firmwareWorkflow = await invoke<FirmwareWorkflowStatus>('get_firmware_workflow_status');
       firmwareCompatibility = firmwareWorkflow.compatibility;
       if (firmwareJobWasActive && !firmwareWorkflow.job?.active) {
+        closeBlockedNotice = '';
+        const finishedJob = firmwareWorkflow.last_restore;
+        const finishedFailure = finishedJob?.failure ?? firmwareWorkflow.last_failure;
         // A native-USB restore intentionally returns on a different COM port
         // from the ESP32 bridge used for upload. Refresh exactly once after a
         // terminal firmware job so the selected board cannot remain stale.
@@ -488,6 +579,12 @@
         // Refresh the independent acquisition state immediately as well; it
         // must not wait for a route change or retain a stale Faulted snapshot.
         await pollSession();
+        // Report the restore result last, so the board count does not hide it.
+        statusMessage = finishedJob?.stage === 'complete'
+          ? `WVU Firmware was restored and verified on ${finishedJob.final_port ?? selectedPort}.`
+          : finishedFailure
+            ? `WVU Firmware was not restored. ${formatCommandError(finishedFailure)}`
+            : 'WVU Firmware was not restored. Open Advanced details for more information.';
       }
     } catch {
       firmwareCompatibility = 'unknown';
@@ -500,7 +597,7 @@
       await invoke('cancel_firmware_job');
       await refreshFirmwareCompatibility();
     } catch (error) {
-      statusMessage = `Firmware job cancellation error: ${String(error)}`;
+      statusMessage = formatCommandError(error);
     }
   }
 
@@ -540,14 +637,18 @@
       { title: 'Restore WVU Firmware', kind: 'warning', okLabel: 'Restore firmware', cancelLabel: 'Cancel' }
     );
     if (!approved) return;
+    const port = selectedPort;
     try {
-      firmwareWorkflow = {
-        ...firmwareWorkflow,
-        job: await invoke<FirmwareJob>('restore_wvu_reference_firmware', { request: { port: selectedPort, confirmation: true } })
-      };
+      // The command checks the board before the job starts; keep conflicting
+      // actions blocked while it does.
+      const job = await runOperation(
+        { title: 'Restoring WVU Firmware…', stage: `Checking ${port} before the restore begins.`, cancelable: false },
+        () => invoke<FirmwareJob>('restore_wvu_reference_firmware', { request: { port, confirmation: true } })
+      );
+      firmwareWorkflow = { ...firmwareWorkflow, job };
       statusMessage = 'Restoring WVU Firmware. The board will be verified when the update finishes.';
     } catch (error) {
-      statusMessage = `WVU Firmware could not be restored: ${String(error)}`;
+      statusMessage = `WVU Firmware could not be restored. ${formatCommandError(error)}`;
     }
   }
 
@@ -937,15 +1038,39 @@
   }
 
   function recordingFaultMessage(): string {
-    switch (session.connection_diagnostics?.failure_category) {
+    const category = session.connection_diagnostics?.failure_category;
+    const nextStep = session.connection_diagnostics?.recommended_action ?? 'Select Retry connection, or Refresh Board.';
+    // A storage fault is never a firmware problem.
+    if (session.fault_origin === 'storage' || category === 'recording_storage_error') {
+      return 'The recording could not be saved completely. Check that the Project folder’s drive is connected and has free space, then start a new recording. Files already saved were kept.';
+    }
+    // No recording ran for these, so none "ended".
+    if (session.fault_origin === 'request') {
+      // The request was refused before START (for example a lab too large
+      // for a recording header); `last_error` is the student text.
+      return `The recording did not start. ${session.last_error ?? ''}`.trim();
+    }
+    if (session.fault_origin === 'verification') {
+      return `The firmware on ${session.port || 'the selected board'} could not be verified. ${nextStep}`;
+    }
+    if (session.fault_origin === 'connection') {
+      return session.simulator
+        ? 'The simulator recording could not start. Open Advanced details for more information.'
+        : `The Arduino did not finish connecting. ${nextStep}`;
+    }
+    switch (category) {
       case 'firmware_protocol_error':
         return 'The Arduino reported that it stopped the recording. Verify Firmware, then Refresh Board before starting a new recording.';
       case 'no_data_timeout':
         return 'The Arduino stopped sending samples. Refresh Board and verify the firmware before starting a new recording.';
       case 'device_disconnected':
         return 'The Arduino connection was interrupted. Reconnect the board, refresh it, and start a new recording.';
-      default:
+      case 'serial_transport_error':
         return 'The recording ended because the Arduino serial connection reported an error. Refresh Board and start a new recording. Open Advanced details if the problem continues.';
+      default:
+        return session.simulator
+          ? 'The simulator recording stopped because of an error. Open Advanced details for more information.'
+          : 'The recording stopped because of an error. Refresh Board and start a new recording. Open Advanced details if the problem continues.';
     }
   }
 
@@ -969,41 +1094,35 @@
 
   async function disconnect() {
     try {
+      // The backend only requests the stop; polling shows when saving ends.
       session = await invoke<SessionStatus>('disconnect_session');
-      statusMessage = 'Session disconnected. A future recording requires an explicit new start.';
+      statusMessage = activeStates.includes(session.state)
+        ? 'Stopping and saving the recording…'
+        : 'Session disconnected. A future recording requires an explicit new start.';
     } catch (error) {
-      statusMessage = 'The Arduino connection could not be closed cleanly. Unplug and reconnect it before starting a new recording.';
-    }
-  }
-
-  async function resetBoardAndRetry() {
-    if (!canReset) return;
-    statusMessage = 'Resetting the selected UNO R4 WiFi at 1200 bps, then waiting for it to re-enumerate…';
-    try {
-      const result = await invoke<ResetRetryResult>('reset_board_and_retry', { port: selectedPort });
-      if (result.final_port) selectedPort = result.final_port;
-      await refreshBoards();
-      await pollSession();
-      statusMessage = result.handshake_succeeded
-        ? `Reset and retry succeeded on ${result.final_port ?? result.original_port}. Select Start recording for a new session.`
-        : `${result.diagnostics.failure_category ?? 'reset_failed'}: ${result.diagnostics.recommended_action}`;
-    } catch (error) {
-      statusMessage = `Reset and retry error: ${String(error)}`;
+      statusMessage = formatCommandError(error);
     }
   }
 
   async function retryHandshake() {
-    if (!canRetryHandshake) return;
-    statusMessage = 'Retrying the normal protocol handshake without resetting or uploading the board…';
-    try {
-      const result = await invoke<HandshakeRetryResult>('retry_hardware_handshake', { port: selectedPort });
-      await pollSession();
-      statusMessage = result.handshake_succeeded
-        ? `Handshake succeeded on ${selectedPort}. Select Start recording for a new session.`
-        : `${result.diagnostics.failure_category ?? 'handshake_failed'}: ${result.diagnostics.recommended_action}`;
-    } catch (error) {
-      statusMessage = `Handshake retry error: ${String(error)}`;
-    }
+    if (!canRetryHandshake || boardOperationBusy) return;
+    const port = selectedPort;
+    await runOperation(
+      { title: 'Retrying connection…', stage: `Opening ${port} and repeating the WVU protocol handshake. The board is not reset and no firmware is uploaded.`, cancelable: false },
+      async () => {
+        try {
+          const result = await invoke<HandshakeRetryResult>('retry_hardware_handshake', { port });
+          await pollSession();
+          statusMessage = result.handshake_succeeded
+            ? firmwareReadyOnSelectedPort
+              ? `Connection confirmed on ${port}. Select Start recording for a new session.`
+              : `Connection confirmed on ${port}. Select Verify Firmware before recording.`
+            : `The connection was not confirmed on ${port}. ${result.diagnostics.recommended_action}`;
+        } catch (error) {
+          statusMessage = formatCommandError(error);
+        }
+      }
+    );
   }
 
   onMount(() => {
@@ -1016,20 +1135,33 @@
         statusMessage = `Project folder needs attention: ${String(error)}`;
       }
       await prepareArduinoTools();
-      if (arduinoToolsReady) {
+      if (arduinoToolsState === 'ready') {
         await refreshEnvironmentSummary();
         await refreshBoards('startup');
       }
     })();
+    // The backend keeps the window open during a firmware restore (and while
+    // a recording is saved on close) and says why.
+    let stopCloseBlockedListener: (() => void) | undefined;
+    let unmounted = false;
+    listen<{ reason: string; message: string }>('close-blocked', (event) => {
+      closeBlockedNotice = event.payload.message;
+      statusMessage = event.payload.message;
+    }).then((unlisten) => {
+      if (unmounted) unlisten();
+      else stopCloseBlockedListener = unlisten;
+    }).catch(() => undefined);
     void pollSession();
     void refreshFirmwareCompatibility();
     void (async () => {
       await refreshProfiles();
       await refreshCalibrations();
     })();
-    const timer = window.setInterval(() => void pollSession(), 40); // 25 Hz; no per-sample events.
+    const timer = window.setInterval(pollSessionTick, 40); // 25 Hz; no per-sample events.
     const firmwareTimer = window.setInterval(() => void refreshFirmwareCompatibility(), 750);
     return () => {
+      unmounted = true;
+      stopCloseBlockedListener?.();
       window.clearInterval(timer);
       window.clearInterval(firmwareTimer);
     };
@@ -1046,7 +1178,7 @@
 
   <main class="content wide-content">
     <section class="panel board-panel" aria-labelledby="board-title">
-      <div class="panel-heading"><div><h2 id="board-title">Board</h2><p class="help">Select the Arduino UNO R4 WiFi used for this recording.</p></div><span class:locked={firmwareCompatibility === 'wvu_protocol_compatible'} class="mode-badge">{firmwareCompatibility === 'wvu_protocol_compatible' ? 'Firmware ready' : selectedPort ? 'Firmware update required' : 'Arduino not detected'}</span></div>
+      <div class="panel-heading"><div><h2 id="board-title">Board</h2><p class="help">Select the Arduino UNO R4 WiFi used for this recording.</p></div><span class:locked={firmwareReadyOnSelectedPort} class="mode-badge">{firmwareReadyOnSelectedPort ? 'Firmware ready' : selectedPort ? 'Firmware update required' : 'Arduino not detected'}</span></div>
       <div class="control-grid">
         <label>Board
           <select bind:value={selectedPort} onchange={() => void selectedBoardChanged()} disabled={!boardControlState.canSelectBoard}>
@@ -1056,8 +1188,9 @@
         </label>
         <div class="field-action"><span>Board actions</span><div class="button-pair"><button onclick={() => void refreshBoards()} disabled={!boardControlState.canRefreshBoards}>Refresh Board</button><button onclick={() => void verifySelectedFirmware()} disabled={!boardControlState.canVerifyFirmware}>Verify Firmware</button><button class="gold" onclick={restoreWvuFirmware} disabled={!boardControlState.canRestoreFirmware}>Restore WVU Firmware</button></div></div>
       </div>
-      <p class="device-cache-status" role="status">Board: {selectedPort ? `${boards.find((board) => board.port === selectedPort)?.name ?? 'Arduino UNO R4 WiFi'} — ${selectedPort}` : 'Not connected'} · Firmware: {firmwareCompatibility === 'wvu_protocol_compatible' ? 'Ready' : selectedPort ? 'Update required' : '—'} · Arduino tools: {arduinoToolsReady ? 'Ready' : 'Preparing…'}</p>
-          <details class="advanced-details"><summary>Advanced details</summary><div class="diagnostic-grid"><p>Protocol: {session.protocol_version}</p><p>Firmware status: {firmwareCompatibility}</p>{#if session.connection_diagnostics?.firmware_build}<p>Firmware build: {session.connection_diagnostics.firmware_build}</p>{/if}{#if session.connection_diagnostics?.firmware_board_id}<p>Board ID: {session.connection_diagnostics.firmware_board_id}</p>{/if}<p>Arduino tools: {firmwareEnvironment.cli_version ?? firmwareEnvironment.problem ?? 'preparing'}</p><p>Last board refresh: {boardScanLastCompleted || 'not yet completed'}</p><p>Received packets: {session.integrity.received_packets}</p><p>CRC failures: {session.integrity.crc_failures}</p>{#if session.connection_diagnostics?.terminal_error_stage}<p>Capture failure stage: {session.connection_diagnostics.terminal_error_stage}</p><p>Capture failure type: {session.connection_diagnostics.terminal_error_classification}</p><p>I/O error kind: {session.connection_diagnostics.terminal_error_kind}</p><p>Windows error: {session.connection_diagnostics.terminal_error_raw_os_error ?? 'none'}</p><p>Capture error detail: {session.connection_diagnostics.terminal_error_detail}</p><p>Capture failure elapsed: {session.connection_diagnostics.terminal_error_elapsed_ms} ms</p><p>Port still listed: {yesNoUnknown(session.connection_diagnostics.selected_port_present_after_error)}</p><p>Same VID/PID listed: {yesNoUnknown(session.connection_diagnostics.same_vid_pid_present_after_error)}</p><p>Same USB serial listed: {yesNoUnknown(session.connection_diagnostics.same_serial_present_after_error)}</p><p>UNO R4 listed: {yesNoUnknown(session.connection_diagnostics.uno_r4_present_after_error)}</p>{#if session.connection_diagnostics.port_enumeration_error}<p>Port enumeration error: {session.connection_diagnostics.port_enumeration_error}</p>{/if}<p>Last valid packet: {session.connection_diagnostics.last_valid_packet_utc ?? 'not recorded'}</p><p>Last valid sample: {session.connection_diagnostics.last_valid_sample_utc ?? 'not recorded'}</p><p>Last successful PING: {session.connection_diagnostics.last_successful_ping_utc ?? 'not recorded'}</p><p>Last PONG/status: {session.connection_diagnostics.last_pong_or_status_utc ?? 'not recorded'}</p>{/if}{#if lastStartFailure}<p>Last recording start: {lastStartFailure.timestamp}</p><p>Stage: {lastStartFailure.stage}</p><p>Code: {lastStartFailure.code}</p><p>Board: {lastStartFailure.port}</p><p>Lab: {lastStartFailure.lab}</p><p>Detail: {lastStartFailure.technicalDetail}</p>{/if}{#if lastPlotError}<p>Last live-plot error: {lastPlotError.timestamp}</p><p>Plot stage: {lastPlotError.stage}</p><p>Plot detail: {lastPlotError.detail}</p>{/if}{#if session.last_error}<p>Recent connection error: {session.last_error}</p>{/if}</div></details>
+      <p class="device-cache-status" role="status">Board: {selectedPort ? `${boards.find((board) => board.port === selectedPort)?.name ?? 'Arduino UNO R4 WiFi'} — ${selectedPort}` : 'Not connected'} · Firmware: {firmwareReadyOnSelectedPort ? 'Ready' : selectedPort ? 'Update required' : '—'} · Arduino tools: {arduinoToolsState === 'ready' ? 'Ready' : arduinoToolsState === 'failed' ? 'Needs attention' : 'Preparing…'}</p>
+      {#if arduinoToolsState === 'failed'}<p class="warning" role="alert">{arduinoToolsProblem}{#if arduinoToolsRepairable} <button onclick={() => void repairArduinoTools()} disabled={!canRepairArduinoTools}>Repair Arduino tools</button>{/if}</p>{/if}
+          <details class="advanced-details"><summary>Advanced details</summary><div class="diagnostic-grid"><p>Protocol: {session.protocol_version}</p><p>Firmware status: {firmwareCompatibility}</p>{#if session.connection_diagnostics?.firmware_build}<p>Firmware build: {session.connection_diagnostics.firmware_build}</p>{/if}{#if session.connection_diagnostics?.firmware_board_id}<p>Board ID: {session.connection_diagnostics.firmware_board_id}</p>{/if}<p>Arduino tools: {firmwareEnvironment.cli_version ?? (arduinoToolsState === 'preparing' ? 'preparing' : 'not available')}</p>{#if firmwareEnvironment.problem}<p>Arduino tools problem: {firmwareEnvironment.problem}</p>{/if}{#if arduinoToolsDetail}<p>Arduino tools detail: {arduinoToolsDetail}</p>{/if}<p>Last board refresh: {boardScanLastCompleted || 'not yet completed'}</p><p>Received packets: {session.integrity.received_packets}</p><p>CRC failures: {session.integrity.crc_failures}</p>{#if session.connection_diagnostics?.terminal_error_stage}<p>Capture failure stage: {session.connection_diagnostics.terminal_error_stage}</p><p>Capture failure type: {session.connection_diagnostics.terminal_error_classification}</p><p>I/O error kind: {session.connection_diagnostics.terminal_error_kind}</p><p>Windows error: {session.connection_diagnostics.terminal_error_raw_os_error ?? 'none'}</p><p>Capture error detail: {session.connection_diagnostics.terminal_error_detail}</p><p>Capture failure elapsed: {session.connection_diagnostics.terminal_error_elapsed_ms} ms</p><p>Port still listed: {yesNoUnknown(session.connection_diagnostics.selected_port_present_after_error)}</p><p>Same VID/PID listed: {yesNoUnknown(session.connection_diagnostics.same_vid_pid_present_after_error)}</p><p>Same USB serial listed: {yesNoUnknown(session.connection_diagnostics.same_serial_present_after_error)}</p><p>UNO R4 listed: {yesNoUnknown(session.connection_diagnostics.uno_r4_present_after_error)}</p>{#if session.connection_diagnostics.port_enumeration_error}<p>Port enumeration error: {session.connection_diagnostics.port_enumeration_error}</p>{/if}<p>Last valid packet: {session.connection_diagnostics.last_valid_packet_utc ?? 'not recorded'}</p><p>Last valid sample: {session.connection_diagnostics.last_valid_sample_utc ?? 'not recorded'}</p><p>Last successful PING: {session.connection_diagnostics.last_successful_ping_utc ?? 'not recorded'}</p><p>Last PONG/status: {session.connection_diagnostics.last_pong_or_status_utc ?? 'not recorded'}</p>{/if}{#if lastStartFailure}<p>Last recording start: {lastStartFailure.timestamp}</p><p>Stage: {lastStartFailure.stage}</p><p>Code: {lastStartFailure.code}</p><p>Board: {lastStartFailure.port}</p><p>Lab: {lastStartFailure.lab}</p><p>Detail: {lastStartFailure.technicalDetail}</p>{/if}{#if lastPlotError}<p>Last live-plot error: {lastPlotError.timestamp}</p><p>Plot stage: {lastPlotError.stage}</p><p>Plot detail: {lastPlotError.detail}</p>{/if}{#if session.last_error}<p>Recent connection error: {session.last_error}</p>{/if}</div></details>
     </section>
 
     <section class="panel project-panel" aria-labelledby="project-folder-title">
@@ -1069,7 +1202,7 @@
     <section class="acquisition-section" aria-labelledby="acquisition-title">
         <h2 id="acquisition-title">Acquisition</h2>
         <p class="notice">Teaching use only — not a medical device. Follow BMEG 420L lab instructions and instructor safety procedures. Raw counts and Arduino-input volts are preserved; this app makes no diagnostic or clinical decision.</p>
-        {#if source === 'hardware' && firmwareCompatibility !== 'wvu_protocol_compatible'}
+        {#if source === 'hardware' && !firmwareReadyOnSelectedPort}
           <p class="warning" role="status">Hardware recording is unavailable until Firmware is ready. Use Verify Firmware or Restore WVU Firmware above.</p>
         {/if}
 
@@ -1198,9 +1331,8 @@
         <div class="action-row recording-actions">
           <button class="gold" onclick={startRecording} disabled={isActive || startInFlight || boardOperationBusy}>Connect, configure, and start recording</button>
           <button class="stop" onclick={stopRecording} disabled={!isActive || session.state === 'Stopping'}>Stop recording</button>
-          <button onclick={disconnect} disabled={session.state === 'Disconnected'}>Disconnect</button>
-          {#if canRetryHandshake}<button onclick={retryHandshake}>Retry handshake</button>{/if}
-          {#if canReset}<button onclick={resetBoardAndRetry}>Reset board and retry</button>{/if}
+          <button onclick={disconnect} disabled={session.state === 'Disconnected' || startInFlight}>Disconnect</button>
+          {#if canRetryHandshake}<button onclick={retryHandshake} disabled={boardOperationBusy}>Retry connection</button>{/if}
         </div>
         {#if !canStart}
           <p class="warning" role="status">{startReadiness.message}</p>
@@ -1311,10 +1443,15 @@
     <div class="operation-modal" role="dialog" aria-modal="true" aria-labelledby="operation-title" aria-describedby="operation-stage">
       <div class="spinner" aria-hidden="true"></div>
       <div>
-        <h2 id="operation-title">{activeOperation?.title ?? `${firmwareWorkflow.job?.kind ?? 'Firmware'} in progress…`}</h2>
-        <p id="operation-stage">{activeOperation?.stage ?? firmwareWorkflow.job?.message ?? firmwareWorkflow.job?.stage}</p>
+        <h2 id="operation-title">{activeOperation?.title ?? firmwareJobDisplay.title}</h2>
+        <p id="operation-stage">{activeOperation?.stage ?? firmwareJobDisplay.detail}</p>
+        {#if !activeOperation && firmwareWorkflow.job?.active}<p class="help">Step: {firmwareJobDisplay.step}</p>{/if}
         <p class="help">This operation has no reliable numeric percentage. The application remains responsive; conflicting actions are temporarily blocked.</p>
-        {#if !activeOperation && firmwareWorkflow.job?.active}<button class="stop" onclick={cancelFirmwareJob}>Cancel {firmwareWorkflow.job.kind}</button>{/if}
+        {#if !activeOperation && firmwareWorkflow.job?.active}
+          <!-- From the upload onward the backend refuses Cancel: stopping a flash part-way could leave the board without firmware. -->
+          {#if firmwareJobDisplay.cancelable}<button class="stop" onclick={cancelFirmwareJob}>{firmwareJobDisplay.cancelLabel}</button>{:else}<p class="warning" role="status">{FIRMWARE_WRITE_NOTICE}</p>{/if}
+          {#if closeBlockedNotice}<p class="help" role="status">{closeBlockedNotice}</p>{/if}
+        {/if}
       </div>
     </div>
   </div>

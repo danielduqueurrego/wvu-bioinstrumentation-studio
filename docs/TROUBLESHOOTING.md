@@ -8,6 +8,10 @@ Confirm that the Arduino UNO R4 WiFi is connected directly by USB, then select *
 
 Select the detected board, use **Verify Firmware**, and then select **Restore WVU Firmware** if the app still reports that an update is required. Restore compiles and uploads the repository-controlled reference firmware, waits for the board to return, and verifies it before recording is enabled.
 
+Connect only the board you are restoring. Restore is refused while more than one Arduino UNO R4 WiFi is connected, because the board changes its COM port during the upload and could otherwise be confused with another one. Disconnect the other UNO boards, select **Refresh Board**, and try again.
+
+**Cancel restore** is available until the upload starts. Once the app shows "Writing firmware — do not unplug the board", the restore cannot be canceled and the window stays open until it finishes; keep the board connected.
+
 ## Arduino port is busy
 
 Close other serial applications, reconnect the board if necessary, select **Refresh Board**, then try again.
@@ -22,11 +26,13 @@ The application finalizes the available raw data as incomplete and reports the d
 
 ## Arduino tools problem
 
-Restart the application to retry first-run runtime preparation. If the problem continues, reinstall the course distribution and share Advanced details or the diagnostic log with the instructor.
+If the Board status shows **Arduino tools: Needs attention**, select **Repair Arduino tools**. Repair extracts the offline Arduino tools included with the application again (nothing is downloaded); it waits until no recording or board operation is running. The app also checks the prepared tools at every start and extracts them again if a file is missing or changed, for example after an antivirus scan.
 
-## Reset board and retry
+The tools are kept in `%LOCALAPPDATA%\WVU-BMEG\rt`, outside the installation folder, so reinstalling alone does not replace them; use Repair first. If the app or Repair reports that the included tools are missing or incomplete (Repair is not offered then, because it cannot help), reinstall the course distribution and share Advanced details or the diagnostic log with the instructor.
 
-The explicit reset/retry action can observe a returning COM port that produces no protocol response on some systems. It never uploads firmware automatically. Use **Restore WVU Firmware** if ordinary verification cannot recover communication.
+## Board did not answer
+
+After a failed connection, select **Retry connection** (a new handshake that neither resets the board nor uploads firmware), then **Verify Firmware**. If the board still does not answer, use **Restore WVU Firmware**, which handles the board's double-reset upload mode. The former "Reset board and retry" action was retired because it could not reach the native-USB WVU firmware.
 
 ## Diagnostic information
 

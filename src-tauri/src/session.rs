@@ -18,6 +18,7 @@ use crate::{
         RecordLayout, RecordingDuration, RecordingError, RecordingMarker, RecordingMetadata,
         RecordingSafetyContext, StopReason, SynchronizedRecord,
     },
+    serial_lease::{SerialBusy, SerialLease, SerialOwner, SerialOwnership},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use serde::Serialize;
@@ -49,11 +50,10 @@ const HANDSHAKE_STARTUP_GRACE: Duration = Duration::from_millis(1_250);
 const HANDSHAKE_OVERALL_TIMEOUT: Duration = Duration::from_secs(8);
 const HANDSHAKE_PING_ATTEMPTS: u32 = 3;
 const HANDSHAKE_PING_INTERVAL: Duration = Duration::from_secs(2);
-const RESET_ENUMERATION_TIMEOUT: Duration = Duration::from_secs(10);
-const RESET_ENUMERATION_POLL: Duration = Duration::from_millis(300);
-const RESET_ENUMERATION_SETTLE: Duration = Duration::from_secs(2);
-const RESET_APPLICATION_GRACE: Duration = Duration::from_secs(2);
-const RESET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long a claim waits for a previous owner of the serial lease that has
+/// already published its final state and is returning. A real conflict (a
+/// recording, restore, or handshake still running) is refused after this.
+const SERIAL_CLAIM_GRACE: Duration = Duration::from_millis(500);
 const DISK_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
 const DISK_CRITICAL_BYTES: u64 = 250 * 1024 * 1024;
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(15);
@@ -342,13 +342,37 @@ pub enum ConnectionFailureCategory {
     /// the bounded active-stream deadline.
     NoDataTimeout,
     DeviceDisconnected,
-    ResetPortDidNotReturn,
-    ResetReturnedDifferentPort,
-    AmbiguousReturningDevice,
     /// The recording folder could not be used, or the recording could not be
     /// written or finalized completely. This is a storage problem, not a
     /// serial or firmware one, so it must not suggest verifying firmware.
     RecordingStorageError,
+    /// The selected lab's channels, outputs, or rate cannot be configured on
+    /// the connected firmware (checked before CONFIGURE is sent).
+    LabNotSupportedByFirmware,
+    /// The firmware rejected CONFIGURE or did not acknowledge it in time.
+    ConfigurationRejected,
+    /// The firmware rejected START or did not confirm acquisition in time.
+    StartNotConfirmed,
+}
+
+/// Which operation raised the current fault, so the UI does not describe a
+/// failed Verify or connection attempt as a recording that ended, and does
+/// not send a student to firmware recovery for a storage problem.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultOrigin {
+    /// Verify Firmware, including the verification step of a restore.
+    Verification,
+    /// Retry connection, or a hardware start that failed before START.
+    Connection,
+    /// Acquisition ended by a serial, firmware, or session failure.
+    Recording,
+    /// The recording folder or files could not be used or saved.
+    Storage,
+    /// The recording request itself was refused before START (for example a
+    /// lab header too large for a recording). No recording ran, and the board
+    /// and connection are not at fault; `last_error` is the student text.
+    Request,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -371,6 +395,9 @@ pub struct ConnectionDiagnostics {
     pub raw_byte_classification: String,
     pub ping_attempts: u32,
     pub handshake_elapsed_ms: u128,
+    /// The reset/re-enumeration fields below are retained for the stable
+    /// diagnostics shape. "Reset board and retry" was retired, so they are
+    /// always false/empty apart from `original_port`.
     pub reset_attempted: bool,
     pub original_port: Option<String>,
     pub final_port: Option<String>,
@@ -428,7 +455,7 @@ impl ConnectionDiagnostics {
             reappearance_observed: false,
             bootloader_observed: false,
             failure_category: None,
-            recommended_action: "Retry handshake or refresh devices.".into(),
+            recommended_action: "Select Retry connection, or Refresh Board.".into(),
             terminal_error_classification: None,
             terminal_error_stage: None,
             terminal_error_kind: None,
@@ -449,23 +476,9 @@ impl ConnectionDiagnostics {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ResetRetryResult {
-    pub original_port: String,
-    pub final_port: Option<String>,
-    pub handshake_succeeded: bool,
-    pub diagnostics: ConnectionDiagnostics,
-}
-
-#[derive(Clone, Debug, Serialize)]
 pub struct HandshakeRetryResult {
     pub handshake_succeeded: bool,
     pub diagnostics: ConnectionDiagnostics,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResetTarget {
-    pub port: String,
-    pub serial_number: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -531,6 +544,8 @@ pub struct SessionStatus {
     pub stop_reason: Option<StopReason>,
     pub connection_diagnostics: Option<ConnectionDiagnostics>,
     pub last_error: Option<String>,
+    /// Which operation raised `last_error`; present whenever it is.
+    pub fault_origin: Option<FaultOrigin>,
     pub last_summary: Option<SessionSummary>,
     pub profile: Option<ProfileSnapshot>,
     pub calibration: RecordingCalibration,
@@ -569,6 +584,10 @@ pub enum SessionError {
     /// it carries no prefix, and it is not a connection or firmware problem.
     #[error("{0}")]
     InvalidRequest(&'static str),
+    /// Another operation owns the serial port and session. The message is
+    /// student-facing.
+    #[error("{0}")]
+    Busy(#[from] SerialBusy),
 }
 
 #[derive(Clone)]
@@ -580,6 +599,9 @@ pub struct SessionController {
     disk_space: Arc<dyn DiskSpaceProvider>,
     storage: Arc<dyn RecordingStorage>,
     timing: CaptureTiming,
+    /// One owner at a time for the COM port and this session's state, shared
+    /// with the firmware workflow.
+    serial: SerialOwnership,
 }
 
 struct SessionRuntime {
@@ -594,6 +616,7 @@ struct SessionRuntime {
     measured_rate_hz: f64,
     integrity: IntegrityCounters,
     last_error: Option<String>,
+    fault_origin: Option<FaultOrigin>,
     last_summary: Option<SessionSummary>,
     duration: Option<RecordingDuration>,
     started_at: Option<Instant>,
@@ -625,6 +648,9 @@ struct CaptureRequest {
     /// compared with a read-only Windows enumeration if a serial operation
     /// fails; no reset, reopen, or Arduino CLI scan is performed at that time.
     expected_port_identity: Option<UsbPortIdentity>,
+    /// Tooling provenance collected before the port was opened. `None` lets
+    /// capture collect it (simulator, or a direct synchronous capture).
+    provenance: Option<ToolingProvenance>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1030,6 +1056,7 @@ impl SessionController {
                 measured_rate_hz: 0.0,
                 integrity: IntegrityCounters::default(),
                 last_error: None,
+                fault_origin: None,
                 last_summary: None,
                 duration: None,
                 started_at: None,
@@ -1049,8 +1076,25 @@ impl SessionController {
             disk_space,
             storage,
             timing,
+            serial: SerialOwnership::default(),
         }
     }
+
+    /// The serial-ownership lease shared by recordings, Retry connection,
+    /// Verify Firmware, and firmware restore jobs.
+    pub fn serial_ownership(&self) -> SerialOwnership {
+        self.serial.clone()
+    }
+
+    /// Claims the serial port and session for `owner`, or refuses with a
+    /// student-readable busy error. It waits briefly only for an owner that is
+    /// already returning (see `SERIAL_CLAIM_GRACE`).
+    pub fn claim_serial(&self, owner: SerialOwner) -> Result<SerialLease, SessionError> {
+        self.serial
+            .claim_within(owner, SERIAL_CLAIM_GRACE)
+            .map_err(SessionError::Busy)
+    }
+
     pub fn status(&self) -> Result<SessionStatus, SessionError> {
         let runtime = self.lock_runtime()?;
         Ok(Self::status_from_runtime(&runtime))
@@ -1167,6 +1211,36 @@ impl SessionController {
         recording_path_context: Option<RecordingPathContext>,
         recording_context: RecordingContext,
     ) -> Result<SessionStatus, SessionError> {
+        let lease = self.claim_serial(SerialOwner::Session)?;
+        self.start_simulator_leased(
+            lease,
+            profile,
+            RecordingStartOptions {
+                duration,
+                output_dir,
+                calibration,
+                recording_path_context,
+                recording_context,
+            },
+        )
+    }
+
+    /// Starts a simulator recording under a session lease the caller already
+    /// claimed. The worker keeps the lease until it has finished saving.
+    pub fn start_simulator_leased(
+        &self,
+        lease: SerialLease,
+        profile: ProfileSnapshot,
+        options: RecordingStartOptions,
+    ) -> Result<SessionStatus, SessionError> {
+        require_session_lease(&lease)?;
+        let RecordingStartOptions {
+            duration,
+            output_dir,
+            calibration,
+            recording_path_context,
+            recording_context,
+        } = options;
         self.validate_duration(&duration)?;
         validate_recording_context(&recording_context)?;
         calibration
@@ -1190,7 +1264,7 @@ impl SessionController {
             calibration.clone(),
         )?;
         let controller = self.clone();
-        self.spawn_worker(move || {
+        self.spawn_worker(lease, move || {
             controller.capture_simulator_worker(
                 profile,
                 duration,
@@ -1256,6 +1330,24 @@ impl SessionController {
         port_name: String,
         options: RecordingStartOptions,
     ) -> Result<SessionStatus, SessionError> {
+        let lease = self.claim_serial(SerialOwner::Session)?;
+        self.start_serial_leased(lease, profile, port_name, options, None)
+    }
+
+    /// Starts a hardware recording under a session lease the caller already
+    /// claimed; the worker keeps it until it has finished saving.
+    /// `board_serial` comes from the caller's board scan, so Start does not
+    /// scan again. Tool versions come from the per-run cache and are collected
+    /// here, before the worker opens the port.
+    pub fn start_serial_leased(
+        &self,
+        lease: SerialLease,
+        profile: ProfileSnapshot,
+        port_name: String,
+        options: RecordingStartOptions,
+        board_serial: Option<String>,
+    ) -> Result<SessionStatus, SessionError> {
+        require_session_lease(&lease)?;
         let RecordingStartOptions {
             duration,
             output_dir,
@@ -1277,6 +1369,7 @@ impl SessionController {
             recording_path_context: recording_path_context.as_ref(),
             recording_context: &recording_context,
         })?;
+        let provenance = tooling_provenance(false, board_serial);
         self.begin_session(
             false,
             "Arduino UNO R4 WiFi",
@@ -1295,9 +1388,10 @@ impl SessionController {
             recording_path_context,
             recording_context,
             expected_port_identity: None,
+            provenance: Some(provenance),
         };
         let controller = self.clone();
-        self.spawn_worker(move || controller.capture_serial_worker(request))?;
+        self.spawn_worker(lease, move || controller.capture_serial_worker(request))?;
         self.status()
     }
 
@@ -1316,6 +1410,7 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: &Path,
     ) -> Result<SessionSummary, SessionError> {
+        let _lease = self.claim_serial(SerialOwner::Session)?;
         self.validate_duration(&duration)?;
         self.begin_session(
             true,
@@ -1344,6 +1439,7 @@ impl SessionController {
         seconds: u64,
         output_dir: &Path,
     ) -> Result<SessionSummary, SessionError> {
+        let _lease = self.claim_serial(SerialOwner::Session)?;
         let duration = RecordingDuration::Timed { seconds };
         self.begin_session(
             true,
@@ -1388,7 +1484,9 @@ impl SessionController {
         duration: RecordingDuration,
         output_dir: &Path,
     ) -> Result<SessionSummary, SessionError> {
+        let _lease = self.claim_serial(SerialOwner::Session)?;
         self.validate_duration(&duration)?;
+        let provenance = tooling_provenance(false, None);
         self.begin_session(
             false,
             "Arduino UNO R4 WiFi",
@@ -1407,6 +1505,7 @@ impl SessionController {
             recording_path_context: None,
             recording_context: RecordingContext::default(),
             expected_port_identity: None,
+            provenance: Some(provenance),
         })?;
         self.status()?.last_summary.ok_or(SessionError::State(
             "serial session did not produce a summary",
@@ -1465,6 +1564,52 @@ impl SessionController {
         Ok(Self::status_from_runtime(&runtime))
     }
 
+    /// Disconnect for the UI: it never waits for a recording to finish.
+    ///
+    /// An active recording is asked to stop and returns `Stopping`; its worker
+    /// saves the files and publishes the final state (`Disconnected`, or
+    /// `Faulted` if saving failed), which status polling then shows. With no
+    /// active session, an idle fault is cleared to `Disconnected`. Verify,
+    /// Retry connection, and a firmware restore are never interrupted: the
+    /// request is refused as busy while one of them owns the board.
+    pub fn request_disconnect(&self) -> Result<SessionStatus, SessionError> {
+        let _lease = match self.serial.try_claim(SerialOwner::Session) {
+            Ok(lease) => lease,
+            Err(busy) if busy.holder == SerialOwner::Session => {
+                if self.is_recording()? {
+                    return self.request_stop_with_reason(StopReason::User);
+                }
+                // The session lease is held but nothing is recording: either
+                // a worker that has published its final state and is
+                // returning, or a Start that has not begun its session yet.
+                // A stop flag set now would be cleared by that Start, so the
+                // Disconnect would be lost while the recording starts anyway.
+                // Wait briefly for a finishing worker; otherwise refuse.
+                match self
+                    .serial
+                    .claim_within(SerialOwner::Session, SERIAL_CLAIM_GRACE)
+                {
+                    Ok(lease) => lease,
+                    Err(_) if self.is_recording()? => {
+                        return self.request_stop_with_reason(StopReason::User);
+                    }
+                    Err(busy) => return Err(SessionError::Busy(busy)),
+                }
+            }
+            Err(busy) => return Err(SessionError::Busy(busy)),
+        };
+        if self.is_recording()? {
+            // Only a session begun without a lease (tests) reaches this.
+            return self.request_stop_with_reason(StopReason::User);
+        }
+        // Holding the lease proves any previous worker released it on its way
+        // out, so this join does not wait for a recording.
+        self.wait_for_worker()?;
+        let mut runtime = self.lock_runtime()?;
+        runtime.state = SessionState::Disconnected;
+        Ok(Self::status_from_runtime(&runtime))
+    }
+
     /// Clears an idle terminal fault before a new, explicitly requested recording.
     ///
     /// A failed handshake intentionally retains `Faulted` diagnostics for recovery,
@@ -1481,6 +1626,7 @@ impl SessionController {
         let mut runtime = self.lock_runtime()?;
         runtime.state = SessionState::Disconnected;
         runtime.last_error = None;
+        runtime.fault_origin = None;
         runtime.stop_reason = None;
         runtime.connection_diagnostics = None;
         self.cancel.store(false, Ordering::Release);
@@ -1503,11 +1649,17 @@ impl SessionController {
         Ok(())
     }
 
-    /// User-initiated handshake retry that does not reset or upload the board.
-    /// It is useful when the serial port was briefly busy but the device is healthy.
+    /// Handshake-only connection check that never resets or uploads the board.
+    /// It backs Retry connection, Verify Firmware, and the verification step
+    /// of a restore. The caller holds the serial lease for that operation;
+    /// `origin` says which one, so a failure is not described as a recording.
+    ///
+    /// Every failure leaves a `failure_category`, including a port that could
+    /// not be opened (busy, or no longer listed by Windows).
     pub fn retry_handshake(
         &self,
-        target: ResetTarget,
+        port: &str,
+        origin: FaultOrigin,
     ) -> Result<HandshakeRetryResult, SessionError> {
         if self.is_recording()? {
             return Err(SessionError::State(
@@ -1515,199 +1667,85 @@ impl SessionController {
             ));
         }
         self.wait_for_worker()?;
-        self.set_state(SessionState::Connecting)?;
+        {
+            // A fresh attempt replaces the previous fault; its diagnostics are
+            // replaced below as well.
+            let mut runtime = self.lock_runtime()?;
+            runtime.state = SessionState::Connecting;
+            runtime.last_error = None;
+            runtime.fault_origin = None;
+        }
         self.cancel.store(false, Ordering::Release);
-        self.set_reset_diagnostics(ConnectionDiagnostics::new(&target.port))?;
+        self.set_connection_diagnostics(ConnectionDiagnostics::new(port))?;
 
+        // The active-capture timeout, not a 25 ms probe timeout: Windows may
+        // abort a short PING write while frames are arriving (see
+        // ACTIVE_SERIAL_IO_TIMEOUT).
+        let mut serial = match serialport::new(port, CONTROLLED_SERIAL_BAUD)
+            .timeout(ACTIVE_SERIAL_IO_TIMEOUT)
+            .open()
+        {
+            Ok(serial) => serial,
+            Err(error) => {
+                // Windows reports a port held by another program and a
+                // removed device alike, so a read-only enumeration decides.
+                let category = port_open_failure_category(port);
+                crate::app_log::record(
+                    "WARN",
+                    &format!(
+                        "HANDSHAKE_PORT_OPEN_FAIL port={port} category={category:?} detail={error}"
+                    ),
+                );
+                self.note_failure_category(category, true)?;
+                self.set_fault(origin, format!("could not open {port}: {error}"))?;
+                return Ok(HandshakeRetryResult {
+                    handshake_succeeded: false,
+                    diagnostics: self.current_diagnostics(port)?,
+                });
+            }
+        };
         let result = (|| {
-            let mut port = serialport::new(&target.port, CONTROLLED_SERIAL_BAUD)
-                .timeout(Duration::from_millis(25))
-                .open()?;
-            self.mark_port_opened(&target.port)?;
-            port.clear(serialport::ClearBuffer::Input)?;
-            port.write_data_terminal_ready(true)?;
-            port.write_request_to_send(true)?;
+            self.mark_port_opened(port)?;
+            serial.clear(serialport::ClearBuffer::Input)?;
+            serial.write_data_terminal_ready(true)?;
+            serial.write_request_to_send(true)?;
             self.set_state(SessionState::Connected)?;
             let (sender, _receiver) = sync_channel(16);
             let mut acquisition = AcquisitionController::new(sender);
-            self.wait_for_handshake(&mut port, &mut acquisition)
+            self.wait_for_handshake(&mut serial, &mut acquisition)
         })();
-        let diagnostics = self
-            .status()?
-            .connection_diagnostics
-            .unwrap_or_else(|| ConnectionDiagnostics::new(&target.port));
+        drop(serial);
         match result {
             Ok(()) => {
                 self.set_state(SessionState::Disconnected)?;
                 Ok(HandshakeRetryResult {
                     handshake_succeeded: true,
-                    diagnostics,
+                    diagnostics: self.current_diagnostics(port)?,
                 })
             }
             Err(error) => {
-                self.set_fault(error.to_string())?;
+                // The handshake records its own category; control-line or
+                // other serial errors after opening are transport problems.
+                if !matches!(error, SessionError::Cancelled) {
+                    self.note_failure_category(
+                        ConnectionFailureCategory::SerialTransportError,
+                        false,
+                    )?;
+                }
+                self.set_fault(origin, error.to_string())?;
                 Ok(HandshakeRetryResult {
                     handshake_succeeded: false,
-                    diagnostics,
+                    diagnostics: self.current_diagnostics(port)?,
                 })
             }
         }
     }
 
-    /// User-initiated recovery only. This never uploads firmware and is rejected
-    /// while any acquisition state owns a recording or serial transport.
-    pub fn reset_and_retry(&self, target: ResetTarget) -> Result<ResetRetryResult, SessionError> {
-        if self.is_recording()? {
-            return Err(SessionError::State(
-                "cannot reset a board while a recording or connection is active",
-            ));
-        }
-        self.wait_for_worker()?;
-        self.set_state(SessionState::Connecting)?;
-        self.cancel.store(false, Ordering::Release);
-        let mut diagnostics = ConnectionDiagnostics::new(&target.port);
-        diagnostics.reset_attempted = true;
-        diagnostics.original_port = Some(target.port.clone());
-        diagnostics.recommended_action = "Touching the selected UNO R4 WiFi at 1200 bps.".into();
-        self.set_reset_diagnostics(diagnostics.clone())?;
-
-        // Opening then immediately dropping a 1200-bps CDC handle is the explicit,
-        // user-approved reset mechanism observed on the UNO R4 WiFi. It is never
-        // attempted as part of a normal connection and is restricted to a discovered target.
-        // The observed manual recovery uses .NET SerialPort's defaults, which leave
-        // DTR and RTS deasserted for the 1200-bps open/close. Be explicit here: the
-        // serialport crate otherwise preserves Windows control-line state on open.
-        match serialport::new(&target.port, 1_200)
-            .timeout(Duration::from_millis(250))
-            .dtr_on_open(false)
-            .open()
-        {
-            Ok(mut touch_port) => {
-                let _ = touch_port.write_data_terminal_ready(false);
-                let _ = touch_port.write_request_to_send(false);
-                thread::sleep(Duration::from_millis(50));
-                drop(touch_port);
-            }
-            Err(error) => {
-                diagnostics.failure_category = Some(ConnectionFailureCategory::PortBusy);
-                diagnostics.recommended_action =
-                    recommended_action(&ConnectionFailureCategory::PortBusy).into();
-                self.set_reset_diagnostics(diagnostics)?;
-                self.set_fault(error.to_string())?;
-                return Err(SessionError::Serial(error));
-            }
-        }
-
-        let reset_started = Instant::now();
-        let mut final_port = None;
-        let mut ambiguity = false;
-        while reset_started.elapsed() < RESET_ENUMERATION_TIMEOUT {
-            if self.cancel.load(Ordering::Acquire) {
-                // No serial handle is open while waiting for re-enumeration.
-                self.set_state(SessionState::Disconnected)?;
-                return Err(SessionError::Cancelled);
-            }
-            // Arduino CLI discovery is comparatively slow on Windows. Poll the
-            // operating-system USB serial list here so the short bootloader window
-            // is observable; initial target selection still comes from Arduino CLI.
-            let ports = enumerate_uno_usb_ports();
-            let original_present = ports.iter().any(|port| target_matches_port(&target, port));
-            diagnostics.disappearance_observed |= !original_present;
-            diagnostics.bootloader_observed |= ports.iter().any(|port| {
-                port.role == UnoUsbRole::Bootloader
-                    && target
-                        .serial_number
-                        .as_ref()
-                        .is_none_or(|serial| port.serial_number.as_ref() == Some(serial))
-            });
-            match select_returning_port(&target, &ports) {
-                ReturningPort::Found(port)
-                    if reset_started.elapsed() >= RESET_ENUMERATION_SETTLE =>
-                {
-                    final_port = Some(port.port);
-                    break;
-                }
-                ReturningPort::Ambiguous => ambiguity = true,
-                ReturningPort::Absent | ReturningPort::Found(_) => {}
-            }
-            thread::sleep(RESET_ENUMERATION_POLL);
-        }
-
-        let Some(final_port) = final_port else {
-            let category = if ambiguity {
-                ConnectionFailureCategory::AmbiguousReturningDevice
-            } else {
-                ConnectionFailureCategory::ResetPortDidNotReturn
-            };
-            diagnostics.failure_category = Some(category.clone());
-            diagnostics.handshake_elapsed_ms = reset_started.elapsed().as_millis();
-            diagnostics.recommended_action = recommended_action(&category).into();
-            self.set_reset_diagnostics(diagnostics.clone())?;
-            self.set_fault(format!("{category:?}"))?;
-            return Ok(ResetRetryResult {
-                original_port: target.port,
-                final_port: None,
-                handshake_succeeded: false,
-                diagnostics,
-            });
-        };
-
-        diagnostics.final_port = Some(final_port.clone());
-        diagnostics.reappearance_observed = true;
-        diagnostics.selected_port = final_port.clone();
-        diagnostics.recommended_action = if final_port.eq_ignore_ascii_case(&target.port) {
-            "Board re-enumerated. Retrying normal protocol handshake.".into()
-        } else {
-            "Board returned on a different COM port. Retrying normal protocol handshake.".into()
-        };
-        self.set_reset_diagnostics(diagnostics.clone())?;
-
-        let result = (|| {
-            // UNO R4 bootloader activity can leave the USB bridge's COM number
-            // unchanged. Give its application firmware a bounded settling period
-            // even when no disappearance was observable.
-            thread::sleep(RESET_APPLICATION_GRACE);
-            let mut port = serialport::new(&final_port, CONTROLLED_SERIAL_BAUD)
-                .timeout(Duration::from_millis(25))
-                .open()?;
-            self.mark_port_opened(&final_port)?;
-            port.clear(serialport::ClearBuffer::Input)?;
-            port.write_data_terminal_ready(true)?;
-            port.write_request_to_send(true)?;
-            self.set_state(SessionState::Connected)?;
-            let (sender, _receiver) = sync_channel(16);
-            let mut acquisition = AcquisitionController::new(sender);
-            self.wait_for_handshake_with_policy(
-                &mut port,
-                &mut acquisition,
-                HANDSHAKE_STARTUP_GRACE,
-                RESET_HANDSHAKE_TIMEOUT,
-                HANDSHAKE_PING_ATTEMPTS,
-                HANDSHAKE_PING_INTERVAL,
-            )
-        })();
-        let status = self.status()?;
-        let diagnostics = status.connection_diagnostics.unwrap_or(diagnostics);
-        match result {
-            Ok(()) => {
-                self.set_state(SessionState::Disconnected)?;
-                Ok(ResetRetryResult {
-                    original_port: target.port,
-                    final_port: Some(final_port),
-                    handshake_succeeded: true,
-                    diagnostics,
-                })
-            }
-            Err(error) => {
-                self.set_fault(error.to_string())?;
-                Ok(ResetRetryResult {
-                    original_port: target.port,
-                    final_port: Some(final_port),
-                    handshake_succeeded: false,
-                    diagnostics,
-                })
-            }
-        }
+    fn current_diagnostics(&self, port: &str) -> Result<ConnectionDiagnostics, SessionError> {
+        Ok(self
+            .status()?
+            .connection_diagnostics
+            .unwrap_or_else(|| ConnectionDiagnostics::new(port)))
     }
 
     fn validate_duration(&self, duration: &RecordingDuration) -> Result<(), SessionError> {
@@ -1748,6 +1786,7 @@ impl SessionController {
         runtime.measured_rate_hz = 0.0;
         runtime.integrity = IntegrityCounters::default();
         runtime.last_error = None;
+        runtime.fault_origin = None;
         runtime.last_summary = None;
         runtime.duration = Some(duration);
         // Elapsed/remaining are measured from START, set with `Acquiring` by
@@ -1776,21 +1815,25 @@ impl SessionController {
         Ok(())
     }
 
-    fn spawn_worker<F>(&self, capture: F) -> Result<(), SessionError>
+    /// Runs `capture` on the session worker, which owns `lease` until it
+    /// returns: the lease is released only after the recording is saved (or
+    /// when the worker unwinds), never when the start command returns.
+    fn spawn_worker<F>(&self, lease: SerialLease, capture: F) -> Result<(), SessionError>
     where
         F: FnOnce() -> Result<(), SessionError> + Send + 'static,
     {
+        require_session_lease(&lease)?;
         let mut worker = self
             .worker
             .lock()
             .map_err(|_| SessionError::State("worker lock poisoned"))?;
-        if worker.as_ref().is_some_and(|handle| !handle.is_finished()) {
-            return Err(SessionError::State("worker is already running"));
-        }
+        // Every worker holds the session lease until it returns, and the
+        // caller holds it now, so a previous worker is already exiting.
         if let Some(previous) = worker.take() {
             let _ = previous.join();
         }
         *worker = Some(thread::spawn(move || {
+            let _lease = lease;
             let _ = capture();
         }));
         Ok(())
@@ -1822,6 +1865,7 @@ impl SessionController {
                     recording_path_context,
                     recording_context,
                     expected_port_identity: None,
+                    provenance: None,
                 },
             )
         })();
@@ -1837,6 +1881,16 @@ impl SessionController {
             // This is read-only Windows serial-port enumeration. The captured
             // identity is used only if a later active-capture error occurs.
             request.expected_port_identity = usb_port_identity(&port_name);
+            // Board serial provenance normally comes from the Start command's
+            // Arduino CLI scan; the operating system's USB serial is the fallback.
+            if let Some(provenance) = request.provenance.as_mut() {
+                if provenance.board_serial.is_none() {
+                    provenance.board_serial = request
+                        .expected_port_identity
+                        .as_ref()
+                        .and_then(|identity| identity.serial_number.clone());
+                }
+            }
             crate::app_log::record("INFO", &format!("SERIAL_OPEN_BEGIN port={port_name}"));
             let mut port = serialport::new(&port_name, CONTROLLED_SERIAL_BAUD)
                 .timeout(ACTIVE_SERIAL_IO_TIMEOUT)
@@ -1892,8 +1946,11 @@ impl SessionController {
             recording_path_context,
             recording_context,
             expected_port_identity,
+            provenance,
         } = request;
-        // Collect tooling provenance before START so no external command can delay raw intake.
+        // Tooling provenance is resolved before START (normally before the
+        // port was opened) so no external command can delay raw intake.
+        let provenance = provenance.unwrap_or_else(|| tooling_provenance(simulator, None));
         crate::app_log::record("INFO", "OPEN_RECORDING_FILE_BEGIN");
         let paths = self
             .allocate_paths(&output_dir, &profile)
@@ -1917,8 +1974,8 @@ impl SessionController {
         }
         let field_count = profile.profile.acquisition.record_field_names().len();
         let csv_row_bytes = estimated_csv_row_bytes(&profile, &calibration);
-        let mut initial_meta = self
-            .initial_metadata(InitialMetadataRequest {
+        let mut initial_meta = build_initial_metadata(
+            InitialMetadataRequest {
                 simulator,
                 source: &source,
                 bmeg: &paths.bmeg,
@@ -1927,14 +1984,9 @@ impl SessionController {
                 calibration,
                 recording_path_context: recording_path_context.as_ref(),
                 recording_context: &recording_context,
-            })
-            .map_err(|error| {
-                crate::app_log::record(
-                    "WARN",
-                    &format!("START_FAIL stage=PREPARE_METADATA detail={error}"),
-                );
-                error
-            })?;
+            },
+            provenance,
+        );
         initial_meta.initial_free_disk_bytes = Some(initial_free_disk_bytes);
         initial_meta.record_layout = Some(RecordLayout::Synchronized { field_count });
         // The 64 KiB header limit is proven before the board is configured, so
@@ -1995,22 +2047,26 @@ impl SessionController {
             })?;
         crate::app_log::record("INFO", "CONFIGURE_SEND");
         let config_ack_baseline = acquisition.snapshot().config_ack_count;
-        self.send_command(
-            io,
-            MessageType::Configure,
-            1,
-            configure_payload(
-                &profile.profile.acquisition,
-                negotiated_capabilities.as_ref(),
-            )?,
+        let configuration = configure_payload(
+            &profile.profile.acquisition,
+            negotiated_capabilities.as_ref(),
         )
         .map_err(|error| {
             crate::app_log::record(
                 "WARN",
-                &format!("START_FAIL stage=CONFIGURE_SEND detail={error}"),
+                &format!("START_FAIL stage=CONFIGURE_PAYLOAD detail={error}"),
             );
+            self.note_start_failure(&error, ConnectionFailureCategory::LabNotSupportedByFirmware);
             error
         })?;
+        self.send_command(io, MessageType::Configure, 1, configuration)
+            .map_err(|error| {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("START_FAIL stage=CONFIGURE_SEND detail={error}"),
+                );
+                error
+            })?;
         self.wait_until(
             io,
             &mut acquisition,
@@ -2023,6 +2079,7 @@ impl SessionController {
                 "WARN",
                 &format!("START_FAIL stage=CONFIG_ACK detail={error}"),
             );
+            self.note_start_failure(&error, ConnectionFailureCategory::ConfigurationRejected);
             error
         })?;
         crate::app_log::record("INFO", "CONFIG_ACK_RECEIVED");
@@ -2600,15 +2657,18 @@ impl SessionController {
             // Preserve the stage/kind/Windows error in Advanced details rather
             // than overwriting it with the generic I/O display string.
             let detail = terminal_error_detail.unwrap_or_else(|| error.detail());
-            self.set_fault(match save_problem {
-                Some(problem) => format!("{detail} Saving: {problem}"),
-                None => detail,
-            })?;
+            self.set_fault(
+                FaultOrigin::Recording,
+                match save_problem {
+                    Some(problem) => format!("{detail} Saving: {problem}"),
+                    None => detail,
+                },
+            )?;
             return Err(error.into_session_error());
         }
         if let Some(problem) = save_problem {
             self.note_runtime_error("FAILURE_CATEGORY", self.mark_recording_storage_failure());
-            self.set_fault(problem.clone())?;
+            self.set_fault(FaultOrigin::Storage, problem.clone())?;
             return Err(SessionError::Save(problem));
         }
         self.set_state(SessionState::Disconnected)?;
@@ -2645,6 +2705,7 @@ impl SessionController {
                 "WARN",
                 &format!("START_FAIL stage=START_ACK_OR_FIRST_SAMPLE detail={error}"),
             );
+            self.note_start_failure(&error, ConnectionFailureCategory::StartNotConfirmed);
             error
         })
     }
@@ -2938,6 +2999,7 @@ impl SessionController {
         let deadline = started + overall_timeout;
         let mut next_ping = started + startup_grace;
         let mut ping_attempts = 0u32;
+        let mut ping_write_timeouts = 0u32;
         let mut bytes_received = 0u64;
         let mut valid_packets_seen = 0u64;
         let mut buffer = [0u8; 256];
@@ -2947,9 +3009,46 @@ impl SessionController {
                 return Err(SessionError::Cancelled);
             }
             if ping_attempts < ping_attempt_limit && Instant::now() >= next_ping {
-                self.send_command(io, MessageType::Ping, ping_attempts, vec![])?;
+                let sequence = ping_attempts;
                 ping_attempts += 1;
                 next_ping += ping_interval;
+                match self.send_command(io, MessageType::Ping, sequence, vec![]) {
+                    Ok(()) => {}
+                    // A timed-out PING write is one failed attempt, not the
+                    // end of the handshake: Windows can abort a short CDC
+                    // write while the board is still sending frames.
+                    Err(SessionError::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        ping_write_timeouts += 1;
+                        crate::app_log::record(
+                            "WARN",
+                            &format!(
+                                "HANDSHAKE_PING_WRITE_TIMEOUT attempt={ping_attempts} error_kind={:?} raw_os_error={:?} detail={error}",
+                                error.kind(),
+                                error.raw_os_error(),
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        let category = if matches!(error, SessionError::Io(_)) {
+                            self.handshake_io_failure_category()
+                        } else {
+                            ConnectionFailureCategory::HandshakeIncomplete
+                        };
+                        self.update_handshake_diagnostics(
+                            &acquisition.snapshot(),
+                            bytes_received,
+                            ping_attempts,
+                            started.elapsed(),
+                            Some(category),
+                        )?;
+                        return Err(error);
+                    }
+                }
             }
             match io.read(&mut buffer) {
                 Ok(n) if n > 0 => {
@@ -2959,13 +3058,16 @@ impl SessionController {
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(error) => {
+                    // A read error alone does not prove the board was removed;
+                    // a read-only enumeration decides, as in active capture.
+                    let category = self.handshake_io_failure_category();
                     let snapshot = acquisition.snapshot();
                     self.update_handshake_diagnostics(
                         &snapshot,
                         bytes_received,
                         ping_attempts,
                         started.elapsed(),
-                        Some(ConnectionFailureCategory::DeviceDisconnected),
+                        Some(category),
                     )?;
                     return Err(SessionError::Io(error));
                 }
@@ -3014,7 +3116,13 @@ impl SessionController {
         }
 
         let snapshot = acquisition.snapshot();
-        let category = handshake_failure_category(&snapshot, bytes_received);
+        // When nothing arrived and PING writes kept timing out, the serial
+        // transport, not the firmware, is the likely problem.
+        let category = if ping_write_timeouts > 0 && bytes_received == 0 {
+            ConnectionFailureCategory::SerialTransportError
+        } else {
+            handshake_failure_category(&snapshot, bytes_received)
+        };
         self.update_handshake_diagnostics(
             &snapshot,
             bytes_received,
@@ -3023,11 +3131,12 @@ impl SessionController {
             Some(category.clone()),
         )?;
         Err(SessionError::Protocol(format!(
-            "handshake failed on {} after {} ms: {:?}; bytes={}, valid_frames={}, CRC failures={}, HELLO={}, CAPABILITIES={}, PONG={}. {}",
+            "handshake failed on {} after {} ms: {:?}; bytes={}, ping_write_timeouts={}, valid_frames={}, CRC failures={}, HELLO={}, CAPABILITIES={}, PONG={}. {}",
             self.status()?.port,
             started.elapsed().as_millis(),
             category,
             bytes_received,
+            ping_write_timeouts,
             snapshot.integrity.received_packets,
             snapshot.integrity.crc_failures,
             snapshot.hello_seen,
@@ -3299,11 +3408,12 @@ impl SessionController {
         Ok(())
     }
 
+    #[cfg(test)]
     fn initial_metadata(
         &self,
         request: InitialMetadataRequest<'_>,
     ) -> Result<RecordingMetadata, SessionError> {
-        let provenance = tooling_provenance(request.simulator, request.source)?;
+        let provenance = tooling_provenance(request.simulator, None);
         Ok(build_initial_metadata(request, provenance))
     }
 
@@ -3312,7 +3422,15 @@ impl SessionController {
         output_dir: &Path,
         profile: &ProfileSnapshot,
     ) -> Result<RecordingPaths, SessionError> {
-        fs::create_dir_all(output_dir)?;
+        // A folder problem is a storage problem. It must not surface as
+        // `SessionError::Io`, which is how serial transport errors arrive.
+        fs::create_dir_all(output_dir).map_err(|error| {
+            SessionError::Storage(format!(
+                "could not create the recording folder {}: {}",
+                output_dir.display(),
+                describe_io_error(&error)
+            ))
+        })?;
         let stamp = Local::now().format("%Y%m%d_%H%M%S");
         for run in 1..=99 {
             let name =
@@ -3338,8 +3456,8 @@ impl SessionController {
                 return Ok(paths);
             }
         }
-        Err(SessionError::State(
-            "could not allocate a unique recording filename",
+        Err(SessionError::Storage(
+            "could not allocate a unique recording filename; choose another Output folder".into(),
         ))
     }
 
@@ -3398,11 +3516,51 @@ impl SessionController {
         Ok(())
     }
 
-    fn set_fault(&self, error: String) -> Result<(), SessionError> {
+    fn set_fault(&self, origin: FaultOrigin, error: String) -> Result<(), SessionError> {
         let mut runtime = self.lock_runtime()?;
         runtime.state = SessionState::Faulted;
         runtime.last_error = Some(error);
+        runtime.fault_origin = Some(origin);
         Ok(())
+    }
+
+    /// Records a connection failure category for a hardware session.
+    /// `replace` overwrites a category recorded earlier in the same attempt;
+    /// otherwise the first, more specific category is kept.
+    fn note_failure_category(
+        &self,
+        category: ConnectionFailureCategory,
+        replace: bool,
+    ) -> Result<(), SessionError> {
+        let mut runtime = self.lock_runtime()?;
+        if let Some(diagnostics) = runtime.connection_diagnostics.as_mut() {
+            if replace || diagnostics.failure_category.is_none() {
+                diagnostics.recommended_action = recommended_action(&category).into();
+                diagnostics.failure_category = Some(category);
+            }
+        }
+        Ok(())
+    }
+
+    /// Labels a pre-START configuration failure by its stage. Serial I/O and
+    /// cancellation keep their own handling (transport category, quiet stop).
+    fn note_start_failure(&self, error: &SessionError, category: ConnectionFailureCategory) {
+        if matches!(error, SessionError::Protocol(_) | SessionError::State(_)) {
+            self.note_runtime_error(
+                "FAILURE_CATEGORY",
+                self.note_failure_category(category, false),
+            );
+        }
+    }
+
+    /// Category for a serial read/write error during the handshake. Only a
+    /// read-only enumeration that no longer lists the port proves removal.
+    fn handshake_io_failure_category(&self) -> ConnectionFailureCategory {
+        let port = self
+            .lock_runtime()
+            .map(|runtime| runtime.port.clone())
+            .unwrap_or_default();
+        category_after_io_failure(&diagnose_port_enumeration(&port, None))
     }
 
     /// Only a genuine cancellation (a stop requested before acquisition began)
@@ -3427,40 +3585,48 @@ impl SessionController {
         if !detailed_fault_is_present {
             self.record_worker_failure_category(error)?;
             crate::app_log::record("ERROR", &format!("SESSION_WORKER_FAIL detail={error}"));
-            self.set_fault(error.to_string())?;
+            self.set_fault(worker_fault_origin(error), error.to_string())?;
         }
         Ok(())
     }
 
     fn record_worker_failure_category(&self, error: &SessionError) -> Result<(), SessionError> {
-        let mut runtime = self.lock_runtime()?;
-        if let Some(diagnostics) = runtime.connection_diagnostics.as_mut() {
+        let (port, port_opened) = {
+            let mut runtime = self.lock_runtime()?;
+            let port = runtime.port.clone();
+            let Some(diagnostics) = runtime.connection_diagnostics.as_mut() else {
+                return Ok(());
+            };
             if let SessionError::InvalidRequest(message) = error {
                 // The request (for example an oversized lab header) was
                 // refused; the board and connection are not at fault, so no
                 // connection category or firmware advice is recorded.
                 diagnostics.recommended_action = (*message).into();
-            } else if diagnostics.failure_category.is_none() {
-                let category = if matches!(
-                    error,
-                    SessionError::Storage(_) | SessionError::Recording(_) | SessionError::Save(_)
-                ) {
-                    ConnectionFailureCategory::RecordingStorageError
-                } else if !diagnostics.port_opened {
-                    ConnectionFailureCategory::PortBusy
-                } else if matches!(error, SessionError::Io(_)) {
-                    // An I/O error by itself does not prove that Windows
-                    // removed the USB device. Active capture records a
-                    // read-only enumeration before assigning DeviceDisconnected.
-                    ConnectionFailureCategory::SerialTransportError
-                } else {
-                    ConnectionFailureCategory::HandshakeIncomplete
-                };
-                diagnostics.failure_category = Some(category.clone());
-                diagnostics.recommended_action = recommended_action(&category).into();
+                return Ok(());
             }
-        }
-        Ok(())
+            if diagnostics.failure_category.is_some() {
+                return Ok(());
+            }
+            (port, diagnostics.port_opened)
+        };
+        let category = if matches!(
+            error,
+            SessionError::Storage(_) | SessionError::Recording(_) | SessionError::Save(_)
+        ) {
+            ConnectionFailureCategory::RecordingStorageError
+        } else if !port_opened {
+            // Windows reports a port held by another program and a removed
+            // device alike; a read-only enumeration (outside the lock) decides.
+            port_open_failure_category(&port)
+        } else if matches!(error, SessionError::Io(_)) {
+            // An I/O error by itself does not prove that Windows
+            // removed the USB device. Active capture records a
+            // read-only enumeration before assigning DeviceDisconnected.
+            ConnectionFailureCategory::SerialTransportError
+        } else {
+            ConnectionFailureCategory::HandshakeIncomplete
+        };
+        self.note_failure_category(category, false)
     }
 
     fn set_summary(&self, summary: SessionSummary) -> Result<(), SessionError> {
@@ -3539,7 +3705,7 @@ impl SessionController {
         Ok(())
     }
 
-    fn set_reset_diagnostics(
+    fn set_connection_diagnostics(
         &self,
         diagnostics: ConnectionDiagnostics,
     ) -> Result<(), SessionError> {
@@ -3597,6 +3763,7 @@ impl SessionController {
             stop_reason: runtime.stop_reason,
             connection_diagnostics: runtime.connection_diagnostics.clone(),
             last_error: runtime.last_error.clone(),
+            fault_origin: runtime.fault_origin,
             last_summary: runtime.last_summary.clone(),
             profile: runtime.profile.clone(),
             calibration: runtime.calibration.clone(),
@@ -3937,6 +4104,7 @@ fn check_header_budget(request: HeaderBudgetRequest<'_>) -> Result<(), SessionEr
 }
 
 /// Arduino tooling facts recorded in the header of a hardware recording.
+#[derive(Clone, Debug)]
 struct ToolingProvenance {
     arduino_cli_version: String,
     uno_r4_core_version: String,
@@ -3967,35 +4135,104 @@ impl ToolingProvenance {
     }
 }
 
-/// Collects tooling provenance. For hardware this runs Arduino CLI before
-/// START so no external command can delay raw intake.
-fn tooling_provenance(simulator: bool, source: &str) -> Result<ToolingProvenance, SessionError> {
+/// Value recorded when a tool version could not be determined.
+const PROVENANCE_UNAVAILABLE: &str = "unavailable";
+
+/// Tooling provenance for a recording header, without a board scan.
+///
+/// Provenance is best effort: if no version is known, "unavailable" is
+/// recorded and the recording proceeds. Firmware identity is still proven
+/// strictly by the handshake.
+fn tooling_provenance(simulator: bool, board_serial: Option<String>) -> ToolingProvenance {
     if simulator {
-        return Ok(ToolingProvenance::not_applicable());
+        return ToolingProvenance::not_applicable();
     }
-    let cli = crate::arduino_cli::ArduinoCli::discover(None)
-        .map_err(|error| SessionError::Protocol(error.to_string()))?;
-    let arduino_cli_version = cli
-        .version()
-        .map_err(|error| SessionError::Protocol(error.to_string()))?
-        .stdout
-        .trim()
-        .to_owned();
-    let uno_r4_core_version = cli
-        .uno_r4_core_version()
-        .map_err(|error| SessionError::Protocol(error.to_string()))?;
-    let board_serial = cli
-        .boards()
-        .ok()
-        .into_iter()
-        .flatten()
-        .find(|board| board.port.eq_ignore_ascii_case(source))
-        .and_then(|board| board.serial_number);
-    Ok(ToolingProvenance {
-        arduino_cli_version,
-        uno_r4_core_version,
-        board_serial,
-    })
+    let versions = provenance_tool_versions(
+        crate::arduino_cli::known_tool_versions(),
+        crate::arduino_runtime::active_runtime(),
+        crate::arduino_cli::cached_tool_versions,
+    );
+    match versions {
+        Ok(versions) => ToolingProvenance {
+            arduino_cli_version: versions.arduino_cli_version,
+            uno_r4_core_version: versions.uno_r4_core_version,
+            board_serial,
+        },
+        Err(error) => {
+            crate::app_log::record("WARN", &format!("PROVENANCE_UNAVAILABLE detail={error}"));
+            ToolingProvenance {
+                arduino_cli_version: PROVENANCE_UNAVAILABLE.into(),
+                uno_r4_core_version: PROVENANCE_UNAVAILABLE.into(),
+                board_serial,
+            }
+        }
+    }
+}
+
+/// The tool versions for a recording header. Start holds the session lease,
+/// so it must not wait on Arduino CLI probes (up to 30 s each) every time a
+/// previous probe failed. In order: the versions probed once after tool
+/// preparation; otherwise the bundled runtime's pinned manifest versions
+/// (production runs only those tools); a probe only in a development build
+/// that has no bundled runtime.
+fn provenance_tool_versions(
+    known: Option<crate::arduino_cli::ToolVersions>,
+    runtime: Option<&crate::arduino_runtime::RuntimePaths>,
+    probe: impl FnOnce() -> Result<crate::arduino_cli::ToolVersions, crate::arduino_cli::CliError>,
+) -> Result<crate::arduino_cli::ToolVersions, crate::arduino_cli::CliError> {
+    if let Some(versions) = known {
+        return Ok(versions);
+    }
+    if let Some(runtime) = runtime {
+        return Ok(crate::arduino_cli::ToolVersions {
+            arduino_cli_version: runtime.cli_version.clone(),
+            uno_r4_core_version: runtime.core_version.clone(),
+        });
+    }
+    probe()
+}
+
+/// Every session worker must own the session lease.
+fn require_session_lease(lease: &SerialLease) -> Result<(), SessionError> {
+    if lease.owner() == SerialOwner::Session {
+        Ok(())
+    } else {
+        Err(SessionError::State(
+            "a recording requires the session lease",
+        ))
+    }
+}
+
+/// Which operation a worker error that escaped capture (one raised before
+/// START, so no recording ended) belongs to.
+fn worker_fault_origin(error: &SessionError) -> FaultOrigin {
+    match error {
+        SessionError::Storage(_) | SessionError::Recording(_) | SessionError::Save(_) => {
+            FaultOrigin::Storage
+        }
+        SessionError::InvalidRequest(_) => FaultOrigin::Request,
+        _ => FaultOrigin::Connection,
+    }
+}
+
+/// Windows reports "access denied" (another program owns the port) and "file
+/// not found" (the device is gone) with the same serialport error kind, so a
+/// failed open is classified by a read-only enumeration instead.
+fn port_open_failure_category(port: &str) -> ConnectionFailureCategory {
+    if diagnose_port_enumeration(port, None).selected_port_present == Some(false) {
+        ConnectionFailureCategory::DeviceDisconnected
+    } else {
+        ConnectionFailureCategory::PortBusy
+    }
+}
+
+/// A serial I/O error proves removal only when the port is no longer listed.
+fn category_after_io_failure(port_state: &PortEnumerationDiagnostic) -> ConnectionFailureCategory {
+    if port_state.selected_port_present == Some(false) {
+        ConnectionFailureCategory::DeviceDisconnected
+    } else {
+        ConnectionFailureCategory::SerialTransportError
+    }
 }
 
 /// Builds the immutable recording header. `utc_start`/`local_start` are
@@ -4380,49 +4617,6 @@ fn validate_firmware_capabilities(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct UnoUsbPort {
-    port: String,
-    serial_number: Option<String>,
-    role: UnoUsbRole,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UnoUsbRole {
-    Application,
-    Bootloader,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ReturningPort {
-    Found(UnoUsbPort),
-    Absent,
-    Ambiguous,
-}
-
-fn enumerate_uno_usb_ports() -> Vec<UnoUsbPort> {
-    serialport::available_ports()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|candidate| match candidate.port_type {
-            serialport::SerialPortType::UsbPort(info)
-                if info.vid == 0x2341 && matches!(info.pid, 0x1002 | 0x006d) =>
-            {
-                Some(UnoUsbPort {
-                    port: candidate.port_name,
-                    serial_number: info.serial_number,
-                    role: if info.pid == 0x006d {
-                        UnoUsbRole::Bootloader
-                    } else {
-                        UnoUsbRole::Application
-                    },
-                })
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 fn usb_port_identity(port_name: &str) -> Option<UsbPortIdentity> {
     serialport::available_ports()
         .ok()?
@@ -4445,7 +4639,7 @@ fn usb_port_identity(port_name: &str) -> Option<UsbPortIdentity> {
 
 /// Enumerates only the operating system's current serial-port list after an
 /// active-capture transport failure. It intentionally does not open the port,
-/// run Arduino CLI, change DTR/RTS, or invoke the 1200-bps reset path.
+/// run Arduino CLI, change DTR/RTS, or reset the board.
 fn diagnose_port_enumeration(
     selected_port: &str,
     expected: Option<&UsbPortIdentity>,
@@ -4512,53 +4706,6 @@ fn diagnose_port_enumeration(
     }
 }
 
-fn target_matches_port(target: &ResetTarget, candidate: &UnoUsbPort) -> bool {
-    candidate.role == UnoUsbRole::Application
-        && candidate.port.eq_ignore_ascii_case(&target.port)
-        && target
-            .serial_number
-            .as_ref()
-            .is_none_or(|serial| candidate.serial_number.as_ref() == Some(serial))
-}
-
-fn select_returning_port(target: &ResetTarget, candidates: &[UnoUsbPort]) -> ReturningPort {
-    let candidates: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| candidate.role == UnoUsbRole::Application)
-        .cloned()
-        .collect();
-    let serial_matches: Vec<_> = target
-        .serial_number
-        .as_ref()
-        .map(|serial| {
-            candidates
-                .iter()
-                .filter(|candidate| candidate.serial_number.as_ref() == Some(serial))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    match serial_matches.as_slice() {
-        [port] => return ReturningPort::Found(port.clone()),
-        [] => {}
-        _ => return ReturningPort::Ambiguous,
-    }
-
-    let port_matches: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| candidate.port.eq_ignore_ascii_case(&target.port))
-        .cloned()
-        .collect();
-    match port_matches.as_slice() {
-        [port] => ReturningPort::Found(port.clone()),
-        [] if target.serial_number.is_none() && candidates.len() == 1 => {
-            ReturningPort::Found(candidates[0].clone())
-        }
-        [] => ReturningPort::Absent,
-        _ => ReturningPort::Ambiguous,
-    }
-}
-
 fn board_elapsed_seconds(snapshot: &AcquisitionSnapshot) -> f64 {
     if snapshot.sample_count > 1 && snapshot.measured_rate_hz > 0.0 {
         (snapshot.sample_count - 1) as f64 / snapshot.measured_rate_hz
@@ -4610,55 +4757,59 @@ fn raw_byte_classification(snapshot: &AcquisitionSnapshot, bytes_received: u64) 
     }
 }
 
+/// Student-facing next step for each category. Texts name the visible
+/// buttons (Retry connection, Verify Firmware, Restore WVU Firmware, Refresh
+/// Board); the recovery order is Retry connection, then Verify Firmware, then
+/// Restore WVU Firmware.
 fn recommended_action(category: &ConnectionFailureCategory) -> &'static str {
     match category {
         ConnectionFailureCategory::PortBusy => {
-            "Close the application using this port, then retry or refresh devices."
+            "Another program may be using the board. Close Arduino IDE, Serial Monitor, or Arduino Cloud Agent, then select Retry connection."
         }
         ConnectionFailureCategory::PortOpenNoBytes => {
-            "Retry handshake. If the UNO remains silent, select Reset board and retry."
+            "The board did not answer. Select Retry connection, then Verify Firmware. If it still does not answer, use Restore WVU Firmware."
         }
         ConnectionFailureCategory::NonProtocolBytes => {
-            "Refresh devices and confirm the selected port is the UNO R4 WiFi."
+            "The board is not running the WVU firmware. Check that the right board is selected, then use Verify Firmware or Restore WVU Firmware."
         }
         ConnectionFailureCategory::ProtocolCrcFailure => {
-            "Retry handshake after refreshing devices; reset only if CRC-valid frames do not resume."
+            "The data from the board was damaged. Check the USB cable, select Retry connection, then Verify Firmware."
         }
         ConnectionFailureCategory::WrongProtocolVersion => {
-            "The connected sketch is incompatible with protocol v0.1; contact the instructor before firmware recovery."
+            "The board has a different WVU firmware version. Use Restore WVU Firmware."
         }
         ConnectionFailureCategory::MissingFirmwareIdentity => {
-            "WVU protocol frames arrived without the required firmware identity. Install the controlled reference firmware for this application version."
+            "The board did not identify its WVU firmware. Use Restore WVU Firmware."
         }
         ConnectionFailureCategory::IncompatibleFirmwareIdentity => {
-            "WVU protocol firmware responded, but its build or device identity is incompatible. Install the controlled reference firmware for this application version."
+            "The board has a different WVU firmware version. Use Restore WVU Firmware."
         }
         ConnectionFailureCategory::HandshakeIncomplete => {
-            "Retry handshake. If identity/PONG stays incomplete, select Reset board and retry."
+            "The board did not finish connecting. Select Retry connection, then Verify Firmware. If it still fails, use Restore WVU Firmware."
         }
         ConnectionFailureCategory::SerialTransportError => {
-            "The serial connection reported an error, but the board was not proven removed. Refresh the board and review Advanced details before starting a new session."
+            "The USB serial connection reported an error, but the board was not proven removed. Select Refresh Board, then Retry connection."
         }
         ConnectionFailureCategory::FirmwareProtocolError => {
-            "The Arduino reported that it stopped the recording. Verify the firmware, then refresh the board before starting a new session."
+            "The Arduino stopped the recording, often because the computer paused or slept. Select Refresh Board and start a new recording; use Verify Firmware if it happens again."
         }
         ConnectionFailureCategory::NoDataTimeout => {
-            "The Arduino stopped sending samples. Refresh the board and verify the firmware before starting a new session."
+            "The Arduino stopped sending samples. Select Refresh Board, then Verify Firmware before starting a new recording."
         }
         ConnectionFailureCategory::DeviceDisconnected => {
-            "Reconnect the UNO R4 WiFi, refresh devices, and explicitly start a new session."
-        }
-        ConnectionFailureCategory::ResetPortDidNotReturn => {
-            "Wait for the UNO to re-enumerate, then refresh devices. Do not upload firmware automatically."
-        }
-        ConnectionFailureCategory::ResetReturnedDifferentPort => {
-            "Use the rediscovered UNO port shown below, then explicitly start a new recording."
-        }
-        ConnectionFailureCategory::AmbiguousReturningDevice => {
-            "Multiple UNO candidates appeared; refresh devices and select the board by serial number."
+            "The board is no longer connected. Reconnect the UNO R4 WiFi, then select Refresh Board."
         }
         ConnectionFailureCategory::RecordingStorageError => {
             "The recording folder could not be used or written. Check that its drive is connected and has free space, then start a new recording. Files already saved were kept."
+        }
+        ConnectionFailureCategory::LabNotSupportedByFirmware => {
+            "The board's firmware cannot run this lab's settings. Use Restore WVU Firmware, or ask your instructor to check the lab."
+        }
+        ConnectionFailureCategory::ConfigurationRejected => {
+            "The board did not accept the lab settings. Select Retry connection, then Verify Firmware before starting again."
+        }
+        ConnectionFailureCategory::StartNotConfirmed => {
+            "The board did not confirm the start of recording. Select Retry connection, then Verify Firmware before starting again."
         }
     }
 }
@@ -5175,7 +5326,7 @@ mod tests {
     fn faulted_handshake_does_not_own_the_serial_session_for_recovery() {
         let session = SessionController::default();
         session
-            .set_fault("firmware did not respond".into())
+            .set_fault(FaultOrigin::Verification, "firmware did not respond".into())
             .unwrap_or_else(|error| panic!("{error}"));
 
         assert!(!session
@@ -5187,7 +5338,7 @@ mod tests {
     fn successful_recovery_normalizes_an_idle_fault_before_the_next_recording() {
         let session = SessionController::default();
         session
-            .set_fault("firmware did not respond".into())
+            .set_fault(FaultOrigin::Verification, "firmware did not respond".into())
             .unwrap_or_else(|error| panic!("{error}"));
 
         let status = session
@@ -5216,65 +5367,314 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
     }
 
-    fn uno(port: &str, serial: Option<&str>) -> UnoUsbPort {
-        UnoUsbPort {
-            port: port.into(),
-            serial_number: serial.map(str::to_owned),
-            role: UnoUsbRole::Application,
-        }
-    }
-
-    fn target() -> ResetTarget {
-        ResetTarget {
-            port: "COM12".into(),
-            serial_number: Some("48CA4360243C".into()),
-        }
+    #[test]
+    fn a_recording_holds_the_session_lease_until_its_worker_finishes() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        let ownership = session.serial_ownership();
+        session
+            .start_simulator(RecordingDuration::UntilStopped, dir.path().into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(ownership.current(), SerialOwner::Session);
+        // Verify, Retry connection, and a restore cannot take the board.
+        let busy = ownership
+            .try_claim(SerialOwner::Verify)
+            .err()
+            .unwrap_or_else(|| panic!("a recording must refuse Verify"));
+        assert_eq!(busy.holder, SerialOwner::Session);
+        assert!(matches!(
+            session.claim_serial(SerialOwner::FirmwareJob),
+            Err(SessionError::Busy(_))
+        ));
+        assert_eq!(
+            wait_for_state(&session, SessionState::Acquiring).state,
+            SessionState::Acquiring
+        );
+        session
+            .request_stop()
+            .unwrap_or_else(|error| panic!("{error}"));
+        session
+            .wait_for_worker()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(ownership.current(), SerialOwner::Idle);
     }
 
     #[test]
-    fn reset_matching_prefers_serial_and_handles_same_or_changed_port() {
-        assert_eq!(
-            select_returning_port(&target(), &[uno("COM12", Some("48CA4360243C"))]),
-            ReturningPort::Found(uno("COM12", Some("48CA4360243C")))
+    fn a_start_is_refused_while_another_operation_owns_the_board() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        let _verify = session
+            .serial_ownership()
+            .try_claim(SerialOwner::Verify)
+            .unwrap_or_else(|busy| panic!("{busy}"));
+        let error = session
+            .start_simulator(RecordingDuration::Timed { seconds: 10 }, dir.path().into())
+            .err()
+            .unwrap_or_else(|| panic!("Start must wait for Verify Firmware"));
+        assert!(
+            matches!(error, SessionError::Busy(busy) if busy.holder == SerialOwner::Verify),
+            "{error}"
         );
-        assert_eq!(
-            select_returning_port(&target(), &[uno("COM15", Some("48CA4360243C"))]),
-            ReturningPort::Found(uno("COM15", Some("48CA4360243C")))
-        );
+        assert!(error.to_string().contains("being verified"), "{error}");
+        let status = session.status().unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(status.state, SessionState::Disconnected);
+        assert!(fs::read_dir(dir.path())
+            .unwrap_or_else(|error| panic!("{error}"))
+            .next()
+            .is_none());
     }
 
     #[test]
-    fn reset_matching_ignores_unknown_delayed_and_ambiguous_candidates() {
-        let unrelated = UnoUsbPort {
-            port: "COM3".into(),
-            serial_number: None,
-            role: UnoUsbRole::Application,
+    fn disconnect_requests_the_stop_and_returns_before_the_recording_is_saved() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        session
+            .start_simulator(RecordingDuration::UntilStopped, dir.path().into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            wait_for_state(&session, SessionState::Acquiring).state,
+            SessionState::Acquiring
+        );
+        let returned = session
+            .request_disconnect()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(returned.state, SessionState::Stopping);
+        // The worker finishes saving by itself; polling observes the result.
+        let finished = wait_for_state(&session, SessionState::Disconnected);
+        assert_eq!(finished.state, SessionState::Disconnected);
+        assert_eq!(finished.stop_reason, Some(StopReason::User));
+        assert!(finished
+            .last_summary
+            .as_ref()
+            .is_some_and(|summary| summary.completion_status == "complete"));
+        session
+            .wait_for_worker()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(session.serial_ownership().current(), SerialOwner::Idle);
+    }
+
+    #[test]
+    fn disconnect_clears_an_idle_fault_but_never_interrupts_a_board_operation() {
+        let session = SessionController::default();
+        session
+            .set_fault(FaultOrigin::Verification, "firmware did not respond".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        let job = session
+            .serial_ownership()
+            .try_claim(SerialOwner::FirmwareJob)
+            .unwrap_or_else(|busy| panic!("{busy}"));
+        assert!(matches!(
+            session.request_disconnect(),
+            Err(SessionError::Busy(_))
+        ));
+        assert_eq!(
+            session
+                .status()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .state,
+            SessionState::Faulted
+        );
+        drop(job);
+        let cleared = session
+            .request_disconnect()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(cleared.state, SessionState::Disconnected);
+        assert_eq!(session.serial_ownership().current(), SerialOwner::Idle);
+    }
+
+    #[test]
+    fn disconnect_during_a_start_that_has_not_begun_is_refused_not_lost() {
+        let session = SessionController::default();
+        session
+            .set_fault(FaultOrigin::Connection, "handshake failed".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        // A Start command holds the session lease while it checks the folder,
+        // lab, and board, before its worker exists.
+        let start = session
+            .claim_serial(SerialOwner::Session)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let refused = session
+            .request_disconnect()
+            .err()
+            .unwrap_or_else(|| panic!("a Disconnect that would be lost must be refused"));
+        assert!(
+            matches!(refused, SessionError::Busy(busy) if busy.holder == SerialOwner::Session),
+            "{refused}"
+        );
+        assert!(!session.cancel.load(Ordering::Acquire));
+        assert!(session
+            .stop_reason
+            .lock()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .is_none());
+        assert_eq!(
+            session
+                .status()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .state,
+            SessionState::Faulted
+        );
+
+        // A worker that is returning releases the lease within the grace
+        // period, and the Disconnect then clears the idle fault.
+        let finishing = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(start);
+        });
+        let cleared = session
+            .request_disconnect()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(cleared.state, SessionState::Disconnected);
+        finishing
+            .join()
+            .unwrap_or_else(|_| panic!("finishing thread panicked"));
+        assert_eq!(session.serial_ownership().current(), SerialOwner::Idle);
+    }
+
+    #[test]
+    fn a_port_that_cannot_be_opened_still_reports_a_category_and_origin() {
+        let session = SessionController::default();
+        let result = session
+            .retry_handshake("WVU_TEST_NO_SUCH_PORT", FaultOrigin::Connection)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!result.handshake_succeeded);
+        assert!(!result.diagnostics.port_opened);
+        // Not listed by the operating system, so it is reported as no longer
+        // connected; a listed port that cannot be opened is PortBusy.
+        assert_eq!(
+            result.diagnostics.failure_category,
+            Some(ConnectionFailureCategory::DeviceDisconnected)
+        );
+        assert!(!result.diagnostics.recommended_action.contains("Reset"));
+        let status = session.status().unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        assert_eq!(status.fault_origin, Some(FaultOrigin::Connection));
+        assert!(status.last_error.is_some());
+    }
+
+    #[test]
+    fn only_an_unlisted_port_counts_as_a_removed_board() {
+        let listed = PortEnumerationDiagnostic {
+            selected_port_present: Some(true),
+            same_vid_pid_present: None,
+            same_serial_present: None,
+            uno_r4_present: Some(true),
+            observed_vid: None,
+            observed_pid: None,
+            observed_serial_number: None,
+            enumeration_error: None,
         };
         assert_eq!(
-            select_returning_port(&target(), &[unrelated]),
-            ReturningPort::Absent
+            category_after_io_failure(&listed),
+            ConnectionFailureCategory::SerialTransportError
         );
-        assert_eq!(select_returning_port(&target(), &[]), ReturningPort::Absent);
+        let unknown = PortEnumerationDiagnostic {
+            selected_port_present: None,
+            enumeration_error: Some("enumeration failed".into()),
+            ..listed.clone()
+        };
         assert_eq!(
-            select_returning_port(
-                &target(),
-                &[
-                    uno("COM14", Some("48CA4360243C")),
-                    uno("COM15", Some("48CA4360243C")),
-                ],
-            ),
-            ReturningPort::Ambiguous
+            category_after_io_failure(&unknown),
+            ConnectionFailureCategory::SerialTransportError
         );
+        let removed = PortEnumerationDiagnostic {
+            selected_port_present: Some(false),
+            ..listed
+        };
         assert_eq!(
-            select_returning_port(
-                &target(),
-                &[UnoUsbPort {
-                    port: "COM15".into(),
-                    serial_number: Some("48CA4360243C".into()),
-                    role: UnoUsbRole::Bootloader,
-                }],
-            ),
-            ReturningPort::Absent
+            category_after_io_failure(&removed),
+            ConnectionFailureCategory::DeviceDisconnected
+        );
+    }
+
+    #[test]
+    fn recommended_actions_name_only_buttons_that_exist() {
+        use ConnectionFailureCategory as Category;
+        for category in [
+            Category::PortBusy,
+            Category::PortOpenNoBytes,
+            Category::NonProtocolBytes,
+            Category::ProtocolCrcFailure,
+            Category::WrongProtocolVersion,
+            Category::MissingFirmwareIdentity,
+            Category::IncompatibleFirmwareIdentity,
+            Category::HandshakeIncomplete,
+            Category::SerialTransportError,
+            Category::FirmwareProtocolError,
+            Category::NoDataTimeout,
+            Category::DeviceDisconnected,
+            Category::RecordingStorageError,
+            Category::LabNotSupportedByFirmware,
+            Category::ConfigurationRejected,
+            Category::StartNotConfirmed,
+        ] {
+            let action = recommended_action(&category);
+            assert!(!action.contains("Reset board"), "{category:?}: {action}");
+            assert!(!action.contains("v0.1"), "{category:?}: {action}");
+            assert!(
+                !action.contains("refresh devices"),
+                "{category:?}: {action}"
+            );
+        }
+        assert!(
+            !recommended_action(&Category::RecordingStorageError).contains("Verify Firmware"),
+            "storage problems must not send students to firmware recovery"
+        );
+    }
+
+    #[test]
+    fn an_unusable_recording_folder_is_a_storage_failure_not_a_serial_one() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let file = dir.path().join("not-a-folder");
+        fs::write(&file, b"x").unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        let error = session
+            .allocate_paths(
+                &file.join("Trial01"),
+                &default_general_profile().unwrap_or_else(|error| panic!("{error}")),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a file cannot hold a recording folder"));
+        assert!(matches!(error, SessionError::Storage(_)), "{error}");
+        assert_eq!(worker_fault_origin(&error), FaultOrigin::Storage);
+    }
+
+    #[test]
+    fn a_start_the_board_does_not_confirm_is_a_connection_fault_with_its_own_category() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        let profile = default_general_profile().unwrap_or_else(|error| panic!("{error}"));
+        // A hardware-style session, which carries connection diagnostics.
+        session
+            .begin_session(
+                false,
+                "Arduino UNO R4 WiFi",
+                "COM12",
+                RecordingDuration::UntilStopped,
+                profile.clone(),
+                RecordingCalibration::default(),
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        let inner = SimulatorIo::new(&profile, RecordingDuration::UntilStopped)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut transport =
+            FailingStart::new(inner, session.cancel.clone(), StartFailure::FirmwareError);
+        let result = session.capture_transport(
+            &mut transport,
+            simulator_request(&profile, RecordingDuration::UntilStopped, dir.path()),
+        );
+        session
+            .finish_worker_error(&result)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let status = session.status().unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        // No recording ran, so the UI must not say that one ended.
+        assert_eq!(status.fault_origin, Some(FaultOrigin::Connection));
+        assert_eq!(
+            status
+                .connection_diagnostics
+                .and_then(|diagnostics| diagnostics.failure_category),
+            Some(ConnectionFailureCategory::StartNotConfirmed)
         );
     }
 
@@ -5283,6 +5683,9 @@ mod tests {
         commands: FrameParser,
         answer_on_ping: Option<u32>,
         pings: u32,
+        /// The next this-many writes fail with a Windows-style write timeout
+        /// before any byte reaches the board.
+        ping_write_timeouts: u32,
         hello_payload: Vec<u8>,
     }
 
@@ -5293,6 +5696,7 @@ mod tests {
                 commands: FrameParser::default(),
                 answer_on_ping,
                 pings: 0,
+                ping_write_timeouts: 0,
                 hello_payload: [
                     REFERENCE_FIRMWARE_BUILD.to_le_bytes().as_slice(),
                     REFERENCE_DEVICE_ID.to_le_bytes().as_slice(),
@@ -5339,6 +5743,13 @@ mod tests {
 
     impl Write for HandshakeMock {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.ping_write_timeouts > 0 {
+                self.ping_write_timeouts -= 1;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "mock write timeout",
+                ));
+            }
             for frame in self.commands.push(bytes) {
                 if frame.message_type == MessageType::Ping {
                     self.pings += 1;
@@ -5460,15 +5871,71 @@ mod tests {
     }
 
     #[test]
-    fn reset_is_prohibited_while_acquiring() {
+    fn a_timed_out_ping_write_is_one_failed_attempt_not_the_end_of_the_handshake() {
+        let (session, mut acquisition) = handshake_session();
+        let mut io = HandshakeMock::new(Some(1));
+        io.ping_write_timeouts = 1;
+        session
+            .wait_for_handshake_with_policy(
+                &mut io,
+                &mut acquisition,
+                Duration::ZERO,
+                Duration::from_millis(500),
+                3,
+                Duration::from_millis(5),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let diagnostics = session
+            .status()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .connection_diagnostics
+            .unwrap_or_else(|| panic!("missing diagnostics"));
+        assert_eq!(diagnostics.ping_attempts, 2);
+        assert!(diagnostics.pong_received);
+        assert_eq!(diagnostics.failure_category, None);
+    }
+
+    #[test]
+    fn ping_writes_that_always_time_out_are_a_serial_transport_problem() {
+        let (session, mut acquisition) = handshake_session();
+        let mut io = HandshakeMock::new(Some(1));
+        io.ping_write_timeouts = u32::MAX;
+        assert!(session
+            .wait_for_handshake_with_policy(
+                &mut io,
+                &mut acquisition,
+                Duration::ZERO,
+                Duration::from_millis(30),
+                3,
+                Duration::from_millis(1),
+            )
+            .is_err());
+        let diagnostics = session
+            .status()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .connection_diagnostics
+            .unwrap_or_else(|| panic!("missing diagnostics"));
+        assert_eq!(diagnostics.ping_attempts, 3);
+        assert_eq!(
+            diagnostics.failure_category,
+            Some(ConnectionFailureCategory::SerialTransportError)
+        );
+    }
+
+    #[test]
+    fn retry_is_prohibited_while_acquiring() {
         let (session, _acquisition) = handshake_session();
         session
             .set_state(SessionState::Acquiring)
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(
-            session.reset_and_retry(target()),
+            session.retry_handshake("COM12", FaultOrigin::Connection),
             Err(SessionError::State(_))
         ));
+        assert_eq!(
+            session.status().unwrap_or_else(|e| panic!("{e}")).state,
+            SessionState::Acquiring
+        );
     }
 
     #[test]
@@ -5572,6 +6039,8 @@ mod tests {
         let status = session.status().unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(status.available_disk_bytes, Some(DISK_CRITICAL_BYTES - 1));
         assert!(status.storage_warning.is_some());
+        // A storage refusal must not be described as a board problem.
+        assert_eq!(status.fault_origin, Some(FaultOrigin::Storage));
     }
 
     #[test]
@@ -5845,11 +6314,13 @@ mod tests {
                     recording_path_context: None,
                     recording_context: RecordingContext::default(),
                     expected_port_identity: None,
+                    provenance: None,
                 },
             )
             .err()
             .unwrap_or_else(|| panic!("disconnecting transport unexpectedly completed"));
         let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.fault_origin, Some(FaultOrigin::Recording));
         let summary = status.last_summary.unwrap_or_else(|| {
             panic!(
                 "missing interrupted summary after {capture_error}; state={:?}, reads={}",
@@ -5920,6 +6391,7 @@ mod tests {
                     recording_path_context: None,
                     recording_context: RecordingContext::default(),
                     expected_port_identity: None,
+                    provenance: None,
                 },
             )
             .err()
@@ -6811,6 +7283,7 @@ mod tests {
             recording_path_context: None,
             recording_context: RecordingContext::default(),
             expected_port_identity: None,
+            provenance: None,
         }
     }
 
@@ -7105,6 +7578,7 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|message| message.contains("CSV export failed")));
+        assert_eq!(status.fault_origin, Some(FaultOrigin::Storage));
         let summary = status
             .last_summary
             .unwrap_or_else(|| panic!("missing summary"));
@@ -7194,7 +7668,7 @@ mod tests {
         begin_simulated_session(&detailed, &profile, timed);
         detailed.request_stop().unwrap_or_else(|e| panic!("{e}"));
         detailed
-            .set_fault("stage-specific save detail".into())
+            .set_fault(FaultOrigin::Storage, "stage-specific save detail".into())
             .unwrap_or_else(|e| panic!("{e}"));
         detailed
             .finish_worker_error(&Err(SessionError::Io(std::io::Error::other("generic"))))
@@ -7285,6 +7759,38 @@ mod tests {
     }
 
     #[test]
+    fn start_provenance_never_probes_when_a_version_is_already_known() {
+        use crate::arduino_cli::{CliError, ToolVersions};
+        let probed = ToolVersions {
+            arduino_cli_version: "probed".into(),
+            uno_r4_core_version: "probed".into(),
+        };
+        let runtime = crate::arduino_runtime::RuntimePaths {
+            executable: PathBuf::from("arduino-cli.exe"),
+            config_file: PathBuf::from("arduino-cli.yaml"),
+            root: PathBuf::from("rt"),
+            cli_version: "1.5.2-rc.1".into(),
+            core_version: "1.6.0".into(),
+        };
+        let no_probe = || -> Result<ToolVersions, CliError> {
+            panic!("Start must not run Arduino CLI when a version is known")
+        };
+        let cached = provenance_tool_versions(Some(probed.clone()), Some(&runtime), no_probe)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(cached, probed);
+        // A failed earlier probe falls back to the bundled runtime's versions.
+        let pinned = provenance_tool_versions(None, Some(&runtime), no_probe)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(pinned.arduino_cli_version, "1.5.2-rc.1");
+        assert_eq!(pinned.uno_r4_core_version, "1.6.0");
+        // Only a development build without the bundled runtime probes.
+        let probed_now = provenance_tool_versions(None, None, || Ok(probed.clone()))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(probed_now, probed);
+        assert!(provenance_tool_versions(None, None, || Err(CliError::NotFound)).is_err());
+    }
+
+    #[test]
     fn an_oversized_lab_header_is_rejected_before_the_session_begins() {
         let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
         let session = SessionController::default();
@@ -7303,6 +7809,9 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("an oversized header must be rejected"));
         assert!(matches!(error, SessionError::InvalidRequest(_)), "{error}");
+        // Had it reached the worker, it would not be described as a recording
+        // that ended or as a connection problem.
+        assert_eq!(worker_fault_origin(&error), FaultOrigin::Request);
         assert!(error.to_string().contains("too long"), "{error}");
         // The student sees the reason, not an internal state-machine prefix.
         assert!(!error.to_string().contains("illegal transition"), "{error}");

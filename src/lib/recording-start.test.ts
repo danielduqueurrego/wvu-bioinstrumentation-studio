@@ -35,6 +35,20 @@ describe('recording start readiness', () => {
     expect(result.message).toMatch(message);
   });
 
+  it('does not send a student to firmware recovery after a storage fault', () => {
+    const result = recordingStartReadiness({ ...readyHardware, sessionState: 'Faulted', faultOrigin: 'storage' });
+    expect(result.canStart).toBe(false);
+    expect(result.message).toMatch(/not saved completely/i);
+    expect(result.message).not.toMatch(/firmware/i);
+  });
+
+  it('does not send a student to firmware recovery after a refused recording request', () => {
+    const result = recordingStartReadiness({ ...readyHardware, sessionState: 'Faulted', faultOrigin: 'request' });
+    expect(result.canStart).toBe(false);
+    expect(result.message).toMatch(/did not start/i);
+    expect(result.message).not.toMatch(/firmware/i);
+  });
+
   it('does not use raw backend errors as the primary student message', () => {
     expect(studentRecordingStartError('only one session may be active; disconnect first')).toMatch(/Arduino is busy/i);
     expect(studentRecordingStartError('firmware compatibility is not verified')).toMatch(/firmware is not ready/i);

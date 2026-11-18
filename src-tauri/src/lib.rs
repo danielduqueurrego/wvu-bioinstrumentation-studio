@@ -9,11 +9,20 @@ pub mod project_paths;
 pub mod protocol;
 pub mod recording;
 pub mod reference_firmware;
+pub mod serial_lease;
 pub mod session;
 
 use serde::Serialize;
-use std::path::PathBuf;
-use tauri::{Manager, WindowEvent};
+use serial_lease::SerialOwner;
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+use tauri::{Emitter, Manager, WindowEvent};
 
 struct AppState {
     /// Exactly one controller owns the acquisition-session lifecycle. It has no frontend serial handle.
@@ -24,6 +33,27 @@ struct AppState {
     profiles: profiles::ProfileStore,
     /// Student-facing local calibration presets. They never modify a locked profile.
     calibrations: calibration::CalibrationStore,
+    /// Window-close progress (`CLOSE_*`): closing during a recording first
+    /// saves it, and repeated close clicks never start a second save.
+    closing: Arc<AtomicU8>,
+}
+
+/// No close is in progress.
+const CLOSE_IDLE: u8 = 0;
+/// The window asked to close during a recording, which is being saved first.
+const CLOSE_SAVING: u8 = 1;
+/// The recording was saved; the next close request is allowed.
+const CLOSE_READY: u8 = 2;
+/// After the recording worker has been joined, how long the close waits for
+/// the session to report that it is no longer recording.
+const CLOSE_SETTLE_LIMIT: Duration = Duration::from_secs(120);
+/// Sent to the page when a close request was refused or deferred.
+const CLOSE_BLOCKED_EVENT: &str = "close-blocked";
+
+#[derive(Clone, Serialize)]
+struct CloseBlocked {
+    reason: &'static str,
+    message: &'static str,
 }
 
 #[derive(serde::Deserialize)]
@@ -89,6 +119,37 @@ impl StartRecordingFailure {
             technical_detail,
         }
     }
+
+    /// Another operation owns the board, or the session is still saving.
+    fn busy(error: session::SessionError) -> Self {
+        let user_message = match &error {
+            session::SessionError::Busy(busy) => busy.message(),
+            _ => "The Arduino is busy. Wait for the current operation to finish and try again.",
+        };
+        Self::new("CLAIM_SERIAL", "session_busy", user_message, error)
+    }
+
+    /// A failure while the session prepares the recording. A refused request
+    /// (for example an oversized lab header) carries its own student text.
+    fn session_start(error: session::SessionError) -> Self {
+        let user_message = match &error {
+            session::SessionError::InvalidRequest(message) => *message,
+            session::SessionError::Busy(busy) => busy.message(),
+            _ => "The recording could not be prepared. Try again. If it continues, open Advanced details and share the information with your instructor.",
+        };
+        Self::new("INITIALIZE_SESSION", "session_start", user_message, error)
+    }
+}
+
+/// Every board command runs off the main thread; a task that cannot run is
+/// reported like any other start failure.
+fn start_task_failure(error: impl ToString) -> StartRecordingFailure {
+    StartRecordingFailure::new(
+        "START_TASK",
+        "start_task",
+        "The recording could not be prepared. Try again. If it continues, open Advanced details and share the information with your instructor.",
+        error,
+    )
 }
 
 #[derive(Serialize)]
@@ -111,14 +172,74 @@ async fn list_boards(cli_path: Option<String>) -> Result<Vec<arduino_cli::BoardI
     .map_err(|error| format!("board discovery task failed: {error}"))?
 }
 
+/// Tool preparation and repair reject with `ArduinoToolsFailure` (title,
+/// explanation, recommended action), never with a raw I/O string.
 #[tauri::command]
 async fn prepare_arduino_runtime(
     app: tauri::AppHandle,
-) -> Result<arduino_runtime::RuntimeStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || arduino_runtime::prepare_runtime(&app))
+) -> Result<arduino_runtime::RuntimeStatus, arduino_runtime::ArduinoToolsFailure> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = arduino_runtime::prepare_runtime(&app).map_err(|error| {
+            app_log::record(
+                "WARN",
+                &format!("ARDUINO_TOOLS_PREPARE_FAIL detail={error}"),
+            );
+            error.failure()
+        })?;
+        probe_tool_versions();
+        Ok(status)
+    })
+    .await
+    .map_err(|error| {
+        arduino_runtime::ArduinoToolsFailure::task_failure(format!(
+            "Arduino tool preparation task failed: {error}"
+        ))
+    })?
+}
+
+/// Probe the tool versions once per run, now that the tools exist.
+/// Recordings reuse them; a failure only makes provenance unavailable.
+fn probe_tool_versions() {
+    if let Err(error) = arduino_cli::cached_tool_versions() {
+        app_log::record("WARN", &format!("TOOL_VERSIONS_UNAVAILABLE detail={error}"));
+    }
+}
+
+/// Repair Arduino tools: extracts the included offline tools again (it never
+/// downloads anything). Allowed in both student and instructor mode.
+#[tauri::command]
+async fn repair_arduino_runtime(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<arduino_runtime::RuntimeStatus, arduino_runtime::ArduinoToolsFailure> {
+    let session = state.session.clone();
+    tauri::async_runtime::spawn_blocking(move || repair_tools(&app, &session))
         .await
-        .map_err(|error| format!("Arduino tool preparation task failed: {error}"))?
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            arduino_runtime::ArduinoToolsFailure::task_failure(format!(
+                "Arduino tool repair task failed: {error}"
+            ))
+        })?
+}
+
+fn repair_tools(
+    app: &tauri::AppHandle,
+    session: &session::SessionController,
+) -> Result<arduino_runtime::RuntimeStatus, arduino_runtime::ArduinoToolsFailure> {
+    // Start, Verify, Retry connection, and Restore all run the tools being
+    // replaced and all claim this lease, so none can run during the repair
+    // (and a repair waits for none of them: it is refused instead).
+    let _lease = session
+        .claim_serial(SerialOwner::ToolRepair)
+        .map_err(|error| arduino_runtime::ArduinoToolsFailure::busy(&error.to_string()))?;
+    app_log::record("INFO", "ARDUINO_TOOLS_REPAIR_BEGIN");
+    let status = arduino_runtime::repair_runtime(app).map_err(|error| {
+        app_log::record("WARN", &format!("ARDUINO_TOOLS_REPAIR_FAIL detail={error}"));
+        error.failure()
+    })?;
+    probe_tool_versions();
+    app_log::record("INFO", "ARDUINO_TOOLS_REPAIR_OK");
+    Ok(status)
 }
 
 #[tauri::command]
@@ -150,13 +271,6 @@ fn record_frontend_plot_error(stage: String, detail: String) {
     );
 }
 
-fn firmware_error<T>(result: Result<T, firmware_workflow::FirmwareFailure>) -> Result<T, String> {
-    result.map_err(|failure| {
-        serde_json::to_string(&failure)
-            .unwrap_or_else(|error| format!("firmware workflow error: {error}"))
-    })
-}
-
 #[tauri::command]
 async fn firmware_environment(
     state: tauri::State<'_, AppState>,
@@ -167,38 +281,51 @@ async fn firmware_environment(
         .map_err(|error| format!("firmware environment task failed: {error}"))
 }
 
+/// Firmware commands return `FirmwareFailure` itself as the error, so the
+/// frontend receives its title, explanation, and recommended action.
 #[tauri::command]
-fn restore_wvu_reference_firmware(
+async fn restore_wvu_reference_firmware(
     state: tauri::State<'_, AppState>,
     request: firmware_workflow::RestoreReferenceRequest,
-) -> Result<firmware_workflow::FirmwareJobStatus, String> {
-    firmware_error(state.firmware.start_restore_reference(request))
+) -> Result<firmware_workflow::FirmwareJobStatus, firmware_workflow::FirmwareFailure> {
+    let firmware = state.firmware.clone();
+    // Board discovery runs Arduino CLI, so it stays off the main thread.
+    tauri::async_runtime::spawn_blocking(move || firmware.start_restore_reference(request))
+        .await
+        .map_err(|error| {
+            firmware_workflow::FirmwareFailure::task_failure(format!(
+                "firmware restore task failed: {error}"
+            ))
+        })?
 }
 
 #[tauri::command]
 fn cancel_firmware_job(
     state: tauri::State<'_, AppState>,
-) -> Result<firmware_workflow::FirmwareWorkflowStatus, String> {
-    firmware_error(state.firmware.cancel_active_job())
+) -> Result<firmware_workflow::FirmwareWorkflowStatus, firmware_workflow::FirmwareFailure> {
+    state.firmware.cancel_active_job()
 }
 
 #[tauri::command]
 fn get_firmware_workflow_status(
     state: tauri::State<'_, AppState>,
-) -> Result<firmware_workflow::FirmwareWorkflowStatus, String> {
-    firmware_error(state.firmware.status())
+) -> Result<firmware_workflow::FirmwareWorkflowStatus, firmware_workflow::FirmwareFailure> {
+    state.firmware.status()
 }
 
 #[tauri::command]
 async fn verify_wvu_reference_firmware(
     state: tauri::State<'_, AppState>,
     port: String,
-) -> Result<firmware_workflow::FirmwareVerification, String> {
+) -> Result<firmware_workflow::FirmwareVerification, firmware_workflow::FirmwareFailure> {
     let firmware = state.firmware.clone();
     tauri::async_runtime::spawn_blocking(move || firmware.verify_existing_reference(port))
         .await
-        .map_err(|error| format!("firmware verification task failed: {error}"))
-        .and_then(firmware_error)
+        .map_err(|error| {
+            firmware_workflow::FirmwareFailure::task_failure(format!(
+                "firmware verification task failed: {error}"
+            ))
+        })?
 }
 
 #[tauri::command]
@@ -455,10 +582,24 @@ fn estimate_recording_storage(
 }
 
 #[tauri::command]
-fn start_profile_simulator_recording(
+async fn start_profile_simulator_recording(
     state: tauri::State<'_, AppState>,
     request: StartProfileSimulatorRequest,
-) -> Result<session::SessionStatus, String> {
+) -> Result<session::SessionStatus, StartRecordingFailure> {
+    let session = state.session.clone();
+    let profiles = state.profiles.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        start_simulator_recording(&session, &profiles, request)
+    })
+    .await
+    .map_err(start_task_failure)?
+}
+
+fn start_simulator_recording(
+    session: &session::SessionController,
+    profiles: &profiles::ProfileStore,
+    request: StartProfileSimulatorRequest,
+) -> Result<session::SessionStatus, StartRecordingFailure> {
     let StartProfileSimulatorRequest {
         project_folder,
         output_folder,
@@ -468,36 +609,84 @@ fn start_profile_simulator_recording(
         recording_note,
         calibration,
     } = request;
-    let destination =
-        project_paths::resolve_recording_destination(&project_folder, &output_folder)?;
-    let profile = state
-        .profiles
-        .get_locked(&profile_id)
-        .map_err(|error| error.to_string())?;
-    let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())?;
-    state
-        .session
-        .prepare_for_new_recording()
-        .map_err(|error| error.to_string())?;
-    state
-        .session
-        .start_simulator_with_profile_calibration_and_path_context(
-            profile.snapshot(bench_notice_acknowledged),
-            duration,
-            destination.effective_folder,
-            calibration,
-            Some(session::RecordingPathContext {
-                project_folder: destination.project_folder.to_string_lossy().into_owned(),
-                output_folder: destination.output_folder,
-            }),
-            session::RecordingContext { recording_note },
+    // The session (and the board) are claimed first, so a Verify, Retry, or
+    // restore cannot change the session state while this start is prepared.
+    let lease = session
+        .claim_serial(SerialOwner::Session)
+        .map_err(StartRecordingFailure::busy)?;
+    let destination = project_paths::resolve_recording_destination(&project_folder, &output_folder)
+        .map_err(|error| {
+            StartRecordingFailure::new(
+                "VALIDATE_PATHS",
+                "recording_folder",
+                "The recording folder is not writable. Choose another Project or Output folder before recording.",
+                error,
+            )
+        })?;
+    let profile = profiles.get_locked(&profile_id).map_err(|error| {
+        StartRecordingFailure::new(
+            "LOAD_LAB",
+            "lab_unavailable",
+            "The selected lab is not available. Choose the assigned lab and try again.",
+            error,
         )
-        .map_err(|error| error.to_string())
+    })?;
+    let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())
+        .map_err(|error| {
+            StartRecordingFailure::new(
+                "CHECK_CALIBRATION",
+                "calibration",
+                "The selected calibration cannot be used with this lab. Choose another calibration and try again.",
+                error,
+            )
+        })?;
+    session.prepare_for_new_recording().map_err(|error| {
+        StartRecordingFailure::new(
+            "PREPARE_SESSION",
+            "session_busy",
+            "The Arduino is busy. Wait for the current operation to finish and try again.",
+            error,
+        )
+    })?;
+    session
+        .start_simulator_leased(
+            lease,
+            profile.snapshot(bench_notice_acknowledged),
+            session::RecordingStartOptions {
+                duration,
+                output_dir: destination.effective_folder,
+                calibration,
+                recording_path_context: Some(session::RecordingPathContext {
+                    project_folder: destination.project_folder.to_string_lossy().into_owned(),
+                    output_folder: destination.output_folder,
+                }),
+                recording_context: session::RecordingContext { recording_note },
+            },
+        )
+        .map_err(StartRecordingFailure::session_start)
 }
 
 #[tauri::command]
-fn start_profile_hardware_recording(
+async fn start_profile_hardware_recording(
     state: tauri::State<'_, AppState>,
+    request: StartProfileHardwareRequest,
+) -> Result<session::SessionStatus, StartRecordingFailure> {
+    let session = state.session.clone();
+    let firmware = state.firmware.clone();
+    let profiles = state.profiles.clone();
+    // Board discovery and session preparation run Arduino CLI and wait on
+    // the previous worker, so they never block the window.
+    tauri::async_runtime::spawn_blocking(move || {
+        start_hardware_recording(&session, &firmware, &profiles, request)
+    })
+    .await
+    .map_err(start_task_failure)?
+}
+
+fn start_hardware_recording(
+    session: &session::SessionController,
+    firmware: &firmware_workflow::FirmwareWorkflow,
+    profiles: &profiles::ProfileStore,
     request: StartProfileHardwareRequest,
 ) -> Result<session::SessionStatus, StartRecordingFailure> {
     let StartProfileHardwareRequest {
@@ -514,6 +703,12 @@ fn start_profile_hardware_recording(
         "INFO",
         &format!("START_REQUEST port={port} lab={profile_id}"),
     );
+    // Claimed before any check: no restore, Verify, or Retry can run between
+    // the firmware check and the worker opening the port. The worker keeps the
+    // lease until the recording is saved.
+    let lease = session
+        .claim_serial(SerialOwner::Session)
+        .map_err(StartRecordingFailure::busy)?;
     app_log::record("INFO", "VALIDATE_PATHS_BEGIN");
     let destination = project_paths::resolve_recording_destination(&project_folder, &output_folder)
         .map_err(|error| {
@@ -531,7 +726,7 @@ fn start_profile_hardware_recording(
             destination.effective_folder.display()
         ),
     );
-    let profile = state.profiles.get_locked(&profile_id).map_err(|error| {
+    let profile = profiles.get_locked(&profile_id).map_err(|error| {
         StartRecordingFailure::new(
             "LOAD_LAB",
             "lab_unavailable",
@@ -539,21 +734,20 @@ fn start_profile_hardware_recording(
             error,
         )
     })?;
-    let firmware_allowed =
-        firmware_error(state.firmware.is_acquisition_allowed(&port)).map_err(|error| {
-            StartRecordingFailure::new(
-                "CHECK_FIRMWARE",
-                "firmware_status",
-                "WVU firmware is not ready. Verify or restore the firmware before recording.",
-                error,
-            )
-        })?;
+    let firmware_allowed = firmware.is_acquisition_allowed(&port).map_err(|error| {
+        StartRecordingFailure::new(
+            "CHECK_FIRMWARE",
+            "firmware_status",
+            "WVU firmware is not ready. Verify or restore the firmware before recording.",
+            error,
+        )
+    })?;
     if !firmware_allowed {
         return Err(StartRecordingFailure::new(
             "CHECK_FIRMWARE",
             "firmware_not_ready",
-            "WVU firmware is not ready. Verify or restore the firmware before recording.",
-            "firmware workflow did not report a compatible WVU firmware for the selected port",
+            "WVU firmware is not ready on this board. Select Verify Firmware, then try again.",
+            "compatible WVU firmware was not verified on the selected port",
         ));
     }
     if !serialport::available_ports()
@@ -580,11 +774,13 @@ fn start_profile_hardware_recording(
         StartRecordingFailure::new(
             "BOARD_DISCOVERY",
             "arduino_tools",
-            "Arduino tools need attention. Click Refresh Board, then try again.",
+            "Arduino tools need attention. Select Repair Arduino tools, then try again.",
             error,
         )
     })?;
-    if !cli
+    // This is the only board scan for a Start; its serial number is reused as
+    // recording provenance.
+    let board = cli
         .boards()
         .map_err(|error| {
             StartRecordingFailure::new(
@@ -595,15 +791,15 @@ fn start_profile_hardware_recording(
             )
         })?
         .into_iter()
-        .any(|board| board.port.eq_ignore_ascii_case(&port))
-    {
-        return Err(StartRecordingFailure::new(
-            "BOARD_DISCOVERY",
-            "unsupported_board",
-            "The selected board is no longer available. Reconnect the UNO R4 WiFi, then click Refresh Board.",
-            format!("selected port {port} was not reported as an Arduino UNO R4 WiFi"),
-        ));
-    }
+        .find(|board| board.port.eq_ignore_ascii_case(&port))
+        .ok_or_else(|| {
+            StartRecordingFailure::new(
+                "BOARD_DISCOVERY",
+                "unsupported_board",
+                "The selected board is no longer available. Reconnect the UNO R4 WiFi, then click Refresh Board.",
+                format!("selected port {port} was not reported as an Arduino UNO R4 WiFi"),
+            )
+        })?;
     app_log::record("INFO", "BOARD_DISCOVERY_OK");
     let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())
         .map_err(|error| {
@@ -614,7 +810,7 @@ fn start_profile_hardware_recording(
                 error,
             )
         })?;
-    state.session.prepare_for_new_recording().map_err(|error| {
+    session.prepare_for_new_recording().map_err(|error| {
         StartRecordingFailure::new(
             "PREPARE_SESSION",
             "session_busy",
@@ -623,9 +819,9 @@ fn start_profile_hardware_recording(
         )
     })?;
     app_log::record("INFO", "SERIAL_OPEN_BEGIN");
-    state
-        .session
-        .start_serial_with_profile_and_options(
+    session
+        .start_serial_leased(
+            lease,
             profile.snapshot(bench_notice_acknowledged),
             port,
             session::RecordingStartOptions {
@@ -636,76 +832,49 @@ fn start_profile_hardware_recording(
                     project_folder: destination.project_folder.to_string_lossy().into_owned(),
                     output_folder: destination.output_folder,
                 }),
-                recording_context: session::RecordingContext {
-                    recording_note,
-                },
+                recording_context: session::RecordingContext { recording_note },
             },
+            board.serial_number,
         )
-        .map_err(|error| {
-            StartRecordingFailure::new(
-                "INITIALIZE_SESSION",
-                "session_start",
-                "The recording could not be prepared. Try again. If it continues, open Advanced details and share the information with your instructor.",
-                error,
-            )
-        })
+        .map_err(StartRecordingFailure::session_start)
 }
 
-/// Explicit recovery action for a previously discovered UNO R4 WiFi. It performs
-/// only a 1200-bps touch/reset and a fresh protocol handshake; it never uploads firmware.
+/// Retry connection: a fresh protocol handshake on a discovered UNO R4 WiFi.
+/// It never resets the board at 1200 bps and never uploads firmware.
 #[tauri::command]
-fn reset_board_and_retry(
-    state: tauri::State<'_, AppState>,
-    port: String,
-) -> Result<session::ResetRetryResult, String> {
-    if port.trim().is_empty() || port.contains('\0') {
-        return Err("select a valid discovered UNO R4 WiFi port".into());
-    }
-    let cli = arduino_cli::ArduinoCli::discover(None).map_err(|error| error.to_string())?;
-    let board = cli
-        .boards()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|board| board.port.eq_ignore_ascii_case(&port))
-        .ok_or_else(|| {
-            "selected port is not a currently discovered Arduino UNO R4 WiFi; refresh devices first"
-                .to_string()
-        })?;
-    state
-        .session
-        .reset_and_retry(session::ResetTarget {
-            port: board.port,
-            serial_number: board.serial_number,
-        })
-        .map_err(|error| error.to_string())
-}
-
-/// Explicit no-reset retry for a discovered UNO R4 WiFi. This is distinct from
-/// Reset and retry so normal connection attempts never touch the board at 1200 bps.
-#[tauri::command]
-fn retry_hardware_handshake(
+async fn retry_hardware_handshake(
     state: tauri::State<'_, AppState>,
     port: String,
 ) -> Result<session::HandshakeRetryResult, String> {
+    let session = state.session.clone();
+    tauri::async_runtime::spawn_blocking(move || retry_connection(&session, &port))
+        .await
+        .map_err(|error| format!("connection retry task failed: {error}"))?
+}
+
+fn retry_connection(
+    session: &session::SessionController,
+    port: &str,
+) -> Result<session::HandshakeRetryResult, String> {
     if port.trim().is_empty() || port.contains('\0') {
-        return Err("select a valid discovered UNO R4 WiFi port".into());
+        return Err("Select a detected Arduino UNO R4 WiFi, then try again.".into());
     }
+    // Released when this function returns, on success, error, or panic.
+    let _lease = session
+        .claim_serial(SerialOwner::Retry)
+        .map_err(|error| error.to_string())?;
     let cli = arduino_cli::ArduinoCli::discover(None).map_err(|error| error.to_string())?;
     let board = cli
         .boards()
         .map_err(|error| error.to_string())?
         .into_iter()
-        .find(|board| board.port.eq_ignore_ascii_case(&port))
+        .find(|board| board.port.eq_ignore_ascii_case(port))
         .ok_or_else(|| {
-            "selected port is not a currently discovered Arduino UNO R4 WiFi; refresh devices first"
+            "The selected board is no longer detected. Select Refresh Board, then try again."
                 .to_string()
         })?;
-    state
-        .session
-        .retry_handshake(session::ResetTarget {
-            port: board.port,
-            serial_number: board.serial_number,
-        })
+    session
+        .retry_handshake(&board.port, session::FaultOrigin::Connection)
         .map_err(|error| error.to_string())
 }
 
@@ -730,11 +899,16 @@ fn add_recording_marker(
         .map_err(|error| error.to_string())
 }
 
+/// Requests the stop and returns at once; the recording finishes saving on
+/// its worker and polling shows the final state. An idle fault is cleared.
 #[tauri::command]
-fn disconnect_session(state: tauri::State<'_, AppState>) -> Result<session::SessionStatus, String> {
-    state
-        .session
-        .disconnect()
+async fn disconnect_session(
+    state: tauri::State<'_, AppState>,
+) -> Result<session::SessionStatus, String> {
+    let session = state.session.clone();
+    tauri::async_runtime::spawn_blocking(move || session.request_disconnect())
+        .await
+        .map_err(|error| format!("disconnect task failed: {error}"))?
         .map_err(|error| error.to_string())
 }
 
@@ -771,6 +945,110 @@ fn get_recent_display_data(
         })
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum CloseDecision {
+    /// Nothing needs to finish first.
+    Allow,
+    /// A firmware restore is running: the window stays open.
+    RefuseDuringFirmwareJob,
+    /// This close is already saving the recording: wait for it.
+    AlreadySaving,
+    /// Stop and save the recording, then close.
+    SaveRecordingThenClose,
+}
+
+fn close_decision(firmware_job_active: bool, close_state: u8, recording: bool) -> CloseDecision {
+    if firmware_job_active {
+        return CloseDecision::RefuseDuringFirmwareJob;
+    }
+    match close_state {
+        CLOSE_READY => CloseDecision::Allow,
+        CLOSE_SAVING => CloseDecision::AlreadySaving,
+        _ if recording => CloseDecision::SaveRecordingThenClose,
+        _ => CloseDecision::Allow,
+    }
+}
+
+fn notify_close_blocked(window: &tauri::Window, reason: &'static str, message: &'static str) {
+    let _ = window.emit(CLOSE_BLOCKED_EVENT, CloseBlocked { reason, message });
+}
+
+/// Close-request policy.
+///
+/// A firmware restore is never interrupted by closing the window: its
+/// Arduino tools would be ended and the board could be left part-way written.
+/// The page is told why the window stayed open. During a recording the
+/// recording is stopped and saved before the window closes, by exactly one
+/// thread no matter how many times close is clicked.
+fn handle_close_request(window: &tauri::Window, api: &tauri::CloseRequestApi) {
+    let state = window.state::<AppState>();
+    let decision = close_decision(
+        state.firmware.has_active_job(),
+        state.closing.load(Ordering::Acquire),
+        matches!(state.session.is_recording(), Ok(true)),
+    );
+    match decision {
+        CloseDecision::Allow => {}
+        CloseDecision::RefuseDuringFirmwareJob => {
+            api.prevent_close();
+            // A save that finished just before a restore began no longer
+            // authorizes closing; the next request is evaluated afresh.
+            state.closing.store(CLOSE_IDLE, Ordering::Release);
+            notify_close_blocked(
+                window,
+                "firmware_job",
+                "WVU Firmware is being restored. The window stays open until the restore finishes; do not unplug the board.",
+            );
+        }
+        CloseDecision::AlreadySaving => {
+            api.prevent_close();
+            notify_close_blocked(
+                window,
+                "saving_recording",
+                "The recording is being saved. The window will close when saving finishes.",
+            );
+        }
+        CloseDecision::SaveRecordingThenClose => {
+            // Preventing close and finalizing first avoids abandoning a writer.
+            api.prevent_close();
+            if state
+                .closing
+                .compare_exchange(
+                    CLOSE_IDLE,
+                    CLOSE_SAVING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return;
+            }
+            notify_close_blocked(
+                window,
+                "saving_recording",
+                "The recording is being saved. The window will close when saving finishes.",
+            );
+            let session = state.session.clone();
+            let closing = Arc::clone(&state.closing);
+            let closing_window = window.clone();
+            std::thread::spawn(move || {
+                let _ = session.request_stop_with_reason(recording::StopReason::ApplicationClose);
+                let _ = session.wait_for_worker();
+                // Normally already final once the worker is joined; this
+                // covers a worker handle that another caller was joining.
+                let settle_started = Instant::now();
+                while matches!(session.is_recording(), Ok(true))
+                    && settle_started.elapsed() < CLOSE_SETTLE_LIMIT
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                closing.store(CLOSE_READY, Ordering::Release);
+                let _ = closing_window.close();
+            });
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // The acquisition controller is intentionally shared with the firmware workflow:
@@ -787,9 +1065,11 @@ pub fn run() {
             firmware,
             profiles,
             calibrations,
+            closing: Arc::new(AtomicU8::new(CLOSE_IDLE)),
         })
         .invoke_handler(tauri::generate_handler![
             prepare_arduino_runtime,
+            repair_arduino_runtime,
             get_project_folder,
             set_project_folder,
             record_frontend_plot_error,
@@ -822,7 +1102,6 @@ pub fn run() {
             estimate_recording_storage,
             start_profile_simulator_recording,
             start_profile_hardware_recording,
-            reset_board_and_retry,
             retry_hardware_handshake,
             stop_recording,
             add_recording_marker,
@@ -832,18 +1111,7 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let session = window.state::<AppState>().session.clone();
-                if matches!(session.is_recording(), Ok(true)) {
-                    // Preventing close and finalizing first avoids abandoning a writer.
-                    api.prevent_close();
-                    let closing_window = window.clone();
-                    std::thread::spawn(move || {
-                        let _ = session
-                            .request_stop_with_reason(recording::StopReason::ApplicationClose);
-                        let _ = session.wait_for_worker();
-                        let _ = closing_window.close();
-                    });
-                }
+                handle_close_request(window, api);
             }
         })
         .run(tauri::generate_context!())
@@ -885,3 +1153,46 @@ fn show_startup_failure_dialog(error: &str) {
 
 #[cfg(not(windows))]
 fn show_startup_failure_dialog(_error: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_never_interrupts_a_firmware_restore() {
+        for close_state in [CLOSE_IDLE, CLOSE_SAVING, CLOSE_READY] {
+            for recording in [false, true] {
+                assert_eq!(
+                    close_decision(true, close_state, recording),
+                    CloseDecision::RefuseDuringFirmwareJob
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn closing_during_a_recording_saves_it_once_then_closes() {
+        assert_eq!(
+            close_decision(false, CLOSE_IDLE, false),
+            CloseDecision::Allow
+        );
+        assert_eq!(
+            close_decision(false, CLOSE_IDLE, true),
+            CloseDecision::SaveRecordingThenClose
+        );
+        // Further clicks while saving start no second save thread.
+        assert_eq!(
+            close_decision(false, CLOSE_SAVING, true),
+            CloseDecision::AlreadySaving
+        );
+        assert_eq!(
+            close_decision(false, CLOSE_SAVING, false),
+            CloseDecision::AlreadySaving
+        );
+        // The save thread's own close request goes through.
+        assert_eq!(
+            close_decision(false, CLOSE_READY, false),
+            CloseDecision::Allow
+        );
+    }
+}
