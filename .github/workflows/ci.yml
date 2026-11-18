@@ -16,15 +16,151 @@ concurrency:
 jobs:
   verify:
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      # Third-party actions are pinned to full commit SHAs; the comment names
+      # the release tag. Dependabot (.github/dependabot.yml) proposes updates.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml pins the Rust version and its rustfmt/clippy
+      # components; this installs exactly that toolchain.
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          components: rustfmt, clippy
+          workspaces: src-tauri
+      - name: Release metadata consistency
+        shell: pwsh
+        run: ./scripts/check_release_consistency.ps1
+      - name: Student installer ZIP matches its scripts
+        shell: pwsh
+        run: ./scripts/package_op_amp_lab_installer.ps1 -Check
+      # The student Op Amp Lab installer must work in Windows PowerShell 5.1
+      # (which the .bat launches) and in PowerShell 7, install the expected
+      # locked profile into a new catalog and into an existing one (keeping
+      # its other labs and backing it up first), change nothing when run
+      # again, and fail cleanly with exit code 1. It writes only to temporary
+      # catalog folders, never to a real user catalog.
+      - name: Student lab installer (Windows PowerShell 5.1 and PowerShell 7)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = (Resolve-Path 'scripts/install_op_amp_lab_profile.ps1').Path
+          $launcher = (Resolve-Path 'scripts/install_op_amp_lab_profile.bat').Path
+          $profileId = 'wvu.bmeg420l.general.analog.development.v2'
+          $profileVersion = '2.0.1'
+          $expectedHash = 'c73cc1f2941910696d88f934b7b4c09b8b110438a4886d7d799b13807f61471d'
+          $testRoot = Join-Path $env:RUNNER_TEMP 'op-amp-installer'
+          if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
+
+          # The installer's canonical form: the profile with an empty
+          # canonical_hash, as compact JSON, hashed with SHA-256. This clears
+          # the field on the object it is given.
+          function Get-CanonicalHash($LabProfile) {
+            $LabProfile.integrity.canonical_hash = ''
+            $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($LabProfile | ConvertTo-Json -Depth 100 -Compress))
+            return ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))).ToLowerInvariant()
+          }
+
+          # 'bat' runs the student's double-click launcher, which starts
+          # Windows PowerShell 5.1 itself.
+          function Invoke-Installer([string]$Shell, [string]$CatalogRoot) {
+            if ($Shell -eq 'bat') {
+              Write-Host "> install_op_amp_lab_profile.bat -CatalogRoot $CatalogRoot"
+              $env:WVU_PROFILE_INSTALLER_NO_PAUSE = '1'
+              & $launcher -CatalogRoot $CatalogRoot | Out-Host
+            } else {
+              Write-Host "> $Shell -File install_op_amp_lab_profile.ps1 -CatalogRoot $CatalogRoot"
+              & $Shell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer -CatalogRoot $CatalogRoot | Out-Host
+            }
+            return $LASTEXITCODE
+          }
+
+          function Assert-Installed([string]$CatalogRoot) {
+            $catalogPath = Join-Path $CatalogRoot 'lab_state.json'
+            $catalog = [IO.File]::ReadAllText($catalogPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            $installed = @($catalog.profiles | Where-Object { $_.profile_id -eq $profileId -and $_.profile_version -eq $profileVersion })
+            if ($installed.Count -ne 1) { throw "Expected one installed $profileId $profileVersion; found $($installed.Count)." }
+            if ($installed[0].integrity.canonical_hash -ne $expectedHash) { throw "Installed profile records hash $($installed[0].integrity.canonical_hash)." }
+            $computed = Get-CanonicalHash $installed[0]
+            if ($computed -ne $expectedHash) { throw "Installed profile content hashes to $computed, not $expectedHash." }
+            $active = $catalog.active_versions.PSObject.Properties[$profileId]
+            if ($null -eq $active -or $active.Value -ne $profileVersion) { throw "$profileId is not active at $profileVersion." }
+          }
+
+          foreach ($shell in @('powershell', 'pwsh', 'bat')) {
+            $catalogRoot = Join-Path $testRoot $shell
+            $catalogPath = Join-Path $catalogRoot 'lab_state.json'
+
+            $exitCode = Invoke-Installer $shell $catalogRoot
+            if ($exitCode -ne 0) { throw "${shell}: first install exited with $exitCode." }
+            Assert-Installed $catalogRoot
+            $before = (Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash
+
+            $exitCode = Invoke-Installer $shell $catalogRoot
+            if ($exitCode -ne 0) { throw "${shell}: second install exited with $exitCode." }
+            Assert-Installed $catalogRoot
+            if ((Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash -ne $before) { throw "${shell}: the second run changed lab_state.json." }
+            $extra = @(Get-ChildItem -LiteralPath $catalogRoot -File | Where-Object { $_.Name -like 'lab_state.backup-*' -or $_.Name -like '*.tmp' })
+            if ($extra.Count -gt 0) { throw "${shell}: the second run left $($extra.Name -join ', ')." }
+
+            # An existing catalog: its other lab must survive, and the
+            # previous file must be kept as exactly one backup.
+            $existingRoot = Join-Path $testRoot "$shell-existing"
+            New-Item -ItemType Directory -Force -Path $existingRoot | Out-Null
+            $existingPath = Join-Path $existingRoot 'lab_state.json'
+            $unrelatedId = 'ci.unrelated.lab'
+            $seed = [ordered]@{
+              profiles = @([ordered]@{ schema_version = 1; profile_id = $unrelatedId; profile_version = '1.0.0'; display_name = 'Unrelated CI lab'; source = 'instructor' })
+              retired = @()
+              active_versions = [ordered]@{ $unrelatedId = '1.0.0' }
+              completed_save_requests = [ordered]@{}
+            }
+            [IO.File]::WriteAllText($existingPath, ($seed | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+            $seedHash = (Get-FileHash -LiteralPath $existingPath -Algorithm SHA256).Hash
+
+            $exitCode = Invoke-Installer $shell $existingRoot
+            if ($exitCode -ne 0) { throw "${shell}: install into an existing catalog exited with $exitCode." }
+            Assert-Installed $existingRoot
+            $catalog = [IO.File]::ReadAllText($existingPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            $unrelated = @($catalog.profiles | Where-Object { $_.profile_id -eq $unrelatedId -and $_.profile_version -eq '1.0.0' -and $_.display_name -eq 'Unrelated CI lab' })
+            if ($unrelated.Count -ne 1) { throw "${shell}: the existing catalog's other lab was not kept." }
+            $unrelatedActive = $catalog.active_versions.PSObject.Properties[$unrelatedId]
+            if ($null -eq $unrelatedActive -or $unrelatedActive.Value -ne '1.0.0') { throw "${shell}: the other lab is no longer active." }
+            $backups = @(Get-ChildItem -LiteralPath $existingRoot -File -Filter 'lab_state.backup-*.json')
+            if ($backups.Count -ne 1) { throw "${shell}: expected one catalog backup; found $($backups.Count)." }
+            if ((Get-FileHash -LiteralPath $backups[0].FullName -Algorithm SHA256).Hash -ne $seedHash) { throw "${shell}: the backup is not the previous catalog." }
+            if (@(Get-ChildItem -LiteralPath $existingRoot -File -Filter '*.tmp').Count -gt 0) { throw "${shell}: the install left a .tmp file." }
+            $before = (Get-FileHash -LiteralPath $existingPath -Algorithm SHA256).Hash
+
+            $exitCode = Invoke-Installer $shell $existingRoot
+            if ($exitCode -ne 0) { throw "${shell}: second install into the existing catalog exited with $exitCode." }
+            if ((Get-FileHash -LiteralPath $existingPath -Algorithm SHA256).Hash -ne $before) { throw "${shell}: the second run changed the existing catalog." }
+            $after = @(Get-ChildItem -LiteralPath $existingRoot -File | Where-Object { $_.Name -like 'lab_state.backup-*' -or $_.Name -like '*.tmp' })
+            if ($after.Count -ne 1) { throw "${shell}: the second run left $($after.Name -join ', ')." }
+
+            # A catalog that is not JSON must be refused with exit code 1 and left unchanged.
+            $brokenRoot = Join-Path $testRoot "$shell-invalid"
+            New-Item -ItemType Directory -Force -Path $brokenRoot | Out-Null
+            $brokenPath = Join-Path $brokenRoot 'lab_state.json'
+            Set-Content -LiteralPath $brokenPath -Value 'not json' -NoNewline
+            $exitCode = Invoke-Installer $shell $brokenRoot
+            if ($exitCode -ne 1) { throw "${shell}: an invalid catalog gave exit code $exitCode, not 1." }
+            if ((Get-Content -LiteralPath $brokenPath -Raw) -ne 'not json') { throw "${shell}: the invalid catalog was modified." }
+            Write-Host "${shell}: new and existing catalogs, idempotent reruns and clean failure verified." -ForegroundColor Green
+          }
+          # The last installer run deliberately exited with 1; do not let the
+          # runner treat that leftover $LASTEXITCODE as the step's result.
+          exit 0
       - name: Install frontend dependencies
         run: npm ci
       - name: Svelte check
@@ -53,15 +189,18 @@ jobs:
           It is not a distributable Arduino runtime and must never be used for release packaging.
           '@
           Compress-Archive -Path (Join-Path $placeholderDir '*') -DestinationPath 'src-tauri/resources/arduino-runtime.zip' -Force
+      # cargo fmt does not resolve dependencies, so it takes no --locked. Every
+      # other cargo command uses --locked: a Cargo.lock that is out of date
+      # fails the build instead of being rewritten.
       - name: Rust format
         shell: pwsh
         run: cargo fmt --manifest-path src-tauri\Cargo.toml -- --check
       - name: Rust check
         shell: pwsh
-        run: cargo check --manifest-path src-tauri\Cargo.toml
+        run: cargo check --manifest-path src-tauri\Cargo.toml --all-targets --locked
       - name: Rust tests
         shell: pwsh
-        run: cargo test --manifest-path src-tauri\Cargo.toml
+        run: cargo test --manifest-path src-tauri\Cargo.toml --locked
       - name: Rust clippy
         shell: pwsh
-        run: cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets --locked -- -D warnings

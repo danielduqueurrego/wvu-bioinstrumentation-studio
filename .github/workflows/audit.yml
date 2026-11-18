@@ -1,0 +1,83 @@
+name: Dependency audit
+
+on:
+  schedule:
+    # Weekly, Monday 06:23 UTC.
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - package.json
+      - package-lock.json
+      - src-tauri/Cargo.toml
+      - src-tauri/Cargo.lock
+      - .github/workflows/audit.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    # Advisory checks read only the lockfiles, so a Linux runner is enough.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Third-party actions are pinned to full commit SHAs; the comment names
+      # the release tag. Dependabot (.github/dependabot.yml) proposes updates.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install frontend dependencies
+        run: npm ci
+      # Blocking: the packages that ship inside the application.
+      - name: npm audit (production dependencies)
+        run: npm audit --omit=dev --audit-level=high
+      # Informational: build and test tools, which never ship to students.
+      - name: npm audit (all dependencies, informational)
+        continue-on-error: true
+        run: npm audit --audit-level=high
+      # rust-toolchain.toml pins the Rust version; this installs it.
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+      # Pinned to the reviewed release, so a new cargo-audit (or its minimum
+      # Rust version) cannot silently change this blocking job. Update the
+      # version deliberately.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.23.0
+      # Blocking for every vulnerability except the zip 2.x advisories below,
+      # which were reviewed and need a maintainer decision: each fix requires
+      # zip >= 9, a semver-major upgrade. The advisories concern
+      # ZipArchive::extract, ZipStreamReader, AES archives and SUID bits. This
+      # Windows-only application opens only the Arduino runtime archive
+      # installed with it in the per-machine Program Files folder. It reads
+      # that archive with ZipArchive::new and by_index/by_index_raw, checks
+      # every entry with enclosed_name, writes files without Unix permission
+      # bits, never calls ZipArchive::extract or ZipStreamReader, and builds
+      # zip without the aes feature. (The archive's SHA-256 is checked only
+      # when scripts/build_student_release.ps1 packages it, not at run time.)
+      # Remove these ignores when zip is upgraded. Unmaintained-crate warnings
+      # do not fail this step.
+      - name: cargo audit (vulnerabilities)
+        working-directory: src-tauri
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0367
+          --ignore RUSTSEC-2026-0368
+          --ignore RUSTSEC-2026-0369
+          --ignore RUSTSEC-2026-0429
+          --ignore RUSTSEC-2026-0545
+          --ignore RUSTSEC-2026-0548
+      # Informational: the full report, including the ignored advisories and
+      # unmaintained-crate warnings.
+      - name: cargo audit (full report, informational)
+        continue-on-error: true
+        working-directory: src-tauri
+        run: cargo audit

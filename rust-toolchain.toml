@@ -1,0 +1,8 @@
+# The Rust toolchain used by CI and by local builds. rustup installs it
+# automatically the first time cargo runs in this repository. New stable
+# Clippy lints can otherwise break `-D warnings` on unrelated code, so update
+# this pin deliberately and rerun every check in docs/DEVELOPER_GUIDE.md.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

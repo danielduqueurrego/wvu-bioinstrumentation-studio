@@ -266,6 +266,9 @@ try {
   Write-Host 'Open WVU Bioinstrumentation Studio and select Op Amp Lab.'
   exit 0
 } catch {
-  Write-Error $_.Exception.Message
+  # Write-Error would become a new terminating error here (the preference is
+  # Stop), print a full PowerShell error record, and skip `exit 1`. Show only
+  # the message and return the documented failure code instead.
+  Write-Host $_.Exception.Message -ForegroundColor Red
   exit 1
 }

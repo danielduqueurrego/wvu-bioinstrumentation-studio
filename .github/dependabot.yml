@@ -1,0 +1,45 @@
+# Weekly dependency update pull requests. Minor and patch updates for each
+# ecosystem arrive grouped in one pull request; major updates arrive one by one
+# so they can be reviewed against the release and hardware checks.
+# Dependabot does not update rust-toolchain.toml; change that pin by hand.
+#
+# Tauri npm packages (@tauri-apps/api, @tauri-apps/plugin-*) and their crates
+# (tauri, tauri-plugin-*) arrive in separate npm and Cargo pull requests.
+# `tauri build` refuses a major.minor mismatch between the two, so
+# scripts/check_release_consistency.ps1 fails CI on such a pull request: merge
+# the npm and Cargo updates together (or update both by hand).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Updates the commit SHAs (and their tag comments) in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch

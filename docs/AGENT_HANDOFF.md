@@ -63,7 +63,7 @@ The archive contains `repository.bundle`, `source/`, `local-assets/arduino-runti
 ## Recover on the newly installed computer
 
 1. Copy the archive and checksum from the external/cloud backup. Verify the archive SHA-256, then extract it to a recovery folder using Explorer or `Expand-Archive`.
-2. Install Git, Node.js/npm, Rust with the Windows MSVC toolchain, Microsoft C++ build tools with a Windows SDK, WebView2, and PowerShell 7. Follow the official [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows). CI uses Node `22` and Rust stable; keep `package-lock.json` and `src-tauri/Cargo.lock`.
+2. Install Git, Node.js/npm, Rust with the Windows MSVC toolchain, Microsoft C++ build tools with a Windows SDK, WebView2, and PowerShell 7. Follow the official [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows). CI uses Node `22` and the Rust version pinned in `rust-toolchain.toml` (rustup installs it on first use); keep `package-lock.json` and `src-tauri/Cargo.lock`. `scripts/check_environment.ps1` reports anything missing.
 3. Recover Git from the bundle, then overlay the saved working files. Example, with the extracted archive in `D:\WVU-Recovery`:
 
 ```powershell
@@ -83,7 +83,7 @@ Overlay only into the new recovered clone. The `source/` snapshot includes hidde
 5. Select the new Project folder in the app. Old absolute paths in preferences and historical logs may refer to the former Windows account. Let the app prepare a fresh `%LOCALAPPDATA%\WVU-BMEG\rt`; its native-USB core shim is applied automatically.
 6. Authenticate GitHub and the coding agent again through their normal sign-in methods if required. No credentials are included in the recovery archive.
 
-The environment observed before formatting was Node `24.19.0`, npm `11.17.0`, Rust/Cargo `1.97.1`, PowerShell `7.6.5`, and Visual Studio Community with C++ tools. These are an observation of this machine, not additional package-version pins. The release script uses `ConvertFrom-Json -AsHashtable` and should run with PowerShell 7. The student lab installer deliberately supports Windows PowerShell 5.1.
+The environment observed before formatting was Node `24.19.0`, npm `11.17.0`, Rust/Cargo `1.97.1`, PowerShell `7.6.5`, and Visual Studio Community with C++ tools. These are an observation of this machine, not additional package-version pins. The release script requires PowerShell 7 (`#Requires -Version 7.0`). The student lab installer deliberately supports Windows PowerShell 5.1.
 
 ### Verify the irreplaceable asset
 
@@ -110,13 +110,14 @@ With the preserved real runtime copied into place, run from the repository root:
 
 ```powershell
 npm ci
+pwsh -NoProfile -File scripts\check_release_consistency.ps1
 npm run check
 npm run build
 npm test
 cargo fmt --manifest-path src-tauri\Cargo.toml -- --check
-cargo check --manifest-path src-tauri\Cargo.toml
-cargo test --manifest-path src-tauri\Cargo.toml
-cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
+cargo check --manifest-path src-tauri\Cargo.toml --all-targets --locked
+cargo test --manifest-path src-tauri\Cargo.toml --locked
+cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets --locked -- -D warnings
 npm run tauri build
 ```
 
@@ -192,7 +193,7 @@ Required: protocol 0.4, firmware build 0x00010006
 
 Instructor canonical hash: `bcc08868305ca55e81920e3a5805b020cfa612a0374e75fd5a290fa11f918ad9`. The standalone student installer embeds the same profile with `source=imported`, as the application's Import operation does; its resulting hash is `c73cc1f2941910696d88f934b7b4c09b8b110438a4886d7d799b13807f61471d`. That source-field change explains the different hash.
 
-The `.bat` and `.ps1` must stay together. Double-clicking the `.bat` requires no elevation and installs/activates version 2.0.1 for the current Windows user. The PowerShell script preserves unrelated labs, backs up an existing catalog before a change, rejects conflicting same-ID/version content, verifies the embedded hash, and refuses installation while the app runs. Previous checks covered Windows PowerShell 5.1, PowerShell 7, idempotence, conflict rejection, backup/preservation, and launcher exit codes. Explicit UTF-8 catalog reads and escaped non-ASCII JSON preserve hash consistency in PowerShell 5.1.
+The `.bat` and `.ps1` must stay together. Double-clicking the `.bat` requires no elevation and installs/activates version 2.0.1 for the current Windows user. The PowerShell script preserves unrelated labs, backs up an existing catalog before a change, rejects conflicting same-ID/version content, verifies the embedded hash, and refuses installation while the app runs. Previous checks covered Windows PowerShell 5.1, PowerShell 7, idempotence, conflict rejection, backup/preservation, and launcher exit codes. Explicit UTF-8 catalog reads and escaped non-ASCII JSON preserve hash consistency in PowerShell 5.1. CI now repeats the install, hash, existing-catalog preservation and backup, idempotence and invalid-catalog checks under Windows PowerShell 5.1, PowerShell 7 and the `.bat` launcher. After editing either script, rebuild the student ZIP with `pwsh -NoProfile -File scripts\package_op_amp_lab_installer.ps1` (CI fails on a stale ZIP).
 
 The instructor profile is not a factory definition in Git. Recover the private AppData catalog or use the embedded installer; do not assume a fresh clone contains all local instructor labs. Test changes against a temporary `-CatalogRoot`, not the maintainer's live catalog.
 

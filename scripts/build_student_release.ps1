@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
   [switch]$AllowDirty
@@ -21,8 +22,11 @@ if ($appVersion -notmatch '^\d+\.\d+\.\d+$') {
   throw "Release manifest app_version is not semantic version text: $appVersion"
 }
 $releaseNotesPath = Join-Path $projectRoot "RELEASE_NOTES_$appVersion.md"
-$distRoot = Join-Path $projectRoot "dist\WVU-Bioinstrumentation-Studio-$appVersion"
-$zipPath = Join-Path $projectRoot "dist\WVU-Bioinstrumentation-Studio-$appVersion-Windows-x64.zip"
+$distParent = Join-Path $projectRoot 'dist'
+$distRoot = Join-Path $distParent "WVU-Bioinstrumentation-Studio-$appVersion"
+$zipPath = Join-Path $distParent "WVU-Bioinstrumentation-Studio-$appVersion-Windows-x64.zip"
+$zipChecksumPath = "$zipPath.sha256"
+$buildInfoPath = Join-Path $distParent "WVU-Bioinstrumentation-Studio-$appVersion-build-info.txt"
 
 function Invoke-NativeChecked {
   param(
@@ -35,13 +39,35 @@ function Invoke-NativeChecked {
   }
 }
 
+# Checksum files use the `sha256sum` layout: "<lowercase hex>  <file name>",
+# LF line endings, UTF-8 without a BOM, so `sha256sum -c` works in the folder
+# that holds the listed files.
+function Write-ChecksumFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string[]]$Files
+  )
+  $lines = foreach ($file in $Files) {
+    $hash = Get-FileHash -LiteralPath $file -Algorithm SHA256
+    '{0}  {1}' -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $file)
+  }
+  [IO.File]::WriteAllText($Path, (($lines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+}
+
 Set-Location $projectRoot
 $dirty = @(git status --short)
+if ($LASTEXITCODE -ne 0) {
+  throw "git status failed with exit code $LASTEXITCODE. Release builds must run from a Git work tree."
+}
 if ($dirty.Count -gt 0 -and -not $AllowDirty) {
   throw "Working tree is not clean. Review changes or rerun with -AllowDirty after confirming the intended release scope."
 }
 if ($dirty.Count -gt 0) {
   Write-Warning 'Building from a dirty working tree by explicit request.'
+}
+$sourceCommit = (git rev-parse HEAD)
+if ($LASTEXITCODE -ne 0) {
+  throw "git rev-parse HEAD failed with exit code $LASTEXITCODE."
 }
 
 $diagnosticBinRoot = Join-Path $tauriRoot 'src\bin'
@@ -67,22 +93,17 @@ foreach ($required in @(
   }
 }
 
+# One shared check, also run by CI: the application version in package.json,
+# package-lock.json, Cargo.toml, Cargo.lock, tauri.conf.json and the release
+# manifest; the CHANGELOG heading and release notes; the firmware protocol,
+# build and device ID; the reference .ino SHA-256; and the Arduino CLI and core
+# versions in the release manifest and the runtime manifests.
+& (Join-Path $PSScriptRoot 'check_release_consistency.ps1') -ProjectRoot $projectRoot
+if ($LASTEXITCODE -ne 0) {
+  throw 'Release metadata is inconsistent (listed above). Release packaging stopped.'
+}
+
 $tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json
-if ($tauriConfig.version -ne $appVersion) {
-  throw "Tauri version $($tauriConfig.version) does not match release manifest $appVersion."
-}
-$packageMetadata = Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json
-if ($packageMetadata.version -ne $appVersion) {
-  throw "package.json version $($packageMetadata.version) does not match release manifest $appVersion."
-}
-$packageLockMetadata = Get-Content -LiteralPath (Join-Path $projectRoot 'package-lock.json') -Raw | ConvertFrom-Json -AsHashtable
-if ($packageLockMetadata['version'] -ne $appVersion -or $packageLockMetadata['packages']['']['version'] -ne $appVersion) {
-  throw 'package-lock.json root versions do not match the release manifest.'
-}
-$cargoManifestText = Get-Content -LiteralPath (Join-Path $tauriRoot 'Cargo.toml') -Raw
-if ($cargoManifestText -notmatch "(?m)^version\s*=\s*`"$([regex]::Escape($appVersion))`"\s*$") {
-  throw "Cargo.toml package version does not match release manifest $appVersion."
-}
 if ($tauriConfig.bundle.windows.nsis.installMode -ne 'perMachine') {
   throw 'The student NSIS installer must use the reviewed perMachine installation mode.'
 }
@@ -98,17 +119,6 @@ if ($tauriConfig.mainBinaryName -ne 'wvu_bioinstrumentation_studio') {
 $frontendDistPath = [System.IO.Path]::GetFullPath((Join-Path $tauriRoot $tauriConfig.build.frontendDist))
 
 $runtimeManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-if ($runtimeManifest.arduino_cli -ne '1.5.2-rc.1' -or $runtimeManifest.renesas_uno_core -ne '1.6.0') {
-  throw 'Unexpected Arduino runtime manifest. Update the reviewed release metadata before building.'
-}
-$expectedReferenceFirmwareSha256 = $releaseManifest.reference_firmware_source_sha256
-if ($expectedReferenceFirmwareSha256 -notmatch '^[0-9a-fA-F]{64}$') {
-  throw 'Release manifest is missing the reviewed reference firmware SHA-256 digest.'
-}
-$referenceFirmwareHash = (Get-FileHash -LiteralPath $referenceFirmwarePath -Algorithm SHA256).Hash
-if (-not $referenceFirmwareHash.Equals($expectedReferenceFirmwareSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
-  throw "Reference firmware source hash does not match the reviewed manifest: $referenceFirmwareHash"
-}
 $expectedRuntimeArchiveSha256 = $releaseManifest.arduino_runtime_archive_sha256
 if ($expectedRuntimeArchiveSha256 -notmatch '^[0-9a-fA-F]{64}$') {
   throw 'Release manifest is missing the reviewed Arduino runtime archive SHA-256 digest.'
@@ -121,27 +131,47 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $runtimeZip = [System.IO.Compression.ZipFile]::OpenRead($runtimeArchive)
 try {
   $runtimeEntries = @($runtimeZip.Entries | ForEach-Object FullName)
+  $coreVersion = [string]$releaseManifest.arduino_core
   foreach ($entry in @(
     'runtime-manifest.json',
     'arduino-cli.exe',
     'data/package_index.json',
     'data/library_index.json',
-    'data/packages/arduino/hardware/renesas_uno/1.6.0/platform.txt',
+    "data/packages/arduino/hardware/renesas_uno/$coreVersion/platform.txt",
     'data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/bin/arm-none-eabi-g++.exe',
     'data/packages/arduino/tools/bossac/1.9.1-arduino5/bossac.exe',
     'data/packages/builtin/tools/serial-discovery/1.5.2/serial-discovery.exe'
   )) {
     if ($runtimeEntries -notcontains $entry) { throw "Arduino runtime archive is missing: $entry" }
   }
+  # The application accepts an extracted runtime only when its
+  # runtime-manifest.json equals arduino-runtime-manifest.json.
+  $archivedManifestEntry = $runtimeZip.GetEntry('runtime-manifest.json')
+  $reader = [System.IO.StreamReader]::new($archivedManifestEntry.Open(), [System.Text.Encoding]::UTF8)
+  try {
+    $archivedManifest = $reader.ReadToEnd() | ConvertFrom-Json
+  } finally {
+    $reader.Dispose()
+  }
+  foreach ($field in @('runtime_schema', 'arduino_cli', 'renesas_uno_core', 'bundle_revision')) {
+    # -cne: the application compares these values exactly, including case.
+    if ([string]$archivedManifest.$field -cne [string]$runtimeManifest.$field) {
+      throw "The runtime archive's runtime-manifest.json $field '$($archivedManifest.$field)' does not match arduino-runtime-manifest.json '$($runtimeManifest.$field)'."
+    }
+  }
 } finally {
   $runtimeZip.Dispose()
 }
 & (Join-Path $projectRoot 'scripts\audit_bundled_runtime_notices.ps1') -ArchivePath $runtimeArchive
 
+# npm ci installs exactly package-lock.json (it needs network access or a warm
+# npm cache). Cargo commands use --locked so an out-of-date Cargo.lock stops
+# the build instead of being rewritten after the clean-tree check.
+Invoke-NativeChecked 'npm ci' { npm ci }
 Invoke-NativeChecked 'cargo fmt' { cargo fmt --manifest-path src-tauri\Cargo.toml -- --check }
-Invoke-NativeChecked 'cargo check' { cargo check --manifest-path src-tauri\Cargo.toml }
-Invoke-NativeChecked 'cargo test' { cargo test --manifest-path src-tauri\Cargo.toml }
-Invoke-NativeChecked 'cargo clippy' { cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings }
+Invoke-NativeChecked 'cargo check' { cargo check --manifest-path src-tauri\Cargo.toml --all-targets --locked }
+Invoke-NativeChecked 'cargo test' { cargo test --manifest-path src-tauri\Cargo.toml --locked }
+Invoke-NativeChecked 'cargo clippy' { cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets --locked -- -D warnings }
 Invoke-NativeChecked 'npm run check' { npm run check }
 Invoke-NativeChecked 'npm run build' { npm run build }
 Invoke-NativeChecked 'npm test' { npm test }
@@ -150,9 +180,10 @@ if (-not (Test-Path -LiteralPath $frontendDistPath) -or -not (Test-Path -Literal
 }
 # The Tauri Windows bundlers patch the same release executable. Build them
 # serially so MSI and NSIS cannot contend for that file on slower computers.
+# Arguments after the second `--` go to cargo build.
 $releaseBuildStartedUtc = [DateTime]::UtcNow
-Invoke-NativeChecked 'Tauri NSIS build' { npm run tauri build }
-Invoke-NativeChecked 'Tauri MSI build' { npm run tauri -- build --bundles msi }
+Invoke-NativeChecked 'Tauri NSIS build' { npm run tauri -- build -- --locked }
+Invoke-NativeChecked 'Tauri MSI build' { npm run tauri -- build --bundles msi -- --locked }
 
 $releaseExe = Join-Path $tauriRoot 'target\release\wvu_bioinstrumentation_studio.exe'
 if (-not (Test-Path -LiteralPath $releaseExe)) {
@@ -191,21 +222,42 @@ Copy-Item -LiteralPath $releaseNotesPath -Destination $distRoot
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $distRoot
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\THIRD_PARTY_NOTICES.md') -Destination $distRoot
 
-if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-$installerHashTargets = @(
+foreach ($stale in @($zipPath, $zipChecksumPath, $buildInfoPath)) {
+  if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
+}
+# SHA256SUMS.txt lists the installers in the folder and is never changed after
+# zipping, so the folder copy and the copy inside the ZIP are identical. The
+# ZIP's own checksum goes in a separate <zip>.sha256 beside the ZIP.
+Write-ChecksumFile -Path (Join-Path $distRoot 'SHA256SUMS.txt') -Files @(
   (Join-Path $distRoot $setupName),
   (Join-Path $distRoot $msiName)
 )
-$hashLines = foreach ($file in $installerHashTargets) {
-  $hash = Get-FileHash -LiteralPath $file -Algorithm SHA256
-  "{0}  {1}" -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $file)
-}
-Set-Content -LiteralPath (Join-Path $distRoot 'SHA256SUMS.txt') -Value $hashLines
 Compress-Archive -LiteralPath (Get-ChildItem -LiteralPath $distRoot -File | Select-Object -ExpandProperty FullName) -DestinationPath $zipPath -CompressionLevel Optimal
-$zipHash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
-Add-Content -LiteralPath (Join-Path $distRoot 'SHA256SUMS.txt') -Value ("`n{0}  {1}" -f $zipHash.Hash.ToLowerInvariant(), (Split-Path -Leaf $zipPath))
+Write-ChecksumFile -Path $zipChecksumPath -Files @($zipPath)
+
+# Build provenance for the maintainer; not part of the student ZIP.
+$tauriCliVersion = (Get-Content -LiteralPath (Join-Path $projectRoot 'node_modules\@tauri-apps\cli\package.json') -Raw | ConvertFrom-Json).version
+$rustcVersion = Invoke-NativeChecked 'rustc --version' { rustc --version }
+$cargoVersion = Invoke-NativeChecked 'cargo --version' { cargo --version }
+$nodeVersion = Invoke-NativeChecked 'node --version' { node --version }
+$npmVersion = Invoke-NativeChecked 'npm --version' { npm --version }
+$buildInfo = @(
+  "WVU Bioinstrumentation Studio $appVersion",
+  "Built (UTC): $($releaseBuildStartedUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))",
+  "Source commit: $sourceCommit",
+  "Working tree: $(if ($dirty.Count -gt 0) { 'dirty (built with -AllowDirty)' } else { 'clean' })",
+  "rustc: $rustcVersion",
+  "cargo: $cargoVersion",
+  "node: $nodeVersion",
+  "npm: $npmVersion",
+  "@tauri-apps/cli: $tauriCliVersion",
+  "PowerShell: $($PSVersionTable.PSVersion)"
+)
+[IO.File]::WriteAllText($buildInfoPath, (($buildInfo -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
 
 Write-Host "Student distribution staged: $distRoot"
 Write-Host "Distribution ZIP: $zipPath"
+Write-Host "ZIP checksum: $zipChecksumPath"
+Write-Host "Build information: $buildInfoPath"
 Write-Host "NSIS: $(Join-Path $distRoot $setupName)"
 Write-Host "MSI: $(Join-Path $distRoot $msiName)"

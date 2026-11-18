@@ -27,3 +27,5 @@ vite.config.ts.timestamp-*
 /src-tauri/resources/arduino-runtime/data/
 /src-tauri/resources/arduino-runtime.zip
 /.local-diagnostics/
+# Disposable app data for scripts/start_dev_sandbox.ps1.
+/.dev-sandbox/

@@ -2,10 +2,12 @@
 
 ## Source and verification
 
-- Confirm `package.json`, Tauri configuration, release manifest, and release notes use the intended application version.
+- Set the intended application version in `package.json`, the `package-lock.json` root (both `version` fields), `src-tauri/Cargo.toml`, the `src-tauri/Cargo.lock` root package, `src-tauri/tauri.conf.json` and `release/release-manifest.json`; add a `## <version>` heading to `CHANGELOG.md` and a `RELEASE_NOTES_<version>.md`.
+- Run `pwsh -NoProfile -File scripts\check_release_consistency.ps1`. It must report no mismatch in those versions, the firmware protocol/build/device ID, the reference `.ino` SHA-256, or the Arduino CLI and core versions.
+- Run `npm ci`.
+- Run `npm run check`, then `npm run build`, then `npm test` (the tests need the built frontend).
 - Run `cargo fmt --manifest-path src-tauri\Cargo.toml -- --check`.
-- Run Cargo check, test, and Clippy with `-D warnings`.
-- Run `npm run check`, `npm test`, and `npm run build`.
+- Run `cargo check`, `cargo test` and `cargo clippy` with `--locked` (Clippy with `--all-targets -- -D warnings`).
 - Run `npm run tauri build`; do not substitute `cargo build --release` for a production application build.
 - Launch the resulting Tauri release executable with no Vite or Node development server running. It must load bundled frontend assets and never request localhost.
 
@@ -22,7 +24,9 @@
 
 ## Installer and distribution
 
-- Validate the Arduino runtime manifest and bundled archive before running `scripts\build_student_release.ps1`.
+- Validate the Arduino runtime manifest and bundled archive before running `pwsh -NoProfile -File scripts\build_student_release.ps1` (PowerShell 7, clean Git work tree).
+- Check the checksums: `dist\WVU-Bioinstrumentation-Studio-<version>\SHA256SUMS.txt` covers the two installers (the same file is inside the ZIP), and `<zip>.sha256` beside the ZIP covers the ZIP. Keep `...-build-info.txt` with the release records.
+- If the Op Amp Lab installer scripts changed, confirm `pwsh -NoProfile -File scripts\package_op_amp_lab_installer.ps1 -Check` passes.
 - Install the NSIS package on a clean or isolated Windows user if available; confirm Program Files installation and standard-user operation.
 - Confirm uninstall preserves Project folders and recordings.
 - Regenerate installer, MSI, ZIP, manifest, and SHA-256 values for each candidate.
