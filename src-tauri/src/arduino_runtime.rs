@@ -228,19 +228,42 @@ impl RuntimeLayout {
         // multilib discovery on Windows. Keep its app-owned extraction root
         // deliberately short while ordinary application data stays in
         // Tauri's normal directory.
-        let local_data_root = app
-            .path()
-            .app_local_data_dir()
-            .map_err(|_| RuntimeError::MissingBundle)?
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or(RuntimeError::InvalidBundle)?;
+        let local_data_root = match dev_local_data_root() {
+            Some(root) => root,
+            None => app
+                .path()
+                .app_local_data_dir()
+                .map_err(|_| RuntimeError::MissingBundle)?
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or(RuntimeError::InvalidBundle)?,
+        };
         Ok(Self {
             archive: resource_root.join("arduino-runtime.zip"),
             manifest: resource_root.join("arduino-runtime-manifest.json"),
             destination: local_data_root.join("WVU-BMEG").join("rt"),
         })
     }
+}
+
+/// Development builds only: `WVU_STUDIO_DEV_LOCAL_DATA` relocates the
+/// extracted Arduino runtime (normally `%LOCALAPPDATA%\WVU-BMEG\rt`, resolved
+/// through the Known Folder API, which ignores environment overrides). Combined
+/// with a process-level `LOCALAPPDATA` override, this lets a developer run a
+/// debug build against a disposable data root - for example with the CI
+/// placeholder runtime - without replacing a real extracted runtime. Release
+/// builds never read the variable.
+#[cfg(debug_assertions)]
+fn dev_local_data_root() -> Option<PathBuf> {
+    std::env::var_os("WVU_STUDIO_DEV_LOCAL_DATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+#[cfg(not(debug_assertions))]
+fn dev_local_data_root() -> Option<PathBuf> {
+    None
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

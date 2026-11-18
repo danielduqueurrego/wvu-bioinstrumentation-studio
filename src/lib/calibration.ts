@@ -115,7 +115,32 @@ export function displayedValue(
   if (preset?.calibration_type === 'linear') {
     return (preset.parameters.slope ?? Number.NaN) * volts + (preset.parameters.offset ?? Number.NaN);
   }
+  // 'calibrated' means "this channel's own linear fit". Without one there is
+  // no value to show ("—"); the MPXV equation belongs to a different sensor.
+  if (unit === 'calibrated') return Number.NaN;
   return mpxvMmhg(volts, calibration.mpxv_sensor_supply_v);
+}
+
+/**
+ * Keeps every channel's display unit among the units it currently offers.
+ * When a calibration is deselected, deleted, or belongs to another lab, its
+ * 'mmhg' or 'calibrated' unit is no longer offered, and the channel returns
+ * to volts (or the first offered unit) instead of showing a converted value
+ * for a calibration that is not applied. Returns `units` itself when nothing
+ * changes, so a reactive caller settles immediately. Display-only.
+ */
+export function reconcileChannelUnits(
+  units: Record<string, DisplayUnit>,
+  options: Record<string, DisplayUnit[]>
+): Record<string, DisplayUnit> {
+  let reconciled: Record<string, DisplayUnit> | undefined;
+  for (const [channelId, offered] of Object.entries(options)) {
+    const unit = units[channelId];
+    if (unit === undefined || offered.includes(unit)) continue;
+    reconciled ??= { ...units };
+    reconciled[channelId] = offered.includes('volts') ? 'volts' : offered[0] ?? 'counts';
+  }
+  return reconciled ?? units;
 }
 
 export function unitsForGroup(
@@ -129,8 +154,23 @@ export function unitsForGroup(
   return labels.size === 1 ? [...labels][0] : 'Mixed units';
 }
 
-export function initialChannelUnits(channelIds: string[]): Record<string, DisplayUnit> {
-  return Object.fromEntries(channelIds.map((channelId) => [channelId, 'counts']));
+/**
+ * The display units a lab starts with: each channel's `default_display_unit`
+ * when that unit is offered before any calibration is chosen (for example
+ * mmHg on an MPXV channel, but not on a linear-calibration channel, which
+ * offers mmHg only once a calibration is selected); otherwise counts.
+ * Display-only: raw counts are recorded whatever the unit.
+ */
+export function initialChannelUnits(
+  channels: Array<{ id: string; default_display_unit?: string | null; allowed_conversions?: string[] }>,
+  category?: string
+): Record<string, DisplayUnit> {
+  return Object.fromEntries(channels.map((channel) => {
+    const wanted = channel.default_display_unit?.trim().toLowerCase() ?? '';
+    const offered = supportedDisplayUnits(category, channel.id, false, channel.allowed_conversions ?? []);
+    const unit = offered.find((candidate) => candidate === wanted) ?? 'counts';
+    return [channel.id, unit];
+  }));
 }
 
 export function fixedMpxvCalibration(profileId: string, channelId: string, sensorSupplyV: number, adcReferenceV: number): CalibrationPreset {
@@ -149,6 +189,38 @@ export function fixedMpxvCalibration(profileId: string, channelId: string, senso
     // appear to change on every display refresh.
     created_at: '1970-01-01T00:00:00.000Z',
     label: 'MPXV transfer equation'
+  };
+}
+
+/** A channel converted with the fixed MPXV transfer equation (it needs the sensor supply Vs). */
+export function isFixedMpxvChannel(category: string | undefined, channel: { id: string; allowed_conversions?: string[] }): boolean {
+  return Boolean(channel.allowed_conversions?.includes('mpxv_pressure'))
+    || channel.id === 'mpxv'
+    || (category === 'course_emg_force' && channel.id === 'pressure');
+}
+
+/**
+ * The calibration snapshot the live display uses and the next Start freezes
+ * into the recording: Vref, Vs, the display units, the fixed MPXV equation
+ * for each MPXV channel of the lab, and the selected linear calibration.
+ */
+export function recordingCalibrationFor(
+  profile: { profile_id: string; category: string; acquisition: { channels?: Array<{ id: string; allowed_conversions?: string[] }> } } | undefined,
+  linearCalibration: CalibrationPreset | undefined,
+  adcReferenceV: number,
+  mpxvSupplyV: number,
+  channelUnits: Record<string, DisplayUnit>
+): RecordingCalibration {
+  const fixed = profile
+    ? (profile.acquisition.channels ?? [])
+      .filter((channel) => isFixedMpxvChannel(profile.category, channel))
+      .map((channel) => fixedMpxvCalibration(profile.profile_id, channel.id, mpxvSupplyV, adcReferenceV))
+    : [];
+  return {
+    adc_reference_v: adcReferenceV,
+    mpxv_sensor_supply_v: mpxvSupplyV,
+    channel_units: channelUnits,
+    active_calibrations: linearCalibration ? [...fixed, linearCalibration] : fixed
   };
 }
 

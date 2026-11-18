@@ -63,6 +63,8 @@ struct StartProfileHardwareRequest {
     output_folder: String,
     duration: recording::RecordingDuration,
     profile_id: String,
+    /// The lab revision the page showed; Start refuses any other revision.
+    profile_version: String,
     bench_notice_acknowledged: bool,
     recording_note: String,
     calibration: Option<calibration::RecordingCalibration>,
@@ -75,6 +77,20 @@ struct EstimateRecordingStorageRequest {
     profile_id: String,
     duration: recording::RecordingDuration,
     calibration: Option<calibration::RecordingCalibration>,
+    /// When given, the free space in this Project folder is reported too.
+    #[serde(default)]
+    project_folder: Option<String>,
+}
+
+/// The storage estimate plus the free space now available in the Project
+/// folder, so the page can show both before Start.
+#[derive(Serialize)]
+struct RecordingStorageEstimateResponse {
+    #[serde(flatten)]
+    estimate: session::RecordingStorageEstimate,
+    /// `None` when no Project folder was given or its free space is unknown
+    /// (for example a disconnected removable drive).
+    available_free_bytes: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -83,6 +99,8 @@ struct StartProfileSimulatorRequest {
     output_folder: String,
     duration: recording::RecordingDuration,
     profile_id: String,
+    /// The lab revision the page showed; Start refuses any other revision.
+    profile_version: String,
     bench_notice_acknowledged: bool,
     recording_note: String,
     calibration: Option<calibration::RecordingCalibration>,
@@ -162,6 +180,27 @@ fn check_lab_duration(
         )),
         None => Ok(()),
     }
+}
+
+/// Start records exactly the lab revision the page showed. A catalog change
+/// after the page loaded the lab (Retire, Reset, Import, or another window)
+/// would otherwise record a different configuration from the one on screen.
+fn check_lab_version(
+    profile: &profiles::AcquisitionProfile,
+    requested_version: &str,
+) -> Result<(), StartRecordingFailure> {
+    if profile.profile_version == requested_version {
+        return Ok(());
+    }
+    Err(StartRecordingFailure::new(
+        "LOAD_LAB",
+        "lab_changed",
+        "The selected lab changed after this page loaded it (for example in Manage Labs). The lab list was reloaded; check the lab settings, then start the recording again.",
+        format!(
+            "lab {} is active at version {}, but the page requested version {requested_version}",
+            profile.profile_id, profile.profile_version
+        ),
+    ))
 }
 
 /// Every board command runs off the main thread; a task that cannot run is
@@ -275,6 +314,55 @@ fn set_project_folder(
     project_folder: String,
 ) -> Result<project_paths::ProjectFolderSettings, String> {
     project_paths::save_project_folder(&project_folder)
+}
+
+/// Show in folder: opens File Explorer with a finished recording file
+/// selected. Only an existing file inside the current Project folder is
+/// accepted (both paths are canonicalized first); nothing is created,
+/// written, or deleted. It touches no port and never affects acquisition.
+#[tauri::command]
+async fn reveal_recording_file(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || reveal_file(&path))
+        .await
+        .map_err(|error| format!("Show in folder could not run: {error}"))?
+}
+
+fn reveal_file(path: &str) -> Result<(), String> {
+    let settings = project_paths::load_project_folder()?;
+    let file = project_paths::checked_file_in_project_folder(path, &settings.project_folder)
+        .inspect_err(|error| {
+            app_log::record("WARN", &format!("REVEAL_FILE_REFUSED detail={error}"));
+        })?;
+    open_explorer_selecting(&project_paths::explorer_path(&file))
+}
+
+/// `explorer.exe /select,"<file>"`, started with the hidden-process helper
+/// (`CREATE_NO_WINDOW`) from the Windows folder rather than a PATH search.
+/// The quotes are written explicitly because Explorer parses its own command
+/// line; a Windows path cannot contain a quotation mark.
+#[cfg(windows)]
+fn open_explorer_selecting(file: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let windows_folder = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let mut command = arduino_cli::hidden_command(&windows_folder.join("explorer.exe"));
+    command.raw_arg(format!("/select,\"{}\"", file.display()));
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("File Explorer could not be opened: {error}"))?;
+    // Explorer hands the request to the running shell and exits; its exit
+    // code is not meaningful, so it is only collected.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_explorer_selecting(_file: &std::path::Path) -> Result<(), String> {
+    Err("Show in folder is available only on Windows.".into())
 }
 
 /// Browser-side chart failures must never influence the acquisition controller.
@@ -569,7 +657,7 @@ fn delete_calibration(
 #[tauri::command]
 fn fit_xgzp_calibration(
     request: calibration::XgzpFitRequest,
-) -> Result<calibration::LinearFit, String> {
+) -> Result<calibration::XgzpFit, String> {
     calibration::fit_xgzp_from_recording(&request).map_err(|error| error.to_string())
 }
 
@@ -603,29 +691,72 @@ fn checked_recording_calibration(
     Ok(calibration)
 }
 
+/// The Start refusal for a recording calibration that cannot be used. An
+/// out-of-range voltage names its own field (the ADC reference or the MPXV
+/// sensor supply) instead of blaming the selected calibration.
+fn calibration_start_failure(
+    calibration: &calibration::RecordingCalibration,
+    error: String,
+) -> StartRecordingFailure {
+    let (code, message) = if calibration::validate_voltage(calibration.adc_reference_v).is_err() {
+        (
+            "calibration_voltage",
+            "The ADC reference voltage must be from 0.1 to 10 V. Correct it under Calibration & Units, then try again.",
+        )
+    } else if calibration::validate_voltage(calibration.mpxv_sensor_supply_v).is_err() {
+        (
+            "calibration_voltage",
+            "The MPXV sensor supply voltage must be from 0.1 to 10 V. Correct it under Calibration & Units, then try again.",
+        )
+    } else {
+        (
+            "calibration",
+            "The selected calibration cannot be used with this lab. Choose another calibration and try again.",
+        )
+    };
+    StartRecordingFailure::new("CHECK_CALIBRATION", code, message, error)
+}
+
 /// Projected BMEG + CSV size and the free space a timed recording needs, so
-/// it can be shown before Start. It reads the lab catalog only: no port, file,
-/// or acquisition command is touched.
+/// it can be shown before Start, plus the Project folder's current free space.
+/// It reads the lab catalog and the folder's free space only: no port, file,
+/// folder creation, or acquisition command is touched. It runs off the main
+/// thread because a network or removable drive can answer slowly.
 #[tauri::command]
-fn estimate_recording_storage(
+async fn estimate_recording_storage(
     state: tauri::State<'_, AppState>,
     request: EstimateRecordingStorageRequest,
-) -> Result<session::RecordingStorageEstimate, String> {
+) -> Result<RecordingStorageEstimateResponse, String> {
+    let profiles = state.profiles.clone();
+    tauri::async_runtime::spawn_blocking(move || estimate_storage(&profiles, request))
+        .await
+        .map_err(|error| format!("storage estimate task failed: {error}"))?
+}
+
+fn estimate_storage(
+    profiles: &profiles::ProfileStore,
+    request: EstimateRecordingStorageRequest,
+) -> Result<RecordingStorageEstimateResponse, String> {
     let EstimateRecordingStorageRequest {
         profile_id,
         duration,
         calibration,
+        project_folder,
     } = request;
-    let profile = state
-        .profiles
+    let profile = profiles
         .get_locked(&profile_id)
         .map_err(|error| error.to_string())?;
     let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())?;
-    Ok(session::estimate_recording_storage(
-        &profile.snapshot(false),
-        &calibration,
-        &duration,
-    ))
+    Ok(RecordingStorageEstimateResponse {
+        estimate: session::estimate_recording_storage(
+            &profile.snapshot(false),
+            &calibration,
+            &duration,
+        ),
+        available_free_bytes: project_folder
+            .as_deref()
+            .and_then(project_paths::project_folder_free_space),
+    })
 }
 
 #[tauri::command]
@@ -652,6 +783,7 @@ fn start_simulator_recording(
         output_folder,
         duration,
         profile_id,
+        profile_version,
         bench_notice_acknowledged,
         recording_note,
         calibration,
@@ -678,16 +810,11 @@ fn start_simulator_recording(
             error,
         )
     })?;
+    check_lab_version(&profile, &profile_version)?;
     check_lab_duration(&profile, &duration)?;
-    let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())
-        .map_err(|error| {
-            StartRecordingFailure::new(
-                "CHECK_CALIBRATION",
-                "calibration",
-                "The selected calibration cannot be used with this lab. Choose another calibration and try again.",
-                error,
-            )
-        })?;
+    let requested_calibration = calibration.unwrap_or_default();
+    let calibration = checked_recording_calibration(&profile, requested_calibration.clone())
+        .map_err(|error| calibration_start_failure(&requested_calibration, error))?;
     session.prepare_for_new_recording().map_err(|error| {
         StartRecordingFailure::new(
             "PREPARE_SESSION",
@@ -743,13 +870,14 @@ fn start_hardware_recording(
         output_folder,
         duration,
         profile_id,
+        profile_version,
         bench_notice_acknowledged,
         recording_note,
         calibration,
     } = request;
     app_log::record(
         "INFO",
-        &format!("START_REQUEST port={port} lab={profile_id}"),
+        &format!("START_REQUEST port={port} lab={profile_id} version={profile_version}"),
     );
     // Claimed before any check: no restore, Verify, or Retry can run between
     // the firmware check and the worker opening the port. The worker keeps the
@@ -782,6 +910,7 @@ fn start_hardware_recording(
             error,
         )
     })?;
+    check_lab_version(&profile, &profile_version)?;
     check_lab_duration(&profile, &duration)?;
     if let Some(message) = profile.acquisition.firmware_configuration_issue() {
         return Err(StartRecordingFailure::new(
@@ -861,15 +990,9 @@ fn start_hardware_recording(
             )
         })?;
     app_log::record("INFO", "BOARD_DISCOVERY_OK");
-    let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())
-        .map_err(|error| {
-            StartRecordingFailure::new(
-                "CHECK_CALIBRATION",
-                "calibration",
-                "The selected calibration cannot be used with this lab. Choose another calibration and try again.",
-                error,
-            )
-        })?;
+    let requested_calibration = calibration.unwrap_or_default();
+    let calibration = checked_recording_calibration(&profile, requested_calibration.clone())
+        .map_err(|error| calibration_start_failure(&requested_calibration, error))?;
     session.prepare_for_new_recording().map_err(|error| {
         StartRecordingFailure::new(
             "PREPARE_SESSION",
@@ -1132,6 +1255,7 @@ pub fn run() {
             repair_arduino_runtime,
             get_project_folder,
             set_project_folder,
+            reveal_recording_file,
             record_frontend_plot_error,
             list_boards,
             firmware_environment,
@@ -1255,5 +1379,150 @@ mod tests {
             close_decision(false, CLOSE_READY, false),
             CloseDecision::Allow
         );
+    }
+
+    fn first_factory_lab() -> profiles::AcquisitionProfile {
+        profiles::built_in_profiles()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("no factory lab"))
+    }
+
+    #[test]
+    fn start_refuses_a_lab_revision_the_page_did_not_show() {
+        let profile = first_factory_lab();
+        assert!(check_lab_version(&profile, &profile.profile_version).is_ok());
+        let refused = check_lab_version(&profile, "0.0.0-shown-before-reset")
+            .err()
+            .unwrap_or_else(|| panic!("a different revision must be refused"));
+        assert_eq!(refused.stage, "LOAD_LAB");
+        assert_eq!(refused.code, "lab_changed");
+        assert!(refused.user_message.contains("changed"));
+        assert!(refused
+            .technical_detail
+            .contains(profile.profile_version.as_str()));
+        assert!(refused
+            .technical_detail
+            .contains("0.0.0-shown-before-reset"));
+    }
+
+    #[test]
+    fn an_invalid_calibration_voltage_names_its_field() {
+        let profile = first_factory_lab();
+        let refusal = |adc_reference_v: f64, mpxv_sensor_supply_v: f64| {
+            let calibration = calibration::RecordingCalibration {
+                adc_reference_v,
+                mpxv_sensor_supply_v,
+                ..calibration::RecordingCalibration::default()
+            };
+            let error = checked_recording_calibration(&profile, calibration.clone())
+                .err()
+                .unwrap_or_else(|| panic!("an out-of-range voltage must be refused"));
+            calibration_start_failure(&calibration, error)
+        };
+        let adc = refusal(0.0, 5.0);
+        assert_eq!(adc.stage, "CHECK_CALIBRATION");
+        assert_eq!(adc.code, "calibration_voltage");
+        assert!(
+            adc.user_message.contains("ADC reference voltage"),
+            "{}",
+            adc.user_message
+        );
+        let supply = refusal(5.0, 12.0);
+        assert_eq!(supply.code, "calibration_voltage");
+        assert!(
+            supply.user_message.contains("MPXV sensor supply"),
+            "{}",
+            supply.user_message
+        );
+        assert!(!supply.user_message.contains("selected calibration"));
+
+        // A calibration from another lab still blames the calibration.
+        let mut foreign = calibration::RecordingCalibration::default();
+        foreign.active_calibrations.push(
+            calibration::fixed_mpxv_calibration("another.lab".into(), "mpxv".into(), 5.0, 5.0)
+                .unwrap_or_else(|error| panic!("{error}")),
+        );
+        let error = checked_recording_calibration(&profile, foreign.clone())
+            .err()
+            .unwrap_or_else(|| panic!("a foreign calibration must be refused"));
+        let other = calibration_start_failure(&foreign, error);
+        assert_eq!(other.code, "calibration");
+        assert!(other.user_message.contains("selected calibration"));
+    }
+
+    #[test]
+    fn start_requests_carry_the_profile_version_under_its_snake_case_name() {
+        let simulator: StartProfileSimulatorRequest = serde_json::from_value(serde_json::json!({
+            "project_folder": "C:\\BMEG",
+            "output_folder": "",
+            "duration": { "mode": "until_stopped" },
+            "profile_id": "lab",
+            "profile_version": "2.0.1",
+            "bench_notice_acknowledged": false,
+            "recording_note": "",
+            "calibration": null
+        }))
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(simulator.profile_version, "2.0.1");
+        let hardware: StartProfileHardwareRequest = serde_json::from_value(serde_json::json!({
+            "port": "COM5",
+            "project_folder": "C:\\BMEG",
+            "output_folder": "",
+            "duration": { "mode": "timed", "seconds": 60 },
+            "profile_id": "lab",
+            "profile_version": "2.0.1",
+            "bench_notice_acknowledged": false,
+            "recording_note": "",
+            "calibration": null
+        }))
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(hardware.profile_version, "2.0.1");
+        // A page that does not say which revision it showed cannot start.
+        assert!(
+            serde_json::from_value::<StartProfileSimulatorRequest>(serde_json::json!({
+                "project_folder": "C:\\BMEG",
+                "output_folder": "",
+                "duration": { "mode": "until_stopped" },
+                "profile_id": "lab",
+                "bench_notice_acknowledged": false,
+                "recording_note": "",
+                "calibration": null
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn storage_estimate_reports_the_project_folder_free_space() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let store = profiles::ProfileStore::with_root(dir.path().join("catalog"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let profile = first_factory_lab();
+        let request = |project_folder: Option<String>| EstimateRecordingStorageRequest {
+            profile_id: profile.profile_id.clone(),
+            duration: recording::RecordingDuration::Timed { seconds: 60 },
+            calibration: None,
+            project_folder,
+        };
+        let with_folder = estimate_storage(
+            &store,
+            request(Some(dir.path().to_string_lossy().into_owned())),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(with_folder.available_free_bytes.is_some());
+        assert!(with_folder.estimate.projected_bytes.is_some());
+        let serialized =
+            serde_json::to_value(&with_folder).unwrap_or_else(|error| panic!("{error}"));
+        // Flattened, so the page reads one object.
+        assert!(serialized.get("projected_bytes").is_some());
+        assert!(serialized.get("available_free_bytes").is_some());
+        let without_folder =
+            estimate_storage(&store, request(None)).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(without_folder.available_free_bytes, None);
+        let relative = estimate_storage(&store, request(Some("relative\\folder".into())))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(relative.available_free_bytes, None);
     }
 }

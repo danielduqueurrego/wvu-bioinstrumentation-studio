@@ -1,13 +1,24 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { open, save } from '@tauri-apps/plugin-dialog';
-  import { labConfigurationIssues, newChannel, normalizeEditorDraft, pulseOxCycleRateHz, pulseOxDraft, pulseOxOutput, SIMULTANEOUS_RATES_HZ } from '$lib/lab-authoring';
+  import { estimatedPulseOxCycleRate, labConfigurationIssues, newChannel, normalizeEditorDraft, pulseOxCycleRateHz, pulseOxDraft, pulseOxOutput, SIMULTANEOUS_RATES_HZ } from '$lib/lab-authoring';
   import { beginEditSession, beginNewLabSession, labSaveErrorMessage, labSourceLabel, resetConfirmationText, resetOutcomeText, saveArguments, type CatalogStatus, type LabResetOutcome } from '$lib/lab-catalog';
   import type { LabChannel as Channel, LabDigitalOutput as DigitalOutput, LabListEntry as LabEntry, LabPlotGroup as PlotGroup, LabProfile } from '$lib/labs';
+  import Modal from './Modal.svelte';
 
   export let selectedProfile: LabProfile | undefined;
+  /** A revision became active (save, import, restore, activate): select it. */
   export let onSaved: (profile: LabProfile) => void;
+  /**
+   * The catalog changed without a new revision to select (retire, reset):
+   * the page reloads its lab list so Start never records a lab other than
+   * the one shown. Awaited before the result message is shown.
+   */
+  export let onCatalogChanged: () => Promise<void> | void = () => {};
   export let onStatus: (message: string) => void;
+  /** True while a recording runs: the catalog must not change under it. */
+  export let disabled = false;
 
   const analogPins = ['A0', 'A1', 'A2', 'A3', 'A4', 'A5'];
   const digitalPins = ['D4', 'D5', 'D6'];
@@ -21,12 +32,21 @@
   let duplicateId = '';
   let error = '';
   let loading = false;
+  // The error is not a live region (the page has exactly one, outside this
+  // modal). Focus moves to it instead, so a screen reader reads it at once.
+  let errorElement: HTMLParagraphElement | undefined;
+  $: if (error) void focusError();
+
+  async function focusError() {
+    await tick();
+    errorElement?.focus();
+  }
 
   $: simultaneous = draft?.acquisition.acquisition_mode === 'simultaneous';
   $: pulseox = draft?.acquisition.acquisition_mode === 'pulseox_4state';
   $: draftChannels = draft?.acquisition.channels ?? [];
   $: outputSummary = draft?.acquisition.digital_outputs?.map((output) => `${output.pin} ${output.label} — ${output.behavior.replaceAll('_', ' ')}`).join('; ') || 'None';
-  $: estimatedPulseRate = draft?.acquisition.state_dwell_us ? (1_000_000 / (4 * Number(draft.acquisition.state_dwell_us))).toFixed(1) : '—';
+  $: estimatedPulseRate = draft?.acquisition.state_dwell_us ? estimatedPulseOxCycleRate(Number(draft.acquisition.state_dwell_us)).toFixed(1) : '—';
 
   async function refresh() {
     loading = true;
@@ -41,9 +61,16 @@
   }
 
   async function openManager() {
+    if (disabled) return;
     visible = true;
     discardDraft();
     await refresh();
+  }
+
+  /** Refuses a catalog change while a recording runs (the dialog may still be open). */
+  function blockedWhileRecording(): boolean {
+    if (disabled) error = 'A recording is running. Lab changes are available when it has finished.';
+    return disabled;
   }
 
   function newRequestId() {
@@ -210,7 +237,7 @@
   }
 
   async function saveDraft() {
-    if (!draft || saving) return;
+    if (!draft || saving || blockedWhileRecording()) return;
     error = '';
     const issues = labConfigurationIssues(draft);
     if (issues.length) {
@@ -229,6 +256,7 @@
   }
 
   async function retire(entry: LabEntry) {
+    if (blockedWhileRecording()) return;
     if (entry.active) {
       const factory = labs.find((candidate) => candidate.profile.profile_id === entry.profile.profile_id && candidate.profile.source === 'built_in');
       const consequence = factory
@@ -239,11 +267,13 @@
     try {
       await invoke('retire_profile', { profileId: entry.profile.profile_id, profileVersion: entry.profile.profile_version });
       await refresh();
+      await onCatalogChanged();
       onStatus(`Retired ${entry.profile.display_name} ${entry.profile.profile_version}. Existing recording snapshots remain unchanged.`);
     } catch (reason) { error = String(reason); }
   }
 
   async function restore(entry: LabEntry) {
+    if (blockedWhileRecording()) return;
     try {
       const restored = await invoke<LabProfile>('restore_retired_lab', { profileId: entry.profile.profile_id, profileVersion: entry.profile.profile_version });
       await refresh();
@@ -252,7 +282,7 @@
   }
 
   async function restoreDefault() {
-    if (!selectedProfile) return;
+    if (!selectedProfile || blockedWhileRecording()) return;
     try {
       const restored = await invoke<LabProfile>('restore_course_default_lab', { profileId: selectedProfile.profile_id });
       await refresh();
@@ -271,6 +301,7 @@
   }
 
   async function importLab() {
+    if (blockedWhileRecording()) return;
     const source = await open({ multiple: false, filters: [{ name: 'BMEG lab configuration', extensions: ['json'] }] });
     if (typeof source !== 'string') return;
     try {
@@ -282,6 +313,7 @@
   }
 
   async function activate(entry: LabEntry) {
+    if (blockedWhileRecording()) return;
     try {
       const active = await invoke<LabProfile>('set_active_lab_version', { profileId: entry.profile.profile_id, profileVersion: entry.profile.profile_version });
       await refresh();
@@ -290,6 +322,7 @@
   }
 
   async function resetLocalCustomizations() {
+    if (blockedWhileRecording()) return;
     const localRevisions = labs.filter((entry) => entry.profile.source !== 'built_in').length;
     // Stored labs that could not be loaded are not listed but are removed too.
     let skippedLabs = 0;
@@ -300,20 +333,20 @@
     try {
       const outcome = await invoke<LabResetOutcome | null>('reset_local_lab_customizations');
       await refresh();
+      await onCatalogChanged();
       onStatus(resetOutcomeText(outcome));
     } catch (reason) { error = String(reason); }
   }
 </script>
 
 <section class="authoring" aria-label="Instructor Lab Editor">
-  <div class="manager-heading"><div><h3>Instructor Lab Editor</h3><p class="help">Editing creates a new locked revision. Earlier lab snapshots and recordings are never changed.</p></div><button type="button" onclick={openManager}>Manage Labs</button></div>
+  <div class="manager-heading"><div><h4>Instructor Lab Editor</h4><p class="help">Editing creates a new locked revision. Earlier lab snapshots and recordings are never changed.</p></div><button type="button" onclick={openManager} disabled={disabled}>Manage Labs</button></div>
+  {#if disabled}<p class="help">Lab management is available when no recording is running.</p>{/if}
 </section>
 
-{#if visible}
-  <div class="backdrop">
-    <dialog open class="lab-dialog" aria-modal="true" aria-labelledby="lab-manager-title">
+<Modal open={visible} labelledBy="lab-manager-title" describedBy={error ? 'lab-manager-error' : undefined} onClose={closeManager} size="wide">
       <div class="manager-heading"><div><h2 id="lab-manager-title">Manage Labs</h2><p class="help">Instructor mode is a safety step against accidental changes, not a password lock. A saved lab must be supported by the connected WVU firmware before recording.</p></div><button type="button" onclick={closeManager}>Close</button></div>
-      {#if error}<p class="error" role="alert">{error}</p>{/if}
+      {#if error}<p id="lab-manager-error" class="error" tabindex="-1" bind:this={errorElement}>{error}</p>{/if}
       {#if !draft}
         <div class="actions"><button type="button" class="gold" onclick={() => editLab()}>Edit selected lab</button><label>New/duplicate lab ID<input bind:value={duplicateId} placeholder="team2.custom.emg" /></label><button type="button" onclick={duplicateLab}>Duplicate selected lab</button><button type="button" onclick={createBlankLab}>Blank simultaneous lab</button><button type="button" onclick={importLab}>Import lab</button><button type="button" onclick={restoreDefault} disabled={!selectedProfile}>Restore course default</button><button type="button" class="danger" onclick={resetLocalCustomizations}>Reset local customizations</button></div>
         <section class="history" aria-label="Lab version history">
@@ -326,30 +359,26 @@
         <p class="warning">This is an in-memory draft based on <strong>{draft.profile_id} {draftBaseVersion ?? 'new lab'}</strong>. Only <strong>Save changes</strong> creates one new immutable active version. Firmware upload is never automatic.</p>
         <section class="editor-grid"><label>Lab name<input bind:value={draft.display_name} /></label><label>Lab ID<input value={draft.profile_id} readonly /></label><label>Description<textarea bind:value={draft.description} rows="3"></textarea></label><label>Acquisition mode<select value={draft.acquisition.acquisition_mode} onchange={(event) => event.currentTarget.value === 'pulseox_4state' ? configurePulseox() : configureSimultaneous()}><option value="simultaneous">Simultaneous Analog</option><option value="pulseox_4state">Pulse Oximetry — 4-State</option></select></label>{#if simultaneous}<label>Frame rate<select bind:value={draft.acquisition.sample_rate_hz}>{#each rates as rate}<option value={rate}>{rate} Hz</option>{/each}</select></label>{:else}<span class="estimate"><strong>Cycle rate (from dwell)</strong>{estimatedPulseRate} cycles/s nominal</span>{/if}<label>ADC resolution<select bind:value={draft.acquisition.adc_resolution_bits}><option value={12}>12 bit</option><option value={14}>14 bit</option></select></label></section>
         {#if simultaneous}
-          <section class="subpanel"><div class="manager-heading"><h3>Analog channel editor</h3><button type="button" onclick={addChannel} disabled={draftChannels.length >= 6}>Add channel</button></div><p class="help">Each enabled channel needs a unique pin, ID, and CSV field. CSV fields use only letters, digits, and underscores, and must stay distinct from the generated _V and pressure columns. WVU firmware supports A0–A5 and 1–6 synchronized channels.</p><div class="channel-grid header"><span>Pin</span><span>Channel ID</span><span>Label</span><span>CSV field</span><span>Calibration capability</span><span>Visible</span><span>Plot</span><span>Remove</span></div>{#each draftChannels as channel, index}<div class="channel-grid"><select value={channel.pin} onchange={(event) => updateChannel(index, 'pin', event.currentTarget.value)}>{#each analogPins as pin}<option value={pin}>{pin}</option>{/each}</select><input value={channel.id} oninput={(event) => updateChannel(index, 'id', event.currentTarget.value)} /><input value={channel.label} oninput={(event) => updateChannel(index, 'label', event.currentTarget.value)} /><input value={channel.csv_name} oninput={(event) => updateChannel(index, 'csv_name', event.currentTarget.value)} /><select value={channel.allowed_conversions?.includes('mpxv_pressure') ? 'mpxv_pressure' : channel.allowed_conversions?.includes('linear_calibration') ? 'linear_calibration' : 'counts_volts'} onchange={(event) => updateChannel(index, 'allowed_conversions', [event.currentTarget.value])}><option value="counts_volts">Counts / Volts only</option><option value="mpxv_pressure">MPXV pressure</option><option value="linear_calibration">Generic linear calibration</option></select><input type="checkbox" checked={channel.default_visible !== false} onchange={(event) => updateChannel(index, 'default_visible', event.currentTarget.checked)} /><select value={String(Math.max(0, (draft.plot_defaults?.groups ?? []).findIndex((group) => group.channel_ids.includes(channel.id))) + 1)} onchange={(event) => setPlotNumber(channel.id, event.currentTarget.value)}>{#each draftChannels as _, groupIndex}<option value={String(groupIndex + 1)}>Plot {groupIndex + 1}</option>{/each}</select><button type="button" onclick={() => removeChannel(index)} disabled={draftChannels.length <= 1}>Remove</button></div>{/each}</section>
+          <section class="subpanel"><div class="manager-heading"><h3>Analog channel editor</h3><button type="button" onclick={addChannel} disabled={draftChannels.length >= 6}>Add channel</button></div><p class="help">Each enabled channel needs a unique pin, ID, and CSV field. CSV fields use only letters, digits, and underscores, and must stay distinct from the generated _V and pressure columns. WVU firmware supports A0–A5 and 1–6 synchronized channels.</p><div class="channel-grid header" aria-hidden="true"><span>Pin</span><span>Channel ID</span><span>Label</span><span>CSV field</span><span>Calibration capability</span><span>Visible</span><span>Plot</span><span>Remove</span></div>{#each draftChannels as channel, index}<div class="channel-grid" role="group" aria-label={`Channel ${index + 1}`}><select aria-label={`Channel ${index + 1} pin`} value={channel.pin} onchange={(event) => updateChannel(index, 'pin', event.currentTarget.value)}>{#each analogPins as pin}<option value={pin}>{pin}</option>{/each}</select><input aria-label={`Channel ${index + 1} ID`} value={channel.id} oninput={(event) => updateChannel(index, 'id', event.currentTarget.value)} /><input aria-label={`Channel ${index + 1} label`} value={channel.label} oninput={(event) => updateChannel(index, 'label', event.currentTarget.value)} /><input aria-label={`Channel ${index + 1} CSV field`} value={channel.csv_name} oninput={(event) => updateChannel(index, 'csv_name', event.currentTarget.value)} /><select aria-label={`Channel ${index + 1} calibration capability`} value={channel.allowed_conversions?.includes('mpxv_pressure') ? 'mpxv_pressure' : channel.allowed_conversions?.includes('linear_calibration') ? 'linear_calibration' : 'counts_volts'} onchange={(event) => updateChannel(index, 'allowed_conversions', [event.currentTarget.value])}><option value="counts_volts">Counts / Volts only</option><option value="mpxv_pressure">MPXV pressure</option><option value="linear_calibration">Generic linear calibration</option></select><input type="checkbox" aria-label={`Channel ${index + 1} visible by default`} checked={channel.default_visible !== false} onchange={(event) => updateChannel(index, 'default_visible', event.currentTarget.checked)} /><select aria-label={`Channel ${index + 1} plot`} value={String(Math.max(0, (draft.plot_defaults?.groups ?? []).findIndex((group) => group.channel_ids.includes(channel.id))) + 1)} onchange={(event) => setPlotNumber(channel.id, event.currentTarget.value)}>{#each draftChannels as _, groupIndex}<option value={String(groupIndex + 1)}>Plot {groupIndex + 1}</option>{/each}</select><button type="button" aria-label={`Remove channel ${index + 1}`} onclick={() => removeChannel(index)} disabled={draftChannels.length <= 1}>Remove</button></div>{/each}</section>
           <section class="subpanel"><h3>Digital outputs</h3><p class="help">D4 can be HIGH while recording. D5/D6 stay LOW in simultaneous labs so RED and IR are never accidentally enabled.</p><div class="output-grid">{#each digitalPins as pin}<label class="choice"><input type="checkbox" checked={Boolean(draft.acquisition.digital_outputs?.some((output) => output.pin === pin))} onchange={(event) => setSimultaneousOutput(pin, event.currentTarget.checked)} /> {pin} {pin === 'D4' ? 'Green LED — HIGH while recording' : 'controlled output — Always LOW'}</label>{/each}</div></section>
         {:else if pulseox}
           <section class="subpanel"><h3>Pulse oximetry — fixed 4-state phase</h3><p class="warning">Phase order is fixed: <strong>RED ON → DARK 1 → IR ON → DARK 2</strong>. RED and IR are independently remappable but never HIGH simultaneously.</p><div class="editor-grid"><label>TX analog pin<select value={draft.acquisition.analog_inputs?.tx ?? 'A0'} onchange={(event) => setPulseInput('tx', event.currentTarget.value)}>{#each analogPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>RX analog pin<select value={draft.acquisition.analog_inputs?.rx ?? 'A1'} onchange={(event) => setPulseInput('rx', event.currentTarget.value)}>{#each analogPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>RED output<select value={pulseOxOutput(draft.acquisition.digital_outputs, 'red')?.pin ?? 'D5'} onchange={(event) => setPulseOutput('red', event.currentTarget.value)}>{#each digitalPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>IR output<select value={pulseOxOutput(draft.acquisition.digital_outputs, 'ir')?.pin ?? 'D6'} onchange={(event) => setPulseOutput('ir', event.currentTarget.value)}>{#each digitalPins as pin}<option value={pin}>{pin}</option>{/each}</select></label><label>State dwell (µs)<input type="number" min="250" max="5000" value={draft.acquisition.state_dwell_us} oninput={(event) => setPulseDwell(event.currentTarget.value)} /></label><span class="estimate"><strong>Estimated cycle rate</strong>{estimatedPulseRate} cycles/s (nominal; measured timing is recorded separately)</span></div><p class="help">Raw fields are automatically preserved: cycle_index, t_us, red_TX, dark1_TX, ir_TX, dark2_TX, red_RX, dark1_RX, ir_RX, dark2_RX.</p></section>
         {/if}
         <section class="subpanel"><h3>Save-time summary</h3><p class="help">Mode: {draft.acquisition.acquisition_mode === 'pulseox_4state' ? 'Pulse Oximetry — 4-State' : 'Simultaneous Analog'} · Channels: {pulseox ? 'TX + RX' : draftChannels.length} · Rate: {draft.acquisition.sample_rate_hz} Hz · ADC: {draft.acquisition.adc_resolution_bits} bit · Outputs: {outputSummary}</p><p class="help">Firmware compatibility: the connected firmware advertises its limits during the normal handshake. The shipped WVU firmware supports up to six analog channels, 12/14-bit ADC, 100–1000 Hz simultaneous frames, and the fixed four-state pulse-ox workflow. Save is allowed offline; Start blocks if the connected board cannot advertise or configure the requested resources.</p><div class="actions"><button class="gold" type="button" onclick={saveDraft} disabled={saving}>{saving ? 'Saving…' : 'Save changes as new version'}</button><button type="button" onclick={discardDraft} disabled={saving}>Discard draft</button></div></section>
       {/if}
-    </dialog>
-  </div>
-{/if}
+</Modal>
 
 <style>
   .authoring { margin-top: .8rem; padding-top: .8rem; border-top: 1px solid #d7dde2; }
   .manager-heading, .actions { display: flex; flex-wrap: wrap; gap: .7rem; align-items: end; justify-content: space-between; }
-  .manager-heading h2, .manager-heading h3 { margin: 0; } .manager-heading p { margin: .35rem 0 0; max-width: 74ch; }
-  .backdrop { position: fixed; inset: 0; z-index: 1100; display: grid; place-items: center; padding: 1rem; background: rgb(12 27 42 / 52%); }
-  .lab-dialog { width: min(100%, 96rem); max-height: min(92vh, 70rem); overflow: auto; border: 1px solid #8aa0b6; border-radius: .4rem; padding: clamp(1rem, 2.5vw, 1.5rem); background: #fff; }
+  .manager-heading h2, .manager-heading h3, .manager-heading h4 { margin: 0; } .manager-heading p { margin: .35rem 0 0; max-width: 74ch; }
   .help { color: #4b5965; } .warning { border-left: 4px solid #EEAA00; background: #fff8e8; padding: .7rem; } .error { color: #8b1515; font-weight: 700; }
   label { min-width: 0; display: grid; gap: .3rem; font-weight: 650; } input, select, textarea { min-width: 0; width: 100%; min-height: 2.35rem; border: 1px solid #8493a0; border-radius: .25rem; padding: .35rem .5rem; font: inherit; } textarea { min-height: 5rem; resize: vertical; }
-  button { min-height: 2.4rem; border: 1px solid #002855; border-radius: .3rem; background: #fff; color: #002855; padding: .45rem .7rem; font: inherit; font-weight: 650; cursor: pointer; } button.gold { background: #EEAA00; color: #17222e; } button.danger { border-color: #8b1515; color: #8b1515; } button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid #EEAA00; outline-offset: 2px; }
+  button { min-height: 2.4rem; border: 1px solid #002855; border-radius: .3rem; background: #fff; color: #002855; padding: .45rem .7rem; font: inherit; font-weight: 650; cursor: pointer; } button.gold { background: #EEAA00; color: #17222e; } button.danger { border-color: #8b1515; color: #8b1515; } button:disabled { cursor: not-allowed; opacity: .55; } button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid var(--focus-ring, #002855); outline-offset: 2px; box-shadow: 0 0 0 2px #fff; }
   .history, .subpanel { min-width: 0; margin-top: 1rem; padding: .8rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .history h3, .subpanel h3 { margin-top: 0; }
   .history-table { min-width: 0; overflow: auto; } .history-head, .history-row { min-width: 56rem; display: grid; grid-template-columns: minmax(14rem, 1.4fr) 6rem 6rem minmax(15rem, 1.3fr) minmax(16rem, 1.3fr); gap: .6rem; padding: .6rem; border-bottom: 1px solid #d7dde2; align-items: center; } .history-head { font-weight: 800; background: #eaf0f4; } .history-row small { display: block; overflow-wrap: anywhere; } .row-actions { display: flex; flex-wrap: wrap; gap: .35rem; } .row-actions button { min-height: 2rem; }
   .editor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .75rem; align-items: end; margin-top: .8rem; }
   .channel-grid { display: grid; grid-template-columns: 5.5rem minmax(8rem, 1fr) minmax(10rem, 1.2fr) minmax(10rem, 1.2fr) minmax(12rem, 1.2fr) 4.5rem 5rem auto; gap: .45rem; align-items: center; margin-top: .45rem; min-width: 63rem; } .channel-grid.header { font-weight: 800; font-size: .84rem; } .channel-grid input[type='checkbox'] { width: auto; min-height: auto; justify-self: center; } .subpanel { overflow-x: auto; }
   .output-grid { display: flex; flex-wrap: wrap; gap: .8rem; } .choice { display: flex; align-items: center; gap: .45rem; } .choice input { width: auto; min-height: auto; } .estimate { display: grid; gap: .3rem; padding: .55rem .7rem; border: 1px solid #d7dde2; border-radius: .25rem; background: #fff; }
-  @media (max-width: 700px) { .lab-dialog { padding: 1rem; } .manager-heading, .actions { align-items: stretch; } .manager-heading > button, .actions > button { flex: 1 1 12rem; } }
+  @media (max-width: 700px) { .manager-heading, .actions { align-items: stretch; } .manager-heading > button, .actions > button { flex: 1 1 12rem; } }
 </style>

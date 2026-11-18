@@ -21,6 +21,11 @@ describe('production Tauri frontend configuration', () => {
     expect(existsSync(resolve(frontendDist, 'index.html'))).toBe(true);
   });
 
+  it('opens a centred window that fits a 1366×768 lab PC, title bar and taskbar included', () => {
+    const window = (config.app as { windows?: Array<Record<string, number | boolean>> } | undefined)?.windows?.[0];
+    expect(window).toMatchObject({ width: 1280, height: 680, minWidth: 960, minHeight: 600, center: true });
+  });
+
   it('declares the Tauri application binary explicitly', () => {
     expect(config.mainBinaryName).toBe('wvu_bioinstrumentation_studio');
   });

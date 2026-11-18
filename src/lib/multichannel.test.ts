@@ -1,11 +1,17 @@
 import { describe, expect, it } from 'vitest';
+import type { LabProfile } from './labs';
 import {
   assignChannelToPlot,
+  channelColor,
   defaultPlotGroups,
-  hasUniqueAnalogPins,
   initialTraceVisibility,
+  labRevisionKey,
+  numberedVisiblePlotGroups,
   onePlotPerSignal,
   overlayAll,
+  plotChannelsFor,
+  profileChannels,
+  PULSEOX_PLOT_CHANNELS,
   seriesColor,
   setPlotGroupCount,
   setTraceVisibility,
@@ -97,19 +103,62 @@ describe('multi-channel UI helpers', () => {
     expect(four).toHaveLength(4);
   });
 
-  it('updates legend membership and exact stroke colors when signals are hidden or reassigned', () => {
+  it('keeps each signal in one colour when other traces are hidden or reassigned', () => {
     const overlay = visiblePlotSeries(channels, ['raw_emg', 'rectified_emg']);
     expect(overlay.map((series) => series.color)).toEqual([seriesColor(0), seriesColor(1)]);
 
-    const oneRemaining = visiblePlotSeries(channels, ['raw_emg']);
+    // Hiding Raw EMG does not recolour Rectified EMG.
+    const oneRemaining = visiblePlotSeries(channels, ['rectified_emg']);
     expect(shouldShowPlotLegend(oneRemaining)).toBe(false);
+    expect(oneRemaining[0]?.color).toBe(overlay[1]?.color);
 
+    // The same signal has the same colour in whichever plot it is drawn, and
+    // different signals in different plots do not share a colour.
     const firstPlot = visiblePlotSeries(channels, ['raw_emg', 'rectified_emg']);
     const secondPlot = visiblePlotSeries(channels, ['envelope', 'pressure']);
     expect(firstPlot.map((series) => series.label)).toEqual(['Raw EMG', 'Rectified EMG']);
     expect(secondPlot.map((series) => series.label)).toEqual(['Envelope', 'Pressure / Force Surrogate']);
-    expect(firstPlot[0]?.color).toBe(seriesColor(0));
-    expect(secondPlot[0]?.color).toBe(seriesColor(0));
+    expect(secondPlot[0]?.color).toBe(channelColor(channels, 'envelope'));
+    expect(secondPlot[0]?.color).not.toBe(firstPlot[0]?.color);
+    const reassigned = visiblePlotSeries(channels, ['raw_emg', 'envelope']);
+    expect(reassigned.map((series) => series.color)).toEqual([
+      channelColor(channels, 'raw_emg'), channelColor(channels, 'envelope')
+    ]);
+    expect(new Set(channels.map((channel) => channelColor(channels, channel.id))).size).toBe(channels.length);
+  });
+
+  it('draws pulse-ox RED in red and IR in a distinct dark colour wherever they appear', () => {
+    const pulse = [...PULSEOX_PLOT_CHANNELS];
+    const red = channelColor(pulse, 'red_tx');
+    const ir = channelColor(pulse, 'ir_tx');
+    expect(red).toBe('#C8102E');
+    expect(ir).not.toBe(red);
+    expect(ir).not.toBe(channelColor(pulse, 'dark1_tx'));
+    expect(ir).not.toBe(channelColor(pulse, 'dark2_tx'));
+    // The navy/gold position palette is not used for the LED phases.
+    expect([red, ir]).not.toContain(seriesColor(0));
+    // Hiding RED changes no other trace's colour.
+    const all = visiblePlotSeries(pulse, ['red_tx', 'dark1_tx', 'ir_tx', 'dark2_tx']);
+    const withoutRed = visiblePlotSeries(pulse, ['dark1_tx', 'ir_tx', 'dark2_tx']);
+    expect(withoutRed.map((series) => series.color)).toEqual(all.slice(1).map((series) => series.color));
+    // TX and RX stay distinguishable in an overlay.
+    expect(channelColor(pulse, 'red_rx')).not.toBe(red);
+    expect(new Set(pulse.map((channel) => channelColor(pulse, channel.id))).size).toBe(8);
+  });
+
+  it('numbers rendered plots by their assignment slot, not by render position', () => {
+    const groups = onePlotPerSignal(channels);
+    const visibility = setTraceVisibility(initialTraceVisibility(channels), 'raw_emg', false);
+    const numbered = numberedVisiblePlotGroups(channels, groups, visibility);
+    expect(numbered.map((group) => group.slot)).toEqual([2, 3, 4]);
+    expect(numbered[0]?.channelIds).toEqual(['rectified_emg']);
+    // An empty slot is skipped without renumbering the plots after it.
+    const withEmpty = setPlotGroupCount(channels, overlayAll(channels), 3);
+    const moved = assignChannelToPlot(channels, withEmpty, 'pressure', 2);
+    expect(numberedVisiblePlotGroups(channels, moved, initialTraceVisibility(channels)).map((group) => group.slot))
+      .toEqual([1, 3]);
+    expect(visiblePlotGroups(channels, moved, initialTraceVisibility(channels)).map((group) => group.id))
+      .toEqual(['plot-1', 'plot-3']);
   });
 
   it('keeps plot IDs stable while an active recording is rearranged', () => {
@@ -157,9 +206,27 @@ describe('multi-channel UI helpers', () => {
     expect(shouldShowPlotLegend(visiblePlotSeries(rawPulseChannels, pulseGroups[0]?.channelIds ?? []))).toBe(true);
   });
 
-  it('accepts one through six unique A0–A5 general-development pins only', () => {
-    expect(hasUniqueAnalogPins(['A0', 'A1', 'A5'])).toBe(true);
-    expect(hasUniqueAnalogPins(['A0', 'A0'])).toBe(false);
-    expect(hasUniqueAnalogPins(['A6'])).toBe(false);
+  it('derives the plotted signals from the lab, including a legacy single-pin lab and pulse-ox raw fields', () => {
+    const base = {
+      profile_id: 'lab', profile_version: '1.0.0', category: 'development',
+      acquisition: { analog_pin: 'A2', acquisition_mode: 'simultaneous', channels: [] },
+      display: { channel_label: 'Signal' }, export: { signal_name: 'signal_counts' }
+    } as unknown as LabProfile;
+    expect(profileChannels(undefined)).toEqual([]);
+    expect(profileChannels(base)).toEqual([
+      { pin: 'A2', id: 'raw', label: 'Signal', csv_name: 'signal_counts', units: 'ADC counts' }
+    ]);
+    const twoChannels = { ...base, acquisition: { ...base.acquisition, channels: [
+      { pin: 'A0', id: 'vmid', label: 'Vmid', csv_name: 'vmid', units: 'ADC counts' },
+      { pin: 'A1', id: 'vout', label: 'Vout', csv_name: 'vout', units: 'ADC counts' }
+    ] } } as LabProfile;
+    expect(plotChannelsFor(twoChannels).map((channel) => channel.id)).toEqual(['vmid', 'vout']);
+    const pulse = { ...base, acquisition: { ...base.acquisition, acquisition_mode: 'pulseox_4state' } } as LabProfile;
+    expect(plotChannelsFor(pulse).map((channel) => channel.id)).toEqual([
+      'red_tx', 'dark1_tx', 'ir_tx', 'dark2_tx', 'red_rx', 'dark1_rx', 'ir_rx', 'dark2_rx'
+    ]);
+    expect(labRevisionKey(twoChannels)).toBe('lab@1.0.0');
+    expect(labRevisionKey({ ...twoChannels, profile_version: '1.0.1' })).not.toBe(labRevisionKey(twoChannels));
+    expect(labRevisionKey(undefined)).toBe('');
   });
 });

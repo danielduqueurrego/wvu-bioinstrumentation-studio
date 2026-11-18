@@ -164,6 +164,10 @@ pub struct FirmwareJobStatus {
     pub bootloader_port: Option<String>,
     pub final_port: Option<String>,
     pub board_serial: Option<String>,
+    /// Set only while a native-USB restore waits for the student's double
+    /// press of RESET: when that wait gives up. The page shows the "press
+    /// RESET twice" card and its countdown from it.
+    pub manual_reset_deadline_utc: Option<DateTime<Utc>>,
     pub started_utc: DateTime<Utc>,
     pub completed_utc: Option<DateTime<Utc>>,
     pub message: String,
@@ -657,15 +661,24 @@ impl FirmwareWorkflow {
         require_core(&cli, FirmwareJobStage::Uploading)?;
         let native_restore = uses_native_usb(&board);
         let upload_board = if native_restore {
-            self.set_stage(
-                job_id,
-                FirmwareJobStage::WaitingForBootloader,
-                "The WVU firmware is using native USB. Press the board Reset button twice to switch safely to the upload interface.",
-            )?;
-            let bridge = wait_for_esp32_bridge_port(&cli, &self.cancel)?;
+            let deadline = chrono::Duration::from_std(NATIVE_USB_MANUAL_RESET_TIMEOUT)
+                .ok()
+                .map(|timeout| Utc::now() + timeout);
             self.update_job(job_id, |job| {
-                job.bootloader_port = Some(bridge.port.clone())
+                job.stage = FirmwareJobStage::WaitingForBootloader;
+                job.message = "The WVU firmware is using native USB. Press the board Reset button twice to switch safely to the upload interface.".into();
+                job.manual_reset_deadline_utc = deadline;
             })?;
+            let waited = wait_for_esp32_bridge_port(&cli, &self.cancel);
+            // The double-reset wait is over whether or not the bridge appeared.
+            let cleared = self.update_job(job_id, |job| {
+                job.manual_reset_deadline_utc = None;
+                if let Ok(bridge) = &waited {
+                    job.bootloader_port = Some(bridge.port.clone());
+                }
+            });
+            let bridge = waited?;
+            cleared?;
             bridge
         } else {
             board.clone()
@@ -801,6 +814,7 @@ impl FirmwareWorkflow {
             bootloader_port: None,
             final_port: None,
             board_serial,
+            manual_reset_deadline_utc: None,
             started_utc: Utc::now(),
             completed_utc: None,
             message: "Preparing firmware operation.".into(),
@@ -1638,6 +1652,18 @@ mod tests {
 
     fn failure(category: FirmwareErrorCategory) -> FirmwareFailure {
         FirmwareFailure::new(category, FirmwareJobStage::Failed, "test", "test")
+    }
+
+    #[test]
+    fn a_new_job_reports_no_double_reset_wait() {
+        let workflow = FirmwareWorkflow::new(SessionController::default());
+        let job = restore_job(&workflow, "COM9");
+        assert!(job.manual_reset_deadline_utc.is_none());
+        // The page reads the field by this name; it is always present.
+        let json = serde_json::to_value(&job).unwrap_or_else(|error| panic!("{error}"));
+        assert!(json
+            .get("manual_reset_deadline_utc")
+            .is_some_and(serde_json::Value::is_null));
     }
 
     #[test]

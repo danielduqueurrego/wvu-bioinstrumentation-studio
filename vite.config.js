@@ -27,5 +27,11 @@ export default defineConfig(async () => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+    // 4. the header logo is imported from the repository-level `assets/`
+    // folder; production builds bundle it, but the dev server must be allowed
+    // to serve it.
+    fs: {
+      allow: ["assets"],
+    },
   },
 }));

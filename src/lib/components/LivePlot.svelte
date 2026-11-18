@@ -3,11 +3,13 @@
   import uPlot from 'uplot';
   import { visiblePlotSeries, shouldShowPlotLegend, type PlotSeries } from '$lib/multichannel';
   import { displayedValue, displayUnitLabel, type DisplayUnit, type RecordingCalibration } from '$lib/calibration';
+  import { markersInRange, type PlacedMarker } from '$lib/markers';
   import {
     formatLiveDisplayValue,
     formatElapsedSeconds,
     filterStartupDisplayTransient,
     layoutEndpointLabels,
+    plotAreaCssBounds,
     MAX_RENDERED_DISPLAY_POINTS
   } from '$lib/live-display';
   import 'uplot/dist/uPlot.min.css';
@@ -29,8 +31,14 @@
   export let displayRevision = 0;
   export let timeOriginUs: number | undefined = undefined;
   export let hardwareSource = false;
+  // Markers of the current recording on the elapsed-time axis (display-only).
+  export let markers: PlacedMarker[] = [];
+  // Display-only pause: the plot keeps the frozen frame and never calls
+  // setData; it is rebuilt only when its series must change.
+  export let paused = false;
 
   type EndpointLabel = { id: string; label: string; color: string; value: string; top: number };
+  type MarkerLine = { id: string; text: string; left: number; top: number; height: number };
 
   // The backend returns no more than this many timestamp-windowed records. Keep
   // a matching defensive cap here in case a future backend response is larger.
@@ -45,6 +53,9 @@
   let recoveryAttemptedSignature = '';
   let activeSeries: PlotSeries[] = [];
   let endpointLabels: EndpointLabel[] = [];
+  let markerLines: MarkerLine[] = [];
+  // The elapsed-time range of the data last given to uPlot.
+  let dataRange: { min: number; max: number } | undefined;
 
   function displayChannels(): PlotSeries[] {
     return activeSeries;
@@ -59,6 +70,7 @@
     const bounded = filtered.slice(-maximum);
     const origin = timeOriginUs ?? bounded[0]?.timestamp_us ?? 0;
     const x = bounded.map((point) => Math.max(0, (point.timestamp_us - origin) / 1_000_000));
+    dataRange = x.length ? { min: x[0], max: x[x.length - 1] } : undefined;
     const values = active.map((channel) => {
       const index = channels.findIndex((candidate) => candidate.id === channel.id);
       return bounded.map((point) => {
@@ -82,6 +94,7 @@
     plot = undefined;
     plotSignature = '';
     endpointLabels = [];
+    markerLines = [];
     if (!previous) return;
     try {
       previous.destroy();
@@ -136,7 +149,9 @@
             {},
             ...active.map((channel) => ({ label: channel.label, stroke: channel.color, width: 2 }))
           ],
-          axes: [{ values: (_u, splits) => splits.map((value) => formatElapsedSeconds(value)) }, {
+          // uPlot passes the tick spacing it chose as the 5th argument; the
+          // label decimals follow it (0.25 s ticks need two decimals).
+          axes: [{ values: (_u, splits, _axisIdx, _space, increment) => splits.map((value) => formatElapsedSeconds(value, increment)) }, {
             label: new Set(active.map((channel) => displayUnitLabel(channelUnits[channel.id] ?? 'counts', calibration, channel.id))).size === 1
               ? displayUnitLabel(channelUnits[active[0]?.id] ?? 'counts', calibration, active[0]?.id)
               : 'Mixed units'
@@ -153,6 +168,7 @@
       failedSignature = '';
       recoveryAttemptedSignature = '';
       refreshEndpointLabels();
+      refreshMarkerLines();
     } catch (error) {
       handlePlotFailure('create', error, allowRecovery);
     }
@@ -161,13 +177,40 @@
   function update() {
     try {
       if (plotSignature !== currentSignature()) createPlot();
+      else if (paused) refreshMarkerLines();
       else {
         plot?.setData(chartData());
         refreshEndpointLabels();
+        refreshMarkerLines();
       }
     } catch (error) {
       handlePlotFailure('update', error);
     }
+  }
+
+  /**
+   * Vertical marker lines at each marker's elapsed recording time, for the
+   * markers inside the plotted range. Positioned in CSS pixels over the
+   * plotting area; display-only.
+   */
+  function refreshMarkerLines() {
+    if (!plot || !markers.length) {
+      markerLines = [];
+      return;
+    }
+    const currentPlot = plot;
+    const ratio = Number.isFinite(uPlot.pxRatio) && uPlot.pxRatio > 0 ? uPlot.pxRatio : 1;
+    const bounds = plotAreaCssBounds(currentPlot.bbox, ratio);
+    const left = currentPlot.bbox.left / ratio;
+    const width = currentPlot.bbox.width / ratio;
+    const scale = currentPlot.scales?.x;
+    const min = Number.isFinite(scale?.min) ? scale!.min! : dataRange?.min;
+    const max = Number.isFinite(scale?.max) ? scale!.max! : dataRange?.max;
+    markerLines = markersInRange(markers, min, max).flatMap((marker) => {
+      const offset = currentPlot.valToPos(marker.seconds, 'x');
+      if (!Number.isFinite(offset) || offset < 0 || (width > 0 && offset > width)) return [];
+      return [{ id: marker.id, text: marker.text, left: left + offset, top: bounds.top, height: Math.max(0, bounds.bottom - bounds.top) }];
+    });
   }
 
   function resizePlot() {
@@ -179,6 +222,7 @@
       if (width >= 220 && height >= 180) {
         plot.setSize({ width, height });
         refreshEndpointLabels();
+        refreshMarkerLines();
       }
     } catch (error) {
       handlePlotFailure('resize', error);
@@ -201,7 +245,8 @@
     }
     const currentPlot = plot;
     const newest = samples[samples.length - 1];
-    const bounds = currentPlot.bbox;
+    // Badges are placed in CSS pixels; uPlot's bbox is in canvas pixels.
+    const bounds = plotAreaCssBounds(currentPlot.bbox, uPlot.pxRatio);
     const pending = activeSeries.map((channel) => {
       const channelIndex = channels.findIndex((candidate) => candidate.id === channel.id);
       const unit = channelUnits[channel.id] ?? 'counts';
@@ -211,11 +256,12 @@
         label: channel.label,
         color: channel.color,
         value: formatLiveDisplayValue(value, unit, calibration, channel.id),
-        naturalTop: currentPlot.valToPos(value, 'y')
+        // CSS pixels from the top of the plotting area, which starts at bounds.top.
+        naturalTop: bounds.top + currentPlot.valToPos(value, 'y')
       };
     });
     const positions = new Map(
-      layoutEndpointLabels(pending, bounds.top, bounds.top + bounds.height)
+      layoutEndpointLabels(pending, bounds.top, bounds.bottom)
         .map((label) => [label.id, label.top ?? bounds.top])
     );
     endpointLabels = pending.map((label) => ({
@@ -239,6 +285,8 @@
     const _adcBits = adcBits;
     const _timeOriginUs = timeOriginUs;
     const _hardwareSource = hardwareSource;
+    const _markers = markers;
+    const _paused = paused;
     activeSeries = visiblePlotSeries(channels, visibleChannelIds);
     void _revision;
     void _samples;
@@ -249,6 +297,8 @@
     void _adcBits;
     void _timeOriginUs;
     void _hardwareSource;
+    void _markers;
+    void _paused;
     if (plot) update();
     else if (element && failedSignature !== currentSignature()) createPlot();
   }
@@ -274,11 +324,20 @@
   </div>
 {/if}
 <div class="plot-shell">
-  <div class="plot" bind:this={element} aria-label="Bounded synchronized live acquisition plot"></div>
-  <div class="endpoint-labels" aria-label="Newest visible signal values">
+  <div class="plot" bind:this={element} role="img" aria-label={`Live signal plot${markers.length ? `, ${markers.length} marker${markers.length === 1 ? '' : 's'}` : ''}${paused ? ', paused' : ''}`}></div>
+  <!-- Marker lines repeat the markers named in the plot's label; hidden from assistive technology. -->
+  <div class="marker-lines" aria-hidden="true">
+    {#each markerLines as line (line.id)}
+      <div class="marker-line" style:left={`${line.left}px`} style:top={`${line.top}px`} style:height={`${line.height}px`}>
+        <span class="marker-text">{line.text}</span>
+      </div>
+    {/each}
+  </div>
+  <div class="endpoint-labels" role="list" aria-label="Newest visible signal values">
     {#each endpointLabels as endpoint (endpoint.id)}
       <span
         class="endpoint-label"
+        role="listitem"
         style:top={`${endpoint.top}px`}
         style:--series-color={endpoint.color}
         aria-label={`${endpoint.label}: ${endpoint.value}`}
@@ -294,5 +353,23 @@
   .plot-shell { position: relative; min-width: 0; }
   .plot { width: 100%; height: clamp(260px, 42vh, 500px); min-width: 0; min-height: 240px; overflow: hidden; }
   .endpoint-labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 2; }
+  .marker-lines { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 1; }
+  .marker-line { position: absolute; width: 0; border-left: 2px dashed var(--wvu-navy, #002855); }
+  .marker-text {
+    position: absolute;
+    top: 0;
+    left: 3px;
+    max-width: 10rem;
+    overflow: hidden;
+    padding: .05rem .3rem;
+    border-radius: .2rem;
+    background: var(--wvu-navy, #002855);
+    color: #fff;
+    font-size: .72rem;
+    font-weight: 700;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .endpoint-label { position: absolute; right: .45rem; max-width: calc(100% - 1rem); transform: translateY(-50%); padding: .1rem .34rem; border: 1px solid var(--series-color); border-radius: .25rem; background: rgb(255 255 255 / 88%); color: #172b3a; box-shadow: 0 1px 2px rgb(0 0 0 / 12%); font-size: .76rem; font-weight: 700; line-height: 1.15; white-space: nowrap; }
 </style>

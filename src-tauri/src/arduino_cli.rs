@@ -389,7 +389,9 @@ impl ArduinoCli {
     }
 }
 
-fn hidden_command(executable: &Path) -> Command {
+/// Every helper process (Arduino CLI, File Explorer) starts without a console
+/// window: the application uses the Windows GUI subsystem.
+pub(crate) fn hidden_command(executable: &Path) -> Command {
     let mut command = Command::new(executable);
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);

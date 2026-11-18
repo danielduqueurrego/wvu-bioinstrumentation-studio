@@ -43,11 +43,6 @@ function labelRole(label: string): PulseOxRole | undefined {
   return lower === 'red led' ? 'red' : lower === 'ir led' ? 'ir' : undefined;
 }
 
-/** The explicit role, or the historical "Red LED"/"IR LED" label rule. */
-export function pulseOxRoleOf(output: LabDigitalOutput): PulseOxRole | undefined {
-  return (output as RoleAwareOutput).pulse_ox_role ?? labelRole(output.label);
-}
-
 /**
  * The one shared RED/IR selection rule (mirrors `profiles::pulse_ox_output`):
  * an output that names the role explicitly wins; otherwise the first output

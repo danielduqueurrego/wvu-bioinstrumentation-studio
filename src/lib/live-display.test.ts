@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  axisTickDecimals,
   DEFAULT_PLOT_TIME_WINDOW_SECONDS,
   filterStartupDisplayTransient,
   formatElapsedSeconds,
+  IDLE_STATUS_POLL_MS,
+  plotAreaCssBounds,
+  shouldFetchDisplayData,
+  statusPollDue,
   HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS,
   formatLiveDisplayValue,
   layoutEndpointLabels,
@@ -48,6 +53,71 @@ describe('live display helpers', () => {
     expect(formatElapsedSeconds(0)).toBe('0 s');
     expect(formatElapsedSeconds(2.5)).toBe('2.5 s');
     expect(formatElapsedSeconds(12.4)).toBe('12.4 s');
+  });
+
+  it('chooses x-axis tick decimals from the tick increment uPlot picked', () => {
+    expect(axisTickDecimals(1)).toBe(0);
+    expect(axisTickDecimals(2)).toBe(0);
+    expect(axisTickDecimals(0.5)).toBe(1);
+    expect(axisTickDecimals(0.1)).toBe(1);
+    expect(axisTickDecimals(0.25)).toBe(2);
+    expect(axisTickDecimals(0.05)).toBe(2);
+    expect(axisTickDecimals(0.025)).toBe(3);
+    expect(axisTickDecimals(Number.NaN)).toBe(1);
+    expect(axisTickDecimals(0)).toBe(1);
+  });
+
+  it('labels 0.25 s ticks evenly instead of rounding them to 0.3/0.5/0.8', () => {
+    const splits = [0, 0.25, 0.5, 0.75, 1, 1.25];
+    expect(splits.map((value) => formatElapsedSeconds(value, 0.25)))
+      .toEqual(['0 s', '0.25 s', '0.50 s', '0.75 s', '1.00 s', '1.25 s']);
+  });
+
+  it('keeps short-window ticks distinct instead of repeating one-decimal labels', () => {
+    const labels = [0.025, 0.05, 0.075, 0.1].map((value) => formatElapsedSeconds(value, 0.025));
+    expect(labels).toEqual(['0.025 s', '0.050 s', '0.075 s', '0.100 s']);
+    expect(new Set(labels).size).toBe(labels.length);
+    // Before, any tick below 0.05 s was printed as "0 s".
+    expect(formatElapsedSeconds(0.02, 0.01)).toBe('0.02 s');
+  });
+
+  it('prints whole-second ticks without decimals and never shows a negative zero', () => {
+    expect([0, 1, 2, 3].map((value) => formatElapsedSeconds(value, 1))).toEqual(['0 s', '1 s', '2 s', '3 s']);
+    expect(formatElapsedSeconds(-0.0001, 0.25)).toBe('0 s');
+    expect(formatElapsedSeconds(Number.NaN, 1)).toBe('—');
+  });
+
+  it('converts the uPlot plotting area from canvas pixels to CSS pixels', () => {
+    expect(plotAreaCssBounds({ top: 15, height: 300 }, 1)).toEqual({ top: 15, bottom: 315 });
+    // 150 % Windows scaling: canvas pixels are 1.5 CSS pixels each.
+    expect(plotAreaCssBounds({ top: 22.5, height: 450 }, 1.5)).toEqual({ top: 15, bottom: 315 });
+    expect(plotAreaCssBounds({ top: 10, height: 100 }, 0)).toEqual({ top: 10, bottom: 110 });
+  });
+
+  it('keeps endpoint badges inside the CSS plotting area at any display scaling', () => {
+    const bounds = plotAreaCssBounds({ top: 22.5, height: 450 }, 1.5);
+    // valToPos is relative to the plotting area, so add its top.
+    const labels = layoutEndpointLabels([{ id: 'a', naturalTop: bounds.top + 300 }], bounds.top, bounds.bottom);
+    expect(labels[0]?.top).toBe(bounds.bottom - 10);
+  });
+
+  it('fetches display data only while a session can produce frames, plus once when it ends', () => {
+    expect(shouldFetchDisplayData({ state: 'Acquiring', previousState: 'Acquiring', refreshRequested: false })).toBe(true);
+    expect(shouldFetchDisplayData({ state: 'Stopping', previousState: 'Acquiring', refreshRequested: false })).toBe(true);
+    // The final frames after the recording ends.
+    expect(shouldFetchDisplayData({ state: 'Disconnected', previousState: 'Stopping', refreshRequested: false })).toBe(true);
+    expect(shouldFetchDisplayData({ state: 'Faulted', previousState: 'Acquiring', refreshRequested: false })).toBe(true);
+    // Idle: no fetch or redraw.
+    expect(shouldFetchDisplayData({ state: 'Disconnected', previousState: 'Disconnected', refreshRequested: false })).toBe(false);
+    expect(shouldFetchDisplayData({ state: 'Faulted', previousState: 'Faulted', refreshRequested: false })).toBe(false);
+    // A time-window change (or the first poll) still refreshes the plot.
+    expect(shouldFetchDisplayData({ state: 'Disconnected', previousState: 'Disconnected', refreshRequested: true })).toBe(true);
+  });
+
+  it('reads the session every tick while recording and a few times a second while idle', () => {
+    expect(statusPollDue(true, 1_000, 1_040)).toBe(true);
+    expect(statusPollDue(false, 1_000, 1_040)).toBe(false);
+    expect(statusPollDue(false, 1_000, 1_000 + IDLE_STATUS_POLL_MS)).toBe(true);
   });
 
   it('removes only a converging first hardware ADC transient from the display', () => {

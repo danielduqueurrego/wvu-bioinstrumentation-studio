@@ -528,6 +528,11 @@ pub struct SessionSummary {
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionStatus {
     pub state: SessionState,
+    /// True while a recording (a Start) owns the session, from `Connecting`
+    /// through `Stopping`. False while Retry connection, Verify Firmware, or a
+    /// restore's verification runs its handshake: their `Connecting` and
+    /// `Connected` states describe a board check, not a recording.
+    pub recording_active: bool,
     pub board: String,
     pub port: String,
     pub protocol_version: String,
@@ -629,6 +634,24 @@ struct SessionRuntime {
     markers: Vec<RecordingMarker>,
     digital_output_mask: Option<u8>,
     display_origin_timestamp_us: Option<u64>,
+    /// Set while `retry_handshake` runs (see `SessionStatus::recording_active`).
+    handshake_check: bool,
+}
+
+/// Clears `SessionRuntime::handshake_check` when a handshake check returns,
+/// whichever way it returns.
+struct HandshakeCheckGuard<'a> {
+    runtime: &'a Mutex<SessionRuntime>,
+}
+
+impl Drop for HandshakeCheckGuard<'_> {
+    fn drop(&mut self) {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.handshake_check = false;
+    }
 }
 
 /// Immutable inputs for one production capture worker.  Keeping these together
@@ -1069,6 +1092,7 @@ impl SessionController {
                 markers: Vec::new(),
                 digital_output_mask: None,
                 display_origin_timestamp_us: None,
+                handshake_check: false,
             })),
             cancel: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
@@ -1123,14 +1147,7 @@ impl SessionController {
     }
 
     pub fn is_recording(&self) -> Result<bool, SessionError> {
-        Ok(matches!(
-            self.lock_runtime()?.state,
-            SessionState::Connecting
-                | SessionState::Connected
-                | SessionState::Configured
-                | SessionState::Acquiring
-                | SessionState::Stopping
-        ))
+        Ok(is_active_state(self.lock_runtime()?.state))
     }
 
     /// Adds a bounded user annotation to the active logical-record stream. It is recorded in the
@@ -1669,12 +1686,17 @@ impl SessionController {
         self.wait_for_worker()?;
         {
             // A fresh attempt replaces the previous fault; its diagnostics are
-            // replaced below as well.
+            // replaced below as well. The states it passes through are a board
+            // check, never reported as a recording.
             let mut runtime = self.lock_runtime()?;
             runtime.state = SessionState::Connecting;
+            runtime.handshake_check = true;
             runtime.last_error = None;
             runtime.fault_origin = None;
         }
+        let _check = HandshakeCheckGuard {
+            runtime: &self.runtime,
+        };
         self.cancel.store(false, Ordering::Release);
         self.set_connection_diagnostics(ConnectionDiagnostics::new(port))?;
 
@@ -1772,6 +1794,7 @@ impl SessionController {
             ));
         }
         runtime.state = SessionState::Connecting;
+        runtime.handshake_check = false;
         runtime.board = board.to_owned();
         runtime.port = port.to_owned();
         runtime.simulator = simulator;
@@ -3747,6 +3770,7 @@ impl SessionController {
         };
         SessionStatus {
             state: runtime.state,
+            recording_active: is_active_state(runtime.state) && !runtime.handshake_check,
             board: runtime.board.clone(),
             port: runtime.port.clone(),
             protocol_version: runtime.protocol_version.clone(),
@@ -3855,6 +3879,18 @@ impl SessionController {
             .lock()
             .map_err(|_| SessionError::State("session lock poisoned"))
     }
+}
+
+/// A session (a recording, or a handshake check) owns the serial transport.
+fn is_active_state(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Connecting
+            | SessionState::Connected
+            | SessionState::Configured
+            | SessionState::Acquiring
+            | SessionState::Stopping
+    )
 }
 
 fn file_name_string(path: &Path) -> Result<String, SessionError> {
@@ -5547,6 +5583,64 @@ mod tests {
         assert_eq!(status.state, SessionState::Faulted);
         assert_eq!(status.fault_origin, Some(FaultOrigin::Connection));
         assert!(status.last_error.is_some());
+        assert!(!status.recording_active);
+        assert!(
+            !session
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .handshake_check
+        );
+    }
+
+    #[test]
+    fn a_handshake_check_is_never_reported_as_a_recording() {
+        let session = SessionController::default();
+        for state in [SessionState::Connecting, SessionState::Connected] {
+            {
+                let mut runtime = session
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|error| panic!("{error}"));
+                runtime.state = state;
+                runtime.handshake_check = true;
+            }
+            let status = session.status().unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(status.state, state);
+            assert!(!status.recording_active, "{state:?} during a board check");
+            session
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .handshake_check = false;
+            let status = session.status().unwrap_or_else(|error| panic!("{error}"));
+            assert!(status.recording_active, "{state:?} during a recording");
+        }
+        session
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .state = SessionState::Disconnected;
+        assert!(
+            !session
+                .status()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .recording_active
+        );
+    }
+
+    #[test]
+    fn a_running_simulator_recording_is_reported_as_recording() {
+        let directory = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let session = SessionController::default();
+        let started = session
+            .start_simulator(RecordingDuration::UntilStopped, directory.path().into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(started.recording_active);
+        let stopped = session
+            .disconnect()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!stopped.recording_active);
     }
 
     #[test]
@@ -6721,10 +6815,32 @@ mod tests {
                 mpxv_sensor_supply_v: 5.0,
             })
             .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(fit.paired_samples, 1_201);
-        assert!((fit.slope - 120.0).abs() < 0.25);
-        assert!((fit.offset + 10.0).abs() < 1.0);
-        assert!(fit.r_squared > 0.999);
+        assert_eq!(fit.fit.paired_samples, 1_201);
+        assert!((fit.fit.slope - 120.0).abs() < 0.25);
+        assert!((fit.fit.offset + 10.0).abs() < 1.0);
+        assert!(fit.fit.r_squared > 0.999);
+        assert_eq!(fit.adc_reference_v, 5.0);
+        assert_eq!(fit.mpxv_sensor_supply_v, 5.0);
+        assert_eq!(fit.recording_adc_reference_v, Some(5.0));
+        assert_eq!(fit.recording_mpxv_sensor_supply_v, Some(5.0));
+
+        // A different Vs on the page is used as requested (the math does not
+        // silently switch), and the recording's own value is reported beside it.
+        let changed =
+            crate::calibration::fit_xgzp_from_recording(&crate::calibration::XgzpFitRequest {
+                bmeg_path: bmeg.display().to_string(),
+                start_seconds: 2.0,
+                end_seconds: 8.0,
+                adc_reference_v: 5.0,
+                mpxv_sensor_supply_v: 4.8,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(changed.mpxv_sensor_supply_v, 4.8);
+        assert_eq!(changed.recording_mpxv_sensor_supply_v, Some(5.0));
+        assert!((changed.fit.slope - fit.fit.slope).abs() > 1.0);
+        let serialized = serde_json::to_value(&changed).unwrap_or_else(|e| panic!("{e}"));
+        assert!(serialized.get("slope").is_some());
+        assert!(serialized.get("recording_mpxv_sensor_supply_v").is_some());
     }
 
     #[test]

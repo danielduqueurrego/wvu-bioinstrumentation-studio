@@ -47,14 +47,79 @@ export function formatLiveDisplayValue(
 }
 
 /**
+ * Decimals needed to show every tick of an axis whose ticks are `increment`
+ * apart: 1 s → 0, 0.5 s → 1, 0.25 s → 2, 0.025 s → 3. uPlot picks
+ * 1/2/2.5/5 × 10ⁿ steps, so a fixed one-decimal format would print 0.25 s
+ * steps as uneven 0.3/0.5/0.8 labels and 0.025 s steps as repeated labels.
+ */
+export function axisTickDecimals(increment: number): number {
+  if (!Number.isFinite(increment) || increment <= 0) return 1;
+  for (let decimals = 0; decimals < 6; decimals += 1) {
+    const scaled = increment * 10 ** decimals;
+    if (Math.abs(scaled - Math.round(scaled)) < 1e-6 * Math.max(1, scaled)) return decimals;
+  }
+  return 6;
+}
+
+/**
  * uPlot's default time scale treats values as Unix seconds. Live acquisition
  * timestamps are board-relative microseconds, so format the x-axis explicitly
- * as elapsed recording time instead of a calendar date.
+ * as elapsed recording time instead of a calendar date. `increment` is the
+ * tick spacing uPlot chose (the 5th argument of an axis `values` callback);
+ * without it one decimal is shown.
  */
-export function formatElapsedSeconds(value: number): string {
+export function formatElapsedSeconds(value: number, increment?: number): string {
   if (!Number.isFinite(value)) return '—';
-  if (Math.abs(value) < 0.05) return '0 s';
-  return `${value.toFixed(1)} s`;
+  const decimals = increment === undefined ? 1 : axisTickDecimals(increment);
+  const text = value.toFixed(decimals);
+  // Rounds to zero (including "-0.00"): show a plain origin label.
+  if (Number(text) === 0) return '0 s';
+  return `${text} s`;
+}
+
+/**
+ * uPlot reports `bbox` in canvas (device) pixels, while `valToPos(value, 'y')`
+ * returns CSS pixels relative to the plotting area. Endpoint badges are
+ * positioned in CSS pixels, so convert the plotting area once here. At 125 %
+ * or 150 % Windows scaling the two units differ by that ratio.
+ */
+export function plotAreaCssBounds(
+  bbox: { top: number; height: number },
+  pixelRatio: number
+): { top: number; bottom: number } {
+  const ratio = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1;
+  return { top: bbox.top / ratio, bottom: (bbox.top + bbox.height) / ratio };
+}
+
+const activeDisplayStates = new Set(['Connecting', 'Connected', 'Configured', 'Acquiring', 'Stopping']);
+
+/** While no recording runs, the session status is read at this interval. */
+export const IDLE_STATUS_POLL_MS = 250;
+
+/**
+ * Whether a status-poll tick should read the session now. A recording (or a
+ * Start in progress) is followed every 40 ms tick; while idle a few reads per
+ * second are enough, because every command that changes the session reads
+ * a fresh status itself.
+ */
+export function statusPollDue(active: boolean, lastPollMs: number, nowMs: number): boolean {
+  return active || nowMs - lastPollMs >= IDLE_STATUS_POLL_MS;
+}
+
+/**
+ * Whether a poll should fetch and redraw the bounded display data. Only an
+ * active session produces new frames; when it ends, one more fetch shows the
+ * final frames. An explicit request (a time-window change, the first poll)
+ * always fetches. Idle polls otherwise skip the fetch and the redraw.
+ */
+export function shouldFetchDisplayData(input: {
+  state: string;
+  previousState: string;
+  refreshRequested: boolean;
+}): boolean {
+  return input.refreshRequested
+    || activeDisplayStates.has(input.state)
+    || activeDisplayStates.has(input.previousState);
 }
 
 function median(values: number[]): number {

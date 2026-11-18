@@ -394,6 +394,86 @@ fn resolve_recording_destination_with(
     })
 }
 
+/// Free bytes on the drive that holds `project_folder`, for the Storage
+/// display before Start. Nothing is created or written. A Project folder
+/// that does not exist yet on a fixed local drive is measured at its nearest
+/// existing parent (Start would create it there); a missing folder on a
+/// removable or network drive, an invalid path, or a failed query gives
+/// `None` ("not yet checked"), never a guessed number.
+pub fn project_folder_free_space(project_folder: &str) -> Option<u64> {
+    project_folder_free_space_with(project_folder, is_on_fixed_local_volume, |path| {
+        fs2::available_space(path)
+    })
+}
+
+fn project_folder_free_space_with(
+    project_folder: &str,
+    fixed_volume: fn(&Path) -> bool,
+    available_space: impl Fn(&Path) -> std::io::Result<u64>,
+) -> Option<u64> {
+    let root = checked_project_root(project_folder).ok()?;
+    if root.is_dir() {
+        return available_space(&root).ok();
+    }
+    if !fixed_volume(&root) {
+        return None;
+    }
+    let existing = root.ancestors().find(|candidate| candidate.is_dir())?;
+    available_space(existing).ok()
+}
+
+/// The recording file Show in folder may reveal: an existing file inside the
+/// current Project folder. Both paths are canonicalized first, so `..`
+/// segments, junctions, and links cannot point outside the Project folder,
+/// and a sibling folder that merely shares a name prefix is not "inside".
+pub fn checked_file_in_project_folder(path: &str, project_folder: &str) -> Result<PathBuf, String> {
+    let value = path.trim();
+    if value.is_empty() || value.contains('\0') {
+        return Err("No recording file was given.".into());
+    }
+    let requested = PathBuf::from(value);
+    if !requested.is_absolute() {
+        return Err("The recording file path is not a full path.".into());
+    }
+    let project = checked_project_root(project_folder)?;
+    let project = fs::canonicalize(&project).map_err(|_| {
+        format!(
+            "The Project folder {} is not available. Reconnect its drive or choose another Project folder.",
+            project.display()
+        )
+    })?;
+    let file = fs::canonicalize(&requested).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "The file no longer exists. It may have been moved, renamed, or deleted.".to_string()
+        } else {
+            format!("The file could not be found: {error}")
+        }
+    })?;
+    if !file.is_file() {
+        return Err("Only a recording file can be shown in its folder.".into());
+    }
+    if !file.starts_with(&project) {
+        return Err("Only files inside the current Project folder can be shown.".into());
+    }
+    Ok(file)
+}
+
+/// `canonicalize` returns verbatim Windows paths (`\\?\C:\…`,
+/// `\\?\UNC\server\share\…`), which File Explorer does not accept; this
+/// gives the ordinary form of the same path.
+pub fn explorer_path(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn checked_project_root(value: &str) -> Result<PathBuf, String> {
     let value = value.trim();
     if value.is_empty() || value.contains('\0') {
@@ -507,6 +587,232 @@ mod tests {
     }
     fn never_fixed(_path: &Path) -> bool {
         false
+    }
+
+    #[test]
+    fn free_space_is_read_without_creating_the_project_folder() {
+        let dir = tempdir().unwrap();
+        let existing = dir.path().to_string_lossy().into_owned();
+        let missing = dir.path().join("BMEG 420L").join("Lab6");
+        let missing_text = missing.to_string_lossy().into_owned();
+        let measured = |path: &Path| -> std::io::Result<u64> {
+            // Only existing folders are measured.
+            assert!(path.is_dir(), "{} was measured", path.display());
+            Ok(1_234)
+        };
+        assert_eq!(
+            project_folder_free_space_with(&existing, always_fixed, measured),
+            Some(1_234)
+        );
+        // A not-yet-created folder on a fixed drive is measured at its parent.
+        assert_eq!(
+            project_folder_free_space_with(&missing_text, always_fixed, measured),
+            Some(1_234)
+        );
+        assert!(!missing.exists());
+        // A missing folder on a removable drive is unknown, not guessed.
+        assert_eq!(
+            project_folder_free_space_with(&missing_text, never_fixed, measured),
+            None
+        );
+        assert_eq!(
+            project_folder_free_space_with("relative\\folder", always_fixed, measured),
+            None
+        );
+        assert_eq!(
+            project_folder_free_space_with(&existing, always_fixed, |_| Err(
+                std::io::Error::other("query failed")
+            )),
+            None
+        );
+        assert!(project_folder_free_space(&existing).is_some());
+    }
+
+    fn write_file(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap_or_else(|| panic!("no parent")))
+            .unwrap_or_else(|error| panic!("{error}"));
+        fs::write(path, b"BMEG").unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn show_in_folder_accepts_only_existing_files_inside_the_project_folder() {
+        let root = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let project = root.path().join("Project");
+        let recording = project.join("Lab6").join("Trial1").join("run.bmeg");
+        let at_root = project.join("run.csv");
+        write_file(&recording);
+        write_file(&at_root);
+        let project_text = project.to_string_lossy().into_owned();
+
+        let accepted = checked_file_in_project_folder(&recording.to_string_lossy(), &project_text)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            accepted,
+            fs::canonicalize(&recording).unwrap_or_else(|error| panic!("{error}"))
+        );
+        assert!(checked_file_in_project_folder(&at_root.to_string_lossy(), &project_text).is_ok());
+        // Surrounding whitespace from a copied path is ignored.
+        assert!(checked_file_in_project_folder(
+            &format!("  {}  ", recording.to_string_lossy()),
+            &project_text
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn show_in_folder_refuses_files_outside_the_project_folder() {
+        let root = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let project = root.path().join("Project");
+        let outside = root.path().join("Elsewhere").join("secret.txt");
+        // A sibling folder whose name merely starts with the Project folder's name.
+        let sibling = root.path().join("Project2").join("run.bmeg");
+        fs::create_dir_all(&project).unwrap_or_else(|error| panic!("{error}"));
+        write_file(&outside);
+        write_file(&sibling);
+        let project_text = project.to_string_lossy().into_owned();
+
+        for refused in [
+            outside.to_string_lossy().into_owned(),
+            sibling.to_string_lossy().into_owned(),
+            // `..` cannot climb out once the path is canonicalized.
+            project
+                .join("..")
+                .join("Elsewhere")
+                .join("secret.txt")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            let error = checked_file_in_project_folder(&refused, &project_text)
+                .expect_err("a file outside the Project folder must be refused");
+            assert!(
+                error.contains("inside the current Project folder"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn show_in_folder_refuses_missing_files_folders_and_relative_paths() {
+        let root = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let project = root.path().join("Project");
+        let folder = project.join("Lab6");
+        fs::create_dir_all(&folder).unwrap_or_else(|error| panic!("{error}"));
+        let project_text = project.to_string_lossy().into_owned();
+
+        let missing = checked_file_in_project_folder(
+            &project.join("deleted.bmeg").to_string_lossy(),
+            &project_text,
+        )
+        .expect_err("a missing file must be refused");
+        assert!(missing.contains("no longer exists"), "{missing}");
+        assert!(checked_file_in_project_folder(&folder.to_string_lossy(), &project_text).is_err());
+        assert!(checked_file_in_project_folder("Lab6\\run.bmeg", &project_text).is_err());
+        assert!(checked_file_in_project_folder("", &project_text).is_err());
+        assert!(checked_file_in_project_folder("C:\\run\0.bmeg", &project_text).is_err());
+
+        // A Project folder that is gone (for example an unplugged USB drive).
+        let gone = root.path().join("Unplugged");
+        let file = project.join("run.bmeg");
+        write_file(&file);
+        assert!(
+            checked_file_in_project_folder(&file.to_string_lossy(), &gone.to_string_lossy())
+                .is_err()
+        );
+    }
+
+    /// A directory junction needs no special privilege on Windows (unlike a
+    /// symbolic link), so this always runs there.
+    #[cfg(windows)]
+    #[test]
+    fn show_in_folder_follows_junctions_and_refuses_one_that_leaves_the_project_folder() {
+        let root = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let project = root.path().join("Project");
+        let outside = root.path().join("Elsewhere");
+        let inside = project.join("Lab6");
+        write_file(&outside.join("secret.bmeg"));
+        write_file(&inside.join("run.bmeg"));
+        let junction = |link: &Path, target: &Path| {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap_or_else(|error| panic!("mklink could not run: {error}"));
+            assert!(
+                status.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        };
+        let escape = project.join("Shortcut");
+        let alias = project.join("Alias");
+        junction(&escape, &outside);
+        junction(&alias, &inside);
+        let project_text = project.to_string_lossy().into_owned();
+
+        let refused = checked_file_in_project_folder(
+            &escape.join("secret.bmeg").to_string_lossy(),
+            &project_text,
+        )
+        .expect_err("a junction must not lead outside the Project folder");
+        assert!(
+            refused.contains("inside the current Project folder"),
+            "{refused}"
+        );
+
+        let accepted = checked_file_in_project_folder(
+            &alias.join("run.bmeg").to_string_lossy(),
+            &project_text,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            accepted,
+            fs::canonicalize(inside.join("run.bmeg")).unwrap_or_else(|error| panic!("{error}"))
+        );
+    }
+
+    /// A file symbolic link needs Developer Mode or an elevated account on
+    /// Windows; without that privilege the check is skipped, not failed.
+    #[cfg(windows)]
+    #[test]
+    fn show_in_folder_refuses_a_file_link_that_points_outside_the_project_folder() {
+        let root = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let project = root.path().join("Project");
+        let target = root.path().join("Elsewhere").join("secret.bmeg");
+        fs::create_dir_all(&project).unwrap_or_else(|error| panic!("{error}"));
+        write_file(&target);
+        let link = project.join("run.bmeg");
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+            eprintln!(
+                "skipped: creating a symbolic link needs a privilege this account lacks ({error})"
+            );
+            return;
+        }
+        let refused =
+            checked_file_in_project_folder(&link.to_string_lossy(), &project.to_string_lossy())
+                .expect_err("a link must not lead outside the Project folder");
+        assert!(
+            refused.contains("inside the current Project folder"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn explorer_receives_ordinary_paths_not_verbatim_ones() {
+        assert_eq!(
+            explorer_path(Path::new(r"\\?\C:\BMEG 420L\run.bmeg")),
+            PathBuf::from(r"C:\BMEG 420L\run.bmeg")
+        );
+        assert_eq!(
+            explorer_path(Path::new(r"\\?\UNC\server\share\BMEG\run.bmeg")),
+            PathBuf::from(r"\\server\share\BMEG\run.bmeg")
+        );
+        assert_eq!(
+            explorer_path(Path::new(r"C:\BMEG\run.bmeg")),
+            PathBuf::from(r"C:\BMEG\run.bmeg")
+        );
     }
 
     #[test]

@@ -1,16 +1,48 @@
 /** Small pure helpers shared by the profile-aware Acquisition page and plot. */
+import type { LabChannel, LabProfile } from './labs';
+
 export type DisplayChannel = { id: string; label: string; csv_name: string; default_visible?: boolean };
 export type VisibleChannelMap = Record<string, boolean>;
 export type PlotGroup = { id: string; channelIds: string[] };
 export type PlotSeries = DisplayChannel & { color: string };
+/** A rendered plot plus its slot number in the assignment selectors. */
+export type NumberedPlotGroup = PlotGroup & { slot: number };
+/** A channel as the page plots it; pulse-ox raw fields are not lab channels. */
+export type PlotChannel = DisplayChannel & { pin?: string; units?: string; allowed_conversions?: string[] };
 
-// One shared color mapping for each LivePlot instance.  The uPlot stroke and
-// the Svelte legend both consume this helper so a legend can never drift from
-// the line it identifies.
-const plotColors = ['#002855', '#EEAA00', '#007A78', '#9D2235', '#5D4E99', '#C65E00'];
+// One shared color mapping. The uPlot stroke and the Svelte legend both
+// consume `visiblePlotSeries`, so a legend can never drift from the line it
+// identifies. The gold is darkened for at least 3:1 against the plot background.
+const plotColors = ['#002855', '#B07800', '#007A78', '#9D2235', '#5D4E99', '#C65E00'];
+
+/**
+ * Pulse-ox raw fields keep meaningful colours wherever they are drawn: RED is
+ * red, IR a dark violet, and the two DARK phases greys. RX uses a lighter
+ * shade of the same colour as TX so an overlay still tells them apart.
+ */
+const pulseOxColors: Record<string, string> = {
+  red_tx: '#C8102E',
+  red_rx: '#E35D6A',
+  dark1_tx: '#5B6670',
+  dark1_rx: '#7D8891',
+  ir_tx: '#4B1F7A',
+  ir_rx: '#8C6BC2',
+  dark2_tx: '#1E252B',
+  dark2_rx: '#4A535B'
+};
 
 export function seriesColor(index: number): string {
   return plotColors[index % plotColors.length];
+}
+
+/**
+ * The colour of one channel. It depends on the channel itself (its position
+ * among all of the lab's plot channels, or its pulse-ox role), never on which
+ * traces are visible or which plot it was assigned to, so a signal keeps its
+ * colour when others are hidden or rearranged.
+ */
+export function channelColor(channels: DisplayChannel[], channelId: string): string {
+  return pulseOxColors[channelId] ?? seriesColor(Math.max(0, channels.findIndex((channel) => channel.id === channelId)));
 }
 
 export function visibleChannels(channels: DisplayChannel[], selected: string[]): DisplayChannel[] {
@@ -19,10 +51,53 @@ export function visibleChannels(channels: DisplayChannel[], selected: string[]):
 
 /** Series currently visible in one display-only plot group, in uPlot order. */
 export function visiblePlotSeries(channels: DisplayChannel[], selected: string[]): PlotSeries[] {
-  return visibleChannels(channels, selected).map((channel, index) => ({
+  return visibleChannels(channels, selected).map((channel) => ({
     ...channel,
-    color: seriesColor(index)
+    color: channelColor(channels, channel.id)
   }));
+}
+
+/** The eight raw pulse-ox fields, in record order. One stable array. */
+export const PULSEOX_PLOT_CHANNELS: readonly PlotChannel[] = Object.freeze([
+  { id: 'red_tx', label: 'TX Red', csv_name: 'red_TX', allowed_conversions: ['counts_volts'] },
+  { id: 'dark1_tx', label: 'TX Dark 1', csv_name: 'dark1_TX', allowed_conversions: ['counts_volts'] },
+  { id: 'ir_tx', label: 'TX IR', csv_name: 'ir_TX', allowed_conversions: ['counts_volts'] },
+  { id: 'dark2_tx', label: 'TX Dark 2', csv_name: 'dark2_TX', allowed_conversions: ['counts_volts'] },
+  { id: 'red_rx', label: 'RX Red', csv_name: 'red_RX', allowed_conversions: ['counts_volts'] },
+  { id: 'dark1_rx', label: 'RX Dark 1', csv_name: 'dark1_RX', allowed_conversions: ['counts_volts'] },
+  { id: 'ir_rx', label: 'RX IR', csv_name: 'ir_RX', allowed_conversions: ['counts_volts'] },
+  { id: 'dark2_rx', label: 'RX Dark 2', csv_name: 'dark2_RX', allowed_conversions: ['counts_volts'] }
+]);
+
+export function isPulseOxProfile(profile: LabProfile | undefined): boolean {
+  return profile?.acquisition.acquisition_mode === 'pulseox_4state';
+}
+
+/** A lab's analog channels; a legacy single-pin lab becomes one 'raw' channel. */
+export function profileChannels(profile: LabProfile | undefined): LabChannel[] {
+  if (!profile) return [];
+  if (profile.acquisition.channels?.length) return profile.acquisition.channels;
+  return [{
+    pin: profile.acquisition.analog_pin,
+    id: 'raw',
+    label: profile.display.channel_label,
+    csv_name: profile.export.signal_name,
+    units: 'ADC counts'
+  }];
+}
+
+/** The signals the live plots draw for a lab, in record (`values`) order. */
+export function plotChannelsFor(profile: LabProfile | undefined): PlotChannel[] {
+  return isPulseOxProfile(profile) ? [...PULSEOX_PLOT_CHANNELS] : profileChannels(profile);
+}
+
+/**
+ * Identifies one lab revision. While a recording runs the plots follow the
+ * recorded lab; this key changes only when that revision really changes, not
+ * on every status poll that returns a new (equal) snapshot object.
+ */
+export function labRevisionKey(profile: LabProfile | undefined): string {
+  return profile ? `${profile.profile_id}@${profile.profile_version}` : '';
 }
 
 export function shouldShowPlotLegend(series: PlotSeries[]): boolean {
@@ -125,12 +200,24 @@ export function onePlotPerSignal(channels: DisplayChannel[]): PlotGroup[] {
 }
 
 export function visiblePlotGroups(channels: DisplayChannel[], groups: PlotGroup[], visibility: VisibleChannelMap): PlotGroup[] {
-  return normalizePlotGroups(channels, groups)
-    .map((group) => ({ ...group, channelIds: group.channelIds.filter((id) => visibility[id] !== false) }))
-    .filter((group) => group.channelIds.length > 0);
+  return numberedVisiblePlotGroups(channels, groups, visibility).map(({ id, channelIds }) => ({ id, channelIds }));
 }
 
-export function hasUniqueAnalogPins(pins: string[]): boolean {
-  return pins.length > 0 && pins.length <= 6 && new Set(pins).size === pins.length
-    && pins.every((pin) => /^A[0-5]$/.test(pin));
+/**
+ * The plots to render, each numbered by its slot, so "Plot 2" is the same
+ * plot as "Plot 2" in the assignment selectors even when an earlier slot is
+ * empty or all of its signals are hidden (and therefore not rendered).
+ */
+export function numberedVisiblePlotGroups(
+  channels: DisplayChannel[],
+  groups: PlotGroup[],
+  visibility: VisibleChannelMap
+): NumberedPlotGroup[] {
+  return normalizePlotGroups(channels, groups)
+    .map((group, index) => ({
+      ...group,
+      slot: index + 1,
+      channelIds: group.channelIds.filter((id) => visibility[id] !== false)
+    }))
+    .filter((group) => group.channelIds.length > 0);
 }

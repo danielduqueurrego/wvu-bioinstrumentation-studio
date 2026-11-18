@@ -1,0 +1,76 @@
+/*
+ * Form primitives shared by the setup cards, the Live signals panel, and
+ * the calibration dialog: an element gets them only inside a `.studio-form`
+ * container. Every selector sits inside :where(), so it has no specificity
+ * and a component's own scoped styles always win. Colours come from the
+ * tokens defined on :root by the page.
+ */
+:where(.studio-form h2) { margin-top: 0; }
+:where(.studio-form h3) { margin: 0 0 .8rem; }
+
+:where(.studio-form button) {
+  min-height: 2.5rem;
+  border: 1px solid var(--wvu-navy);
+  border-radius: .3rem;
+  background: var(--surface);
+  color: var(--wvu-navy);
+  padding: .55rem .75rem;
+  font: inherit;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+/*
+ * The page's global `button { font: inherit }` resets the weight and outranks
+ * a :where() rule, so the weight alone uses a plain (class + element)
+ * selector. No component inside a .studio-form container styles its own
+ * buttons' weight.
+ */
+.studio-form button { font-weight: 650; }
+:where(.studio-form button:disabled) { cursor: not-allowed; opacity: .55; }
+:where(.studio-form button:not(:disabled):hover) { background: var(--wvu-navy); color: #fff; }
+:where(.studio-form button.gold) { background: var(--wvu-gold); color: var(--ink); }
+:where(.studio-form button.gold:not(:disabled):hover) { background: #d99a00; color: var(--ink); }
+/* Destructive actions: red outline, filled red on hover. */
+:where(.studio-form button.danger) { border-color: var(--danger); color: var(--danger); }
+:where(.studio-form button.danger:not(:disabled):hover) { background: var(--danger); color: #fff; }
+
+:where(.studio-form label, .studio-form .field-action) { min-width: 0; display: grid; gap: .3rem; margin-top: .6rem; font-weight: 600; }
+:where(.studio-form .field-action > span) { font-size: .9rem; }
+:where(.studio-form :is(.control-grid, .unit-grid, .plot-assignment-grid) label, .studio-form label.choice) { margin-top: 0; }
+:where(.studio-form input:not([type='radio'], [type='checkbox']), .studio-form select) {
+  min-width: 0;
+  width: 100%;
+  min-height: 2.4rem;
+  border: 1px solid var(--border-strong);
+  border-radius: .25rem;
+  background: var(--surface);
+  padding: .35rem .5rem;
+  font: inherit;
+}
+:where(.studio-form input[readonly]) { background: #eef1f3; color: #374450; }
+:where(.studio-form textarea) { width: 100%; min-height: 7rem; resize: vertical; font: .92rem ui-monospace, Consolas, monospace; }
+
+:where(.studio-form .help) { margin: .7rem 0 0; color: var(--muted); }
+:where(.studio-form .error) { color: #8b1515; font-weight: 650; }
+:where(.studio-form .warning) { border-left: 5px solid var(--warn); background: var(--warn-bg); padding: .75rem; }
+
+:where(.studio-form fieldset) { min-width: 0; border: 0; padding: 0; margin: .6rem 0 0; }
+:where(.studio-form legend) { font-weight: 650; margin-bottom: .3rem; padding: 0; }
+:where(.studio-form :is(.choice-row, .duration-controls, .action-row)) { display: flex; min-width: 0; flex-wrap: wrap; gap: .7rem; align-items: end; }
+:where(.studio-form .choice) { display: flex; align-items: center; gap: .4rem; }
+:where(.studio-form .duration-controls) { margin-top: .75rem; }
+:where(.studio-form .action-row) { margin: 1rem 0; }
+
+:where(.studio-form .control-grid) { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .8rem; align-items: end; margin-top: .8rem; }
+:where(.studio-form .button-pair) { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .8rem; }
+:where(.studio-form .button-pair button) { flex: 0 1 18rem; }
+
+:where(.studio-form .metric-grid) { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: .55rem; margin: .75rem 0; }
+:where(.studio-form .metric-grid span) { min-width: 0; padding: .5rem .7rem; border: 1px solid var(--border); border-radius: .3rem; background: var(--surface); overflow-wrap: anywhere; }
+:where(.studio-form .metric-grid strong) { display: block; color: #42515d; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; }
+
+:where(.studio-form .advanced-details) { min-width: 0; margin-top: .8rem; }
+:where(.studio-form .advanced-details > summary) { cursor: pointer; color: var(--wvu-navy); font-weight: 700; }
+:where(.studio-form .advanced-details[open] > summary) { margin-bottom: .75rem; }

@@ -81,6 +81,22 @@ pub struct XgzpFitRequest {
     pub mpxv_sensor_supply_v: f64,
 }
 
+/// An XGZP fit plus the voltages behind it. The fit always uses the
+/// requested Vref and Vs; the values frozen into the recording are reported
+/// alongside so the page can show a difference instead of hiding it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct XgzpFit {
+    #[serde(flatten)]
+    pub fit: LinearFit,
+    /// The ADC reference and MPXV supply this fit used (the request's).
+    pub adc_reference_v: f64,
+    pub mpxv_sensor_supply_v: f64,
+    /// The values frozen into the recording; `None` for a recording made
+    /// before calibration metadata was stored.
+    pub recording_adc_reference_v: Option<f64>,
+    pub recording_mpxv_sensor_supply_v: Option<f64>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CalibrationError {
     #[error("calibration value must be finite and within the supported 0.1–10 V range")]
@@ -290,7 +306,7 @@ pub fn validate_preset(preset: &CalibrationPreset) -> Result<(), CalibrationErro
     Ok(())
 }
 
-pub fn fit_xgzp_from_recording(request: &XgzpFitRequest) -> Result<LinearFit, CalibrationError> {
+pub fn fit_xgzp_from_recording(request: &XgzpFitRequest) -> Result<XgzpFit, CalibrationError> {
     validate_voltage(request.adc_reference_v)?;
     validate_voltage(request.mpxv_sensor_supply_v)?;
     if !request.start_seconds.is_finite()
@@ -318,6 +334,10 @@ pub fn fit_xgzp_from_recording(request: &XgzpFitRequest) -> Result<LinearFit, Ca
         .iter()
         .position(|channel| channel.id == "xgzp")
         .ok_or(CalibrationError::MissingBpChannels)?;
+    let recorded = reader.metadata.calibration.as_ref();
+    let recording_adc_reference_v = recorded.map(|calibration| calibration.adc_reference_v);
+    let recording_mpxv_sensor_supply_v =
+        recorded.map(|calibration| calibration.mpxv_sensor_supply_v);
     let mut origin = None;
     let mut points = Vec::new();
     while let Some(record) = reader.next_record()? {
@@ -344,7 +364,13 @@ pub fn fit_xgzp_from_recording(request: &XgzpFitRequest) -> Result<LinearFit, Ca
             reference_value: reference,
         });
     }
-    fit_linear(&points)
+    Ok(XgzpFit {
+        fit: fit_linear(&points)?,
+        adc_reference_v: request.adc_reference_v,
+        mpxv_sensor_supply_v: request.mpxv_sensor_supply_v,
+        recording_adc_reference_v,
+        recording_mpxv_sensor_supply_v,
+    })
 }
 
 #[derive(Clone)]

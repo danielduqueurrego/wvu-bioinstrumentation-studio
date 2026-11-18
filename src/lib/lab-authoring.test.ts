@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   derivedColumnName, estimatedPulseOxCycleRate, isValidCsvFieldName, labConfigurationIssues, MAX_LAB_CATEGORY_CHARS, MAX_LAB_IDENTIFIER_CHARS,
   MAX_LAB_NAME_CHARS, MAX_PROFILE_ID_CHARS, newChannel, nextChannelIndex,
-  normalizeEditorDraft, PULSEOX_PHASE_ORDER, pulseOxCycleRateHz, pulseOxDraft, pulseOxOutput, pulseOxRoleOf, resolvedDigitalOutputs, voltageColumnName,
+  normalizeEditorDraft, PULSEOX_PHASE_ORDER, pulseOxCycleRateHz, pulseOxDraft, pulseOxOutput, resolvedDigitalOutputs, voltageColumnName,
   type RoleAwareOutput
 } from './lab-authoring';
 import type { LabProfile } from './labs';
@@ -127,7 +127,7 @@ describe('lab editor normalization and save-time rules', () => {
     ];
     expect(pulseOxOutput(labelled, 'red')?.pin).toBe('D5');
     expect(pulseOxOutput(labelled, 'ir')?.pin).toBe('D6');
-    expect(pulseOxRoleOf({ pin: 'D4', label: 'Green LED', behavior: 'high_while_recording' })).toBeUndefined();
+    expect(pulseOxOutput([{ pin: 'D4', label: 'Green LED', behavior: 'high_while_recording' }], 'red')).toBeUndefined();
     // An extra pulse-ox output is refused rather than silently ignored.
     const pulse = pulseOxDraft(base());
     pulse.acquisition.digital_outputs = [...labelled, { pin: 'D4', label: 'Green LED', behavior: 'high_while_recording' }];
