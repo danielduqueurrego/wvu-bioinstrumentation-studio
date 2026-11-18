@@ -38,6 +38,15 @@ struct StartProfileHardwareRequest {
     calibration: Option<calibration::RecordingCalibration>,
 }
 
+/// Inputs for the pre-Start storage estimate. Field names match the start
+/// requests so the frontend can send the same values.
+#[derive(serde::Deserialize)]
+struct EstimateRecordingStorageRequest {
+    profile_id: String,
+    duration: recording::RecordingDuration,
+    calibration: Option<calibration::RecordingCalibration>,
+}
+
 #[derive(serde::Deserialize)]
 struct StartProfileSimulatorRequest {
     project_folder: String,
@@ -420,6 +429,31 @@ fn checked_recording_calibration(
     Ok(calibration)
 }
 
+/// Projected BMEG + CSV size and the free space a timed recording needs, so
+/// it can be shown before Start. It reads the lab catalog only: no port, file,
+/// or acquisition command is touched.
+#[tauri::command]
+fn estimate_recording_storage(
+    state: tauri::State<'_, AppState>,
+    request: EstimateRecordingStorageRequest,
+) -> Result<session::RecordingStorageEstimate, String> {
+    let EstimateRecordingStorageRequest {
+        profile_id,
+        duration,
+        calibration,
+    } = request;
+    let profile = state
+        .profiles
+        .get_locked(&profile_id)
+        .map_err(|error| error.to_string())?;
+    let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())?;
+    Ok(session::estimate_recording_storage(
+        &profile.snapshot(false),
+        &calibration,
+        &duration,
+    ))
+}
+
 #[tauri::command]
 fn start_profile_simulator_recording(
     state: tauri::State<'_, AppState>,
@@ -785,6 +819,7 @@ pub fn run() {
             delete_calibration,
             fit_xgzp_calibration,
             fit_manual_linear_calibration,
+            estimate_recording_storage,
             start_profile_simulator_recording,
             start_profile_hardware_recording,
             reset_board_and_retry,

@@ -4,15 +4,18 @@
 //! transport read and disk write. Status and the bounded display history are copied
 //! under a short mutex so polling the UI never waits for serial I/O.
 use crate::{
-    acquisition::{AcquisitionController, AcquisitionSnapshot, FirmwareCapabilities},
-    calibration::RecordingCalibration,
+    acquisition::{
+        AcquisitionController, AcquisitionSnapshot, AcquisitionState, FirmwareCapabilities,
+    },
+    calibration::{CalibrationType, RecordingCalibration},
     profiles::{built_in_profiles, ProfileSnapshot, ProfileStatus},
     protocol::{
         encode_frame, Frame, FrameParser, IntegrityCounters, MessageType, SampleBatch,
         CONTROLLED_SERIAL_BAUD, REFERENCE_DEVICE_ID, REFERENCE_FIRMWARE_BUILD,
     },
     recording::{
-        export_bmeg_csv, BmegWriter, RecordingDuration, RecordingMarker, RecordingMetadata,
+        check_synchronized_header, export_bmeg_csv, synchronized_record_bytes, BmegWriter,
+        RecordLayout, RecordingDuration, RecordingError, RecordingMarker, RecordingMetadata,
         RecordingSafetyContext, StopReason, SynchronizedRecord,
     },
 };
@@ -55,6 +58,33 @@ const DISK_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
 const DISK_CRITICAL_BYTES: u64 = 250 * 1024 * 1024;
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const RECORDING_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// Bounded wait, after STOP, for the firmware's terminal STATUS. The firmware
+/// sends that STATUS only after its final partial batch and every queued
+/// batch, so receiving it also proves the recording's tail was read.
+const STOP_STATUS_TIMEOUT: Duration = Duration::from_millis(300);
+/// OneDrive, Windows Search, and antivirus scanners briefly open files that
+/// were just closed. A bounded retry turns those sharing violations into a
+/// short delay instead of a lost rename.
+const RENAME_ATTEMPTS: u32 = 5;
+const RENAME_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+/// Provenance strings (Arduino CLI/core versions, board serial) are known only
+/// inside the worker. The synchronous Start precheck reserves room for them.
+const HEADER_PROVENANCE_RESERVE_BYTES: usize = 2 * 1024;
+/// Conservative upper bounds for one exported CSV row, used so the storage
+/// guard keeps room for the CSV that finalization writes from the BMEG.
+/// Prefix: record/cycle index (<= 10 digits), t_us (<= 20 digits), commas, newline.
+const CSV_ROW_PREFIX_BYTES: u64 = 34;
+/// ",65535" raw ADC counts.
+const CSV_COUNTS_FIELD_BYTES: u64 = 6;
+/// ",d.dddddd" volts with headroom for unusual reference voltages.
+const CSV_VOLTS_FIELD_BYTES: u64 = 12;
+/// A signed calibrated value with six decimals.
+const CSV_DERIVED_FIELD_BYTES: u64 = 24;
+/// Column header plus slack for filesystem allocation granularity.
+const CSV_HEADER_RESERVE_BYTES: u64 = 64 * 1024;
+/// Reason shown by `powercfg /requests` while a recording keeps Windows awake.
+const KEEP_AWAKE_REASON: &str =
+    "WVU Bioinstrumentation Studio is recording data from an Arduino or the simulator.";
 /// `serialport` maps one configured timeout to both Windows read and write
 /// timeouts.  Twenty-five milliseconds is useful for short startup probes,
 /// but is too aggressive for a live 921600-baud CDC session: Windows may abort
@@ -90,6 +120,11 @@ fn normalize_display_max_points(max_points: usize) -> usize {
 /// Filters a chronological display cache by timestamp and deterministically
 /// decimates it for rendering. The final element is always the exact newest
 /// record, even when the interval contains more records than the UI budget.
+///
+/// Timestamps strictly increase within a session (non-increasing ones are
+/// rejected at ingest and `recent` is cleared by `begin_session`), so the
+/// window is a suffix located by binary search. Only the at most `max_points`
+/// selected records are cloned while the runtime lock is held.
 fn select_display_records(
     records: &VecDeque<SynchronizedRecord>,
     window_seconds: f64,
@@ -98,30 +133,27 @@ fn select_display_records(
     let Some(latest) = records.back() else {
         return Vec::new();
     };
+    if max_points == 0 {
+        return Vec::new();
+    }
     let window_us = (window_seconds * 1_000_000.0).round() as u64;
     let earliest_timestamp = latest.timestamp_us.saturating_sub(window_us);
-    let filtered: Vec<SynchronizedRecord> = records
-        .iter()
-        .filter(|record| record.timestamp_us >= earliest_timestamp)
-        .cloned()
-        .collect();
+    let start = records.partition_point(|record| record.timestamp_us < earliest_timestamp);
+    let available = records.len() - start;
 
-    if filtered.len() <= max_points {
-        return filtered;
+    if available <= max_points {
+        return records.range(start..).cloned().collect();
     }
     if max_points == 1 {
-        return filtered.last().cloned().into_iter().collect();
+        return vec![latest.clone()];
     }
 
     // Include both interval endpoints with evenly distributed indices. The
     // newest exact raw display record is therefore never replaced by a stride
     // approximation, while recorded BMEG/CSV frames are never decimated.
-    let last_index = filtered.len() - 1;
+    let last_offset = available - 1;
     (0..max_points)
-        .map(|index| {
-            let selected = index * last_index / (max_points - 1);
-            filtered[selected].clone()
-        })
+        .map(|index| records[start + index * last_offset / (max_points - 1)].clone())
         .collect()
 }
 
@@ -136,6 +168,156 @@ struct SystemDiskSpace;
 impl DiskSpaceProvider for SystemDiskSpace {
     fn available_space(&self, path: &Path) -> std::io::Result<u64> {
         fs2::available_space(path)
+    }
+}
+
+/// File operations used while capturing and finalizing a recording. The
+/// production implementation is the real file system; tests inject failures
+/// to prove that STOP, metadata, and an honest fault always follow.
+trait RecordingStorage: Send + Sync {
+    /// Periodic in-capture flush of buffered BMEG records.
+    fn flush(&self, writer: &mut BmegWriter) -> Result<(), RecordingError> {
+        writer.flush()
+    }
+
+    /// Final flush of the BMEG before it is renamed (fsync is best effort).
+    fn finish(&self, writer: BmegWriter) -> Result<(), RecordingError> {
+        writer.finish()
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    /// Streams the finished BMEG into a CSV and returns the row count.
+    fn export_csv(&self, bmeg: &Path, csv: &Path) -> Result<u64, RecordingError> {
+        export_bmeg_csv(bmeg, csv)
+    }
+
+    /// Creates or truncates `path` and writes `bytes`. A write error fails;
+    /// the fsync that follows is best effort, as for the BMEG and CSV.
+    fn write_durably(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let mut file = fs::File::create(path)?;
+        file.write_all(bytes)?;
+        crate::recording::sync_best_effort(&file, "metadata");
+        Ok(())
+    }
+}
+
+struct SystemRecordingStorage;
+
+impl RecordingStorage for SystemRecordingStorage {}
+
+/// Capture cadence. Production values are fixed; tests shorten them so the
+/// storage guard, flush, and rename paths run within a test's time budget.
+/// The seven-second no-data timeout is deliberately not part of this seam.
+#[derive(Clone, Copy, Debug)]
+struct CaptureTiming {
+    disk_check_interval: Duration,
+    flush_interval: Duration,
+    rename_attempts: u32,
+    rename_initial_backoff: Duration,
+}
+
+impl Default for CaptureTiming {
+    fn default() -> Self {
+        Self {
+            disk_check_interval: DISK_CHECK_INTERVAL,
+            flush_interval: RECORDING_FLUSH_INTERVAL,
+            rename_attempts: RENAME_ATTEMPTS,
+            rename_initial_backoff: RENAME_INITIAL_BACKOFF,
+        }
+    }
+}
+
+/// Keeps Windows from idle-sleeping while a recording worker runs, from
+/// Connecting until finalization ends. A sleeping host stops sending PINGs,
+/// so the firmware watchdog would end the recording as a fault. Creating the
+/// request may fail (for example under restrictive policy); that is logged
+/// and never blocks recording. The request is cleared and its handle closed
+/// on drop, on every exit path.
+struct KeepAwakeGuard {
+    #[cfg(windows)]
+    request: Option<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl KeepAwakeGuard {
+    fn acquire(reason: &str) -> Self {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Power::{
+            PowerCreateRequest, PowerRequestSystemRequired, PowerSetRequest,
+        };
+        use windows_sys::Win32::System::Threading::{
+            POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0,
+        };
+
+        let mut reason_text: Vec<u16> = reason.encode_utf16().chain(std::iter::once(0)).collect();
+        let context = REASON_CONTEXT {
+            // POWER_REQUEST_CONTEXT_VERSION (DIAGNOSTIC_REASON_VERSION) is 0.
+            Version: 0,
+            Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+            Reason: REASON_CONTEXT_0 {
+                SimpleReasonString: reason_text.as_mut_ptr(),
+            },
+        };
+        // SAFETY: `context` and the NUL-terminated `reason_text` it points to
+        // are valid for the duration of the call; Windows copies the reason.
+        let request = unsafe { PowerCreateRequest(&context) };
+        if request.is_null() || request == INVALID_HANDLE_VALUE {
+            crate::app_log::record(
+                "WARN",
+                &format!(
+                    "KEEP_AWAKE_UNAVAILABLE stage=create detail={}",
+                    std::io::Error::last_os_error()
+                ),
+            );
+            return Self { request: None };
+        }
+        // SAFETY: `request` is a valid power-request handle created above.
+        if unsafe { PowerSetRequest(request, PowerRequestSystemRequired) } == 0 {
+            crate::app_log::record(
+                "WARN",
+                &format!(
+                    "KEEP_AWAKE_UNAVAILABLE stage=set detail={}",
+                    std::io::Error::last_os_error()
+                ),
+            );
+            // SAFETY: the handle is valid and owned here; it is closed once.
+            unsafe {
+                CloseHandle(request);
+            }
+            return Self { request: None };
+        }
+        crate::app_log::record("INFO", "KEEP_AWAKE_ACTIVE");
+        Self {
+            request: Some(request),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KeepAwakeGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestSystemRequired};
+
+        if let Some(request) = self.request.take() {
+            // SAFETY: `request` was created and set by `acquire`, is owned by
+            // this guard, and is cleared and closed exactly once.
+            unsafe {
+                PowerClearRequest(request, PowerRequestSystemRequired);
+                CloseHandle(request);
+            }
+            crate::app_log::record("INFO", "KEEP_AWAKE_RELEASED");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl KeepAwakeGuard {
+    fn acquire(_reason: &str) -> Self {
+        Self {}
     }
 }
 
@@ -163,6 +345,10 @@ pub enum ConnectionFailureCategory {
     ResetPortDidNotReturn,
     ResetReturnedDifferentPort,
     AmbiguousReturningDevice,
+    /// The recording folder could not be used, or the recording could not be
+    /// written or finalized completely. This is a storage problem, not a
+    /// serial or firmware one, so it must not suggest verifying firmware.
+    RecordingStorageError,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -315,7 +501,15 @@ pub struct SessionSummary {
     pub profile: ProfileSnapshot,
     pub calibration: RecordingCalibration,
     pub active_digital_output_mask: Option<u8>,
+    /// Output mask from a STATUS received after STOP; `None` when STOP was
+    /// not confirmed (for example after a transport fault).
     pub final_digital_output_mask: Option<u8>,
+    /// Why no CSV was produced. `csv_path` is empty in that case; the raw
+    /// BMEG and metadata are kept.
+    pub csv_error: Option<String>,
+    /// Flush/rename/metadata problems while saving. `bmeg_path` names the raw
+    /// file that was actually kept (a `.bmeg.part` if it could not be renamed).
+    pub finalize_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -360,6 +554,21 @@ pub enum SessionError {
     Protocol(String),
     #[error("storage: {0}")]
     Storage(String),
+    /// A requested stop arrived before acquisition began (during connection,
+    /// handshake, or configuration). It is the only worker error that ends a
+    /// session quietly; every other error, including one raised while saving
+    /// after a user Stop, is reported as a fault.
+    #[error("session was cancelled")]
+    Cancelled,
+    /// The recording could not be written or finalized completely. Files that
+    /// were saved are kept and described in the summary and metadata.
+    #[error("save: {0}")]
+    Save(String),
+    /// The recording request itself cannot be honored (for example a lab
+    /// header that exceeds the BMEG limit). The message is student-facing, so
+    /// it carries no prefix, and it is not a connection or firmware problem.
+    #[error("{0}")]
+    InvalidRequest(&'static str),
 }
 
 #[derive(Clone)]
@@ -369,6 +578,8 @@ pub struct SessionController {
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     stop_reason: Arc<Mutex<Option<StopReason>>>,
     disk_space: Arc<dyn DiskSpaceProvider>,
+    storage: Arc<dyn RecordingStorage>,
+    timing: CaptureTiming,
 }
 
 struct SessionRuntime {
@@ -499,6 +710,115 @@ impl SerialTerminalFailure {
     fn into_session_error(self) -> SessionError {
         SessionError::Io(self.error)
     }
+}
+
+/// A host-side failure that ends acquisition: the BMEG sink could not accept
+/// or flush records, or session state could not be updated. Like a serial
+/// failure it is a terminal cause; STOP, the post-STOP drain, and
+/// finalization still run.
+#[derive(Clone, Copy, Debug)]
+enum HostFailureStage {
+    RecordingWrite,
+    RecordingFlush,
+    SessionState,
+}
+
+impl HostFailureStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RecordingWrite => "RECORDING_WRITE",
+            Self::RecordingFlush => "RECORDING_FLUSH",
+            Self::SessionState => "SESSION_STATE",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HostCaptureFailure {
+    stage: HostFailureStage,
+    detail: String,
+}
+
+impl HostCaptureFailure {
+    fn new(stage: HostFailureStage, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            detail: detail.into(),
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!("{}: {}", self.stage.label(), self.detail)
+    }
+}
+
+/// The four files of one recording. The raw data are written to the `.part`
+/// path and renamed to `bmeg` only after they were flushed and fsynced.
+#[derive(Clone, Debug)]
+struct RecordingPaths {
+    temporary_bmeg: PathBuf,
+    bmeg: PathBuf,
+    csv: PathBuf,
+    metadata: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinalizeStage {
+    Flush,
+    Rename,
+    Metadata,
+    Csv,
+}
+
+impl FinalizeStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flush => "flush",
+            Self::Rename => "rename",
+            Self::Metadata => "metadata",
+            Self::Csv => "csv",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FinalizeFailure {
+    stage: FinalizeStage,
+    detail: String,
+}
+
+impl FinalizeFailure {
+    fn new(stage: FinalizeStage, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Facts that finalization needs but does not derive from the files.
+struct FinalizePlan {
+    reason: StopReason,
+    /// Set when acquisition ended because records could not be written.
+    recording_failure: Option<String>,
+    records_written: u64,
+    csv_bytes_estimate: u64,
+    free_bytes: Option<u64>,
+}
+
+/// What finalization actually left on disk. Every step is attempted even
+/// when an earlier one failed, and nothing that holds samples is deleted.
+struct FinalizeOutcome {
+    /// The file holding the raw recording: the final `.bmeg`, or the `.part`
+    /// when it could not be flushed completely or renamed.
+    raw_path: PathBuf,
+    metadata_written: bool,
+    csv_written: bool,
+    csv_error: Option<String>,
+    /// Every non-CSV problem, including a failed final metadata write that
+    /// the sidecar itself cannot record.
+    finalize_error: Option<String>,
+    failures: Vec<FinalizeFailure>,
 }
 
 fn firmware_error_detail(code: Option<u8>, payload: Option<&[u8]>) -> String {
@@ -681,6 +1001,18 @@ impl Default for SessionController {
 
 impl SessionController {
     fn with_disk_space(disk_space: Arc<dyn DiskSpaceProvider>) -> Self {
+        Self::with_environment(
+            disk_space,
+            Arc::new(SystemRecordingStorage),
+            CaptureTiming::default(),
+        )
+    }
+
+    fn with_environment(
+        disk_space: Arc<dyn DiskSpaceProvider>,
+        storage: Arc<dyn RecordingStorage>,
+        timing: CaptureTiming,
+    ) -> Self {
         Self {
             runtime: Arc::new(Mutex::new(SessionRuntime {
                 state: SessionState::Disconnected,
@@ -715,6 +1047,8 @@ impl SessionController {
             worker: Arc::new(Mutex::new(None)),
             stop_reason: Arc::new(Mutex::new(None)),
             disk_space,
+            storage,
+            timing,
         }
     }
     pub fn status(&self) -> Result<SessionStatus, SessionError> {
@@ -838,6 +1172,15 @@ impl SessionController {
         calibration
             .validate()
             .map_err(|error| SessionError::Protocol(error.to_string()))?;
+        check_header_budget(HeaderBudgetRequest {
+            simulator: true,
+            source: "SIM",
+            duration: &duration,
+            profile: &profile,
+            calibration: &calibration,
+            recording_path_context: recording_path_context.as_ref(),
+            recording_context: &recording_context,
+        })?;
         self.begin_session(
             true,
             "Simulator",
@@ -925,6 +1268,15 @@ impl SessionController {
         calibration
             .validate()
             .map_err(|error| SessionError::Protocol(error.to_string()))?;
+        check_header_budget(HeaderBudgetRequest {
+            simulator: false,
+            source: &port_name,
+            duration: &duration,
+            profile: &profile,
+            calibration: &calibration,
+            recording_path_context: recording_path_context.as_ref(),
+            recording_context: &recording_context,
+        })?;
         self.begin_session(
             false,
             "Arduino UNO R4 WiFi",
@@ -1076,7 +1428,10 @@ impl SessionController {
             let mut runtime = self.lock_runtime()?;
             if matches!(
                 runtime.state,
-                SessionState::Acquiring | SessionState::Configured | SessionState::Connecting
+                SessionState::Acquiring
+                    | SessionState::Configured
+                    | SessionState::Connected
+                    | SessionState::Connecting
             ) {
                 runtime.state = SessionState::Stopping;
             }
@@ -1087,7 +1442,13 @@ impl SessionController {
     }
 
     /// Idempotent disconnect. The worker is joined without holding the runtime mutex.
+    ///
+    /// If this call stopped a running worker and that worker ended `Faulted`
+    /// (including a save failure after this Stop), the fault and its
+    /// `last_error` are kept so the UI can explain what was not saved. An idle
+    /// historical fault is cleared to `Disconnected`, as before.
     pub fn disconnect(&self) -> Result<SessionStatus, SessionError> {
+        let stopped_an_active_session = self.is_recording()?;
         self.request_stop_with_reason(StopReason::User)?;
         let handle = self
             .worker
@@ -1098,7 +1459,9 @@ impl SessionController {
             let _ = handle.join();
         }
         let mut runtime = self.lock_runtime()?;
-        runtime.state = SessionState::Disconnected;
+        if !(stopped_an_active_session && runtime.state == SessionState::Faulted) {
+            runtime.state = SessionState::Disconnected;
+        }
         Ok(Self::status_from_runtime(&runtime))
     }
 
@@ -1240,7 +1603,9 @@ impl SessionController {
         let mut ambiguity = false;
         while reset_started.elapsed() < RESET_ENUMERATION_TIMEOUT {
             if self.cancel.load(Ordering::Acquire) {
-                return Err(SessionError::State("board reset was cancelled"));
+                // No serial handle is open while waiting for re-enumeration.
+                self.set_state(SessionState::Disconnected)?;
+                return Err(SessionError::Cancelled);
             }
             // Arduino CLI discovery is comparatively slow on Windows. Poll the
             // operating-system USB serial list here so the short bootloader window
@@ -1385,7 +1750,11 @@ impl SessionController {
         runtime.last_error = None;
         runtime.last_summary = None;
         runtime.duration = Some(duration);
-        runtime.started_at = Some(Instant::now());
+        // Elapsed/remaining are measured from START, set with `Acquiring` by
+        // `set_acquiring`; connection setup is not part of the recording.
+        runtime.started_at = None;
+        // A previous session's output mask must not be shown while connecting.
+        runtime.digital_output_mask = None;
         runtime.available_disk_bytes = None;
         runtime.storage_warning = None;
         runtime.stop_reason = None;
@@ -1436,9 +1805,11 @@ impl SessionController {
         recording_path_context: Option<RecordingPathContext>,
         recording_context: RecordingContext,
     ) -> Result<(), SessionError> {
+        // Held until this function returns, i.e. through finalization.
+        let _keep_awake = KeepAwakeGuard::acquire(KEEP_AWAKE_REASON);
         let result = (|| {
             let mut simulator = SimulatorIo::new(&profile, duration.clone())?;
-            self.set_state(SessionState::Connected)?;
+            self.set_progress_state(SessionState::Connected)?;
             self.capture_transport(
                 &mut simulator,
                 CaptureRequest {
@@ -1459,6 +1830,8 @@ impl SessionController {
     }
 
     fn capture_serial_worker(&self, mut request: CaptureRequest) -> Result<(), SessionError> {
+        // Held until this function returns, i.e. through finalization.
+        let _keep_awake = KeepAwakeGuard::acquire(KEEP_AWAKE_REASON);
         let result = (|| {
             let port_name = request.source.clone();
             // This is read-only Windows serial-port enumeration. The captured
@@ -1489,13 +1862,21 @@ impl SessionController {
             port.write_request_to_send(true)?;
             // wait_for_handshake passively listens through the bounded startup grace
             // before its first PING, so a healthy board can announce itself first.
-            self.set_state(SessionState::Connected)?;
+            self.set_progress_state(SessionState::Connected)?;
             self.capture_transport(&mut port, request)
         })();
         self.finish_worker_error(&result)?;
         result
     }
 
+    /// Runs one recording on an already opened transport.
+    ///
+    /// Invariants: once START has been written, every exit sends a best-effort
+    /// STOP. Once acquisition is active, no error returns early: a serial,
+    /// firmware, storage, or session-state failure becomes the terminal cause
+    /// of the loop, and STOP, the bounded post-STOP drain, and finalization
+    /// (BMEG, metadata, CSV) always run. A failed recording is never restarted
+    /// or appended to.
     fn capture_transport<T: Read + Write>(
         &self,
         io: &mut T,
@@ -1514,7 +1895,7 @@ impl SessionController {
         } = request;
         // Collect tooling provenance before START so no external command can delay raw intake.
         crate::app_log::record("INFO", "OPEN_RECORDING_FILE_BEGIN");
-        let (temporary_bmeg, bmeg, csv, metadata) = self
+        let paths = self
             .allocate_paths(&output_dir, &profile)
             .map_err(|error| {
                 crate::app_log::record(
@@ -1525,7 +1906,7 @@ impl SessionController {
             })?;
         crate::app_log::record("INFO", "OPEN_RECORDING_FILE_OK");
         let initial_free_disk_bytes = self.free_disk_space(&output_dir)?;
-        self.update_disk_space(initial_free_disk_bytes)?;
+        self.update_disk_space(initial_free_disk_bytes, 0)?;
         if initial_free_disk_bytes < DISK_CRITICAL_BYTES {
             return Err(SessionError::Storage(format!(
                 "only {} MiB free in {}; recording requires at least {} MiB",
@@ -1534,11 +1915,13 @@ impl SessionController {
                 DISK_CRITICAL_BYTES / (1024 * 1024)
             )));
         }
+        let field_count = profile.profile.acquisition.record_field_names().len();
+        let csv_row_bytes = estimated_csv_row_bytes(&profile, &calibration);
         let mut initial_meta = self
             .initial_metadata(InitialMetadataRequest {
                 simulator,
                 source: &source,
-                bmeg: &bmeg,
+                bmeg: &paths.bmeg,
                 duration: &duration,
                 profile: &profile,
                 calibration,
@@ -1553,8 +1936,19 @@ impl SessionController {
                 error
             })?;
         initial_meta.initial_free_disk_bytes = Some(initial_free_disk_bytes);
+        initial_meta.record_layout = Some(RecordLayout::Synchronized { field_count });
+        // The 64 KiB header limit is proven before the board is configured, so
+        // an oversized lab or note is never reported as a connection problem.
+        check_synchronized_header(&initial_meta, field_count).map_err(|error| {
+            crate::app_log::record(
+                "WARN",
+                &format!("START_FAIL stage=PREPARE_METADATA detail={error}"),
+            );
+            header_budget_error(error)
+        })?;
         let (tx, rx) = sync_channel(4_096);
         let mut acquisition = AcquisitionController::new(tx);
+        acquisition.set_expected_field_count(field_count);
         crate::app_log::record("INFO", "HANDSHAKE_BEGIN");
         self.wait_for_handshake(io, &mut acquisition)
             .map_err(|error| {
@@ -1565,8 +1959,42 @@ impl SessionController {
                 error
             })?;
         crate::app_log::record("INFO", "HANDSHAKE_OK");
-        let negotiated_capabilities = acquisition.snapshot().firmware_capabilities;
+        // Frames received so far may have been queued by a previous session
+        // that ended without STOP (for example a watchdog ERROR 7). They are
+        // logged, never counted against this recording; only errors after this
+        // baseline (including a rejected CONFIGURE or START) end it.
+        let handshake_snapshot = acquisition.snapshot();
+        let firmware_error_baseline = handshake_snapshot.firmware_error_count;
+        if firmware_error_baseline > 0 {
+            crate::app_log::record(
+                "WARN",
+                &format!(
+                    "STALE_FIRMWARE_ERROR count={} detail={}",
+                    firmware_error_baseline,
+                    firmware_error_detail(
+                        handshake_snapshot.firmware_error_code,
+                        handshake_snapshot.firmware_error_payload.as_deref(),
+                    )
+                ),
+            );
+        }
+        let negotiated_capabilities = handshake_snapshot.firmware_capabilities;
+        // An idle-safe STOP quiesces a board that may still be acquiring for a
+        // previous session: its outputs go LOW now and CONFIGURE is never
+        // applied mid-acquisition. The firmware answers with an acquiring=0
+        // STATUS, which START confirmation ignores because it requires
+        // acquiring=1.
+        crate::app_log::record("INFO", "QUIESCE_STOP_SEND");
+        self.send_command(io, MessageType::Stop, 0, vec![])
+            .map_err(|error| {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("START_FAIL stage=QUIESCE_STOP detail={error}"),
+                );
+                error
+            })?;
         crate::app_log::record("INFO", "CONFIGURE_SEND");
+        let config_ack_baseline = acquisition.snapshot().config_ack_count;
         self.send_command(
             io,
             MessageType::Configure,
@@ -1583,54 +2011,54 @@ impl SessionController {
             );
             error
         })?;
-        self.wait_until(io, &mut acquisition, |s| s.config_ack_seen, "CONFIG_ACK")
-            .map_err(|error| {
-                crate::app_log::record(
-                    "WARN",
-                    &format!("START_FAIL stage=CONFIG_ACK detail={error}"),
-                );
-                error
-            })?;
-        crate::app_log::record("INFO", "CONFIG_ACK_RECEIVED");
-        acquisition.configure().map_err(SessionError::State)?;
-        self.set_state(SessionState::Configured)?;
-        // The recording is open before START, so every validated post-start sample has a sink.
-        let mut raw = BmegWriter::create_synchronized(
-            &temporary_bmeg,
-            &initial_meta,
-            profile.profile.acquisition.record_field_names().len(),
+        self.wait_until(
+            io,
+            &mut acquisition,
+            move |snapshot| snapshot.config_ack_count > config_ack_baseline,
+            "CONFIG_ACK",
+            firmware_error_baseline,
         )
         .map_err(|error| {
             crate::app_log::record(
                 "WARN",
-                &format!("START_FAIL stage=OPEN_RECORDING_FILE detail={error}"),
+                &format!("START_FAIL stage=CONFIG_ACK detail={error}"),
             );
             error
         })?;
-        acquisition.start().map_err(SessionError::State)?;
-        crate::app_log::record("INFO", "START_SEND");
-        self.send_command(io, MessageType::Start, 2, vec![])
-            .map_err(|error| {
-                crate::app_log::record(
-                    "WARN",
-                    &format!("START_FAIL stage=START_SEND detail={error}"),
-                );
-                error
-            })?;
-        self.wait_until(io, &mut acquisition, |s| s.status_seen, "START status")
-            .map_err(|error| {
-                crate::app_log::record(
-                    "WARN",
-                    &format!("START_FAIL stage=START_ACK_OR_FIRST_SAMPLE detail={error}"),
-                );
-                error
-            })?;
-        self.set_state(SessionState::Acquiring)?;
-        crate::app_log::record("INFO", "RECORDING_ACTIVE");
-        let active_digital_output_mask = acquisition.snapshot().digital_output_mask;
-
+        crate::app_log::record("INFO", "CONFIG_ACK_RECEIVED");
+        acquisition.configure().map_err(SessionError::State)?;
+        self.set_progress_state(SessionState::Configured)?;
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(SessionError::Cancelled);
+        }
+        // `utc_start`/`local_start` describe acquisition, so they are stamped
+        // as late as the header allows: immediately before START. The
+        // pre-handshake time is kept as `session_opened_utc`.
+        let start_stamp = Utc::now();
+        initial_meta.utc_start = start_stamp;
+        initial_meta.local_start = start_stamp.with_timezone(&Local);
+        // The recording is open before START, so every validated post-start sample has a sink.
+        let mut raw =
+            BmegWriter::create_synchronized(&paths.temporary_bmeg, &initial_meta, field_count)
+                .map_err(|error| {
+                    crate::app_log::record(
+                        "WARN",
+                        &format!("START_FAIL stage=OPEN_RECORDING_FILE detail={error}"),
+                    );
+                    error
+                })?;
+        if let Err(error) = self.send_start_and_wait(io, &mut acquisition, firmware_error_baseline)
+        {
+            self.abandon_unstarted_recording(io, &rx, raw, &paths.temporary_bmeg);
+            return Err(error);
+        }
+        // One Instant is the origin of the live elapsed/remaining display, the
+        // timed stop, and host_elapsed_seconds.
         let started = Instant::now();
         let started_utc = Utc::now();
+        self.note_runtime_error("SET_ACQUIRING", self.set_acquiring(started));
+        crate::app_log::record("INFO", "RECORDING_ACTIVE");
+        let active_digital_output_mask = acquisition.snapshot().digital_output_mask;
         crate::app_log::record(
             "INFO",
             &format!(
@@ -1651,8 +2079,10 @@ impl SessionController {
         let mut consecutive_deferred_ping_failures = 0u8;
         let mut last_disk_check = Instant::now();
         let mut last_flush = Instant::now();
+        let mut last_known_free_disk_bytes = initial_free_disk_bytes;
         let mut buffer = [0u8; 512];
         let mut terminal_error: Option<SerialTerminalFailure> = None;
+        let mut host_failure: Option<HostCaptureFailure> = None;
         let mut terminal_failure_category: Option<ConnectionFailureCategory> = None;
         let mut stop_reason = None;
         let mut progress = CaptureProgress::default();
@@ -1660,12 +2090,20 @@ impl SessionController {
 
         loop {
             if self.cancel.load(Ordering::Acquire) {
-                stop_reason = Some(self.stop_reason()?.unwrap_or(StopReason::User));
+                stop_reason = Some(
+                    self.stop_reason()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(StopReason::User),
+                );
                 break;
             }
             if let RecordingDuration::Timed { seconds } = &duration {
                 if started.elapsed() >= Duration::from_secs(*seconds) {
-                    stop_reason = Some(self.set_stop_reason_once(StopReason::TimedComplete)?);
+                    stop_reason = Some(
+                        self.set_stop_reason_once(StopReason::TimedComplete)
+                            .unwrap_or(StopReason::TimedComplete),
+                    );
                     break;
                 }
             }
@@ -1684,12 +2122,24 @@ impl SessionController {
                     break;
                 }
             }
-            self.drain_samples(&rx, &mut raw)?;
-            self.update_from_acquisition(&acquisition)?;
+            if let Err(error) = self.drain_samples(&rx, &mut raw) {
+                host_failure = Some(HostCaptureFailure::new(
+                    HostFailureStage::RecordingWrite,
+                    error.to_string(),
+                ));
+                break;
+            }
+            if let Err(error) = self.update_from_acquisition(&acquisition) {
+                host_failure = Some(HostCaptureFailure::new(
+                    HostFailureStage::SessionState,
+                    error.to_string(),
+                ));
+                break;
+            }
             let active_snapshot = acquisition.snapshot();
             let observed_now = Instant::now();
             progress.observe(&active_snapshot, observed_now);
-            if active_snapshot.firmware_error_count > 0 {
+            if active_snapshot.firmware_error_count > firmware_error_baseline {
                 terminal_error = Some(SerialTerminalFailure::new(
                     SerialFailureStage::FirmwareError,
                     std::io::Error::other(firmware_error_detail(
@@ -1779,58 +2229,144 @@ impl SessionController {
                     }
                 }
             }
-            if last_flush.elapsed() >= RECORDING_FLUSH_INTERVAL {
+            if last_flush.elapsed() >= self.timing.flush_interval {
                 let flush_started = Instant::now();
-                raw.flush()?;
+                if let Err(error) = self.storage.flush(&mut raw) {
+                    host_failure = Some(HostCaptureFailure::new(
+                        HostFailureStage::RecordingFlush,
+                        error.to_string(),
+                    ));
+                    break;
+                }
                 let now = Instant::now();
                 last_flush = now;
                 progress.last_recording_flush = Some(now);
                 progress.last_recording_flush_duration = Some(now.duration_since(flush_started));
             }
-            if last_disk_check.elapsed() >= DISK_CHECK_INTERVAL {
+            if last_disk_check.elapsed() >= self.timing.disk_check_interval {
                 let disk_check_started = Instant::now();
-                let free = self.free_disk_space(&output_dir)?;
-                let now = Instant::now();
-                self.update_disk_space(free)?;
-                if free < DISK_CRITICAL_BYTES {
-                    stop_reason = Some(self.set_stop_reason_once(StopReason::StorageGuard)?);
-                    break;
+                let csv_reserve_bytes = projected_csv_bytes(raw.records, csv_row_bytes);
+                match self.free_disk_space(&output_dir) {
+                    Ok(free) => {
+                        last_known_free_disk_bytes = free;
+                        self.note_runtime_error(
+                            "DISK_STATUS",
+                            self.update_disk_space(free, csv_reserve_bytes),
+                        );
+                        // Room is kept for the CSV that finalization exports
+                        // from the BMEG, not only for the raw recording.
+                        if free < storage_stop_threshold(csv_reserve_bytes) {
+                            crate::app_log::record(
+                                "WARN",
+                                &format!(
+                                    "STORAGE_GUARD free_disk_bytes={free} critical_bytes={DISK_CRITICAL_BYTES} csv_reserve_bytes={csv_reserve_bytes} records={}",
+                                    raw.records
+                                ),
+                            );
+                            stop_reason = Some(
+                                self.set_stop_reason_once(StopReason::StorageGuard)
+                                    .unwrap_or(StopReason::StorageGuard),
+                            );
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        // A transient query failure (removable, network, or
+                        // cloud-backed folder) is not evidence of low space.
+                        // Keep the last confirmed value and retry next interval.
+                        crate::app_log::record(
+                            "WARN",
+                            &format!(
+                                "DISK_SPACE_QUERY_FAILED detail={error} last_known_free_disk_bytes={last_known_free_disk_bytes}"
+                            ),
+                        );
+                    }
                 }
+                let now = Instant::now();
                 last_disk_check = now;
                 progress.last_disk_check = Some(now);
                 progress.last_disk_check_duration = Some(now.duration_since(disk_check_started));
             }
         }
 
+        // The worker owns finalization from here, whatever ended the loop, so
+        // the UI shows Stopping/saving and markers can no longer be added.
+        self.note_runtime_error("SET_STOPPING", self.set_state(SessionState::Stopping));
         if let Some(error) = terminal_error.as_ref() {
             // This reads only the operating system's port list. It does not
             // reopen, reset, upload to, or otherwise touch the selected board.
-            terminal_failure_category = Some(self.record_active_serial_failure(
-                error,
-                ActiveSerialFailureContext {
-                    port: &source,
-                    expected_identity: expected_port_identity.as_ref(),
+            terminal_failure_category = self
+                .record_active_serial_failure(
+                    error,
+                    ActiveSerialFailureContext {
+                        port: &source,
+                        expected_identity: expected_port_identity.as_ref(),
+                        started,
+                        started_utc,
+                        progress: &progress,
+                        snapshot: &acquisition.snapshot(),
+                    },
+                )
+                .ok();
+        }
+        if let Some(failure) = host_failure.as_ref() {
+            crate::app_log::record(
+                "ERROR",
+                &format!(
+                    "RECORDING_WRITE_FAIL stage={} records_written={} detail={}",
+                    failure.stage.label(),
+                    raw.records,
+                    failure.detail
+                ),
+            );
+        }
+        let reason = if terminal_error.is_some() {
+            if matches!(
+                terminal_failure_category,
+                Some(ConnectionFailureCategory::DeviceDisconnected)
+            ) {
+                StopReason::Disconnect
+            } else {
+                StopReason::Fault
+            }
+        } else if host_failure.is_some() {
+            StopReason::Fault
+        } else {
+            stop_reason.unwrap_or(StopReason::Fault)
+        };
+        // Committed now so a Stop click during finalization cannot relabel a
+        // fault as a user stop.
+        self.note_runtime_error("STOP_REASON", self.commit_terminal_stop_reason(reason));
+
+        let stop_status_baseline = acquisition.snapshot().status_count;
+        let stop_sent = match self.send_capture_command(io, MessageType::Stop, 4, vec![]) {
+            Ok(()) => true,
+            Err(CaptureCommandError::Serial(error)) => {
+                self.record_serial_cleanup_failure(
+                    &error,
+                    &source,
                     started,
                     started_utc,
-                    progress: &progress,
-                    snapshot: &acquisition.snapshot(),
-                },
-            )?);
-        }
-
-        match self.send_capture_command(io, MessageType::Stop, 4, vec![]) {
-            Ok(()) => {}
-            Err(CaptureCommandError::Serial(error)) => {
-                self.record_serial_cleanup_failure(&error, &source, started, started_utc, &progress)
+                    &progress,
+                );
+                false
             }
-            Err(CaptureCommandError::Protocol(detail)) => crate::app_log::record(
-                "WARN",
-                &format!("SERIAL_CLEANUP_ERROR stage=STOP_PROTOCOL detail={detail}"),
-            ),
-        }
-        // Give the controlled firmware a bounded opportunity to confirm that all
-        // course LED outputs are low before the serial handle is released.
-        let stop_status_deadline = Instant::now() + Duration::from_millis(300);
+            Err(CaptureCommandError::Protocol(detail)) => {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("SERIAL_CLEANUP_ERROR stage=STOP_PROTOCOL detail={detail}"),
+                );
+                false
+            }
+        };
+        // Read until the firmware's STATUS sent after this STOP arrives (or
+        // the bounded deadline passes). It follows the final partial batch and
+        // every queued batch, so the recording's tail is drained too. An
+        // existing mask of 0 proves nothing: labs with no outputs report 0 at
+        // START.
+        let host_failure_before_stop = host_failure.is_some();
+        let mut stop_confirmed = false;
+        let stop_status_deadline = Instant::now() + STOP_STATUS_TIMEOUT;
         while terminal_error.is_none() && Instant::now() < stop_status_deadline {
             match io.read(&mut buffer) {
                 Ok(n) if n > 0 => {
@@ -1853,18 +2389,57 @@ impl SessionController {
                     break;
                 }
             }
-            if acquisition.snapshot().digital_output_mask == Some(0) {
+            // Drain while waiting so tail batches never fill the bounded channel.
+            if host_failure.is_none() {
+                if let Err(error) = self.drain_samples(&rx, &mut raw) {
+                    host_failure = Some(HostCaptureFailure::new(
+                        HostFailureStage::RecordingWrite,
+                        error.to_string(),
+                    ));
+                }
+            }
+            if stop_is_confirmed(&acquisition.snapshot(), stop_status_baseline) {
+                stop_confirmed = true;
                 break;
             }
         }
-        self.drain_samples(&rx, &mut raw)?;
-        raw.finish()?;
-        fs::rename(&temporary_bmeg, &bmeg)?;
-        let csv_rows = export_bmeg_csv(&bmeg, &csv)?;
+        // After a sink failure nothing more is written: the buffer then holds
+        // only whole records, and further writes could not be trusted.
+        if host_failure.is_none() {
+            if let Err(error) = self.drain_samples(&rx, &mut raw) {
+                host_failure = Some(HostCaptureFailure::new(
+                    HostFailureStage::RecordingWrite,
+                    error.to_string(),
+                ));
+            }
+        }
+        if !host_failure_before_stop {
+            if let Some(failure) = host_failure.as_ref() {
+                crate::app_log::record(
+                    "ERROR",
+                    &format!(
+                        "RECORDING_WRITE_FAIL stage={} during=post_stop records_written={} detail={}",
+                        failure.stage.label(),
+                        raw.records,
+                        failure.detail
+                    ),
+                );
+            }
+        }
+        let records_written = raw.records;
+        crate::app_log::record(
+            if stop_confirmed { "INFO" } else { "WARN" },
+            &format!(
+                "STOP_CONFIRMATION confirmed={stop_confirmed} stop_sent={stop_sent} records_written={records_written}"
+            ),
+        );
         let mut snapshot = acquisition.snapshot();
-        let final_digital_output_mask = snapshot.digital_output_mask;
-        let terminal_error_detail = terminal_error.as_ref().map(SerialTerminalFailure::detail);
-        if terminal_error_detail.is_some()
+        let final_digital_output_mask = if stop_confirmed {
+            snapshot.digital_output_mask
+        } else {
+            None
+        };
+        if terminal_error.is_some()
             && matches!(
                 terminal_failure_category,
                 Some(ConnectionFailureCategory::DeviceDisconnected)
@@ -1872,28 +2447,28 @@ impl SessionController {
         {
             snapshot.integrity.disconnect_events += 1;
         }
-        self.update_snapshot(&snapshot)?;
-        let reason = if terminal_error_detail.is_some() {
-            if matches!(
-                terminal_failure_category,
-                Some(ConnectionFailureCategory::DeviceDisconnected)
-            ) {
-                StopReason::Disconnect
-            } else {
-                StopReason::Fault
-            }
-        } else {
-            stop_reason.unwrap_or(StopReason::Fault)
-        };
+        self.note_runtime_error("SNAPSHOT", self.update_snapshot(&snapshot));
+        if !stop_confirmed {
+            // Without a STATUS after STOP the outputs are unconfirmed; do not
+            // keep showing the mask reported at START.
+            self.note_runtime_error("OUTPUT_MASK", self.set_digital_output_mask(None));
+        }
         let host_elapsed = started.elapsed().as_secs_f64();
         let board_elapsed = board_elapsed_seconds(&snapshot);
-        let recording_status = reason.recording_status();
+        let csv_bytes_estimate = projected_csv_bytes(records_written, csv_row_bytes);
         let final_free_disk_bytes = self.free_disk_space(&output_dir).ok();
         if let Some(free) = final_free_disk_bytes {
-            self.update_disk_space(free)?;
+            self.note_runtime_error(
+                "DISK_STATUS",
+                self.update_disk_space(free, csv_bytes_estimate),
+            );
         }
+        let terminal_error_detail = terminal_error.as_ref().map(SerialTerminalFailure::detail);
+        let recording_failure_detail = host_failure.as_ref().map(HostCaptureFailure::describe);
         let terminal_trigger = if terminal_error_detail.is_some() {
             "serial_error"
+        } else if recording_failure_detail.is_some() {
+            "recording_write_error"
         } else {
             match reason {
                 StopReason::User => "user_stop",
@@ -1905,23 +2480,31 @@ impl SessionController {
             }
         };
         crate::app_log::record(
-            if terminal_error_detail.is_some() { "ERROR" } else { "INFO" },
+            if terminal_error_detail.is_some() || recording_failure_detail.is_some() {
+                "ERROR"
+            } else {
+                "INFO"
+            },
             &format!(
-                "RECORDING_TERMINAL trigger={} stop_reason={:?} cancel={} terminal_error={} elapsed_ms={} port={} samples={} packets={} free_disk_bytes={:?}",
+                "RECORDING_TERMINAL trigger={} stop_reason={:?} cancel={} terminal_error={} recording_error={} elapsed_ms={} port={} samples={} records_written={} packets={} free_disk_bytes={:?} stop_confirmed={}",
                 terminal_trigger,
                 reason,
                 self.cancel.load(Ordering::Acquire),
                 terminal_error_detail.as_deref().unwrap_or("none"),
+                recording_failure_detail.as_deref().unwrap_or("none"),
                 (host_elapsed * 1_000.0).round() as u128,
                 source,
                 snapshot.sample_count,
+                records_written,
                 snapshot.integrity.received_packets,
                 final_free_disk_bytes,
+                stop_confirmed,
             ),
         );
         let mut final_meta = initial_meta;
         final_meta.utc_stop = Some(Utc::now());
         final_meta.local_stop = Some(Local::now());
+        final_meta.acquisition_started_utc = Some(started_utc);
         final_meta.host_elapsed_seconds = Some(host_elapsed);
         final_meta.board_elapsed_seconds = Some(board_elapsed);
         final_meta.measured_sample_rate_hz = snapshot.measured_rate_hz;
@@ -1932,69 +2515,399 @@ impl SessionController {
                 crate::profiles::AcquisitionMode::Pulseox4State
             ),
         ));
-        final_meta.total_samples = snapshot.sample_count;
+        // The count of records actually in the BMEG. Without a sink failure
+        // it equals every sample the acquisition accepted.
+        final_meta.total_samples = records_written;
         final_meta.integrity = snapshot.integrity.clone();
-        final_meta.recording_status = recording_status.into();
-        final_meta.csv_filename = Some(file_name_string(&csv)?);
+        final_meta.recording_status = reason.recording_status().into();
         final_meta.duration_mode = Some(duration.label().into());
         final_meta.requested_duration_seconds = duration.requested_seconds();
         final_meta.stop_reason = Some(reason);
         final_meta.initial_free_disk_bytes = Some(initial_free_disk_bytes);
         final_meta.final_free_disk_bytes = final_free_disk_bytes;
-        final_meta.completion_status = if reason.is_complete() {
-            "complete"
-        } else {
-            "incomplete"
-        }
-        .into();
-        final_meta.markers = self.lock_runtime()?.markers.clone();
-        fs::write(
-            &metadata,
-            serde_json::to_vec_pretty(&final_meta)
-                .map_err(crate::recording::RecordingError::Json)?,
-        )?;
+        // State is Stopping, so no marker can be added after this copy.
+        final_meta.markers = self
+            .lock_runtime()
+            .map(|runtime| runtime.markers.clone())
+            .unwrap_or_default();
+        let FinalizeOutcome {
+            raw_path,
+            metadata_written,
+            csv_written,
+            csv_error,
+            finalize_error,
+            failures,
+        } = self.finalize_recording(
+            raw,
+            &paths,
+            &mut final_meta,
+            FinalizePlan {
+                reason,
+                recording_failure: recording_failure_detail.clone(),
+                records_written,
+                csv_bytes_estimate,
+                free_bytes: final_free_disk_bytes,
+            },
+        );
+        let save_problem = save_failure_message(
+            recording_failure_detail.as_deref(),
+            &failures,
+            &raw_path,
+            &paths,
+        );
         let summary = SessionSummary {
-            state: if terminal_error_detail.is_some() {
+            state: if terminal_error_detail.is_some() || save_problem.is_some() {
                 SessionState::Faulted
             } else {
                 SessionState::Disconnected
             },
-            samples: snapshot.sample_count,
+            samples: records_written,
             packets: snapshot.integrity.received_packets,
             measured_rate_hz: snapshot.measured_rate_hz,
             board_elapsed_seconds: board_elapsed,
             host_elapsed_seconds: host_elapsed,
-            bmeg_path: bmeg.display().to_string(),
-            csv_path: csv.display().to_string(),
-            metadata_path: metadata.display().to_string(),
-            recording_status: recording_status.into(),
+            bmeg_path: raw_path.display().to_string(),
+            csv_path: if csv_written {
+                paths.csv.display().to_string()
+            } else {
+                String::new()
+            },
+            metadata_path: if metadata_written {
+                paths.metadata.display().to_string()
+            } else {
+                String::new()
+            },
+            recording_status: reason.recording_status().into(),
             duration: duration.clone(),
             stop_reason: reason,
             completion_status: final_meta.completion_status.clone(),
             initial_free_disk_bytes: Some(initial_free_disk_bytes),
             final_free_disk_bytes,
             integrity: snapshot.integrity,
-            error: terminal_error_detail.clone(),
+            error: terminal_error_detail
+                .clone()
+                .or_else(|| recording_failure_detail.clone()),
             profile,
             calibration: final_meta.calibration.clone().unwrap_or_default(),
             active_digital_output_mask,
             final_digital_output_mask,
+            csv_error,
+            finalize_error,
         };
-        self.set_summary(summary.clone())?;
-        self.set_runtime_stop_reason(reason)?;
+        self.note_runtime_error("SUMMARY", self.set_summary(summary));
+        self.note_runtime_error("STOP_REASON", self.set_runtime_stop_reason(reason));
         if let Some(error) = terminal_error {
             // Preserve the stage/kind/Windows error in Advanced details rather
             // than overwriting it with the generic I/O display string.
-            self.set_fault(terminal_error_detail.unwrap_or_else(|| error.detail()))?;
+            let detail = terminal_error_detail.unwrap_or_else(|| error.detail());
+            self.set_fault(match save_problem {
+                Some(problem) => format!("{detail} Saving: {problem}"),
+                None => detail,
+            })?;
             return Err(error.into_session_error());
         }
-        if csv_rows != summary.samples {
-            let error = SessionError::Recording(crate::recording::RecordingError::Truncated);
-            self.set_fault(error.to_string())?;
-            return Err(error);
+        if let Some(problem) = save_problem {
+            self.note_runtime_error("FAILURE_CATEGORY", self.mark_recording_storage_failure());
+            self.set_fault(problem.clone())?;
+            return Err(SessionError::Save(problem));
         }
         self.set_state(SessionState::Disconnected)?;
         Ok(())
+    }
+
+    /// Arms the controller, sends START, and waits for the firmware's
+    /// acquiring STATUS (newer than any stale frame by construction).
+    fn send_start_and_wait<T: Read + Write>(
+        &self,
+        io: &mut T,
+        acquisition: &mut AcquisitionController,
+        firmware_error_baseline: u64,
+    ) -> Result<(), SessionError> {
+        acquisition.arm_start().map_err(SessionError::State)?;
+        crate::app_log::record("INFO", "START_SEND");
+        self.send_command(io, MessageType::Start, 2, vec![])
+            .map_err(|error| {
+                crate::app_log::record(
+                    "WARN",
+                    &format!("START_FAIL stage=START_SEND detail={error}"),
+                );
+                error
+            })?;
+        self.wait_until(
+            io,
+            acquisition,
+            |snapshot| snapshot.state == AcquisitionState::Running,
+            "START status",
+            firmware_error_baseline,
+        )
+        .map_err(|error| {
+            crate::app_log::record(
+                "WARN",
+                &format!("START_FAIL stage=START_ACK_OR_FIRST_SAMPLE detail={error}"),
+            );
+            error
+        })
+    }
+
+    /// START may have reached the firmware even though its acknowledgement
+    /// did not arrive (timeout, cancel, or a write error). A best-effort STOP
+    /// returns the outputs LOW now instead of at the firmware watchdog, and
+    /// the header-only `.part` is removed. A file that holds records is kept.
+    fn abandon_unstarted_recording<T: Write>(
+        &self,
+        io: &mut T,
+        rx: &Receiver<SynchronizedRecord>,
+        mut raw: BmegWriter,
+        temporary_bmeg: &Path,
+    ) {
+        match self.send_capture_command(io, MessageType::Stop, 4, vec![]) {
+            Ok(()) => crate::app_log::record("INFO", "START_ABORT_STOP_SENT"),
+            Err(CaptureCommandError::Serial(error)) => crate::app_log::record(
+                "WARN",
+                &format!(
+                    "SERIAL_CLEANUP_ERROR stage=START_ABORT_STOP detail={}",
+                    error.detail()
+                ),
+            ),
+            Err(CaptureCommandError::Protocol(detail)) => crate::app_log::record(
+                "WARN",
+                &format!("SERIAL_CLEANUP_ERROR stage=START_ABORT_STOP_PROTOCOL detail={detail}"),
+            ),
+        }
+        if let Err(error) = self.drain_samples(rx, &mut raw) {
+            crate::app_log::record("WARN", &format!("START_ABORT_DRAIN_FAILED detail={error}"));
+        }
+        let records = raw.records;
+        if let Err(error) = self.storage.finish(raw) {
+            crate::app_log::record("WARN", &format!("START_ABORT_FLUSH_FAILED detail={error}"));
+        }
+        if records == 0 {
+            match fs::remove_file(temporary_bmeg) {
+                Ok(()) => crate::app_log::record(
+                    "INFO",
+                    &format!(
+                        "START_ABORT_EMPTY_RECORDING_REMOVED path={}",
+                        temporary_bmeg.display()
+                    ),
+                ),
+                Err(error) => crate::app_log::record(
+                    "WARN",
+                    &format!(
+                        "START_ABORT_EMPTY_RECORDING_REMOVE_FAILED path={} detail={error}",
+                        temporary_bmeg.display()
+                    ),
+                ),
+            }
+        } else {
+            crate::app_log::record(
+                "WARN",
+                &format!(
+                    "START_ABORT_PARTIAL_RECORDING_KEPT path={} records={records}",
+                    temporary_bmeg.display()
+                ),
+            );
+        }
+    }
+
+    /// Finalizes in a crash-safe order: finish and fsync the BMEG, rename it
+    /// (bounded retry), write the metadata sidecar, export the CSV as best
+    /// effort, then rewrite the sidecar with the CSV result. Every step is
+    /// attempted, failures are logged as `FINALIZE_FAIL stage=...`, and raw
+    /// data are never deleted.
+    fn finalize_recording(
+        &self,
+        raw: BmegWriter,
+        paths: &RecordingPaths,
+        meta: &mut RecordingMetadata,
+        plan: FinalizePlan,
+    ) -> FinalizeOutcome {
+        let mut failures = Vec::new();
+        let mut raw_path = paths.temporary_bmeg.clone();
+        let data_flushed = match self.storage.finish(raw) {
+            Ok(()) => true,
+            Err(error) => {
+                failures.push(FinalizeFailure::new(
+                    FinalizeStage::Flush,
+                    error.to_string(),
+                ));
+                false
+            }
+        };
+        // A file whose final flush failed may end in a partial record; it
+        // keeps its `.part` name so it is never mistaken for a finished BMEG.
+        if data_flushed {
+            match self.rename_with_retry(&paths.temporary_bmeg, &paths.bmeg) {
+                Ok(()) => raw_path = paths.bmeg.clone(),
+                Err(error) => failures.push(FinalizeFailure::new(
+                    FinalizeStage::Rename,
+                    describe_io_error(&error),
+                )),
+            }
+        }
+        if let Ok(name) = file_name_string(&raw_path) {
+            meta.bmeg_filename = name;
+        }
+        let data_complete = data_flushed && plan.recording_failure.is_none();
+        meta.completion_status = if plan.reason.is_complete() && data_complete {
+            "complete"
+        } else {
+            "incomplete"
+        }
+        .into();
+        meta.csv_filename = None;
+        meta.csv_error = None;
+        meta.finalize_error = finalize_error_text(plan.recording_failure.as_deref(), &failures);
+        // The sidecar is written before the CSV so a CSV failure (for example
+        // a full disk) can never leave the recording without metadata.
+        let first_metadata = self.write_metadata(&paths.metadata, meta);
+
+        let mut csv_written = false;
+        let csv_error = if data_flushed {
+            if plan
+                .free_bytes
+                .is_some_and(|free| free < plan.csv_bytes_estimate)
+            {
+                crate::app_log::record(
+                    "WARN",
+                    &format!(
+                        "CSV_EXPORT_LOW_SPACE free_disk_bytes={:?} estimated_csv_bytes={}",
+                        plan.free_bytes, plan.csv_bytes_estimate
+                    ),
+                );
+            }
+            match self.export_csv_atomically(&raw_path, &paths.csv, plan.records_written) {
+                Ok(()) => {
+                    csv_written = true;
+                    None
+                }
+                Err(detail) => {
+                    failures.push(FinalizeFailure::new(FinalizeStage::Csv, detail.clone()));
+                    Some(detail)
+                }
+            }
+        } else {
+            Some(
+                "CSV export skipped because the raw recording could not be completely written"
+                    .into(),
+            )
+        };
+        meta.csv_filename = if csv_written {
+            file_name_string(&paths.csv).ok()
+        } else {
+            None
+        };
+        meta.csv_error = csv_error.clone();
+        meta.finalize_error = finalize_error_text(plan.recording_failure.as_deref(), &failures);
+        let metadata_written = match (first_metadata, self.write_metadata(&paths.metadata, meta)) {
+            (_, Ok(())) => true,
+            (Ok(()), Err(error)) => {
+                failures.push(FinalizeFailure::new(
+                    FinalizeStage::Metadata,
+                    format!("the CSV result could not be added to the metadata: {error}"),
+                ));
+                true
+            }
+            (Err(_), Err(error)) => {
+                failures.push(FinalizeFailure::new(FinalizeStage::Metadata, error));
+                false
+            }
+        };
+        // Recomputed after the last sidecar write so the summary also reports
+        // a metadata failure that the sidecar on disk could not record.
+        let finalize_error = finalize_error_text(plan.recording_failure.as_deref(), &failures);
+        for failure in &failures {
+            crate::app_log::record(
+                "ERROR",
+                &format!(
+                    "FINALIZE_FAIL stage={} raw_file={} detail={}",
+                    failure.stage.label(),
+                    raw_path.display(),
+                    failure.detail
+                ),
+            );
+        }
+        FinalizeOutcome {
+            raw_path,
+            metadata_written,
+            csv_written,
+            csv_error,
+            finalize_error,
+            failures,
+        }
+    }
+
+    /// Writes the sidecar to a temporary sibling, fsyncs it, and renames it
+    /// into place, so rewriting it with the CSV result can never destroy a
+    /// valid sidecar that was already written (for example on a full disk).
+    fn write_metadata(&self, path: &Path, meta: &RecordingMetadata) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(meta).map_err(|error| error.to_string())?;
+        let temporary = sibling_with_suffix(path, ".part");
+        if let Err(error) = self.storage.write_durably(&temporary, &bytes) {
+            let _ = fs::remove_file(&temporary);
+            return Err(describe_io_error(&error));
+        }
+        self.rename_with_retry(&temporary, path).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            describe_io_error(&error)
+        })
+    }
+
+    /// Exports to a temporary sibling and renames it only when the row count
+    /// matches the raw records, so a partial CSV never appears under the final
+    /// name. A failed export's temporary file is removed; the BMEG is not.
+    fn export_csv_atomically(
+        &self,
+        raw_path: &Path,
+        csv: &Path,
+        expected_rows: u64,
+    ) -> Result<(), String> {
+        let temporary = sibling_with_suffix(csv, ".part");
+        let result = match self.storage.export_csv(raw_path, &temporary) {
+            Ok(rows) if rows == expected_rows => {
+                self.rename_with_retry(&temporary, csv).map_err(|error| {
+                    format!(
+                        "the exported CSV could not be renamed: {}",
+                        describe_io_error(&error)
+                    )
+                })
+            }
+            Ok(rows) => Err(format!(
+                "the CSV has {rows} rows but the raw recording has {expected_rows} records"
+            )),
+            Err(error) => Err(error.to_string()),
+        };
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    /// Bounded retry with exponential backoff for transient sharing
+    /// violations (OneDrive, indexer, antivirus) on a just-closed file.
+    fn rename_with_retry(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        let attempts = self.timing.rename_attempts.max(1);
+        let mut backoff = self.timing.rename_initial_backoff;
+        let mut attempt = 1;
+        loop {
+            match self.storage.rename(from, to) {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt < attempts => {
+                    crate::app_log::record(
+                        "WARN",
+                        &format!(
+                            "FINALIZE_RENAME_RETRY attempt={attempt} from={} to={} detail={}",
+                            from.display(),
+                            to.display(),
+                            describe_io_error(&error)
+                        ),
+                    );
+                    thread::sleep(backoff);
+                    backoff = backoff.saturating_mul(2);
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn wait_for_handshake<T: Read + Write>(
@@ -2031,7 +2944,7 @@ impl SessionController {
 
         while Instant::now() < deadline {
             if self.cancel.load(Ordering::Acquire) {
-                return Err(SessionError::State("session was cancelled"));
+                return Err(SessionError::Cancelled);
             }
             if ping_attempts < ping_attempt_limit && Instant::now() >= next_ping {
                 self.send_command(io, MessageType::Ping, ping_attempts, vec![])?;
@@ -2124,18 +3037,24 @@ impl SessionController {
         )))
     }
 
+    /// Waits for a command's response, named by `name` (the awaited frame,
+    /// not the command). `predicate` must compare against a baseline taken
+    /// before the command was sent, so a stale frame from a previous session
+    /// cannot satisfy it. A firmware ERROR newer than
+    /// `firmware_error_baseline` fails the wait immediately.
     fn wait_until<T: Read + Write, F: Fn(&AcquisitionSnapshot) -> bool>(
         &self,
         io: &mut T,
         acquisition: &mut AcquisitionController,
         predicate: F,
         name: &str,
+        firmware_error_baseline: u64,
     ) -> Result<(), SessionError> {
         let deadline = Instant::now() + COMMAND_TIMEOUT;
         let mut buffer = [0u8; 256];
         while Instant::now() < deadline {
             if self.cancel.load(Ordering::Acquire) {
-                return Err(SessionError::State("session was cancelled"));
+                return Err(SessionError::Cancelled);
             }
             match io.read(&mut buffer) {
                 Ok(n) if n > 0 => acquisition.ingest_bytes(&buffer[..n]),
@@ -2145,18 +3064,28 @@ impl SessionController {
             }
             let snapshot = acquisition.snapshot();
             self.update_snapshot(&snapshot)?;
+            if snapshot.firmware_error_count > firmware_error_baseline {
+                return Err(SessionError::Protocol(format!(
+                    "firmware ERROR while waiting for {name}: {}",
+                    firmware_error_detail(
+                        snapshot.firmware_error_code,
+                        snapshot.firmware_error_payload.as_deref(),
+                    )
+                )));
+            }
             if predicate(&snapshot) {
                 return Ok(());
             }
         }
         let snapshot = acquisition.snapshot();
         Err(SessionError::Protocol(format!(
-            "timed out waiting for {name} (HELLO={}, CAPABILITIES={}, PONG={}, CONFIG_ACK={}, STATUS={})",
+            "timed out waiting for {name} (HELLO={}, CAPABILITIES={}, PONG={}, CONFIG_ACK={}, STATUS={}, acquiring={:?})",
             snapshot.hello_seen,
             snapshot.capabilities_seen,
             snapshot.pong_seen,
             snapshot.config_ack_seen,
             snapshot.status_seen,
+            snapshot.last_status_acquiring,
         )))
     }
 
@@ -2372,133 +3301,41 @@ impl SessionController {
 
     fn initial_metadata(
         &self,
-        InitialMetadataRequest {
-            simulator,
-            source,
-            bmeg,
-            duration,
-            profile,
-            calibration,
-            recording_path_context,
-            recording_context,
-        }: InitialMetadataRequest<'_>,
+        request: InitialMetadataRequest<'_>,
     ) -> Result<RecordingMetadata, SessionError> {
-        let (arduino_cli_version, uno_r4_core_version, board_serial) = if simulator {
-            ("not applicable".into(), "not applicable".into(), None)
-        } else {
-            let cli = crate::arduino_cli::ArduinoCli::discover(None)
-                .map_err(|error| SessionError::Protocol(error.to_string()))?;
-            let version = cli
-                .version()
-                .map_err(|error| SessionError::Protocol(error.to_string()))?
-                .stdout
-                .trim()
-                .to_owned();
-            let core = cli
-                .uno_r4_core_version()
-                .map_err(|error| SessionError::Protocol(error.to_string()))?;
-            let serial = cli
-                .boards()
-                .ok()
-                .into_iter()
-                .flatten()
-                .find(|board| board.port.eq_ignore_ascii_case(source))
-                .and_then(|board| board.serial_number);
-            (version, core, serial)
-        };
-        let mut digital_output_mapping = std::collections::BTreeMap::new();
-        for output in profile.profile.acquisition.resolved_digital_outputs() {
-            let key = match output.label.to_ascii_lowercase().as_str() {
-                "green led" => "green".into(),
-                "red led" => "red".into(),
-                "ir led" => "ir".into(),
-                _ => output.label,
-            };
-            digital_output_mapping.insert(key, output.pin);
-        }
-        Ok(RecordingMetadata {
-            utc_start: Utc::now(),
-            local_start: Local::now(),
-            board: if simulator {
-                "Simulator".into()
-            } else {
-                "Arduino UNO R4 WiFi".into()
-            },
-            board_serial,
-            com_port: source.into(),
-            fqbn: if simulator {
-                "simulator".into()
-            } else {
-                "arduino:renesas_uno:unor4wifi".into()
-            },
-            arduino_cli_version,
-            uno_r4_core_version,
-            firmware_build: REFERENCE_FIRMWARE_BUILD,
-            protocol_version: format!(
-                "{}.{}",
-                crate::protocol::PROTOCOL_MAJOR,
-                crate::protocol::PROTOCOL_MINOR
-            ),
-            analog_pin: profile.profile.acquisition.analog_pins().join(","),
-            active_analog_pins: profile.profile.acquisition.analog_pins(),
-            digital_output_mapping,
-            adc_bits: profile.profile.acquisition.adc_resolution_bits,
-            requested_sample_rate_hz: profile.profile.acquisition.sample_rate_hz,
-            measured_sample_rate_hz: 0.0,
-            timing_diagnostics: None,
-            total_samples: 0,
-            integrity: IntegrityCounters::default(),
-            app_version: env!("CARGO_PKG_VERSION").into(),
-            simulator,
-            utc_stop: None,
-            local_stop: None,
-            host_elapsed_seconds: None,
-            board_elapsed_seconds: None,
-            recording_status: "active".into(),
-            bmeg_filename: file_name_string(bmeg).unwrap_or_else(|_| "recording.bmeg".into()),
-            csv_filename: None,
-            notes: if recording_context.recording_note.is_empty() {
-                default_recording_note(simulator, profile)
-            } else {
-                recording_context.recording_note.clone()
-            },
-            user_recording_note: (!recording_context.recording_note.is_empty())
-                .then(|| recording_context.recording_note.clone()),
-            recording_safety: recording_safety_context(profile),
-            project_folder: recording_path_context.map(|context| context.project_folder.clone()),
-            output_folder: recording_path_context.map(|context| context.output_folder.clone()),
-            duration_mode: Some(duration.label().into()),
-            requested_duration_seconds: duration.requested_seconds(),
-            stop_reason: None,
-            initial_free_disk_bytes: None,
-            final_free_disk_bytes: None,
-            completion_status: "active".into(),
-            profile_snapshot: Some(profile.clone()),
-            // Retained as an optional legacy metadata field. New course recordings
-            // never create the retired validation context.
-            validation_context: None,
-            markers: Vec::new(),
-            calibration: Some(calibration),
-        })
+        let provenance = tooling_provenance(request.simulator, request.source)?;
+        Ok(build_initial_metadata(request, provenance))
     }
 
     fn allocate_paths(
         &self,
         output_dir: &Path,
         profile: &ProfileSnapshot,
-    ) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), SessionError> {
+    ) -> Result<RecordingPaths, SessionError> {
         fs::create_dir_all(output_dir)?;
         let stamp = Local::now().format("%Y%m%d_%H%M%S");
         for run in 1..=99 {
             let name =
                 crate::profiles::safe_filename_component(&profile.profile.export.signal_name);
             let base = output_dir.join(format!("{stamp}_{name}_Run{run:02}"));
-            let bmeg = base.with_extension("bmeg");
-            let csv = base.with_extension("csv");
-            let metadata = base.with_extension("metadata.json");
-            let temporary = base.with_extension("bmeg.part");
-            if !bmeg.exists() && !csv.exists() && !metadata.exists() && !temporary.exists() {
-                return Ok((temporary, bmeg, csv, metadata));
+            let paths = RecordingPaths {
+                temporary_bmeg: base.with_extension("bmeg.part"),
+                bmeg: base.with_extension("bmeg"),
+                csv: base.with_extension("csv"),
+                metadata: base.with_extension("metadata.json"),
+            };
+            // Existing files, including temporary siblings left by an
+            // interrupted save, are never overwritten.
+            let occupied = [
+                &paths.temporary_bmeg,
+                &paths.bmeg,
+                &paths.csv,
+                &paths.metadata,
+            ]
+            .into_iter()
+            .any(|path| path.exists() || sibling_with_suffix(path, ".part").exists());
+            if !occupied {
+                return Ok(paths);
             }
         }
         Err(SessionError::State(
@@ -2511,6 +3348,56 @@ impl SessionController {
         Ok(())
     }
 
+    /// Advances a connecting worker's state without undoing a Stop request
+    /// that arrived meanwhile (which already set `Stopping`).
+    fn set_progress_state(&self, state: SessionState) -> Result<(), SessionError> {
+        let mut runtime = self.lock_runtime()?;
+        if runtime.state != SessionState::Stopping {
+            runtime.state = state;
+        }
+        Ok(())
+    }
+
+    /// Enters `Acquiring` and fixes the live elapsed-time origin under one
+    /// lock, using the same Instant the worker uses for the timed stop and
+    /// `host_elapsed_seconds`, so Elapsed/Remaining are measured from START.
+    fn set_acquiring(&self, started: Instant) -> Result<(), SessionError> {
+        let mut runtime = self.lock_runtime()?;
+        runtime.started_at = Some(started);
+        if runtime.state != SessionState::Stopping {
+            runtime.state = SessionState::Acquiring;
+        }
+        Ok(())
+    }
+
+    fn set_digital_output_mask(&self, mask: Option<u8>) -> Result<(), SessionError> {
+        self.lock_runtime()?.digital_output_mask = mask;
+        Ok(())
+    }
+
+    /// Best-effort runtime updates after START must never skip STOP or
+    /// finalization; a failure (only possible through lock poisoning) is logged.
+    fn note_runtime_error(&self, stage: &str, result: Result<(), SessionError>) {
+        if let Err(error) = result {
+            crate::app_log::record(
+                "WARN",
+                &format!("SESSION_STATE_UPDATE_FAILED stage={stage} detail={error}"),
+            );
+        }
+    }
+
+    /// Labels a save failure as a storage problem so the recommended action
+    /// does not send the student to firmware or serial recovery.
+    fn mark_recording_storage_failure(&self) -> Result<(), SessionError> {
+        let mut runtime = self.lock_runtime()?;
+        if let Some(diagnostics) = runtime.connection_diagnostics.as_mut() {
+            let category = ConnectionFailureCategory::RecordingStorageError;
+            diagnostics.recommended_action = recommended_action(&category).into();
+            diagnostics.failure_category = Some(category);
+        }
+        Ok(())
+    }
+
     fn set_fault(&self, error: String) -> Result<(), SessionError> {
         let mut runtime = self.lock_runtime()?;
         runtime.state = SessionState::Faulted;
@@ -2518,23 +3405,29 @@ impl SessionController {
         Ok(())
     }
 
+    /// Only a genuine cancellation (a stop requested before acquisition began)
+    /// ends a worker quietly. Every other error, including a save failure
+    /// after the user pressed Stop, leaves the session `Faulted` with a
+    /// message, even though the cancel flag is set.
     fn finish_worker_error(&self, result: &Result<(), SessionError>) -> Result<(), SessionError> {
-        if let Err(error) = result {
-            if self.cancel.load(Ordering::Acquire) {
-                self.set_state(SessionState::Disconnected)?;
-            } else {
-                self.record_worker_failure_category(error)?;
-                // Active capture may already have stored a more useful serial
-                // stage/ErrorKind/Windows code. Do not replace it with the
-                // generic `I/O: ...` rendering as the worker unwinds.
-                let detailed_fault_is_present = {
-                    let runtime = self.lock_runtime()?;
-                    runtime.state == SessionState::Faulted && runtime.last_error.is_some()
-                };
-                if !detailed_fault_is_present {
-                    self.set_fault(error.to_string())?;
-                }
-            }
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if matches!(error, SessionError::Cancelled) {
+            self.set_state(SessionState::Disconnected)?;
+            return Ok(());
+        }
+        // Active capture may already have stored a more useful serial stage,
+        // ErrorKind, Windows code, or save stage. Do not replace it (or its
+        // category) with a generic rendering as the worker unwinds.
+        let detailed_fault_is_present = {
+            let runtime = self.lock_runtime()?;
+            runtime.state == SessionState::Faulted && runtime.last_error.is_some()
+        };
+        if !detailed_fault_is_present {
+            self.record_worker_failure_category(error)?;
+            crate::app_log::record("ERROR", &format!("SESSION_WORKER_FAIL detail={error}"));
+            self.set_fault(error.to_string())?;
         }
         Ok(())
     }
@@ -2542,8 +3435,18 @@ impl SessionController {
     fn record_worker_failure_category(&self, error: &SessionError) -> Result<(), SessionError> {
         let mut runtime = self.lock_runtime()?;
         if let Some(diagnostics) = runtime.connection_diagnostics.as_mut() {
-            if diagnostics.failure_category.is_none() {
-                let category = if !diagnostics.port_opened {
+            if let SessionError::InvalidRequest(message) = error {
+                // The request (for example an oversized lab header) was
+                // refused; the board and connection are not at fault, so no
+                // connection category or firmware advice is recorded.
+                diagnostics.recommended_action = (*message).into();
+            } else if diagnostics.failure_category.is_none() {
+                let category = if matches!(
+                    error,
+                    SessionError::Storage(_) | SessionError::Recording(_) | SessionError::Save(_)
+                ) {
+                    ConnectionFailureCategory::RecordingStorageError
+                } else if !diagnostics.port_opened {
                     ConnectionFailureCategory::PortBusy
                 } else if matches!(error, SessionError::Io(_)) {
                     // An I/O error by itself does not prove that Windows
@@ -2713,19 +3616,47 @@ impl SessionController {
             })
     }
 
-    fn update_disk_space(&self, bytes: u64) -> Result<(), SessionError> {
+    /// Publishes free space and the low-storage warning. `csv_reserve_bytes`
+    /// is the room kept for the CSV export, so the stop threshold is
+    /// `DISK_CRITICAL_BYTES + csv_reserve_bytes`. The warning keeps the 1 GiB
+    /// rule and also appears with the same margin above a larger threshold,
+    /// so a student is warned before the guard stops a long recording.
+    fn update_disk_space(&self, bytes: u64, csv_reserve_bytes: u64) -> Result<(), SessionError> {
+        let stop_threshold = storage_stop_threshold(csv_reserve_bytes);
+        let warning_threshold = DISK_WARNING_BYTES
+            .max(stop_threshold.saturating_add(DISK_WARNING_BYTES - DISK_CRITICAL_BYTES));
         let mut runtime = self.lock_runtime()?;
         runtime.available_disk_bytes = Some(bytes);
-        runtime.storage_warning = if bytes < DISK_WARNING_BYTES {
-            Some(format!(
-                "Low disk space: {} MiB available; acquisition will stop below {} MiB.",
-                bytes / (1024 * 1024),
-                DISK_CRITICAL_BYTES / (1024 * 1024)
-            ))
+        runtime.storage_warning = if bytes < warning_threshold {
+            Some(if csv_reserve_bytes == 0 {
+                format!(
+                    "Low disk space: {} MiB available; acquisition will stop below {} MiB.",
+                    bytes / (1024 * 1024),
+                    DISK_CRITICAL_BYTES / (1024 * 1024)
+                )
+            } else {
+                format!(
+                    "Low disk space: {} MiB available; acquisition will stop below {} MiB ({} MiB plus room for the CSV export).",
+                    bytes / (1024 * 1024),
+                    stop_threshold / (1024 * 1024),
+                    DISK_CRITICAL_BYTES / (1024 * 1024)
+                )
+            })
         } else {
             None
         };
         Ok(())
+    }
+
+    /// Records the reason a recording actually ended, overriding an earlier
+    /// request for Fault/Disconnect. A Stop click after the loop ended (during
+    /// finalization) then cannot relabel the recording as a user stop.
+    fn commit_terminal_stop_reason(&self, reason: StopReason) -> Result<(), SessionError> {
+        *self
+            .stop_reason
+            .lock()
+            .map_err(|_| SessionError::State("stop reason lock poisoned"))? = Some(reason);
+        self.set_runtime_stop_reason(reason)
     }
 
     fn set_stop_reason_once(&self, reason: StopReason) -> Result<StopReason, SessionError> {
@@ -2764,6 +3695,410 @@ fn file_name_string(path: &Path) -> Result<String, SessionError> {
         .and_then(|name| name.to_str())
         .map(str::to_owned)
         .ok_or(SessionError::State("recording filename is invalid"))
+}
+
+/// `X.csv` + `.part` -> `X.csv.part`, used for files written then renamed.
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn describe_io_error(error: &std::io::Error) -> String {
+    format!(
+        "{error} (kind={:?}, raw_os_error={:?})",
+        error.kind(),
+        error.raw_os_error()
+    )
+}
+
+fn display_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// The sidecar's `finalize_error`: problems that affect the raw file or the
+/// sidecar itself. CSV problems are reported separately in `csv_error`.
+fn finalize_error_text(
+    recording_failure: Option<&str>,
+    failures: &[FinalizeFailure],
+) -> Option<String> {
+    let parts: Vec<String> = recording_failure
+        .map(|detail| format!("recording: {detail}"))
+        .into_iter()
+        .chain(
+            failures
+                .iter()
+                .filter(|failure| failure.stage != FinalizeStage::Csv)
+                .map(|failure| format!("{}: {}", failure.stage.label(), failure.detail)),
+        )
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// Student-facing, stage-specific explanation of what could not be saved and
+/// which files were kept. `None` when the recording was saved completely.
+fn save_failure_message(
+    recording_failure: Option<&str>,
+    failures: &[FinalizeFailure],
+    raw_path: &Path,
+    paths: &RecordingPaths,
+) -> Option<String> {
+    let raw_name = display_file_name(raw_path);
+    let mut messages = Vec::new();
+    if let Some(detail) = recording_failure {
+        messages.push(format!(
+            "The recording stopped early because the recording file could not be written ({detail}). The samples already saved were kept in {raw_name}."
+        ));
+    }
+    for failure in failures {
+        let detail = &failure.detail;
+        messages.push(match failure.stage {
+            FinalizeStage::Flush => format!(
+                "The end of the recording could not be written to disk ({detail}). The partial raw file {raw_name} was kept; check that the drive is connected and has free space."
+            ),
+            FinalizeStage::Rename => format!(
+                "The recording was kept as {raw_name} because it could not be renamed to {} ({detail}). Another program, such as OneDrive or antivirus, may have been using it.",
+                display_file_name(&paths.bmeg)
+            ),
+            FinalizeStage::Metadata => format!(
+                "The metadata file {} could not be written ({detail}).",
+                display_file_name(&paths.metadata)
+            ),
+            FinalizeStage::Csv => format!(
+                "The CSV export failed ({detail}). The raw recording {raw_name} and its metadata were kept."
+            ),
+        });
+    }
+    (!messages.is_empty()).then(|| messages.join(" "))
+}
+
+/// STOP is confirmed by a STATUS newer than the baseline taken before STOP
+/// was written that reports acquisition stopped with every output LOW.
+fn stop_is_confirmed(snapshot: &AcquisitionSnapshot, status_baseline: u64) -> bool {
+    snapshot.status_count > status_baseline
+        && snapshot.last_status_acquiring == Some(false)
+        && snapshot.digital_output_mask == Some(0)
+}
+
+/// A conservative byte estimate for one exported CSV row of this lab and
+/// calibration (see `export_bmeg_csv` for the column layout).
+fn estimated_csv_row_bytes(profile: &ProfileSnapshot, calibration: &RecordingCalibration) -> u64 {
+    let acquisition = &profile.profile.acquisition;
+    match acquisition.acquisition_mode {
+        crate::profiles::AcquisitionMode::Pulseox4State => {
+            let fields = acquisition.record_field_names().len() as u64;
+            CSV_ROW_PREFIX_BYTES + fields * CSV_COUNTS_FIELD_BYTES
+        }
+        crate::profiles::AcquisitionMode::Simultaneous => acquisition
+            .resolved_channels()
+            .iter()
+            .map(|channel| {
+                let derived = match calibration.for_channel(&channel.id) {
+                    // kPa and, depending on the channel, mmHg.
+                    Some(preset) if preset.calibration_type == CalibrationType::FixedFormula => 2,
+                    Some(_) => 1,
+                    None => 0,
+                };
+                CSV_COUNTS_FIELD_BYTES + CSV_VOLTS_FIELD_BYTES + derived * CSV_DERIVED_FIELD_BYTES
+            })
+            .sum::<u64>()
+            .saturating_add(CSV_ROW_PREFIX_BYTES),
+    }
+}
+
+fn projected_csv_bytes(records: u64, row_bytes: u64) -> u64 {
+    records
+        .saturating_mul(row_bytes)
+        .saturating_add(CSV_HEADER_RESERVE_BYTES)
+}
+
+/// Free space below which acquisition stops: the documented 250 MiB critical
+/// reserve plus the projected size of the CSV still to be exported.
+fn storage_stop_threshold(csv_reserve_bytes: u64) -> u64 {
+    DISK_CRITICAL_BYTES.saturating_add(csv_reserve_bytes)
+}
+
+/// Upper bound for a BMEG header (its length field is a u16) plus its prefix.
+const BMEG_HEADER_RESERVE_BYTES: u64 = 64 * 1024;
+
+/// Projected disk use of one recording, shown before Start so a student can
+/// choose a folder with room for the raw BMEG and the CSV exported from it.
+/// The CSV uses the same conservative per-row estimate as the storage guard.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecordingStorageEstimate {
+    /// Records per second; one pulse-ox record is a full RED/DARK 1/IR/DARK 2
+    /// cycle, so its rate follows the state dwell time.
+    pub records_per_second: u64,
+    pub bmeg_bytes_per_second: u64,
+    pub csv_bytes_per_second: u64,
+    /// BMEG plus CSV for a timed recording; `None` when it runs until stopped.
+    pub projected_bytes: Option<u64>,
+    /// Free space a timed recording needs to finish without the storage guard
+    /// stopping it: the projected files plus the critical reserve.
+    pub required_free_bytes: Option<u64>,
+    /// Acquisition stops when free space falls below this reserve plus the
+    /// CSV still to be exported.
+    pub critical_free_bytes: u64,
+}
+
+/// Estimates the disk use of a recording of `profile` with `calibration` for
+/// `duration`. It reads nothing from disk and opens no port.
+pub fn estimate_recording_storage(
+    profile: &ProfileSnapshot,
+    calibration: &RecordingCalibration,
+    duration: &RecordingDuration,
+) -> RecordingStorageEstimate {
+    let acquisition = &profile.profile.acquisition;
+    let records_per_second = match acquisition.acquisition_mode {
+        crate::profiles::AcquisitionMode::Simultaneous => u64::from(acquisition.sample_rate_hz),
+        crate::profiles::AcquisitionMode::Pulseox4State => acquisition
+            .state_dwell_us
+            .filter(|dwell| *dwell > 0)
+            .map(|dwell| 1_000_000u64.div_ceil(4 * u64::from(dwell)))
+            .unwrap_or(0),
+    };
+    let field_count = acquisition.record_field_names().len();
+    let bmeg_record_bytes = synchronized_record_bytes(field_count) as u64;
+    let csv_row_bytes = estimated_csv_row_bytes(profile, calibration);
+    let projected_bytes = duration.requested_seconds().map(|seconds| {
+        let records = records_per_second.saturating_mul(seconds);
+        records
+            .saturating_mul(bmeg_record_bytes)
+            .saturating_add(BMEG_HEADER_RESERVE_BYTES)
+            .saturating_add(projected_csv_bytes(records, csv_row_bytes))
+    });
+    RecordingStorageEstimate {
+        records_per_second,
+        bmeg_bytes_per_second: records_per_second.saturating_mul(bmeg_record_bytes),
+        csv_bytes_per_second: records_per_second.saturating_mul(csv_row_bytes),
+        projected_bytes,
+        required_free_bytes: projected_bytes.map(|bytes| bytes.saturating_add(DISK_CRITICAL_BYTES)),
+        critical_free_bytes: DISK_CRITICAL_BYTES,
+    }
+}
+
+const HEADER_TOO_LARGE_MESSAGE: &str = "the lab description, notices, and recording note are too long to store in a recording header (64 KiB); shorten the lab description or the note";
+
+fn header_budget_error(error: RecordingError) -> SessionError {
+    match error {
+        RecordingError::HeaderTooLarge => SessionError::InvalidRequest(HEADER_TOO_LARGE_MESSAGE),
+        other => SessionError::Recording(other),
+    }
+}
+
+/// Inputs to the synchronous Start-time header precheck.
+struct HeaderBudgetRequest<'a> {
+    simulator: bool,
+    source: &'a str,
+    duration: &'a RecordingDuration,
+    profile: &'a ProfileSnapshot,
+    calibration: &'a RecordingCalibration,
+    recording_path_context: Option<&'a RecordingPathContext>,
+    recording_context: &'a RecordingContext,
+}
+
+/// Rejects, before any port is opened or the session begins, a lab and note
+/// whose recording header could not fit the 64 KiB BMEG limit. Provenance
+/// strings resolved later by the worker are covered by a fixed reserve; the
+/// worker re-checks the exact header before configuring the board.
+fn check_header_budget(request: HeaderBudgetRequest<'_>) -> Result<(), SessionError> {
+    let field_count = request
+        .profile
+        .profile
+        .acquisition
+        .record_field_names()
+        .len();
+    let placeholder = PathBuf::from(format!(
+        "20000101_000000_{}_Run99.bmeg",
+        crate::profiles::safe_filename_component(&request.profile.profile.export.signal_name)
+    ));
+    let mut metadata = build_initial_metadata(
+        InitialMetadataRequest {
+            simulator: request.simulator,
+            source: request.source,
+            bmeg: &placeholder,
+            duration: request.duration,
+            profile: request.profile,
+            calibration: request.calibration.clone(),
+            recording_path_context: request.recording_path_context,
+            recording_context: request.recording_context,
+        },
+        ToolingProvenance::placeholder(request.simulator),
+    );
+    metadata.record_layout = Some(RecordLayout::Synchronized { field_count });
+    let header_bytes =
+        check_synchronized_header(&metadata, field_count).map_err(header_budget_error)?;
+    if header_bytes.saturating_add(HEADER_PROVENANCE_RESERVE_BYTES) > usize::from(u16::MAX) {
+        return Err(SessionError::InvalidRequest(HEADER_TOO_LARGE_MESSAGE));
+    }
+    Ok(())
+}
+
+/// Arduino tooling facts recorded in the header of a hardware recording.
+struct ToolingProvenance {
+    arduino_cli_version: String,
+    uno_r4_core_version: String,
+    board_serial: Option<String>,
+}
+
+impl ToolingProvenance {
+    fn not_applicable() -> Self {
+        Self {
+            arduino_cli_version: "not applicable".into(),
+            uno_r4_core_version: "not applicable".into(),
+            board_serial: None,
+        }
+    }
+
+    /// Short stand-ins for the precheck; `HEADER_PROVENANCE_RESERVE_BYTES`
+    /// covers the real values.
+    fn placeholder(simulator: bool) -> Self {
+        if simulator {
+            Self::not_applicable()
+        } else {
+            Self {
+                arduino_cli_version: "pending".into(),
+                uno_r4_core_version: "pending".into(),
+                board_serial: None,
+            }
+        }
+    }
+}
+
+/// Collects tooling provenance. For hardware this runs Arduino CLI before
+/// START so no external command can delay raw intake.
+fn tooling_provenance(simulator: bool, source: &str) -> Result<ToolingProvenance, SessionError> {
+    if simulator {
+        return Ok(ToolingProvenance::not_applicable());
+    }
+    let cli = crate::arduino_cli::ArduinoCli::discover(None)
+        .map_err(|error| SessionError::Protocol(error.to_string()))?;
+    let arduino_cli_version = cli
+        .version()
+        .map_err(|error| SessionError::Protocol(error.to_string()))?
+        .stdout
+        .trim()
+        .to_owned();
+    let uno_r4_core_version = cli
+        .uno_r4_core_version()
+        .map_err(|error| SessionError::Protocol(error.to_string()))?;
+    let board_serial = cli
+        .boards()
+        .ok()
+        .into_iter()
+        .flatten()
+        .find(|board| board.port.eq_ignore_ascii_case(source))
+        .and_then(|board| board.serial_number);
+    Ok(ToolingProvenance {
+        arduino_cli_version,
+        uno_r4_core_version,
+        board_serial,
+    })
+}
+
+/// Builds the immutable recording header. `utc_start`/`local_start` are
+/// provisional here and re-stamped immediately before START by capture;
+/// `session_opened_utc` keeps this preparation time.
+fn build_initial_metadata(
+    InitialMetadataRequest {
+        simulator,
+        source,
+        bmeg,
+        duration,
+        profile,
+        calibration,
+        recording_path_context,
+        recording_context,
+    }: InitialMetadataRequest<'_>,
+    provenance: ToolingProvenance,
+) -> RecordingMetadata {
+    let ToolingProvenance {
+        arduino_cli_version,
+        uno_r4_core_version,
+        board_serial,
+    } = provenance;
+    let mut digital_output_mapping = std::collections::BTreeMap::new();
+    for output in profile.profile.acquisition.resolved_digital_outputs() {
+        let key = match output.label.to_ascii_lowercase().as_str() {
+            "green led" => "green".into(),
+            "red led" => "red".into(),
+            "ir led" => "ir".into(),
+            _ => output.label,
+        };
+        digital_output_mapping.insert(key, output.pin);
+    }
+    let opened = Utc::now();
+    RecordingMetadata {
+        utc_start: opened,
+        local_start: opened.with_timezone(&Local),
+        board: if simulator {
+            "Simulator".into()
+        } else {
+            "Arduino UNO R4 WiFi".into()
+        },
+        board_serial,
+        com_port: source.into(),
+        fqbn: if simulator {
+            "simulator".into()
+        } else {
+            "arduino:renesas_uno:unor4wifi".into()
+        },
+        arduino_cli_version,
+        uno_r4_core_version,
+        firmware_build: REFERENCE_FIRMWARE_BUILD,
+        protocol_version: format!(
+            "{}.{}",
+            crate::protocol::PROTOCOL_MAJOR,
+            crate::protocol::PROTOCOL_MINOR
+        ),
+        analog_pin: profile.profile.acquisition.analog_pins().join(","),
+        active_analog_pins: profile.profile.acquisition.analog_pins(),
+        digital_output_mapping,
+        adc_bits: profile.profile.acquisition.adc_resolution_bits,
+        requested_sample_rate_hz: profile.profile.acquisition.sample_rate_hz,
+        measured_sample_rate_hz: 0.0,
+        timing_diagnostics: None,
+        total_samples: 0,
+        integrity: IntegrityCounters::default(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        simulator,
+        utc_stop: None,
+        local_stop: None,
+        host_elapsed_seconds: None,
+        board_elapsed_seconds: None,
+        recording_status: "active".into(),
+        bmeg_filename: file_name_string(bmeg).unwrap_or_else(|_| "recording.bmeg".into()),
+        csv_filename: None,
+        notes: if recording_context.recording_note.is_empty() {
+            default_recording_note(simulator, profile)
+        } else {
+            recording_context.recording_note.clone()
+        },
+        user_recording_note: (!recording_context.recording_note.is_empty())
+            .then(|| recording_context.recording_note.clone()),
+        recording_safety: recording_safety_context(profile),
+        project_folder: recording_path_context.map(|context| context.project_folder.clone()),
+        output_folder: recording_path_context.map(|context| context.output_folder.clone()),
+        duration_mode: Some(duration.label().into()),
+        requested_duration_seconds: duration.requested_seconds(),
+        stop_reason: None,
+        initial_free_disk_bytes: None,
+        final_free_disk_bytes: None,
+        completion_status: "active".into(),
+        profile_snapshot: Some(profile.clone()),
+        // Retained as an optional legacy metadata field. New course recordings
+        // never create the retired validation context.
+        validation_context: None,
+        markers: Vec::new(),
+        calibration: Some(calibration),
+        record_layout: None,
+        session_opened_utc: Some(opened),
+        acquisition_started_utc: None,
+        csv_error: None,
+        finalize_error: None,
+    }
 }
 
 fn encode_command(
@@ -3322,6 +4657,9 @@ fn recommended_action(category: &ConnectionFailureCategory) -> &'static str {
         ConnectionFailureCategory::AmbiguousReturningDevice => {
             "Multiple UNO candidates appeared; refresh devices and select the board by serial number."
         }
+        ConnectionFailureCategory::RecordingStorageError => {
+            "The recording folder could not be used or written. Check that its drive is connected and has free space, then start a new recording. Files already saved were kept."
+        }
     }
 }
 
@@ -3344,6 +4682,12 @@ struct SimulatorIo {
     pulseox: bool,
     adc_resolution_bits: u8,
     output_mask: u8,
+    /// Batches still emitted after STOP before the terminal STATUS, mirroring
+    /// the firmware's final partial batch and queued batches. The default of
+    /// zero (an immediate STATUS) keeps simulator recordings deterministic;
+    /// tests raise it to exercise the post-STOP drain.
+    post_stop_batches: u32,
+    stop_batches_remaining: u32,
 }
 
 impl SimulatorIo {
@@ -3365,6 +4709,8 @@ impl SimulatorIo {
             pulseox: false,
             adc_resolution_bits: profile.profile.acquisition.adc_resolution_bits,
             output_mask: 0,
+            post_stop_batches: 0,
+            stop_batches_remaining: 0,
         };
         simulator.queue(
             MessageType::Hello,
@@ -3405,6 +4751,30 @@ impl SimulatorIo {
         simulator.pulseox = pulseox;
         simulator.sample_period_us = 1_000_000 / logical_rate_hz;
         Ok(simulator)
+    }
+
+    /// Queues what a previous session that ended without STOP can leave in
+    /// the board's transmit queue: a watchdog ERROR 7, a terminal STATUS
+    /// still reporting D4 HIGH with overflows, and a batch of the old run.
+    #[cfg(test)]
+    fn queue_stale_previous_session_frames(&mut self) -> Result<(), SessionError> {
+        self.queue(MessageType::ErrorMessage, vec![7])?;
+        self.queue(MessageType::Status, vec![0, 0x01, 4, 0, 0, 0])?;
+        let records = 10usize;
+        let payload = SampleBatch {
+            first_sample_sequence: 9_000,
+            sample_period_us: 1_000,
+            channel_count: self.channel_count,
+            timestamps_us: (0..records as u64)
+                .map(|index| 50_000_000 + index * 1_000)
+                .collect(),
+            samples: vec![1_000; records * usize::from(self.channel_count)],
+            status_flags: crate::protocol::SAMPLE_STATUS_ACQUIRING,
+            acquisition_queue_overflows: Some(2),
+        }
+        .to_payload()
+        .map_err(|error| SessionError::Protocol(format!("{error:?}")))?;
+        self.queue(MessageType::SampleBatch, payload)
     }
 
     fn queue(&mut self, message_type: MessageType, payload: Vec<u8>) -> Result<(), SessionError> {
@@ -3524,16 +4894,32 @@ impl Read for SimulatorIo {
         if self.bytes.is_empty()
             && self.active
             && self
-                .sample_limit
-                .is_none_or(|limit| u64::from(self.sample_sequence) < limit)
-            && self
                 .batch_interval
                 .is_none_or(|_| Instant::now() >= self.next_batch_at)
         {
-            self.queue_sample_batch()
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            if let Some(interval) = self.batch_interval {
-                self.next_batch_at += interval;
+            let can_generate = self
+                .sample_limit
+                .is_none_or(|limit| u64::from(self.sample_sequence) < limit);
+            if can_generate {
+                self.queue_sample_batch()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                if let Some(interval) = self.batch_interval {
+                    self.next_batch_at += interval;
+                }
+            }
+            if self.stop_batches_remaining > 0 {
+                // STOP was received: emit the configured tail, then the
+                // terminal STATUS, as the firmware does after its queue drains.
+                self.stop_batches_remaining = if can_generate {
+                    self.stop_batches_remaining - 1
+                } else {
+                    0
+                };
+                if self.stop_batches_remaining == 0 {
+                    self.active = false;
+                    self.queue(MessageType::Status, vec![0, self.output_mask, 0, 0, 0, 0])
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                }
             }
         }
         if self.bytes.is_empty() {
@@ -3628,13 +5014,20 @@ impl Write for SimulatorIo {
                 }
                 MessageType::Start => {
                     self.active = true;
+                    self.stop_batches_remaining = 0;
                     self.next_batch_at = Instant::now();
                     self.queue(MessageType::Status, vec![1, self.output_mask, 0, 0, 0, 0])
                 }
                 MessageType::Stop => {
-                    self.active = false;
                     self.output_mask = 0;
-                    self.queue(MessageType::Status, vec![0, self.output_mask, 0, 0, 0, 0])
+                    if self.active && self.post_stop_batches > 0 {
+                        // The terminal STATUS follows the tail (see `read`).
+                        self.stop_batches_remaining = self.post_stop_batches;
+                        Ok(())
+                    } else {
+                        self.active = false;
+                        self.queue(MessageType::Status, vec![0, self.output_mask, 0, 0, 0, 0])
+                    }
                 }
                 _ => Ok(()),
             }
@@ -4982,10 +6375,10 @@ mod tests {
         for profile in built_in_profiles().unwrap_or_else(|error| panic!("{error}")) {
             let expected = crate::profiles::safe_filename_component(&profile.export.signal_name);
             let snapshot = profile.snapshot(true);
-            let (_, bmeg, csv, metadata) = session
+            let paths = session
                 .allocate_paths(dir.path(), &snapshot)
                 .unwrap_or_else(|error| panic!("{error}"));
-            for path in [bmeg, csv, metadata] {
+            for path in [paths.bmeg, paths.csv, paths.metadata] {
                 let filename = path
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -5189,5 +6582,1051 @@ mod tests {
             assert_eq!(batch.sample_period_us, period);
             assert!(batch.samples.len() >= usize::from(fields));
         }
+    }
+
+    /// Requests a stop through the cancel flag (as the Stop button does) once
+    /// the simulator has emitted `stop_after` samples, and records every
+    /// command the host writes.
+    struct StopAfterSamples {
+        inner: SimulatorIo,
+        cancel: Arc<AtomicBool>,
+        stop_after: u32,
+        commands: FrameParser,
+        received: Vec<MessageType>,
+    }
+
+    impl StopAfterSamples {
+        fn new(inner: SimulatorIo, cancel: Arc<AtomicBool>, stop_after: u32) -> Self {
+            Self {
+                inner,
+                cancel,
+                stop_after,
+                commands: FrameParser::default(),
+                received: Vec::new(),
+            }
+        }
+
+        fn count(&self, message_type: MessageType) -> usize {
+            self.received
+                .iter()
+                .filter(|received| **received == message_type)
+                .count()
+        }
+    }
+
+    impl Read for StopAfterSamples {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.sample_sequence >= self.stop_after {
+                self.cancel.store(true, Ordering::Release);
+            }
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Write for StopAfterSamples {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            for frame in self.commands.push(buffer) {
+                self.received.push(frame.message_type);
+            }
+            self.inner.write(buffer)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// How a test transport answers START.
+    #[derive(Clone, Copy)]
+    enum StartFailure {
+        /// The firmware answers START with an ERROR frame instead of STATUS.
+        FirmwareError,
+        /// START's STATUS never arrives and the user cancels during the wait.
+        CancelDuringWait,
+    }
+
+    /// Forwards every command to the simulator except START, which it answers
+    /// according to `failure`, and records every command the host writes.
+    struct FailingStart {
+        inner: SimulatorIo,
+        cancel: Arc<AtomicBool>,
+        failure: StartFailure,
+        commands: FrameParser,
+        received: Vec<MessageType>,
+    }
+
+    impl FailingStart {
+        fn new(inner: SimulatorIo, cancel: Arc<AtomicBool>, failure: StartFailure) -> Self {
+            Self {
+                inner,
+                cancel,
+                failure,
+                commands: FrameParser::default(),
+                received: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for FailingStart {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Write for FailingStart {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            // Each host command is written as one whole frame.
+            let mut start = false;
+            for frame in self.commands.push(buffer) {
+                start |= frame.message_type == MessageType::Start;
+                self.received.push(frame.message_type);
+            }
+            if !start {
+                return self.inner.write(buffer);
+            }
+            match self.failure {
+                StartFailure::FirmwareError => self
+                    .inner
+                    .queue(MessageType::ErrorMessage, vec![4])
+                    .map_err(|error| std::io::Error::other(error.to_string()))?,
+                StartFailure::CancelDuringWait => self.cancel.store(true, Ordering::Release),
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    const PLENTY_OF_SPACE: u64 = 64 * 1024 * 1024 * 1024;
+
+    /// Which metadata sidecar writes fail.
+    #[derive(Clone, Copy, Default)]
+    enum MetadataFailure {
+        #[default]
+        None,
+        /// Both the sidecar written before the CSV and its rewrite fail.
+        Every,
+        /// The first sidecar is written; its rewrite with the CSV result fails.
+        AfterFirst,
+    }
+
+    #[derive(Default)]
+    struct InjectedStorage {
+        fail_flush: bool,
+        fail_finish: bool,
+        fail_csv: bool,
+        fail_bmeg_rename: bool,
+        fail_metadata: MetadataFailure,
+        metadata_writes: AtomicU64,
+    }
+
+    impl RecordingStorage for InjectedStorage {
+        fn flush(&self, writer: &mut BmegWriter) -> Result<(), RecordingError> {
+            if self.fail_flush {
+                return Err(RecordingError::Io(std::io::Error::other(
+                    "injected flush failure",
+                )));
+            }
+            writer.flush()
+        }
+
+        fn finish(&self, writer: BmegWriter) -> Result<(), RecordingError> {
+            if self.fail_finish {
+                // Close the file (so the test can inspect it) but report the
+                // final flush as failed, as a removed USB drive would.
+                drop(writer);
+                return Err(RecordingError::Io(std::io::Error::other(
+                    "injected final flush failure",
+                )));
+            }
+            writer.finish()
+        }
+
+        fn write_durably(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            let call = self.metadata_writes.fetch_add(1, Ordering::Relaxed);
+            let fail = match self.fail_metadata {
+                MetadataFailure::None => false,
+                MetadataFailure::Every => true,
+                MetadataFailure::AfterFirst => call > 0,
+            };
+            if fail {
+                return Err(std::io::Error::other("injected metadata write failure"));
+            }
+            fs::write(path, bytes)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.fail_bmeg_rename && from.to_string_lossy().ends_with(".bmeg.part") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected sharing violation",
+                ));
+            }
+            fs::rename(from, to)
+        }
+
+        fn export_csv(&self, bmeg: &Path, csv: &Path) -> Result<u64, RecordingError> {
+            if self.fail_csv {
+                // Leave a partial file behind, as a full disk would.
+                fs::write(csv, b"record_sequence,t_us\n0,")?;
+                return Err(RecordingError::Io(std::io::Error::other(
+                    "injected disk full during CSV export",
+                )));
+            }
+            export_bmeg_csv(bmeg, csv)
+        }
+    }
+
+    fn fast_timing() -> CaptureTiming {
+        CaptureTiming {
+            disk_check_interval: Duration::from_millis(20),
+            flush_interval: Duration::from_millis(20),
+            rename_attempts: 3,
+            rename_initial_backoff: Duration::from_millis(1),
+        }
+    }
+
+    fn plenty_of_space() -> Arc<dyn DiskSpaceProvider> {
+        Arc::new(FixedDiskSpace(AtomicU64::new(PLENTY_OF_SPACE)))
+    }
+
+    fn controller_with(storage: InjectedStorage) -> SessionController {
+        SessionController::with_environment(plenty_of_space(), Arc::new(storage), fast_timing())
+    }
+
+    fn simulator_request(
+        profile: &ProfileSnapshot,
+        duration: RecordingDuration,
+        output_dir: &Path,
+    ) -> CaptureRequest {
+        CaptureRequest {
+            simulator: true,
+            source: "SIM".into(),
+            profile: profile.clone(),
+            duration,
+            output_dir: output_dir.to_path_buf(),
+            calibration: RecordingCalibration::default(),
+            recording_path_context: None,
+            recording_context: RecordingContext::default(),
+            expected_port_identity: None,
+        }
+    }
+
+    fn begin_simulated_session(
+        session: &SessionController,
+        profile: &ProfileSnapshot,
+        duration: RecordingDuration,
+    ) {
+        session
+            .begin_session(
+                true,
+                "Simulator",
+                "SIM",
+                duration,
+                profile.clone(),
+                RecordingCalibration::default(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        session
+            .set_state(SessionState::Connected)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Runs one simulated until-stopped capture that stops after `stop_after`
+    /// samples (or ends earlier on its own).
+    fn run_simulated_capture(
+        session: &SessionController,
+        output_dir: &Path,
+        stop_after: u32,
+        configure: impl FnOnce(&mut SimulatorIo),
+    ) -> (Result<(), SessionError>, StopAfterSamples) {
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        begin_simulated_session(session, &profile, RecordingDuration::UntilStopped);
+        let mut inner = SimulatorIo::new(&profile, RecordingDuration::UntilStopped)
+            .unwrap_or_else(|e| panic!("{e}"));
+        configure(&mut inner);
+        let mut transport = StopAfterSamples::new(inner, session.cancel.clone(), stop_after);
+        let result = session.capture_transport(
+            &mut transport,
+            simulator_request(&profile, RecordingDuration::UntilStopped, output_dir),
+        );
+        (result, transport)
+    }
+
+    fn last_summary(session: &SessionController) -> SessionSummary {
+        session
+            .status()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"))
+    }
+
+    fn read_metadata(path: &str) -> RecordingMetadata {
+        serde_json::from_slice(&fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}")))
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn bmeg_record_count(path: &str) -> u64 {
+        let mut reader = BmegReader::open(Path::new(path)).unwrap_or_else(|e| panic!("{e}"));
+        let mut count = 0u64;
+        while reader
+            .next_record()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .is_some()
+        {
+            count += 1;
+        }
+        count
+    }
+
+    fn csv_line_count(path: &str) -> u64 {
+        fs::read_to_string(path).unwrap_or_default().lines().count() as u64
+    }
+
+    fn wait_for_state(session: &SessionController, state: SessionState) -> SessionStatus {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+            if status.state == state || Instant::now() >= deadline {
+                return status;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn no_output_lab_keeps_batches_sent_after_stop() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        let (result, transport) = run_simulated_capture(&session, dir.path(), 100, |simulator| {
+            simulator.post_stop_batches = 3;
+        });
+        result.unwrap_or_else(|e| panic!("{e}"));
+        let summary = last_summary(&session);
+        let emitted = u64::from(transport.inner.sample_sequence);
+        assert!(
+            emitted >= 130,
+            "the simulator must have sent its post-STOP tail ({emitted})"
+        );
+        // A lab with no outputs reports mask 0 at START; that must not end the
+        // post-STOP wait before the tail and the terminal STATUS are read.
+        assert_eq!(summary.active_digital_output_mask, Some(0));
+        assert_eq!(summary.final_digital_output_mask, Some(0));
+        assert_eq!(summary.samples, emitted);
+        assert_eq!(bmeg_record_count(&summary.bmeg_path), emitted);
+        assert_eq!(csv_line_count(&summary.csv_path), emitted + 1);
+        assert_eq!(summary.stop_reason, StopReason::User);
+        assert_eq!(summary.completion_status, "complete");
+        assert!(!transport.inner.active);
+    }
+
+    #[test]
+    fn stale_frames_from_a_previous_session_neither_fault_nor_enter_the_recording() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        let (result, transport) = run_simulated_capture(&session, dir.path(), 50, |simulator| {
+            simulator
+                .queue_stale_previous_session_frames()
+                .unwrap_or_else(|e| panic!("{e}"));
+        });
+        assert!(result.is_ok(), "{result:?}");
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Disconnected);
+        assert!(status.last_error.is_none());
+        let summary = status
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"));
+        assert_eq!(summary.stop_reason, StopReason::User);
+        assert_eq!(summary.completion_status, "complete");
+        assert!(summary.error.is_none());
+        assert_eq!(summary.samples, u64::from(transport.inner.sample_sequence));
+        assert_eq!(summary.integrity.missing_sample_sequences, 0);
+        assert_eq!(summary.integrity.duplicate_sample_sequences, 0);
+        assert_eq!(summary.integrity.out_of_order_sample_sequences, 0);
+        assert_eq!(summary.integrity.firmware_overflows, 0);
+        let mut reader =
+            BmegReader::open(Path::new(&summary.bmeg_path)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            reader
+                .next_record()
+                .unwrap_or_else(|e| panic!("{e}"))
+                .map(|record| record.sequence),
+            Some(0)
+        );
+        // An idle-safe STOP quiesced the board before it was configured.
+        let first_stop = transport
+            .received
+            .iter()
+            .position(|message| *message == MessageType::Stop);
+        let configure = transport
+            .received
+            .iter()
+            .position(|message| *message == MessageType::Configure);
+        assert!(first_stop.is_some() && first_stop < configure);
+    }
+
+    #[test]
+    fn flush_failure_mid_recording_still_stops_and_finalizes_with_metadata() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = controller_with(InjectedStorage {
+            fail_flush: true,
+            ..InjectedStorage::default()
+        });
+        // The sample limit is only a backstop; the flush failure ends capture.
+        let (result, transport) = run_simulated_capture(&session, dir.path(), 5_000, |_| {});
+        let error = result
+            .err()
+            .unwrap_or_else(|| panic!("a flush failure must end the recording"));
+        assert!(matches!(error, SessionError::Save(_)), "{error}");
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("could not be written")));
+        let summary = status
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"));
+        assert_eq!(summary.stop_reason, StopReason::Fault);
+        assert_eq!(summary.completion_status, "incomplete");
+        assert!(summary
+            .error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("RECORDING_FLUSH")));
+        // The quiescing STOP and the final STOP were both sent, and the
+        // simulated board stopped acquiring.
+        assert!(transport.count(MessageType::Stop) >= 2);
+        assert!(!transport.inner.active);
+        assert!(summary.bmeg_path.ends_with(".bmeg"));
+        assert_eq!(bmeg_record_count(&summary.bmeg_path), summary.samples);
+        let metadata = read_metadata(&summary.metadata_path);
+        assert_eq!(metadata.stop_reason, Some(StopReason::Fault));
+        assert_eq!(metadata.completion_status, "incomplete");
+        assert_eq!(metadata.total_samples, summary.samples);
+        assert!(metadata
+            .finalize_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("RECORDING_FLUSH")));
+    }
+
+    #[test]
+    fn failed_free_space_queries_are_logged_without_ending_the_recording() {
+        struct FlakyDiskSpace(AtomicU64);
+
+        impl DiskSpaceProvider for FlakyDiskSpace {
+            fn available_space(&self, _path: &Path) -> std::io::Result<u64> {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(PLENTY_OF_SPACE)
+                } else {
+                    Err(std::io::Error::other("network share unavailable"))
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::with_environment(
+            Arc::new(FlakyDiskSpace(AtomicU64::new(0))),
+            Arc::new(InjectedStorage::default()),
+            fast_timing(),
+        );
+        let (result, _transport) = run_simulated_capture(&session, dir.path(), 150, |_| {});
+        result.unwrap_or_else(|e| panic!("{e}"));
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Disconnected);
+        assert_eq!(status.available_disk_bytes, Some(PLENTY_OF_SPACE));
+        let summary = status
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"));
+        assert_eq!(summary.stop_reason, StopReason::User);
+        assert_eq!(summary.completion_status, "complete");
+        assert_eq!(summary.final_free_disk_bytes, None);
+    }
+
+    #[test]
+    fn storage_threshold_adds_the_projected_csv_to_the_critical_reserve() {
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        let row = estimated_csv_row_bytes(&profile, &RecordingCalibration::default());
+        assert_eq!(
+            row,
+            CSV_ROW_PREFIX_BYTES + CSV_COUNTS_FIELD_BYTES + CSV_VOLTS_FIELD_BYTES
+        );
+        assert_eq!(
+            storage_stop_threshold(projected_csv_bytes(0, row)),
+            DISK_CRITICAL_BYTES + CSV_HEADER_RESERVE_BYTES
+        );
+        assert_eq!(
+            storage_stop_threshold(projected_csv_bytes(1_000, row)),
+            DISK_CRITICAL_BYTES + CSV_HEADER_RESERVE_BYTES + 1_000 * row
+        );
+    }
+
+    #[test]
+    fn storage_guard_reserves_room_for_the_csv_export() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        // Enough for the 250 MiB reserve and the CSV header, but only about
+        // 8 KiB of projected CSV rows.
+        let free = DISK_CRITICAL_BYTES + CSV_HEADER_RESERVE_BYTES + 8 * 1024;
+        let session = SessionController::with_environment(
+            Arc::new(FixedDiskSpace(AtomicU64::new(free))),
+            Arc::new(InjectedStorage::default()),
+            fast_timing(),
+        );
+        let (result, _transport) = run_simulated_capture(&session, dir.path(), 5_000, |_| {});
+        result.unwrap_or_else(|e| panic!("{e}"));
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert!(status.storage_warning.is_some());
+        let summary = status
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"));
+        assert_eq!(summary.stop_reason, StopReason::StorageGuard);
+        assert_eq!(summary.recording_status, "storage_guard");
+        assert_eq!(summary.completion_status, "incomplete");
+        assert!(summary.samples < 5_000);
+    }
+
+    #[test]
+    fn csv_failure_after_a_user_stop_keeps_metadata_and_faults() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = controller_with(InjectedStorage {
+            fail_csv: true,
+            ..InjectedStorage::default()
+        });
+        let (result, _transport) = run_simulated_capture(&session, dir.path(), 50, |_| {});
+        // The cancel flag is set (a user Stop); a save failure must still fault.
+        session
+            .finish_worker_error(&result)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(result, Err(SessionError::Save(_))), "{result:?}");
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("CSV export failed")));
+        let summary = status
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"));
+        assert_eq!(summary.stop_reason, StopReason::User);
+        assert_eq!(summary.completion_status, "complete");
+        assert!(summary.csv_path.is_empty());
+        assert!(summary
+            .csv_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("injected disk full")));
+        assert_eq!(bmeg_record_count(&summary.bmeg_path), summary.samples);
+        let metadata = read_metadata(&summary.metadata_path);
+        assert_eq!(metadata.csv_filename, None);
+        assert!(metadata
+            .csv_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("injected disk full")));
+        assert_eq!(metadata.completion_status, "complete");
+        let csv = Path::new(&summary.bmeg_path).with_extension("csv");
+        assert!(!csv.exists());
+        assert!(!sibling_with_suffix(&csv, ".part").exists());
+    }
+
+    #[test]
+    fn rename_failure_keeps_the_part_file_and_still_writes_metadata_and_csv() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = controller_with(InjectedStorage {
+            fail_bmeg_rename: true,
+            ..InjectedStorage::default()
+        });
+        let (result, _transport) = run_simulated_capture(&session, dir.path(), 50, |_| {});
+        assert!(matches!(result, Err(SessionError::Save(_))), "{result:?}");
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        let summary = status
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"));
+        assert!(
+            summary.bmeg_path.ends_with(".bmeg.part"),
+            "{}",
+            summary.bmeg_path
+        );
+        assert_eq!(bmeg_record_count(&summary.bmeg_path), summary.samples);
+        assert!(summary
+            .finalize_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("rename")));
+        assert_eq!(csv_line_count(&summary.csv_path), summary.samples + 1);
+        let metadata = read_metadata(&summary.metadata_path);
+        assert!(metadata.bmeg_filename.ends_with(".bmeg.part"));
+        assert_eq!(metadata.completion_status, "complete");
+        assert!(metadata
+            .finalize_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("rename")));
+    }
+
+    #[test]
+    fn only_cancellation_finishes_a_worker_quietly() {
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        let timed = RecordingDuration::Timed { seconds: 10 };
+
+        let cancelled = SessionController::default();
+        begin_simulated_session(&cancelled, &profile, timed.clone());
+        cancelled.request_stop().unwrap_or_else(|e| panic!("{e}"));
+        cancelled
+            .finish_worker_error(&Err(SessionError::Cancelled))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = cancelled.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Disconnected);
+        assert!(status.last_error.is_none());
+
+        let save_failed = SessionController::default();
+        begin_simulated_session(&save_failed, &profile, timed.clone());
+        save_failed.request_stop().unwrap_or_else(|e| panic!("{e}"));
+        save_failed
+            .finish_worker_error(&Err(SessionError::Save("the CSV export failed".into())))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = save_failed.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("CSV export failed")));
+
+        let detailed = SessionController::default();
+        begin_simulated_session(&detailed, &profile, timed);
+        detailed.request_stop().unwrap_or_else(|e| panic!("{e}"));
+        detailed
+            .set_fault("stage-specific save detail".into())
+            .unwrap_or_else(|e| panic!("{e}"));
+        detailed
+            .finish_worker_error(&Err(SessionError::Io(std::io::Error::other("generic"))))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            detailed
+                .status()
+                .unwrap_or_else(|e| panic!("{e}"))
+                .last_error
+                .as_deref(),
+            Some("stage-specific save detail")
+        );
+    }
+
+    #[test]
+    fn a_stop_during_connection_is_shown_as_stopping() {
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        begin_simulated_session(&session, &profile, RecordingDuration::Timed { seconds: 10 });
+        let status = session.request_stop().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Stopping);
+    }
+
+    #[test]
+    fn disconnect_keeps_a_fault_raised_while_the_worker_saved() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = controller_with(InjectedStorage {
+            fail_csv: true,
+            ..InjectedStorage::default()
+        });
+        session
+            .start_simulator(RecordingDuration::UntilStopped, dir.path().to_path_buf())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let acquiring = wait_for_state(&session, SessionState::Acquiring);
+        assert_eq!(acquiring.state, SessionState::Acquiring);
+        thread::sleep(Duration::from_millis(50));
+        let status = session.disconnect().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("CSV export failed")));
+        // An idle historical fault is still cleared by an explicit disconnect.
+        let cleared = session.disconnect().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(cleared.state, SessionState::Disconnected);
+    }
+
+    #[test]
+    fn elapsed_and_remaining_are_measured_from_start() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        session
+            .start_simulator(
+                RecordingDuration::Timed { seconds: 10 },
+                dir.path().to_path_buf(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = wait_for_state(&session, SessionState::Acquiring);
+        assert_eq!(status.state, SessionState::Acquiring);
+        // The handshake grace (at least 1.25 s) and configuration are not
+        // recording time.
+        assert!(
+            status.elapsed_seconds < 0.5,
+            "elapsed {}",
+            status.elapsed_seconds
+        );
+        assert!(
+            status
+                .remaining_seconds
+                .is_some_and(|remaining| remaining > 9.5),
+            "{:?}",
+            status.remaining_seconds
+        );
+        session.request_stop().unwrap_or_else(|e| panic!("{e}"));
+        session.wait_for_worker().unwrap_or_else(|e| panic!("{e}"));
+        let summary = last_summary(&session);
+        let metadata = read_metadata(&summary.metadata_path);
+        let opened = metadata
+            .session_opened_utc
+            .unwrap_or_else(|| panic!("missing session_opened_utc"));
+        let acquisition_started = metadata
+            .acquisition_started_utc
+            .unwrap_or_else(|| panic!("missing acquisition_started_utc"));
+        assert!(opened <= metadata.utc_start);
+        assert!(metadata.utc_start <= acquisition_started);
+        // utc_start is stamped after the handshake, not when the session opened.
+        assert!((metadata.utc_start - opened).num_milliseconds() >= 1_000);
+    }
+
+    #[test]
+    fn an_oversized_lab_header_is_rejected_before_the_session_begins() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        let mut profile = built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "development")
+            .unwrap_or_else(|| panic!("missing development profile"));
+        profile.description = "x".repeat(70_000);
+        let error = session
+            .start_simulator_with_profile(
+                profile.snapshot(true),
+                RecordingDuration::Timed { seconds: 10 },
+                dir.path().to_path_buf(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("an oversized header must be rejected"));
+        assert!(matches!(error, SessionError::InvalidRequest(_)), "{error}");
+        assert!(error.to_string().contains("too long"), "{error}");
+        // The student sees the reason, not an internal state-machine prefix.
+        assert!(!error.to_string().contains("illegal transition"), "{error}");
+        assert_eq!(
+            session.status().unwrap_or_else(|e| panic!("{e}")).state,
+            SessionState::Disconnected
+        );
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap_or_else(|e| panic!("{e}"))
+                .count(),
+            0
+        );
+    }
+
+    /// Runs one simulated capture whose START fails as `failure` describes,
+    /// then unwinds it the way the worker does.
+    fn run_failing_start(
+        session: &SessionController,
+        output_dir: &Path,
+        failure: StartFailure,
+    ) -> (Result<(), SessionError>, FailingStart) {
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        begin_simulated_session(session, &profile, RecordingDuration::UntilStopped);
+        let inner = SimulatorIo::new(&profile, RecordingDuration::UntilStopped)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut transport = FailingStart::new(inner, session.cancel.clone(), failure);
+        let result = session.capture_transport(
+            &mut transport,
+            simulator_request(&profile, RecordingDuration::UntilStopped, output_dir),
+        );
+        session
+            .finish_worker_error(&result)
+            .unwrap_or_else(|e| panic!("{e}"));
+        (result, transport)
+    }
+
+    fn stop_follows_start(received: &[MessageType]) -> bool {
+        received
+            .iter()
+            .position(|message| *message == MessageType::Start)
+            .is_some_and(|start| received[start + 1..].contains(&MessageType::Stop))
+    }
+
+    fn directory_entries(path: &Path) -> Vec<String> {
+        fs::read_dir(path)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_rejected_start_sends_stop_and_removes_the_empty_recording() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        let (result, transport) =
+            run_failing_start(&session, dir.path(), StartFailure::FirmwareError);
+        let error = result
+            .err()
+            .unwrap_or_else(|| panic!("a rejected START must fail the session"));
+        assert!(matches!(error, SessionError::Protocol(_)), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("firmware ERROR while waiting for START status"),
+            "{error}"
+        );
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        assert!(status.last_error.is_some());
+        // START may have reached the board, so a STOP follows it.
+        assert!(
+            stop_follows_start(&transport.received),
+            "{:?}",
+            transport.received
+        );
+        // The header-only recording is removed; nothing else was written.
+        assert!(
+            directory_entries(dir.path()).is_empty(),
+            "{:?}",
+            directory_entries(dir.path())
+        );
+    }
+
+    #[test]
+    fn cancelling_while_waiting_for_start_stops_quietly_and_leaves_no_files() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        let (result, transport) =
+            run_failing_start(&session, dir.path(), StartFailure::CancelDuringWait);
+        assert!(matches!(result, Err(SessionError::Cancelled)), "{result:?}");
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Disconnected);
+        assert!(status.last_error.is_none());
+        assert!(
+            stop_follows_start(&transport.received),
+            "{:?}",
+            transport.received
+        );
+        assert!(
+            directory_entries(dir.path()).is_empty(),
+            "{:?}",
+            directory_entries(dir.path())
+        );
+    }
+
+    #[test]
+    fn a_failed_final_flush_keeps_the_part_file_skips_the_csv_and_faults() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = controller_with(InjectedStorage {
+            fail_finish: true,
+            ..InjectedStorage::default()
+        });
+        let (result, transport) = run_simulated_capture(&session, dir.path(), 50, |_| {});
+        session
+            .finish_worker_error(&result)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(result, Err(SessionError::Save(_))), "{result:?}");
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("could not be written to disk")));
+        assert!(transport.count(MessageType::Stop) >= 2);
+        assert!(!transport.inner.active);
+        let summary = status
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"));
+        assert_eq!(summary.stop_reason, StopReason::User);
+        assert_eq!(summary.completion_status, "incomplete");
+        // A file whose final flush failed keeps its `.part` name and is not
+        // exported, so it is never mistaken for a finished recording.
+        assert!(
+            summary.bmeg_path.ends_with(".bmeg.part"),
+            "{}",
+            summary.bmeg_path
+        );
+        assert!(Path::new(&summary.bmeg_path).exists());
+        assert!(!Path::new(summary.bmeg_path.trim_end_matches(".part")).exists());
+        assert!(summary.csv_path.is_empty());
+        assert!(summary
+            .csv_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("skipped")));
+        assert!(summary
+            .finalize_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("flush")));
+        let metadata = read_metadata(&summary.metadata_path);
+        assert!(metadata.bmeg_filename.ends_with(".bmeg.part"));
+        assert_eq!(metadata.completion_status, "incomplete");
+        assert_eq!(metadata.csv_filename, None);
+        assert!(metadata
+            .csv_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("skipped")));
+        assert!(!directory_entries(dir.path())
+            .iter()
+            .any(|name| name.ends_with(".csv") || name.ends_with(".csv.part")));
+    }
+
+    #[test]
+    fn failed_metadata_writes_are_reported_and_leave_no_sidecar() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = controller_with(InjectedStorage {
+            fail_metadata: MetadataFailure::Every,
+            ..InjectedStorage::default()
+        });
+        let (result, _transport) = run_simulated_capture(&session, dir.path(), 50, |_| {});
+        session
+            .finish_worker_error(&result)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(result, Err(SessionError::Save(_))), "{result:?}");
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("metadata file")));
+        let summary = status
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"));
+        assert!(summary.metadata_path.is_empty());
+        assert!(summary
+            .finalize_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("metadata")));
+        // The raw recording and the CSV were still saved.
+        assert!(
+            summary.bmeg_path.ends_with(".bmeg"),
+            "{}",
+            summary.bmeg_path
+        );
+        assert_eq!(bmeg_record_count(&summary.bmeg_path), summary.samples);
+        assert_eq!(csv_line_count(&summary.csv_path), summary.samples + 1);
+        assert!(!directory_entries(dir.path())
+            .iter()
+            .any(|name| name.contains(".metadata.json")));
+    }
+
+    #[test]
+    fn a_failed_metadata_rewrite_keeps_the_first_sidecar_and_is_summarized() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = controller_with(InjectedStorage {
+            fail_metadata: MetadataFailure::AfterFirst,
+            ..InjectedStorage::default()
+        });
+        let (result, _transport) = run_simulated_capture(&session, dir.path(), 50, |_| {});
+        session
+            .finish_worker_error(&result)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(result, Err(SessionError::Save(_))), "{result:?}");
+        let status = session.status().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status.state, SessionState::Faulted);
+        let summary = status
+            .last_summary
+            .unwrap_or_else(|| panic!("missing summary"));
+        // The sidecar written before the CSV export survives.
+        assert!(!summary.metadata_path.is_empty());
+        let metadata = read_metadata(&summary.metadata_path);
+        assert_eq!(metadata.total_samples, summary.samples);
+        assert_eq!(metadata.csv_filename, None);
+        // The summary reports the failure the sidecar itself cannot record.
+        assert!(
+            summary
+                .finalize_error
+                .as_deref()
+                .is_some_and(|detail| detail.contains("CSV result could not be added")),
+            "{:?}",
+            summary.finalize_error
+        );
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("metadata file")));
+        assert_eq!(csv_line_count(&summary.csv_path), summary.samples + 1);
+    }
+
+    #[test]
+    fn storage_estimate_uses_the_bmeg_layout_and_the_guard_csv_estimate() {
+        let calibration = RecordingCalibration::default();
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        let rate = u64::from(profile.profile.acquisition.sample_rate_hz);
+        let fields = profile.profile.acquisition.record_field_names().len();
+        let record_bytes = synchronized_record_bytes(fields) as u64;
+        let row_bytes = estimated_csv_row_bytes(&profile, &calibration);
+        let timed = estimate_recording_storage(
+            &profile,
+            &calibration,
+            &RecordingDuration::Timed { seconds: 60 },
+        );
+        assert_eq!(timed.records_per_second, rate);
+        assert_eq!(timed.bmeg_bytes_per_second, rate * record_bytes);
+        assert_eq!(timed.csv_bytes_per_second, rate * row_bytes);
+        let records = rate * 60;
+        let projected = records * record_bytes
+            + BMEG_HEADER_RESERVE_BYTES
+            + projected_csv_bytes(records, row_bytes);
+        assert_eq!(timed.projected_bytes, Some(projected));
+        assert_eq!(
+            timed.required_free_bytes,
+            Some(projected + DISK_CRITICAL_BYTES)
+        );
+        assert_eq!(timed.critical_free_bytes, DISK_CRITICAL_BYTES);
+
+        let open =
+            estimate_recording_storage(&profile, &calibration, &RecordingDuration::UntilStopped);
+        assert_eq!(open.projected_bytes, None);
+        assert_eq!(open.required_free_bytes, None);
+        assert_eq!(open.csv_bytes_per_second, timed.csv_bytes_per_second);
+
+        // A pulse-ox record is one RED/DARK 1/IR/DARK 2 cycle of four dwells.
+        let mut pulseox = built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_pulseox")
+            .unwrap_or_else(|| panic!("missing pulse-ox profile"));
+        pulseox.acquisition.state_dwell_us = Some(1_000);
+        let pulseox = pulseox.snapshot(false);
+        let estimate = estimate_recording_storage(
+            &pulseox,
+            &calibration,
+            &RecordingDuration::Timed { seconds: 10 },
+        );
+        assert_eq!(estimate.records_per_second, 250);
+        assert_eq!(
+            estimate.bmeg_bytes_per_second,
+            250 * synchronized_record_bytes(8) as u64
+        );
+    }
+
+    #[test]
+    fn storage_estimate_is_not_smaller_than_a_real_recording() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        let (result, _transport) = run_simulated_capture(&session, dir.path(), 200, |_| {});
+        result.unwrap_or_else(|e| panic!("{e}"));
+        let summary = last_summary(&session);
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        let calibration = RecordingCalibration::default();
+        let fields = profile.profile.acquisition.record_field_names().len();
+        let file_size = |path: &str| {
+            fs::metadata(path)
+                .unwrap_or_else(|e| panic!("{path}: {e}"))
+                .len()
+        };
+        assert!(
+            file_size(&summary.bmeg_path)
+                <= summary.samples * synchronized_record_bytes(fields) as u64
+                    + BMEG_HEADER_RESERVE_BYTES
+        );
+        assert!(
+            file_size(&summary.csv_path)
+                <= projected_csv_bytes(
+                    summary.samples,
+                    estimated_csv_row_bytes(&profile, &calibration)
+                )
+        );
     }
 }

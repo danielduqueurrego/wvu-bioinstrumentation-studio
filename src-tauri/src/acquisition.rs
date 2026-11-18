@@ -123,6 +123,11 @@ use std::{
 pub enum AcquisitionState {
     Idle,
     Configured,
+    /// START has been (or is about to be) sent. Nothing is recorded until the
+    /// firmware's acquiring STATUS arrives, because the firmware emits that
+    /// STATUS before any batch of the new run; anything earlier belongs to a
+    /// previous run.
+    Starting,
     Running,
     Stopping,
     Disconnected,
@@ -144,6 +149,13 @@ pub struct AcquisitionSnapshot {
     /// putting host timing into the protocol model.
     pub pong_count: u64,
     pub status_count: u64,
+    /// CONFIG_ACK frames received. Capture waits for this to increase past a
+    /// baseline taken before CONFIGURE, so a stale acknowledgement cannot
+    /// satisfy a new command.
+    pub config_ack_count: u64,
+    /// The `acquiring` flag (payload byte 0) of the most recent STATUS frame.
+    /// STOP is confirmed only by a STATUS newer than STOP with this false.
+    pub last_status_acquiring: Option<bool>,
     /// The controlled firmware sends this when it deliberately leaves its
     /// acquisition state (for example, after its host-command watchdog).
     /// Capture owns the policy for turning it into a terminal session fault.
@@ -233,6 +245,8 @@ pub struct AcquisitionController {
     status_seen: bool,
     pong_count: u64,
     status_count: u64,
+    config_ack_count: u64,
+    last_status_acquiring: Option<bool>,
     firmware_error_code: Option<u8>,
     firmware_error_count: u64,
     firmware_error_payload: Option<Vec<u8>>,
@@ -242,6 +256,18 @@ pub struct AcquisitionController {
     digital_output_mask: Option<u8>,
     pulse_state_intervals_outside_tolerance: [u32; 4],
     pulse_state_maximum_error_us: [u32; 4],
+    /// True only after a terminal (acquiring=0) extended STATUS of this run
+    /// was parsed. The START STATUS carries zeroed per-phase counters, so
+    /// without the terminal one the per-phase checks are unknown, not zero.
+    final_phase_timing_received: bool,
+    /// Synchronized fields per record configured for this capture. A batch
+    /// with a different channel count is counted as invalid instead of being
+    /// handed to the raw writer, which would reject the record shape.
+    expected_field_count: Option<usize>,
+    /// Frames the host rejected after a valid CRC (unparseable batch payload,
+    /// non-increasing timestamp, wrong field count). Kept separately because
+    /// `invalid_frames` is refreshed from the parser after every read.
+    rejected_frames: u64,
 }
 impl AcquisitionController {
     pub fn new(sender: SyncSender<SynchronizedRecord>) -> Self {
@@ -260,6 +286,8 @@ impl AcquisitionController {
             status_seen: false,
             pong_count: 0,
             status_count: 0,
+            config_ack_count: 0,
+            last_status_acquiring: None,
             firmware_error_code: None,
             firmware_error_count: 0,
             firmware_error_payload: None,
@@ -269,6 +297,9 @@ impl AcquisitionController {
             digital_output_mask: None,
             pulse_state_intervals_outside_tolerance: [0; 4],
             pulse_state_maximum_error_us: [0; 4],
+            final_phase_timing_received: false,
+            expected_field_count: None,
+            rejected_frames: 0,
         }
     }
     pub fn configure(&mut self) -> Result<(), &'static str> {
@@ -278,12 +309,29 @@ impl AcquisitionController {
         self.state = AcquisitionState::Configured;
         Ok(())
     }
+    /// Records immediately. Used by offline simulations that have no START
+    /// acknowledgement; a hardware capture uses `arm_start` instead.
     pub fn start(&mut self) -> Result<(), &'static str> {
         if self.state != AcquisitionState::Configured {
             return Err("acquisition must be configured before start");
         }
         self.state = AcquisitionState::Running;
         Ok(())
+    }
+    /// Prepares for START without recording yet. The controller enters
+    /// `Running` only when a STATUS reporting `acquiring=1` arrives, and then
+    /// resets the sample-sequence baseline the firmware also resets at START.
+    /// Batches, STATUS counters, and per-phase checks seen earlier are not part
+    /// of the new recording.
+    pub fn arm_start(&mut self) -> Result<(), &'static str> {
+        if self.state != AcquisitionState::Configured {
+            return Err("acquisition must be configured before start");
+        }
+        self.state = AcquisitionState::Starting;
+        Ok(())
+    }
+    pub fn set_expected_field_count(&mut self, field_count: usize) {
+        self.expected_field_count = Some(field_count);
     }
     pub fn stop(&mut self) {
         if self.state == AcquisitionState::Running {
@@ -296,7 +344,8 @@ impl AcquisitionController {
             self.ingest_frame(frame);
         }
         self.monitor.counters.crc_failures = self.parser.stats.crc_failures;
-        self.monitor.counters.invalid_frames = self.parser.stats.invalid_frames;
+        self.monitor.counters.invalid_frames =
+            self.parser.stats.invalid_frames + self.rejected_frames;
         self.monitor.counters.unsupported_versions = self.parser.stats.unsupported_versions;
     }
     fn ingest_frame(&mut self, frame: Frame) {
@@ -325,7 +374,10 @@ impl AcquisitionController {
                 self.capabilities_seen = true;
                 self.firmware_capabilities = FirmwareCapabilities::from_payload(&frame.payload);
             }
-            MessageType::ConfigAck => self.config_ack_seen = true,
+            MessageType::ConfigAck => {
+                self.config_ack_seen = true;
+                self.config_ack_count += 1;
+            }
             MessageType::Pong => {
                 self.pong_seen = true;
                 self.pong_count += 1;
@@ -333,34 +385,52 @@ impl AcquisitionController {
             MessageType::Status => {
                 self.status_seen = true;
                 self.status_count += 1;
+                let acquiring = frame.payload.first().map(|flag| *flag != 0);
+                self.last_status_acquiring = acquiring;
+                // The output mask always reflects the board's latest report,
+                // including a stale one, because it describes physical pins.
                 if frame.payload.len() >= 2 {
                     self.digital_output_mask = Some(frame.payload[1] & 0x07);
                 }
-                if frame.payload.len() >= 6 {
-                    self.monitor
-                        .observe_firmware_queue_overflows(u32::from_le_bytes([
-                            frame.payload[2],
-                            frame.payload[3],
-                            frame.payload[4],
-                            frame.payload[5],
-                        ]));
+                if self.state == AcquisitionState::Starting && acquiring == Some(true) {
+                    // The firmware resets its record sequence and overflow
+                    // counter at START and sends this STATUS before any batch
+                    // of the new run.
+                    self.monitor.reset_sample_baseline();
+                    self.final_phase_timing_received = false;
+                    self.state = AcquisitionState::Running;
                 }
-                if frame.payload.len() >= 38 {
-                    for state in 0..4 {
-                        let violations = 6 + state * 4;
-                        let maximum_error = 22 + state * 4;
-                        self.pulse_state_intervals_outside_tolerance[state] = u32::from_le_bytes([
-                            frame.payload[violations],
-                            frame.payload[violations + 1],
-                            frame.payload[violations + 2],
-                            frame.payload[violations + 3],
-                        ]);
-                        self.pulse_state_maximum_error_us[state] = u32::from_le_bytes([
-                            frame.payload[maximum_error],
-                            frame.payload[maximum_error + 1],
-                            frame.payload[maximum_error + 2],
-                            frame.payload[maximum_error + 3],
-                        ]);
+                // Counters from a STATUS of a previous run are not this
+                // recording's integrity or timing evidence.
+                if self.state == AcquisitionState::Running {
+                    if frame.payload.len() >= 6 {
+                        self.monitor
+                            .observe_firmware_queue_overflows(u32::from_le_bytes([
+                                frame.payload[2],
+                                frame.payload[3],
+                                frame.payload[4],
+                                frame.payload[5],
+                            ]));
+                    }
+                    if frame.payload.len() >= 38 {
+                        for state in 0..4 {
+                            let violations = 6 + state * 4;
+                            let maximum_error = 22 + state * 4;
+                            self.pulse_state_intervals_outside_tolerance[state] =
+                                u32::from_le_bytes([
+                                    frame.payload[violations],
+                                    frame.payload[violations + 1],
+                                    frame.payload[violations + 2],
+                                    frame.payload[violations + 3],
+                                ]);
+                            self.pulse_state_maximum_error_us[state] = u32::from_le_bytes([
+                                frame.payload[maximum_error],
+                                frame.payload[maximum_error + 1],
+                                frame.payload[maximum_error + 2],
+                                frame.payload[maximum_error + 3],
+                            ]);
+                        }
+                        self.final_phase_timing_received = acquiring == Some(false);
                     }
                 }
             }
@@ -375,9 +445,22 @@ impl AcquisitionController {
             return;
         }
         let Ok(batch) = SampleBatch::from_payload(&frame.payload) else {
-            self.monitor.counters.invalid_frames += 1;
+            self.rejected_frames += 1;
             return;
         };
+        if self.state != AcquisitionState::Running {
+            // A batch before the START acknowledgement belongs to a previous
+            // run (for example one that ended without STOP). It is neither
+            // recorded nor allowed to seed this recording's sequence checks.
+            return;
+        }
+        if self
+            .expected_field_count
+            .is_some_and(|expected| expected != usize::from(batch.channel_count))
+        {
+            self.rejected_frames += 1;
+            return;
+        }
         let count = batch.samples.len() / usize::from(batch.channel_count);
         self.monitor.observe_samples(
             batch.first_sample_sequence,
@@ -385,9 +468,6 @@ impl AcquisitionController {
             batch.status_flags,
             batch.acquisition_queue_overflows,
         );
-        if self.state != AcquisitionState::Running {
-            return;
-        }
         for index in 0..count {
             let first = index * usize::from(batch.channel_count);
             let record = SynchronizedRecord {
@@ -397,15 +477,16 @@ impl AcquisitionController {
                 counts: batch.samples[first..first + usize::from(batch.channel_count)].to_vec(),
             };
             if !self.timing.accepts(record.timestamp_us) {
-                self.monitor.counters.invalid_frames += 1;
+                self.rejected_frames += 1;
                 continue;
             }
-            match self.sender.try_send(record.clone()) {
+            let timestamp_us = record.timestamp_us;
+            let first_counts = record.counts.first().copied();
+            match self.sender.try_send(record) {
                 Ok(()) => {
                     self.sample_count += 1;
-                    self.timing
-                        .observe(record.timestamp_us, batch.sample_period_us);
-                    self.last_counts = record.counts.first().copied();
+                    self.timing.observe(timestamp_us, batch.sample_period_us);
+                    self.last_counts = first_counts;
                 }
                 Err(TrySendError::Full(_)) => self.monitor.counters.host_channel_overflows += 1,
                 Err(TrySendError::Disconnected(_)) => {
@@ -429,6 +510,8 @@ impl AcquisitionController {
             status_seen: self.status_seen,
             pong_count: self.pong_count,
             status_count: self.status_count,
+            config_ack_count: self.config_ack_count,
+            last_status_acquiring: self.last_status_acquiring,
             firmware_error_code: self.firmware_error_code,
             firmware_error_count: self.firmware_error_count,
             firmware_error_payload: self.firmware_error_payload.clone(),
@@ -440,16 +523,20 @@ impl AcquisitionController {
         }
     }
 
+    /// Per-phase pulse-ox checks are reported only when the terminal STATUS
+    /// of this run was received. Otherwise (fault, disconnect, simulator) they
+    /// are `None`, meaning unavailable, rather than a false claim of zero.
     pub fn timing_diagnostics(
         &self,
         requested_rate_hz: u32,
         include_pulse_state_timing: bool,
     ) -> AcquisitionTimingDiagnostics {
+        let per_phase = include_pulse_state_timing && self.final_phase_timing_received;
         self.timing.diagnostics(
             requested_rate_hz,
             self.monitor.counters.firmware_overflows,
-            include_pulse_state_timing.then_some(self.pulse_state_intervals_outside_tolerance),
-            include_pulse_state_timing.then_some(self.pulse_state_maximum_error_us),
+            per_phase.then_some(self.pulse_state_intervals_outside_tolerance),
+            per_phase.then_some(self.pulse_state_maximum_error_us),
         )
     }
 }
@@ -627,30 +714,82 @@ mod tests {
         assert_eq!(diagnostics.intervals_outside_tolerance, 0);
     }
 
+    fn encoded(message_type: MessageType, sequence: u32, payload: Vec<u8>) -> Vec<u8> {
+        crate::protocol::encode_frame(&Frame {
+            message_type,
+            flags: 0,
+            sequence,
+            payload,
+        })
+        .unwrap_or_else(|error| panic!("{error:?}"))
+    }
+
+    fn extended_status(
+        acquiring: u8,
+        mask: u8,
+        overflows: u32,
+        violations: [u32; 4],
+        maximum_errors: [u32; 4],
+    ) -> Vec<u8> {
+        let mut payload = vec![0; 38];
+        payload[0] = acquiring;
+        payload[1] = mask;
+        payload[2..6].copy_from_slice(&overflows.to_le_bytes());
+        for (state, value) in violations.into_iter().enumerate() {
+            let offset = 6 + state * 4;
+            payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (state, value) in maximum_errors.into_iter().enumerate() {
+            let offset = 22 + state * 4;
+            payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        payload
+    }
+
+    fn batch_payload(first: u32, timestamps: Vec<u64>, channels: u8) -> Vec<u8> {
+        let samples = (0..timestamps.len() * usize::from(channels))
+            .map(|value| value as u16)
+            .collect();
+        SampleBatch {
+            first_sample_sequence: first,
+            sample_period_us: 1_000,
+            channel_count: channels,
+            timestamps_us: timestamps,
+            samples,
+            status_flags: crate::protocol::SAMPLE_STATUS_ACQUIRING,
+            acquisition_queue_overflows: Some(0),
+        }
+        .to_payload()
+        .unwrap_or_else(|error| panic!("{error:?}"))
+    }
+
     #[test]
     fn extended_status_preserves_per_phase_timing_diagnostics() {
         let (tx, _rx) = sync_channel(4);
         let mut controller = AcquisitionController::new(tx);
-        let mut payload = vec![0; 38];
-        payload[0] = 1;
-        payload[1] = 0x02;
-        payload[2..6].copy_from_slice(&3u32.to_le_bytes());
-        for (state, value) in [0u32, 1, 0, 2].into_iter().enumerate() {
-            let offset = 6 + state * 4;
-            payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
-        for (state, value) in [12u32, 61, 8, 74].into_iter().enumerate() {
-            let offset = 22 + state * 4;
-            payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
-        let status = Frame {
-            message_type: MessageType::Status,
-            flags: 0,
-            sequence: 0,
-            payload,
-        };
-        controller.ingest_bytes(&crate::protocol::encode_frame(&status).unwrap_or_default());
+        controller
+            .configure()
+            .unwrap_or_else(|error| panic!("{error}"));
+        controller
+            .arm_start()
+            .unwrap_or_else(|error| panic!("{error}"));
+        // The START STATUS carries zeroed per-phase counters; on its own it
+        // must not be reported as "zero violations".
+        controller.ingest_bytes(&encoded(
+            MessageType::Status,
+            0,
+            extended_status(1, 0x02, 0, [0; 4], [0; 4]),
+        ));
+        assert_eq!(controller.state, AcquisitionState::Running);
+        let before_stop = controller.timing_diagnostics(250, true);
+        assert_eq!(before_stop.pulse_state_intervals_outside_tolerance, None);
+        assert_eq!(before_stop.pulse_state_maximum_error_us, None);
 
+        controller.ingest_bytes(&encoded(
+            MessageType::Status,
+            1,
+            extended_status(0, 0, 3, [0, 1, 0, 2], [12, 61, 8, 74]),
+        ));
         let timing = controller.timing_diagnostics(250, true);
         assert_eq!(timing.acquisition_queue_overflows, 3);
         assert_eq!(
@@ -658,9 +797,114 @@ mod tests {
             Some([0, 1, 0, 2])
         );
         assert_eq!(timing.pulse_state_maximum_error_us, Some([12, 61, 8, 74]));
+        assert_eq!(controller.snapshot().last_status_acquiring, Some(false));
         let analog_timing = controller.timing_diagnostics(1_000, false);
         assert_eq!(analog_timing.pulse_state_intervals_outside_tolerance, None);
         assert_eq!(analog_timing.pulse_state_maximum_error_us, None);
+    }
+
+    #[test]
+    fn frames_before_the_start_status_belong_to_a_previous_run() {
+        let (tx, rx) = sync_channel(64);
+        let mut controller = AcquisitionController::new(tx);
+        controller.set_expected_field_count(1);
+        controller
+            .configure()
+            .unwrap_or_else(|error| panic!("{error}"));
+        // A terminal STATUS and a batch left over from a run that ended without STOP.
+        controller.ingest_bytes(&encoded(
+            MessageType::Status,
+            40,
+            extended_status(0, 0x01, 9, [5; 4], [500; 4]),
+        ));
+        controller.ingest_bytes(&encoded(
+            MessageType::SampleBatch,
+            41,
+            batch_payload(900, vec![900_000, 901_000], 1),
+        ));
+        controller
+            .arm_start()
+            .unwrap_or_else(|error| panic!("{error}"));
+        controller.ingest_bytes(&encoded(
+            MessageType::SampleBatch,
+            42,
+            batch_payload(902, vec![902_000, 903_000], 1),
+        ));
+        assert_eq!(controller.state, AcquisitionState::Starting);
+        assert_eq!(rx.try_iter().count(), 0);
+
+        controller.ingest_bytes(&encoded(
+            MessageType::Status,
+            43,
+            extended_status(1, 0, 0, [0; 4], [0; 4]),
+        ));
+        assert_eq!(controller.state, AcquisitionState::Running);
+        controller.ingest_bytes(&encoded(
+            MessageType::SampleBatch,
+            44,
+            batch_payload(0, vec![1_000, 2_000, 3_000], 1),
+        ));
+        let records = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.sample_count, 3);
+        assert_eq!(snapshot.integrity.missing_sample_sequences, 0);
+        assert_eq!(snapshot.integrity.out_of_order_sample_sequences, 0);
+        assert_eq!(snapshot.integrity.duplicate_sample_sequences, 0);
+        assert_eq!(snapshot.integrity.firmware_overflows, 0);
+        assert_eq!(snapshot.integrity.invalid_frames, 0);
+        // The stale terminal STATUS cannot stand in for this run's checks.
+        assert_eq!(
+            controller
+                .timing_diagnostics(250, true)
+                .pulse_state_intervals_outside_tolerance,
+            None
+        );
+    }
+
+    #[test]
+    fn a_batch_with_the_wrong_field_count_is_invalid_instead_of_recorded() {
+        let (tx, rx) = sync_channel(64);
+        let mut controller = AcquisitionController::new(tx);
+        controller.set_expected_field_count(2);
+        controller
+            .configure()
+            .unwrap_or_else(|error| panic!("{error}"));
+        controller.start().unwrap_or_else(|error| panic!("{error}"));
+        controller.ingest_bytes(&encoded(
+            MessageType::SampleBatch,
+            0,
+            batch_payload(0, vec![1_000, 2_000], 3),
+        ));
+        assert_eq!(rx.try_iter().count(), 0);
+        assert_eq!(controller.snapshot().integrity.invalid_frames, 1);
+        controller.ingest_bytes(&encoded(
+            MessageType::SampleBatch,
+            1,
+            batch_payload(0, vec![1_000, 2_000], 2),
+        ));
+        assert_eq!(rx.try_iter().count(), 2);
+    }
+
+    #[test]
+    fn config_ack_and_status_frames_are_counted_for_command_baselines() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        controller.ingest_bytes(&encoded(MessageType::ConfigAck, 0, vec![]));
+        controller.ingest_bytes(&encoded(MessageType::Status, 1, vec![1, 0]));
+        controller.ingest_bytes(&encoded(MessageType::Status, 2, vec![0, 0]));
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.config_ack_count, 1);
+        assert_eq!(snapshot.status_count, 2);
+        assert_eq!(snapshot.last_status_acquiring, Some(false));
+        // Not armed: an acquiring STATUS alone never starts recording.
+        assert_eq!(snapshot.state, AcquisitionState::Idle);
     }
 
     #[test]

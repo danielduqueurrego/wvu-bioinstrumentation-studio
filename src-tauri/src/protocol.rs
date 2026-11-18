@@ -392,6 +392,15 @@ impl IntegrityMonitor {
     pub fn observe_firmware_queue_overflows(&mut self, current: u32) {
         self.counters.firmware_overflows += self.queue_overflow_delta(current);
     }
+
+    /// Forgets the sample-sequence and cumulative-overflow baselines. The
+    /// firmware restarts both at START, so a batch left over from a previous
+    /// run must not make the first record of a new recording look missing,
+    /// duplicated, or out of order. Packet-sequence tracking is unaffected.
+    pub fn reset_sample_baseline(&mut self) {
+        self.sample_next = None;
+        self.firmware_queue_overflows = None;
+    }
     fn observe_sequence(&mut self, sequence: u32, sample: bool) {
         let next = &mut self.packet_next;
         if let Some(expected) = *next {

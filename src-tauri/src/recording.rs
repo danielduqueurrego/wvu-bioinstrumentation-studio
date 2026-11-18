@@ -4,8 +4,8 @@
 //! `u32 sequence, u64 timestamp_us, u16 status_flags, u16[field_count] counts`.
 use crate::{
     calibration::{
-        apply_linear, counts_to_volts, mpxv_kpa, mpxv_mmhg, CalibrationType, RecordingCalibration,
-        DEFAULT_ADC_REFERENCE_V, DEFAULT_MPXV_SUPPLY_V,
+        apply_linear, counts_to_volts, mpxv_kpa, mpxv_mmhg, CalibrationPreset, CalibrationType,
+        RecordingCalibration, DEFAULT_ADC_REFERENCE_V, DEFAULT_MPXV_SUPPLY_V,
     },
     profiles::ProfileSnapshot,
     protocol::IntegrityCounters,
@@ -15,11 +15,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, BufWriter, IntoInnerError, Read, Write},
     path::Path,
 };
 pub const BMEG_MAGIC: &[u8; 8] = b"BMEGREC1";
 pub const BMEG_RECORD_BYTES: usize = 14;
+/// Synchronized records carry at most eight u16 fields (pulse ox: TX/RX x
+/// RED, DARK 1, IR, DARK 2). The bound keeps one record encodable on the stack.
+pub const MAX_SYNCHRONIZED_FIELDS: usize = 8;
+const SYNCHRONIZED_RECORD_PREFIX_BYTES: usize = 14;
 
 /// A user-selected recording duration.  The tagged representation makes an
 /// indefinite recording unambiguous at the Tauri boundary: it can never be
@@ -172,6 +176,28 @@ pub struct RecordingMetadata {
     /// remain ADC counts regardless of whether any of these conversions are selected.
     #[serde(default)]
     pub calibration: Option<RecordingCalibration>,
+    /// The raw record layout this file was written with. Readers trust it over
+    /// any profile-derived guess; files written before it existed omit it and
+    /// fall back to `protocol_version`/profile detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_layout: Option<RecordLayout>,
+    /// Host time when the recording session was prepared (before the
+    /// handshake). `utc_start`/`local_start` are stamped immediately before
+    /// START so they describe acquisition, not connection setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_opened_utc: Option<DateTime<Utc>>,
+    /// Host time at which the firmware acknowledged START. Only the final
+    /// sidecar carries it because the BMEG header is written before START.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquisition_started_utc: Option<DateTime<Utc>>,
+    /// Why the derived CSV is absent. The raw BMEG remains authoritative and
+    /// a CSV failure never removes the BMEG or this sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csv_error: Option<String>,
+    /// Problems while flushing, renaming, or writing recording files. The raw
+    /// file named by `bmeg_filename` is kept even when this is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalize_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -258,8 +284,11 @@ pub struct SynchronizedRecord {
     pub counts: Vec<u16>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecordLayout {
+/// Raw record encoding. It is written into every new BMEG header so a reader
+/// never has to infer it from a profile's minimum protocol version.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecordLayout {
     Legacy,
     Synchronized { field_count: usize },
 }
@@ -295,7 +324,7 @@ impl BmegWriter {
         metadata: &RecordingMetadata,
         field_count: usize,
     ) -> Result<Self, RecordingError> {
-        if field_count == 0 || field_count > 8 {
+        if field_count == 0 || field_count > MAX_SYNCHRONIZED_FIELDS {
             return Err(RecordingError::InvalidRecordShape);
         }
         Self::create_with_layout(path, metadata, RecordLayout::Synchronized { field_count })
@@ -306,7 +335,7 @@ impl BmegWriter {
         metadata: &RecordingMetadata,
         layout: RecordLayout,
     ) -> Result<Self, RecordingError> {
-        let header = serde_json::to_vec(metadata)?;
+        let header = encode_header(metadata, layout)?;
         let header_len = u16::try_from(header.len()).map_err(|_| RecordingError::HeaderTooLarge)?;
         let mut writer = BufWriter::new(File::create(path)?);
         writer.write_all(BMEG_MAGIC)?;
@@ -318,13 +347,19 @@ impl BmegWriter {
             layout,
         })
     }
+
+    /// Each record is handed to the buffer in one `write_all`. If the medium
+    /// fails, the buffer therefore never holds a partial record that a later
+    /// successful flush would append to the file out of alignment.
     pub fn write(&mut self, sample: RawSample) -> Result<(), RecordingError> {
         if self.layout != RecordLayout::Legacy {
             return Err(RecordingError::InvalidRecordShape);
         }
-        self.writer.write_all(&sample.sequence.to_le_bytes())?;
-        self.writer.write_all(&sample.timestamp_us.to_le_bytes())?;
-        self.writer.write_all(&sample.counts.to_le_bytes())?;
+        let mut bytes = [0u8; BMEG_RECORD_BYTES];
+        bytes[0..4].copy_from_slice(&sample.sequence.to_le_bytes());
+        bytes[4..12].copy_from_slice(&sample.timestamp_us.to_le_bytes());
+        bytes[12..14].copy_from_slice(&sample.counts.to_le_bytes());
+        self.writer.write_all(&bytes)?;
         self.records += 1;
         Ok(())
     }
@@ -333,30 +368,96 @@ impl BmegWriter {
         let RecordLayout::Synchronized { field_count } = self.layout else {
             return Err(RecordingError::InvalidRecordShape);
         };
-        if record.counts.len() != field_count {
+        if record.counts.len() != field_count || field_count > MAX_SYNCHRONIZED_FIELDS {
             return Err(RecordingError::InvalidRecordShape);
         }
-        self.writer.write_all(&record.sequence.to_le_bytes())?;
-        self.writer.write_all(&record.timestamp_us.to_le_bytes())?;
-        self.writer.write_all(&record.status_flags.to_le_bytes())?;
-        for counts in &record.counts {
-            self.writer.write_all(&counts.to_le_bytes())?;
+        let mut bytes = [0u8; SYNCHRONIZED_RECORD_PREFIX_BYTES + 2 * MAX_SYNCHRONIZED_FIELDS];
+        bytes[0..4].copy_from_slice(&record.sequence.to_le_bytes());
+        bytes[4..12].copy_from_slice(&record.timestamp_us.to_le_bytes());
+        bytes[12..14].copy_from_slice(&record.status_flags.to_le_bytes());
+        for (index, counts) in record.counts.iter().enumerate() {
+            let offset = SYNCHRONIZED_RECORD_PREFIX_BYTES + index * 2;
+            bytes[offset..offset + 2].copy_from_slice(&counts.to_le_bytes());
         }
+        let length = synchronized_record_bytes(field_count);
+        self.writer.write_all(&bytes[..length])?;
         self.records += 1;
         Ok(())
     }
 
     /// Periodic flushing bounds the amount of validated data held by the OS
     /// buffer during a long recording without retaining samples in memory.
+    /// It deliberately does not fsync: the capture thread also services serial
+    /// I/O, and an fsync on slow USB or cloud-backed media could stall it.
     pub fn flush(&mut self) -> Result<(), RecordingError> {
         self.writer.flush()?;
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<(), RecordingError> {
-        self.writer.flush()?;
+    /// Flushes buffered records and asks the operating system to persist the
+    /// file before it is renamed, so a power loss shortly after the UI reports
+    /// a saved recording cannot leave an empty or truncated BMEG.
+    ///
+    /// A failed flush (data not written) is an error. A failed fsync is not:
+    /// some network, virtual, and cloud-mounted drives reject
+    /// `FlushFileBuffers` even though every byte was written, and treating
+    /// that as data loss would fault recordings that were saved correctly.
+    pub fn finish(self) -> Result<(), RecordingError> {
+        let file = self
+            .writer
+            .into_inner()
+            .map_err(IntoInnerError::into_error)?;
+        sync_best_effort(&file, "bmeg");
         Ok(())
     }
+}
+
+/// Size in bytes of one synchronized BMEG record with `field_count` fields.
+pub const fn synchronized_record_bytes(field_count: usize) -> usize {
+    SYNCHRONIZED_RECORD_PREFIX_BYTES + field_count * 2
+}
+
+/// Asks the operating system to persist `file`. Durability is requested, not
+/// required: the data were already written, so a failure is logged as
+/// `FSYNC_FAILED` and the caller continues.
+pub(crate) fn sync_best_effort(file: &File, label: &str) {
+    if let Err(error) = file.sync_all() {
+        crate::app_log::record(
+            "WARN",
+            &format!(
+                "FSYNC_FAILED file={label} kind={:?} raw_os_error={:?} detail={error}",
+                error.kind(),
+                error.raw_os_error()
+            ),
+        );
+    }
+}
+
+/// Serializes the JSON header exactly as a writer with `layout` would.
+fn encode_header(
+    metadata: &RecordingMetadata,
+    layout: RecordLayout,
+) -> Result<Vec<u8>, RecordingError> {
+    let mut header_metadata = metadata.clone();
+    header_metadata.record_layout = Some(layout);
+    let header = serde_json::to_vec(&header_metadata)?;
+    if header.len() > usize::from(u16::MAX) {
+        return Err(RecordingError::HeaderTooLarge);
+    }
+    Ok(header)
+}
+
+/// Proves that a synchronized recording header fits the 64 KiB BMEG limit.
+/// Capture calls this before the board is configured so an oversized lab
+/// definition or note is reported as such, not as a later connection fault.
+pub fn check_synchronized_header(
+    metadata: &RecordingMetadata,
+    field_count: usize,
+) -> Result<usize, RecordingError> {
+    if field_count == 0 || field_count > MAX_SYNCHRONIZED_FIELDS {
+        return Err(RecordingError::InvalidRecordShape);
+    }
+    encode_header(metadata, RecordLayout::Synchronized { field_count }).map(|header| header.len())
 }
 
 /// Streaming reader for finalized BMEG recordings. It retains just one record.
@@ -378,14 +479,15 @@ impl BmegReader {
         let mut header = vec![0u8; usize::from(u16::from_le_bytes(length))];
         reader.read_exact(&mut header).map_err(map_eof)?;
         let metadata: RecordingMetadata = serde_json::from_slice(&header)?;
-        let layout = metadata
-            .profile_snapshot
-            .as_ref()
-            .filter(|snapshot| snapshot.profile.required_firmware.protocol_minor_min >= 2)
-            .map(|snapshot| RecordLayout::Synchronized {
-                field_count: snapshot.profile.acquisition.record_field_names().len(),
-            })
-            .unwrap_or(RecordLayout::Legacy);
+        let layout = match metadata.record_layout {
+            Some(RecordLayout::Synchronized { field_count })
+                if field_count == 0 || field_count > MAX_SYNCHRONIZED_FIELDS =>
+            {
+                return Err(RecordingError::InvalidRecordShape);
+            }
+            Some(layout) => layout,
+            None => historical_record_layout(&metadata),
+        };
         Ok(Self {
             reader,
             metadata,
@@ -469,6 +571,35 @@ impl BmegReader {
     }
 }
 
+/// Layout detection for files written before `record_layout` existed. The
+/// synchronized writer has recorded protocol 0.2 or later since synchronized
+/// frames were introduced, so `protocol_version` identifies such files even
+/// when their lab declared an older minimum. The previous profile-minimum rule
+/// is kept so every file that was readable before remains readable.
+fn historical_record_layout(metadata: &RecordingMetadata) -> RecordLayout {
+    metadata
+        .profile_snapshot
+        .as_ref()
+        .filter(|snapshot| {
+            snapshot.profile.required_firmware.protocol_minor_min >= 2
+                || protocol_version_is_synchronized(&metadata.protocol_version)
+        })
+        .map(|snapshot| RecordLayout::Synchronized {
+            field_count: snapshot.profile.acquisition.record_field_names().len(),
+        })
+        .unwrap_or(RecordLayout::Legacy)
+}
+
+fn protocol_version_is_synchronized(version: &str) -> bool {
+    let mut parts = version
+        .split('.')
+        .map(|part| part.trim().parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => major > 0 || minor >= 2,
+        _ => false,
+    }
+}
+
 fn map_eof(error: std::io::Error) -> RecordingError {
     if error.kind() == std::io::ErrorKind::UnexpectedEof {
         RecordingError::Truncated
@@ -543,8 +674,24 @@ pub fn export_bmeg_csv(bmeg: &Path, csv: &Path) -> Result<u64, RecordingError> {
         count += 1;
     }
     let _ = first_timestamp; // retained for future host/board latency diagnostics.
-    writer.flush()?;
+    finish_csv(writer)?;
     Ok(count)
+}
+
+/// Flushes an exported CSV and requests an fsync so it is durable before the
+/// caller renames it into place. Only the flush is required to succeed (see
+/// `BmegWriter::finish`).
+fn finish_csv(writer: BufWriter<File>) -> Result<(), RecordingError> {
+    let file = writer.into_inner().map_err(IntoInnerError::into_error)?;
+    sync_best_effort(&file, "csv");
+    Ok(())
+}
+
+/// Loop-invariant export decisions for one simultaneous channel. Computing
+/// them once keeps per-record work to arithmetic and formatting.
+struct ChannelCsvPlan<'a> {
+    preset: Option<&'a CalibrationPreset>,
+    emit_mmhg: bool,
 }
 
 fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, RecordingError> {
@@ -572,25 +719,30 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
         } else {
             DEFAULT_MPXV_SUPPLY_V
         };
+    let adc_bits = input.metadata.adc_bits;
     let mut writer = BufWriter::new(File::create(csv)?);
+    // Per-channel decisions are fixed for the whole file. The column schema
+    // (including the display-unit-dependent mmHg column) is unchanged here;
+    // see the review note D-5 before altering it.
+    let mut channel_plans: Vec<ChannelCsvPlan<'_>> = Vec::new();
     if pulseox {
         writeln!(writer, "cycle_index,t_us,{}", fields.join(","))?;
     } else {
-        let channels = snapshot.profile.acquisition.resolved_channels();
         let mut columns = Vec::new();
-        for channel in &channels {
+        for channel in snapshot.profile.acquisition.resolved_channels() {
             columns.push(channel.csv_name.clone());
             columns.push(voltage_column_name(&channel.csv_name));
-            if let Some(preset) = calibration.for_channel(&channel.id) {
+            let preset = calibration.for_channel(&channel.id);
+            let emit_mmhg = channel.id == "mpxv"
+                || calibration
+                    .channel_units
+                    .get(&channel.id)
+                    .is_some_and(|unit| unit == "mmhg");
+            if let Some(preset) = preset {
                 match preset.calibration_type {
                     CalibrationType::FixedFormula => {
                         columns.push(derived_column_name(&channel.csv_name, "kPa"));
-                        if channel.id == "mpxv"
-                            || calibration
-                                .channel_units
-                                .get(&channel.id)
-                                .is_some_and(|unit| unit == "mmhg")
-                        {
+                        if emit_mmhg {
                             columns.push(derived_column_name(&channel.csv_name, "mmHg"));
                         }
                     }
@@ -599,6 +751,7 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
                     }
                 }
             }
+            channel_plans.push(ChannelCsvPlan { preset, emit_mmhg });
         }
         writeln!(writer, "record_sequence,t_us,{}", columns.join(","))?;
     }
@@ -613,26 +766,20 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
                 write!(writer, ",{counts}")?;
             }
         } else {
-            let channels = snapshot.profile.acquisition.resolved_channels();
-            for (index, counts) in record.counts.iter().copied().enumerate() {
-                let channel = channels
-                    .get(index)
-                    .ok_or(RecordingError::InvalidRecordShape)?;
-                let volts = counts_to_volts(counts, input.metadata.adc_bits, adc_reference_v)
+            if record.counts.len() != channel_plans.len() {
+                return Err(RecordingError::InvalidRecordShape);
+            }
+            for (counts, plan) in record.counts.iter().copied().zip(&channel_plans) {
+                let volts = counts_to_volts(counts, adc_bits, adc_reference_v)
                     .map_err(|error| RecordingError::Csv(error.to_string()))?;
                 write!(writer, ",{counts},{volts:.6}")?;
-                if let Some(preset) = calibration.for_channel(&channel.id) {
+                if let Some(preset) = plan.preset {
                     match preset.calibration_type {
                         CalibrationType::FixedFormula => {
                             let kpa = mpxv_kpa(volts, sensor_supply_v)
                                 .map_err(|error| RecordingError::Csv(error.to_string()))?;
                             write!(writer, ",{kpa:.6}")?;
-                            if channel.id == "mpxv"
-                                || calibration
-                                    .channel_units
-                                    .get(&channel.id)
-                                    .is_some_and(|unit| unit == "mmhg")
-                            {
+                            if plan.emit_mmhg {
                                 let mmhg = mpxv_mmhg(volts, sensor_supply_v)
                                     .map_err(|error| RecordingError::Csv(error.to_string()))?;
                                 write!(writer, ",{mmhg:.6}")?;
@@ -650,7 +797,7 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
         writer.write_all(b"\n")?;
         count += 1;
     }
-    writer.flush()?;
+    finish_csv(writer)?;
     Ok(count)
 }
 
@@ -751,6 +898,11 @@ mod tests {
             validation_context: None,
             markers: Vec::new(),
             calibration: None,
+            record_layout: None,
+            session_opened_utc: None,
+            acquisition_started_utc: None,
+            csv_error: None,
+            finalize_error: None,
         };
         let bmeg = dir.path().join("r.bmeg");
         let mut w = BmegWriter::create(&bmeg, &meta).unwrap_or_else(|e| panic!("{e}"));
@@ -863,6 +1015,11 @@ mod tests {
             validation_context: None,
             markers: Vec::new(),
             calibration: None,
+            record_layout: None,
+            session_opened_utc: None,
+            acquisition_started_utc: None,
+            csv_error: None,
+            finalize_error: None,
         };
         let mut old = serde_json::to_value(metadata).unwrap_or_else(|e| panic!("{e}"));
         let object = old
@@ -943,6 +1100,11 @@ mod tests {
                 label: "baseline".into(),
             }],
             calibration: None,
+            record_layout: None,
+            session_opened_utc: None,
+            acquisition_started_utc: None,
+            csv_error: None,
+            finalize_error: None,
         };
         let bmeg = dir.path().join("profile.bmeg");
         let mut writer =
@@ -1085,6 +1247,180 @@ mod tests {
         assert!(metadata.profile_snapshot.is_none());
     }
 
+    fn layout_test_metadata(profile: Option<ProfileSnapshot>, protocol: &str) -> RecordingMetadata {
+        RecordingMetadata {
+            utc_start: Utc::now(),
+            local_start: Local::now(),
+            board: "Simulator".into(),
+            board_serial: None,
+            com_port: "SIM".into(),
+            fqbn: "simulator".into(),
+            arduino_cli_version: "n/a".into(),
+            uno_r4_core_version: "n/a".into(),
+            firmware_build: 0x0001_0006,
+            protocol_version: protocol.into(),
+            analog_pin: "A0".into(),
+            active_analog_pins: vec!["A0".into()],
+            digital_output_mapping: BTreeMap::new(),
+            adc_bits: 12,
+            requested_sample_rate_hz: 1_000,
+            measured_sample_rate_hz: 0.0,
+            timing_diagnostics: None,
+            total_samples: 1,
+            integrity: IntegrityCounters::default(),
+            app_version: "test".into(),
+            simulator: true,
+            utc_stop: None,
+            local_stop: None,
+            host_elapsed_seconds: None,
+            board_elapsed_seconds: None,
+            recording_status: "active".into(),
+            bmeg_filename: "layout.bmeg".into(),
+            csv_filename: None,
+            notes: "layout".into(),
+            user_recording_note: None,
+            recording_safety: RecordingSafetyContext::default(),
+            project_folder: None,
+            output_folder: None,
+            duration_mode: Some("timed".into()),
+            requested_duration_seconds: Some(10),
+            stop_reason: None,
+            initial_free_disk_bytes: None,
+            final_free_disk_bytes: None,
+            completion_status: "active".into(),
+            profile_snapshot: profile,
+            validation_context: None,
+            markers: Vec::new(),
+            calibration: None,
+            record_layout: None,
+            session_opened_utc: None,
+            acquisition_started_utc: None,
+            csv_error: None,
+            finalize_error: None,
+        }
+    }
+
+    fn ecg_with_protocol_minimum(minor: u8) -> ProfileSnapshot {
+        let mut profile = crate::profiles::built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_ecg")
+            .unwrap_or_else(|| panic!("missing ECG profile"));
+        profile.required_firmware.protocol_minor_min = minor;
+        profile.snapshot(true)
+    }
+
+    #[test]
+    fn explicit_record_layout_reads_a_lab_with_an_old_protocol_minimum() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let metadata = layout_test_metadata(Some(ecg_with_protocol_minimum(1)), "0.4");
+        let bmeg = dir.path().join("old-minimum.bmeg");
+        let mut writer =
+            BmegWriter::create_synchronized(&bmeg, &metadata, 1).unwrap_or_else(|e| panic!("{e}"));
+        for sequence in 0..3u32 {
+            writer
+                .write_record(&SynchronizedRecord {
+                    sequence,
+                    timestamp_us: u64::from(sequence) * 1_000,
+                    status_flags: 1,
+                    counts: vec![2_048 + sequence as u16],
+                })
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        writer.finish().unwrap_or_else(|e| panic!("{e}"));
+        let mut reader = BmegReader::open(&bmeg).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            reader.metadata.record_layout,
+            Some(RecordLayout::Synchronized { field_count: 1 })
+        );
+        assert_eq!(
+            reader
+                .next_record()
+                .unwrap_or_else(|e| panic!("{e}"))
+                .map(|record| record.counts),
+            Some(vec![2_048])
+        );
+        let csv = dir.path().join("old-minimum.csv");
+        assert_eq!(
+            export_bmeg_csv(&bmeg, &csv).unwrap_or_else(|e| panic!("{e}")),
+            3
+        );
+    }
+
+    #[test]
+    fn historical_headers_without_a_layout_use_the_recorded_protocol_version() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        // A synchronized file written before `record_layout` existed by a lab
+        // whose declared minimum was protocol 0.1.
+        let metadata = layout_test_metadata(Some(ecg_with_protocol_minimum(1)), "0.4");
+        let header = serde_json::to_vec(&metadata).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!String::from_utf8_lossy(&header).contains("record_layout"));
+        let header_len = u16::try_from(header.len()).unwrap_or_else(|e| panic!("{e}"));
+        let mut record = Vec::new();
+        record.extend_from_slice(&7u32.to_le_bytes());
+        record.extend_from_slice(&1_000u64.to_le_bytes());
+        record.extend_from_slice(&1u16.to_le_bytes());
+        record.extend_from_slice(&1_234u16.to_le_bytes());
+        let synchronized = dir.path().join("historical-synchronized.bmeg");
+        let mut file_bytes = BMEG_MAGIC.to_vec();
+        file_bytes.extend_from_slice(&header_len.to_le_bytes());
+        file_bytes.extend_from_slice(&header);
+        file_bytes.extend_from_slice(&record);
+        std::fs::write(&synchronized, &file_bytes).unwrap_or_else(|e| panic!("{e}"));
+        let mut reader = BmegReader::open(&synchronized).unwrap_or_else(|e| panic!("{e}"));
+        let read = reader
+            .next_record()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("missing record"));
+        assert_eq!(read.sequence, 7);
+        assert_eq!(read.counts, vec![1_234]);
+        assert_eq!(reader.next_record().unwrap_or_else(|e| panic!("{e}")), None);
+
+        // A genuine legacy file (protocol 0.1, minimum 0.1) keeps the 14-byte layout.
+        let legacy_metadata = layout_test_metadata(Some(ecg_with_protocol_minimum(1)), "0.1");
+        let legacy_header = serde_json::to_vec(&legacy_metadata).unwrap_or_else(|e| panic!("{e}"));
+        let legacy_len = u16::try_from(legacy_header.len()).unwrap_or_else(|e| panic!("{e}"));
+        let mut legacy_record = Vec::new();
+        legacy_record.extend_from_slice(&3u32.to_le_bytes());
+        legacy_record.extend_from_slice(&2_000u64.to_le_bytes());
+        legacy_record.extend_from_slice(&4_000u16.to_le_bytes());
+        let legacy = dir.path().join("historical-legacy.bmeg");
+        let mut legacy_bytes = BMEG_MAGIC.to_vec();
+        legacy_bytes.extend_from_slice(&legacy_len.to_le_bytes());
+        legacy_bytes.extend_from_slice(&legacy_header);
+        legacy_bytes.extend_from_slice(&legacy_record);
+        std::fs::write(&legacy, &legacy_bytes).unwrap_or_else(|e| panic!("{e}"));
+        let mut legacy_reader = BmegReader::open(&legacy).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            legacy_reader
+                .next_sample()
+                .unwrap_or_else(|e| panic!("{e}")),
+            Some(RawSample {
+                sequence: 3,
+                timestamp_us: 2_000,
+                counts: 4_000,
+            })
+        );
+    }
+
+    #[test]
+    fn oversized_headers_are_rejected_before_a_file_is_created() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut metadata = layout_test_metadata(Some(ecg_with_protocol_minimum(4)), "0.4");
+        assert!(check_synchronized_header(&metadata, 1).is_ok());
+        metadata.notes = "x".repeat(usize::from(u16::MAX));
+        assert!(matches!(
+            check_synchronized_header(&metadata, 1),
+            Err(RecordingError::HeaderTooLarge)
+        ));
+        let bmeg = dir.path().join("too-large.bmeg");
+        assert!(matches!(
+            BmegWriter::create_synchronized(&bmeg, &metadata, 1),
+            Err(RecordingError::HeaderTooLarge)
+        ));
+        assert!(!bmeg.exists());
+    }
+
     #[test]
     fn legacy_validation_context_deserializes_without_changing_course_csv() {
         let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -1150,6 +1486,11 @@ mod tests {
             }),
             markers: Vec::new(),
             calibration: None,
+            record_layout: None,
+            session_opened_utc: None,
+            acquisition_started_utc: None,
+            csv_error: None,
+            finalize_error: None,
         };
         let bmeg = dir.path().join("validation.bmeg");
         let csv = dir.path().join("validation.csv");

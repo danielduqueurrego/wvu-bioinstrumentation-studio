@@ -67,6 +67,7 @@
     completion_status: string; initial_free_disk_bytes?: number; final_free_disk_bytes?: number;
     integrity: Integrity; error?: string; profile?: ProfileSnapshot; calibration?: RecordingCalibration;
     active_digital_output_mask?: number; final_digital_output_mask?: number;
+    csv_error?: string; finalize_error?: string;
   };
   type SessionStatus = {
     state: string; board: string; port: string; protocol_version: string; simulator: boolean;
