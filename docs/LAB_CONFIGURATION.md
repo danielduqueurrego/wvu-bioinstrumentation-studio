@@ -18,7 +18,17 @@ Recording metadata preserves the selected profile's bench-only status, human-con
 
 ## Instructor revisions
 
-In Instructor mode, **Manage Labs** opens an in-memory draft. Only explicit actions such as **Save changes**, Duplicate, Import, Retire, Restore, Set active version, or Restore course default write the catalog. Reading, selecting, acquiring, plotting, calibrating, or navigating does not create a version.
+In Instructor mode, **Manage Labs** lists the catalog. **Edit**, **Duplicate selected lab**, and **Blank simultaneous lab** open an in-memory draft that is not written until **Save changes as new version**. Only these explicit actions write the catalog:
+
+- **Save changes as new version**
+- **Import lab**
+- **Retire**
+- **Restore**
+- **Make active** / **Use factory default**
+- **Restore course default**
+- **Reset local customizations**
+
+Reading, selecting, acquiring, plotting, calibrating, or navigating does not create a version. Manage Labs is unavailable while a recording runs. Start sends the version of the lab the page shows, and the backend refuses to start if a different revision has become active.
 
 For simultaneous analog labs, an instructor can configure one to six unique A0–A5 channels, machine-safe channel/CSV names, rate, supported ADC resolution, conversion capability, visibility, and plot assignment. D4/D5/D6 can be configured only with supported safe behaviors: LOW, HIGH while recording, or the fixed pulse-ox sequence. The saved output list is exactly what is driven: an unchecked output stays LOW.
 
@@ -28,6 +38,7 @@ Rules for a revision saved or imported now (labs that are already installed keep
 - Simultaneous frame rates are the firmware's 100, 200, 250, 500, or 1000 frames/s. The pulse-ox cycle rate is `round(1,000,000 / (4 × dwell))` and dwell is 250–5000 µs.
 - Pulse-ox labs have no analog channels and only their RED and IR outputs. Pulse-ox acquisition never used a channel list, so the unused `Channel 1 / A0` that the v1.0.2 editor stored in pulse-ox labs is dropped when such a package is imported (and when the lab is next edited); it is not a reason to refuse the package. RED/IR come from an optional `pulse_ox_role` (`"red"`/`"ir"`) on the output; without it, the label `Red LED` / `IR LED` (any letter case) decides.
 - Names, labels, descriptions, and safety notices have length limits.
+- `display.voltage_reference_v` must be positive but is informational only. Conversions use the ADC reference voltage entered in the Calibration & Units card (see [Calibration and Units](CALIBRATION_AND_UNITS.md#raw-data)).
 
 A lab's `allowed_duration_modes` and `minimum_custom_duration_seconds` are enforced: the page offers only the allowed modes, and Start refuses any other duration. A preset duration is always allowed.
 

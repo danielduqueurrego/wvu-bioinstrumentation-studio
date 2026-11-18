@@ -1,6 +1,6 @@
 # Developer Guide
 
-For resuming development after a computer reset or transferring work to another agent, start with the [Maintainer and Agent Handoff](AGENT_HANDOFF.md). It covers local assets, catalog recovery, pending work, and the current release baseline.
+For resuming development after a computer reset or transferring work to another agent, start with the [Maintainer and Agent Handoff](AGENT_HANDOFF.md). It covers local assets, catalog recovery, the current branch and release baseline, open hardware checks, and deferred decisions. [Architecture](ARCHITECTURE.md) describes the code structure; [USB Protocol](USB_PROTOCOL.md) is the byte-level protocol reference.
 
 ## Prerequisites
 
@@ -39,9 +39,36 @@ Build the frontend before `npm test`: a release-configuration test requires `bui
 
 ## Development and production
 
-Use `npm run tauri dev` during development. It uses the Vite development URL.
+Use `npm run tauri dev` during development. It runs Vite on `http://localhost:1420` with hot module replacement and a debug build of the Rust backend; Rust changes rebuild and restart the app, frontend changes reload in place. Use one application per board: two running instances compete for the serial port.
 
-To keep a development session away from your real lab catalog, calibration presets, logs and extracted runtime, run `pwsh -NoProfile -File scripts\start_dev_sandbox.ps1`. It starts `npm run tauri dev` with `LOCALAPPDATA` and the debug-only `WVU_STUDIO_DEV_LOCAL_DATA` pointed at `.dev-sandbox\` (or `-SandboxRoot <absolute path>`), and on first use points the Project folder at `<sandbox>\recordings`. `-RemoteDebuggingPort 9222` also enables WebView2 remote debugging on that port. Delete the folder to start fresh; Git ignores `.dev-sandbox/`.
+### Development sandbox
+
+To keep a development session away from your real lab catalog, calibration presets, logs and extracted runtime, run `pwsh -NoProfile -File scripts\start_dev_sandbox.ps1`.
+
+- **Redirected data.** It starts `npm run tauri dev` with `LOCALAPPDATA` and the debug-only `WVU_STUDIO_DEV_LOCAL_DATA` pointed at `.dev-sandbox\`, or at `-SandboxRoot <absolute path>`. On first use it points the Project folder at `<sandbox>\recordings`.
+- **Not redirected.** WebView2's own browser data stays in the normal place.
+- **Release builds.** They ignore `WVU_STUDIO_DEV_LOCAL_DATA`.
+- **Starting fresh.** Delete the folder; Git ignores `.dev-sandbox/`.
+- **CI placeholder runtime.** With the CI placeholder `arduino-runtime.zip`, the Board card (or, with Source = Hardware, the message under the recording bar) reports that the Arduino tools need attention, and firmware restore cannot work. The Simulator, labs, calibration and recordings work normally.
+
+### Driving and screenshotting the window
+
+`-RemoteDebuggingPort 9222` (any port from 1024 to 65535) also enables WebView2 remote debugging. Any Chrome DevTools Protocol client can then attach to the running window:
+
+- `http://127.0.0.1:9222/json` lists the page target and its `webSocketDebuggerUrl`. Chrome's `chrome://inspect` page can also attach to it.
+- `Runtime.evaluate` runs JavaScript in the page, for example to click **Start recording** (`#start-recording-button`) for a Simulator run.
+- `Emulation.setDeviceMetricsOverride` sets a viewport size, for example the 1366 × 690 used for the README screenshots (the Session setup image is a 1351 × 847 crop of a full-page capture). The override ends when the DevTools connection closes, so set it in the same session as the screenshot.
+- `Page.captureScreenshot` saves a PNG. With `captureBeyondViewport` and a clip from `Page.getLayoutMetrics`, it captures the full page for cropping.
+
+When you refresh the README screenshots:
+
+- Use the Simulator, and say in the caption that the data are simulated.
+- Do not publish personal paths: replace sandbox paths in displayed text with the example Project folder `C:\Users\Student\Documents\BMEG 420L` before capturing.
+- The Board card needs real hardware and the real runtime; it is described in text until it can be captured on hardware.
+
+The DevTools port gives full control of the page; use it only on a development machine.
+
+### Production build
 
 Use `npm run tauri build` for a production executable and installers. It runs the frontend production build and packages the configured local `build` directory into Tauri. Do **not** treat `cargo build --release` as a production application build: it does not package the frontend assets and can open a localhost error page.
 
@@ -49,8 +76,10 @@ Use `npm run tauri build` for a production executable and installers. It runs th
 
 ## Repository layout
 
-- `src/`: Svelte frontend and live-plot UI.
-- `src-tauri/src/`: Rust acquisition, protocol, lab catalog, calibration, runtime, and reference-firmware workflows.
+- `src/routes/+page.svelte`: the single window. It owns state and polling and wires the components together.
+- `src/lib/components/`: Svelte components (recording bar, message center, setup cards, board panel, live signals, result card, dialogs), with `*.svelte.test.ts` component tests.
+- `src/lib/*.ts`: pure TypeScript modules for messages, readiness, board state, plots, calibration, and storage, tested by the Vitest `*.test.ts` files beside them. [Architecture](ARCHITECTURE.md#frontend-structure) lists them.
+- `src-tauri/src/`: Rust acquisition, protocol, serial lease, lab catalog, calibration, runtime, and reference-firmware workflows.
 - `firmware/reference_unor4wifi/`: controlled UNO R4 WiFi reference firmware.
 - `profiles/`: immutable factory course-lab definitions.
 - `docs/`: user, instructor, maintainer, protocol, and release documentation.
@@ -71,8 +100,10 @@ The release build requires `src-tauri/resources/arduino-runtime.zip`, which is i
 
 Run `scripts/audit_bundled_runtime_notices.ps1` against the pinned archive before publishing an installer. It verifies the reviewed Arduino CLI license copy, the component-specific BOSSA license, required runtime components, and the retained LICENSE/COPYING/NOTICE inventory. A maintainer must still review upstream redistribution requirements when any bundled version changes.
 
-`scripts/build_student_release.ps1` requires PowerShell 7 and a Git work tree. It stops on the first failed native command (including `git`), runs the consistency check, reinstalls npm packages with `npm ci` (network access or a warm npm cache), builds with `--locked`, and stages only installers created by that invocation. Do not reuse or manually copy an older installer after a failed release build. In `dist\`, the student folder's `SHA256SUMS.txt` lists the two installers and is identical to the copy inside the ZIP; `<zip>.sha256` beside the ZIP holds the ZIP's checksum; and `WVU-Bioinstrumentation-Studio-<version>-build-info.txt` records the source commit and tool versions. All checksum files use the `sha256sum` layout with LF line endings.
+`scripts/build_student_release.ps1` requires PowerShell 7 and a Git work tree. It stops on the first failed native command (including `git`), runs the consistency check, reinstalls npm packages with `npm ci` (network access or a warm npm cache), builds with `--locked`, and stages only installers created by that invocation. Do not reuse or manually copy an older installer after a failed release build. It builds the NSIS setup (the primary student installer) and an MSI package for managed IT deployment, one after the other. In `dist\`, the student folder's `SHA256SUMS.txt` lists the two installers and is identical to the copy inside the ZIP; `<zip>.sha256` beside the ZIP holds the ZIP's checksum; and `WVU-Bioinstrumentation-Studio-<version>-build-info.txt` records the source commit and tool versions. All checksum files use the `sha256sum` layout with LF line endings.
 
 ## Firmware
 
 The application restores only `firmware/reference_unor4wifi/reference_unor4wifi.ino`. Production external commands are launched by the Rust backend with hidden Windows-console creation and captured output. Keep the D4/D5/D6 safe-LOW and pulse-ox mutual-exclusion invariants intact. Protocol 0.4 records firmware-measured timestamps for every synchronized record, advances pulse-state deadlines absolutely, and uses bounded raw-batch and nonblocking transmit queues; do not move packet encoding, CRC construction, or serial writes back into either acquisition timing path.
+
+Any edit to the `.ino`, even a comment, changes its SHA-256. That hash is pinned in `src-tauri/src/reference_firmware.rs`, in `release/release-manifest.json`, and in exact-source tests, and `check_release_consistency.ps1` compares them. A functional change also needs a new firmware build ID, matching `required_firmware` in the factory profiles, a bench test, and a Restore on every lab board. Keep [USB Protocol](USB_PROTOCOL.md) in step with `protocol.rs` and the sketch. Firmware changes waiting for such a build are listed under deferred decisions in the [handoff](AGENT_HANDOFF.md#deferred-decisions).
