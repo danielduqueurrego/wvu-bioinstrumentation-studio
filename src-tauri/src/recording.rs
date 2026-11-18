@@ -730,8 +730,8 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
     } else {
         let mut columns = Vec::new();
         for channel in snapshot.profile.acquisition.resolved_channels() {
-            columns.push(channel.csv_name.clone());
-            columns.push(voltage_column_name(&channel.csv_name));
+            columns.push(CsvColumn::fixed(channel.csv_name.clone()));
+            columns.push(CsvColumn::fixed(voltage_column_name(&channel.csv_name)));
             let preset = calibration.for_channel(&channel.id);
             let emit_mmhg = channel.id == "mpxv"
                 || calibration
@@ -741,19 +741,32 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
             if let Some(preset) = preset {
                 match preset.calibration_type {
                     CalibrationType::FixedFormula => {
-                        columns.push(derived_column_name(&channel.csv_name, "kPa"));
+                        columns.push(CsvColumn::fixed(derived_column_name(
+                            &channel.csv_name,
+                            "kPa",
+                        )));
                         if emit_mmhg {
-                            columns.push(derived_column_name(&channel.csv_name, "mmHg"));
+                            columns.push(CsvColumn::fixed(derived_column_name(
+                                &channel.csv_name,
+                                "mmHg",
+                            )));
                         }
                     }
                     CalibrationType::Linear => {
-                        columns.push(derived_column_name(&channel.csv_name, &preset.output_units));
+                        columns.push(CsvColumn::calibrated(
+                            &channel.csv_name,
+                            &preset.output_units,
+                        ));
                     }
                 }
             }
             channel_plans.push(ChannelCsvPlan { preset, emit_mmhg });
         }
-        writeln!(writer, "record_sequence,t_us,{}", columns.join(","))?;
+        writeln!(
+            writer,
+            "record_sequence,t_us,{}",
+            csv_header_names(columns).join(",")
+        )?;
     }
     let mut count = 0u64;
     while let Some(record) = input.next_record()? {
@@ -801,14 +814,87 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
     Ok(count)
 }
 
-fn voltage_column_name(raw_column: &str) -> String {
+/// One planned CSV column. A linear-calibration column is named from the
+/// student's unit, so it may collide with another column; it then gets a
+/// `_cal_` infix instead (only on collision, so existing names are kept).
+struct CsvColumn {
+    name: String,
+    calibrated_alternative: Option<String>,
+}
+
+impl CsvColumn {
+    fn fixed(name: String) -> Self {
+        Self {
+            name,
+            calibrated_alternative: None,
+        }
+    }
+    fn calibrated(raw_column: &str, units: &str) -> Self {
+        let base = raw_column.strip_suffix("_counts").unwrap_or(raw_column);
+        let derived = derived_column_name(raw_column, units);
+        let suffix = derived
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('_'))
+            .unwrap_or("calibrated")
+            .to_string();
+        Self {
+            name: derived,
+            calibrated_alternative: Some(format!("{base}_cal_{suffix}")),
+        }
+    }
+}
+
+/// Final, unique, CSV-safe header names. The first column with a name keeps
+/// it; a later duplicate (for example a calibration in volts next to the
+/// `_V` column) is renamed, never silently repeated.
+fn csv_header_names(columns: Vec<CsvColumn>) -> Vec<String> {
+    let mut used: std::collections::BTreeSet<String> = ["record_sequence", "t_us"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut names = Vec::with_capacity(columns.len());
+    for column in columns {
+        let mut name = column.name;
+        if used.contains(&name) {
+            if let Some(alternative) = column.calibrated_alternative {
+                name = alternative;
+            }
+        }
+        if used.contains(&name) {
+            let stem = name.clone();
+            let mut index = 2u32;
+            while used.contains(&name) {
+                name = format!("{stem}_{index}");
+                index += 1;
+            }
+        }
+        used.insert(name.clone());
+        names.push(csv_header_field(&name));
+    }
+    names
+}
+
+/// A header cell that cannot split or shift columns and is not run as a
+/// spreadsheet formula: names starting with `=`, `+`, `-`, `@`, tab, or CR
+/// get a leading `'`, and names with a comma, quote, or line break are quoted
+/// (RFC 4180). Safe names (every factory name) are written unchanged.
+fn csv_header_field(name: &str) -> String {
+    let guarded = if name.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{name}")
+    } else {
+        name.to_owned()
+    };
+    csv_field(&guarded)
+}
+
+pub(crate) fn voltage_column_name(raw_column: &str) -> String {
     raw_column
         .strip_suffix("_counts")
         .map(|base| format!("{base}_V"))
         .unwrap_or_else(|| format!("{raw_column}_V"))
 }
 
-fn derived_column_name(raw_column: &str, units: &str) -> String {
+pub(crate) fn derived_column_name(raw_column: &str, units: &str) -> String {
     let base = raw_column.strip_suffix("_counts").unwrap_or(raw_column);
     let units = units
         .chars()
@@ -1526,6 +1612,59 @@ mod tests {
         assert_eq!(
             header.lines().next(),
             Some("record_sequence,t_us,ecg_counts,ecg_V")
+        );
+    }
+
+    #[test]
+    fn csv_header_names_stay_unique_and_cannot_break_the_header() {
+        // Existing names are unchanged; a calibration in volts next to the
+        // `_V` column and one in counts next to the raw column get `_cal_`.
+        let names = csv_header_names(vec![
+            CsvColumn::fixed("general_a0_counts".into()),
+            CsvColumn::fixed(voltage_column_name("general_a0_counts")),
+            CsvColumn::calibrated("general_a0_counts", "V"),
+        ]);
+        assert_eq!(
+            names,
+            ["general_a0_counts", "general_a0_V", "general_a0_cal_V"]
+        );
+        let names = csv_header_names(vec![
+            CsvColumn::fixed("x_counts".into()),
+            CsvColumn::fixed(voltage_column_name("x_counts")),
+            CsvColumn::calibrated("x_counts", "counts"),
+        ]);
+        assert_eq!(names, ["x_counts", "x_V", "x_cal_counts"]);
+        // The BP XGZP column keeps its documented name.
+        let names = csv_header_names(vec![
+            CsvColumn::fixed("xgzp_counts".into()),
+            CsvColumn::fixed(voltage_column_name("xgzp_counts")),
+            CsvColumn::calibrated("xgzp_counts", "mmHg"),
+        ]);
+        assert_eq!(names, ["xgzp_counts", "xgzp_V", "xgzp_mmHg"]);
+        // Instructor names `x` and `x_V` (stored before the stricter rules).
+        let names = csv_header_names(vec![
+            CsvColumn::fixed("x".into()),
+            CsvColumn::fixed(voltage_column_name("x")),
+            CsvColumn::fixed("x_V".into()),
+            CsvColumn::fixed(voltage_column_name("x_V")),
+            CsvColumn::fixed("t_us".into()),
+        ]);
+        assert_eq!(names, ["x", "x_V", "x_V_2", "x_V_V", "t_us_2"]);
+        // Unsafe stored names are quoted and cannot run as formulas.
+        let names = csv_header_names(vec![
+            CsvColumn::fixed("Vout, filtered".into()),
+            CsvColumn::fixed("say \"hi\"".into()),
+            CsvColumn::fixed("=HYPERLINK(\"x\")".into()),
+            CsvColumn::fixed("-1".into()),
+        ]);
+        assert_eq!(
+            names,
+            [
+                "\"Vout, filtered\"",
+                "\"say \"\"hi\"\"\"",
+                "\"'=HYPERLINK(\"\"x\"\")\"",
+                "'-1"
+            ]
         );
     }
 }

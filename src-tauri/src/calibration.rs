@@ -4,9 +4,10 @@ use crate::recording::BmegReader;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 pub const CALIBRATION_SCHEMA_VERSION: u32 = 1;
@@ -349,6 +350,9 @@ pub fn fit_xgzp_from_recording(request: &XgzpFitRequest) -> Result<LinearFit, Ca
 #[derive(Clone)]
 pub struct CalibrationStore {
     root: PathBuf,
+    /// Unreadable preset files already written to the application log, so
+    /// repeated listing does not repeat the entry.
+    reported: Arc<Mutex<BTreeSet<PathBuf>>>,
 }
 
 impl Default for CalibrationStore {
@@ -358,34 +362,98 @@ impl Default for CalibrationStore {
             .unwrap_or_else(std::env::temp_dir)
             .join("WVU Bioinstrumentation Studio")
             .join("calibrations");
-        Self { root }
+        Self::with_root(root)
     }
+}
+
+/// A preset file that could not be used, and why.
+type SkippedPreset = (PathBuf, String);
+
+fn read_preset_file(path: &Path) -> Result<CalibrationPreset, String> {
+    let bytes = fs::read(path).map_err(|error| format!("could not be read ({error})"))?;
+    let preset: CalibrationPreset = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("is not a valid calibration preset ({error})"))?;
+    validate_preset(&preset).map_err(|error| format!("failed validation ({error})"))?;
+    Ok(preset)
 }
 
 impl CalibrationStore {
     pub fn with_root(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            reported: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+    /// Every usable preset, plus the `.json` files that were skipped because
+    /// they could not be read or validated. One bad file never hides the
+    /// others; the file itself is left untouched.
+    fn scan(&self) -> Result<(Vec<CalibrationPreset>, Vec<SkippedPreset>), CalibrationError> {
+        let mut presets = Vec::new();
+        let mut skipped = Vec::new();
+        if !self.root.exists() {
+            return Ok((presets, skipped));
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    skipped.push((self.root.clone(), format!("could not be listed ({error})")));
+                    continue;
+                }
+            };
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            match read_preset_file(&path) {
+                Ok(preset) => presets.push(preset),
+                Err(reason) => skipped.push((path, reason)),
+            }
+        }
+        self.log_new_skips(&skipped);
+        Ok((presets, skipped))
+    }
+    fn log_new_skips(&self, skipped: &[SkippedPreset]) {
+        let Ok(mut reported) = self.reported.lock() else {
+            return;
+        };
+        for (path, reason) in skipped {
+            if reported.insert(path.clone()) {
+                crate::app_log::record(
+                    "WARN",
+                    &format!(
+                        "CALIBRATION_PRESET_SKIPPED path={} reason={reason}",
+                        path.display()
+                    ),
+                );
+            }
+        }
+    }
+    /// Student-facing descriptions of preset files that were skipped.
+    pub fn load_issues(&self) -> Vec<String> {
+        match self.scan() {
+            Ok((_, skipped)) => skipped
+                .into_iter()
+                .map(|(path, reason)| {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    format!("Calibration file {name} {reason} and was skipped.")
+                })
+                .collect(),
+            Err(error) => vec![format!("The calibration folder could not be read: {error}")],
+        }
     }
     pub fn list(
         &self,
         profile_id: &str,
         channel_id: &str,
     ) -> Result<Vec<CalibrationPreset>, CalibrationError> {
-        if !self.root.exists() {
-            return Ok(Vec::new());
-        }
-        let mut values = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
-            }
-            let preset: CalibrationPreset = serde_json::from_slice(&fs::read(&path)?)?;
-            validate_preset(&preset)?;
-            if preset.profile_id == profile_id && preset.channel_id == channel_id {
-                values.push(preset);
-            }
-        }
+        let (presets, _) = self.scan()?;
+        let mut values: Vec<CalibrationPreset> = presets
+            .into_iter()
+            .filter(|preset| preset.profile_id == profile_id && preset.channel_id == channel_id)
+            .collect();
         values.sort_by(|left, right| {
             left.label
                 .cmp(&right.label)
@@ -528,5 +596,54 @@ mod tests {
             .delete("team2.xgzp.001")
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(store.list("profile", "xgzp").unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn one_unreadable_preset_file_does_not_hide_the_others() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let store = CalibrationStore::with_root(root.path().into());
+        let preset = CalibrationPreset {
+            schema_version: 1,
+            calibration_id: "team3.xgzp.001".into(),
+            profile_id: "profile".into(),
+            channel_id: "xgzp".into(),
+            calibration_type: CalibrationType::Linear,
+            input_quantity: "volts".into(),
+            output_quantity: "pressure".into(),
+            output_units: "mmHg".into(),
+            parameters: BTreeMap::from([("slope".into(), 100.0), ("offset".into(), -5.0)]),
+            created_at: Utc::now(),
+            label: "Team 3".into(),
+        };
+        store
+            .save(preset.clone())
+            .unwrap_or_else(|error| panic!("{error}"));
+        // A hand-edited file, an empty file, and a future-schema preset.
+        fs::write(root.path().join("broken.json"), b"{ not json")
+            .unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.path().join("empty.json"), b"").unwrap_or_else(|error| panic!("{error}"));
+        let mut future = preset.clone();
+        future.schema_version = 2;
+        future.calibration_id = "future.001".into();
+        fs::write(
+            root.path().join("future.001.json"),
+            serde_json::to_vec(&future).unwrap_or_default(),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            store
+                .list("profile", "xgzp")
+                .unwrap_or_else(|error| panic!("{error}")),
+            vec![preset]
+        );
+        let issues = store.load_issues();
+        assert_eq!(issues.len(), 3, "{issues:?}");
+        assert!(issues.iter().any(|issue| issue.contains("broken.json")));
+        // The unreadable files are left untouched for the instructor.
+        assert!(root.path().join("broken.json").is_file());
+        assert!(CalibrationStore::with_root(root.path().join("missing"))
+            .load_issues()
+            .is_empty());
     }
 }

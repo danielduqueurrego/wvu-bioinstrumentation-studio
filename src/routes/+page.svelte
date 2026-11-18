@@ -10,7 +10,14 @@
   import { connectionActions } from '$lib/connection-actions';
   import { commandErrorDetail, commandErrorRepairable, formatCommandError } from '$lib/errors';
   import { FIRMWARE_WRITE_NOTICE, firmwareJobView } from '$lib/firmware-job';
-  import { durationRequest, isTimedDurationValid, type RecordingDurationRequest } from '$lib/duration';
+  import { durationRequest, type RecordingDurationRequest } from '$lib/duration';
+  import {
+    catalogNotice,
+    labDurationModes,
+    labMinimumCustomSeconds,
+    labTimedDurationAllowed,
+    type CatalogStatus
+  } from '$lib/lab-catalog';
   import {
     displayUnitLabel,
     calibrationById,
@@ -148,6 +155,10 @@
   let firmwareEnvironment: FirmwareEnvironment = { expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false };
   let source: 'simulator' | 'hardware' = 'simulator';
   let projectFolder = '';
+  // Shown when the saved Project folder is unavailable or its setting was unreadable.
+  let projectFolderNotice = '';
+  // Lab catalog health (skipped or unloadable labs), shown in both modes.
+  let catalogStatus: CatalogStatus | undefined;
   let outputDirectory = '';
   let durationMode: 'timed' | 'until_stopped' = 'timed';
   let durationPreset = '60';
@@ -293,8 +304,13 @@
   );
   $: instructorModeActive = operatingMode === 'instructor_authoring';
   $: profileTimedPresets = activeProfile?.acquisition.timed_presets_seconds ?? [10, 30, 60, 300, 600];
-  $: timedDurationValid = isTimedDurationValid(timedSeconds);
+  // The lab's own duration rules; Start enforces the same rules in Rust.
+  $: allowedDurationModes = labDurationModes(activeProfile);
+  $: if (!allowedDurationModes.includes(durationMode)) durationMode = allowedDurationModes[0];
+  $: minimumCustomSeconds = labMinimumCustomSeconds(activeProfile);
+  $: timedDurationValid = labTimedDurationAllowed(activeProfile, timedSeconds);
   $: duration = durationRequest(durationMode, timedSeconds);
+  $: catalogNoticeText = catalogNotice(catalogStatus, instructorModeActive);
   $: outputFolderError = relativeOutputFolderError(outputDirectory);
   $: isActive = activeStates.includes(session.state);
   // A failed verification deliberately leaves the session Faulted so its
@@ -331,7 +347,8 @@
     activeProfile: Boolean(activeProfile),
     projectFolder: Boolean(projectFolder),
     outputFolderError,
-    durationValid: durationMode === 'until_stopped' || timedDurationValid,
+    durationValid: allowedDurationModes.includes(durationMode)
+      && (durationMode === 'until_stopped' || timedDurationValid),
     acknowledgementSatisfied: (
       !activeProfile?.safety.bench_only
       || !['ecg', 'emg'].includes(activeProfile.category)
@@ -616,6 +633,11 @@
     } catch (error) {
       statusMessage = `Profile error: ${String(error)}`;
     }
+    try {
+      catalogStatus = await invoke<CatalogStatus>('get_catalog_status');
+    } catch (error) {
+      console.warn('Could not read the lab catalog status', error);
+    }
   }
 
   async function chooseProjectFolder() {
@@ -624,6 +646,7 @@
     try {
       const saved = await invoke<{ project_folder: string }>('set_project_folder', { projectFolder: selected });
       projectFolder = saved.project_folder;
+      projectFolderNotice = '';
       statusMessage = 'Project folder updated. New recordings will use this location.';
     } catch (error) {
       statusMessage = `Project folder could not be used: ${String(error)}`;
@@ -951,7 +974,7 @@
       });
       statusMessage = operatingMode === 'instructor_authoring'
         ? 'Instructor mode is enabled. You can manage lab settings.'
-        : 'Student mode is enabled. Lab settings are protected.';
+        : 'Student mode is enabled. Lab management is hidden. Instructor mode is a safety step against accidental changes, not a password lock.';
     } catch (error) {
       // The backend remains authoritative if a local command failure occurs.
       try {
@@ -1130,7 +1153,10 @@
     // cache; route changes consume that cache and never invoke Arduino CLI discovery.
     void (async () => {
       try {
-        projectFolder = (await invoke<{ project_folder: string }>('get_project_folder')).project_folder;
+        const settings = await invoke<{ project_folder: string; available?: boolean; notice?: string | null }>('get_project_folder');
+        projectFolder = settings.project_folder;
+        // A missing USB/network folder is reported, never recreated elsewhere.
+        projectFolderNotice = settings.notice ?? '';
       } catch (error) {
         statusMessage = `Project folder needs attention: ${String(error)}`;
       }
@@ -1196,6 +1222,7 @@
     <section class="panel project-panel" aria-labelledby="project-folder-title">
       <h2 id="project-folder-title">Project folder</h2>
       <div class="control-grid"><label>Project folder<input value={projectFolder} readonly title={projectFolder} /></label><div class="field-action"><span>Location</span><button onclick={chooseProjectFolder} disabled={session.state !== 'Disconnected'}>Browse</button></div></div>
+      {#if projectFolderNotice}<p class="warning" role="status">{projectFolderNotice}</p>{/if}
       <p class="help">Recordings are saved under this folder. Choose the Output folder in Session setup to create a trial subfolder.</p>
     </section>
 
@@ -1209,6 +1236,7 @@
         <section class="panel profile-panel" aria-labelledby="profile-title">
           <div class="panel-heading"><div><h3 id="profile-title">Lab</h3><p class="help">Choose the assigned course lab. Its required channels and recording settings are applied automatically.</p></div><span class:locked={!instructorModeActive} class="mode-badge">{instructorModeActive ? 'Instructor mode' : 'Student mode'}</span></div>
           <OperatingModeControl bind:operatingMode bind:instructorAcknowledgement disabled={session.state !== 'Disconnected' || modeChangeInFlight} {onModeConfirmed} {onInstructorBlocked} />
+          {#if catalogNoticeText}<p class="warning" role="status">{catalogNoticeText}</p>{/if}
           {#if instructorModeActive}
             <LabManager selectedProfile={activeProfile} onSaved={labRevisionSaved} onStatus={(message) => statusMessage = message} />
           {/if}
@@ -1267,9 +1295,10 @@
           <fieldset disabled={session.state !== 'Disconnected'}>
             <legend>Duration mode</legend>
             <div class="choice-row">
-              <label class="choice"><input type="radio" bind:group={durationMode} value="timed" /> Timed</label>
-              <label class="choice"><input type="radio" bind:group={durationMode} value="until_stopped" /> Until stopped</label>
+              {#if allowedDurationModes.includes('timed')}<label class="choice"><input type="radio" bind:group={durationMode} value="timed" /> Timed</label>{/if}
+              {#if allowedDurationModes.includes('until_stopped')}<label class="choice"><input type="radio" bind:group={durationMode} value="until_stopped" /> Until stopped</label>{/if}
             </div>
+            {#if allowedDurationModes.length === 1}<p class="help">This lab allows only {allowedDurationModes[0] === 'timed' ? 'timed' : 'Until-stopped'} recordings.</p>{/if}
           </fieldset>
           {#if durationMode === 'timed'}
             <div class="duration-controls">
@@ -1280,10 +1309,10 @@
               </label>
               {#if durationPreset === 'custom'}
                 <label>Custom duration (seconds)
-                  <input type="number" min="10" step="1" bind:value={customSeconds} disabled={session.state !== 'Disconnected'} aria-invalid={!timedDurationValid} />
+                  <input type="number" min={minimumCustomSeconds} step="1" bind:value={customSeconds} disabled={session.state !== 'Disconnected'} aria-invalid={!timedDurationValid} />
                 </label>
               {/if}
-              {#if !timedDurationValid}<p class="error">Timed recordings must be whole seconds and at least 10 seconds.</p>{/if}
+              {#if !timedDurationValid}<p class="error">Timed recordings must be whole seconds and at least {minimumCustomSeconds} seconds.</p>{/if}
             </div>
           {:else}
             <p class="help">Recording continues without an automatic time limit. Press <strong>Stop recording</strong> to finish it.</p>

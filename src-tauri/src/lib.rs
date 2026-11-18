@@ -96,7 +96,7 @@ struct StartProfileSimulatorRequest {
 struct StartRecordingFailure {
     stage: &'static str,
     code: &'static str,
-    user_message: &'static str,
+    user_message: std::borrow::Cow<'static, str>,
     technical_detail: String,
 }
 
@@ -104,9 +104,10 @@ impl StartRecordingFailure {
     fn new(
         stage: &'static str,
         code: &'static str,
-        user_message: &'static str,
+        user_message: impl Into<std::borrow::Cow<'static, str>>,
         technical_detail: impl ToString,
     ) -> Self {
+        let user_message = user_message.into();
         let technical_detail = technical_detail.to_string();
         app_log::record(
             "WARN",
@@ -138,6 +139,28 @@ impl StartRecordingFailure {
             _ => "The recording could not be prepared. Try again. If it continues, open Advanced details and share the information with your instructor.",
         };
         Self::new("INITIALIZE_SESSION", "session_start", user_message, error)
+    }
+}
+
+/// The selected lab's own duration rules (allowed modes and the custom
+/// minimum), enforced here as well as in the page.
+fn check_lab_duration(
+    profile: &profiles::AcquisitionProfile,
+    duration: &recording::RecordingDuration,
+) -> Result<(), StartRecordingFailure> {
+    match profile.acquisition.duration_refusal(duration) {
+        Some(message) => Err(StartRecordingFailure::new(
+            "CHECK_DURATION",
+            "duration_not_allowed",
+            message.clone(),
+            format!(
+                "lab {} {} refused duration {}: {message}",
+                profile.profile_id,
+                profile.profile_version,
+                duration.label()
+            ),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -376,60 +399,87 @@ fn create_blank_simultaneous_lab(
         .map_err(|error| error.to_string())
 }
 
+/// Lab catalog writes wait for the cross-process catalog lock (up to a few
+/// seconds while another window writes) and flush to disk, so, like the board
+/// commands, they run off the main thread. Argument names are unchanged.
+async fn catalog_task<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, profiles::ProfileError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || work().map_err(|error| error.to_string()))
+        .await
+        .map_err(|error| format!("lab catalog task failed: {error}"))?
+}
+
 #[tauri::command]
-fn save_lab_draft(
+async fn save_lab_draft(
     state: tauri::State<'_, AppState>,
     draft: profiles::AcquisitionProfile,
     base_version: Option<String>,
     request_id: String,
 ) -> Result<profiles::AcquisitionProfile, String> {
-    state
-        .profiles
-        .save_lab_draft(draft, base_version, request_id)
-        .map_err(|error| error.to_string())
+    let store = state.profiles.clone();
+    catalog_task(move || store.save_lab_draft(draft, base_version, request_id)).await
 }
 
 #[tauri::command]
-fn restore_retired_lab(
+async fn restore_retired_lab(
     state: tauri::State<'_, AppState>,
     profile_id: String,
     profile_version: String,
 ) -> Result<profiles::AcquisitionProfile, String> {
-    state
-        .profiles
-        .restore_retired(&profile_id, &profile_version)
-        .map_err(|error| error.to_string())
+    let store = state.profiles.clone();
+    catalog_task(move || store.restore_retired(&profile_id, &profile_version)).await
 }
 
 #[tauri::command]
-fn restore_course_default_lab(
+async fn restore_course_default_lab(
     state: tauri::State<'_, AppState>,
     profile_id: String,
 ) -> Result<profiles::AcquisitionProfile, String> {
-    state
-        .profiles
-        .restore_course_default(&profile_id)
-        .map_err(|error| error.to_string())
+    let store = state.profiles.clone();
+    catalog_task(move || store.restore_course_default(&profile_id)).await
 }
 
 #[tauri::command]
-fn set_active_lab_version(
+async fn set_active_lab_version(
     state: tauri::State<'_, AppState>,
     profile_id: String,
     profile_version: String,
 ) -> Result<profiles::AcquisitionProfile, String> {
-    state
-        .profiles
-        .set_active_version(&profile_id, &profile_version)
-        .map_err(|error| error.to_string())
+    let store = state.profiles.clone();
+    catalog_task(move || store.set_active_version(&profile_id, &profile_version)).await
+}
+
+/// Returns where the pre-reset copy of the catalog was kept (additive: the
+/// page previously ignored the empty result).
+#[tauri::command]
+async fn reset_local_lab_customizations(
+    state: tauri::State<'_, AppState>,
+) -> Result<profiles::LabResetOutcome, String> {
+    let store = state.profiles.clone();
+    catalog_task(move || store.reset_local_customizations()).await
+}
+
+/// Lab catalog health plus unreadable calibration presets, for the notice in
+/// the Lab panel. Read-only and available in Student mode.
+#[derive(Serialize)]
+struct CatalogStatusResponse {
+    #[serde(flatten)]
+    catalog: profiles::CatalogStatus,
+    calibration_issues: Vec<String>,
 }
 
 #[tauri::command]
-fn reset_local_lab_customizations(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
-        .profiles
-        .reset_local_customizations()
-        .map_err(|error| error.to_string())
+fn get_catalog_status(state: tauri::State<'_, AppState>) -> Result<CatalogStatusResponse, String> {
+    Ok(CatalogStatusResponse {
+        catalog: state
+            .profiles
+            .catalog_status()
+            .map_err(|error| error.to_string())?,
+        calibration_issues: state.calibrations.load_issues(),
+    })
 }
 
 #[tauri::command]
@@ -450,39 +500,36 @@ fn set_profile_mode(
 }
 
 #[tauri::command]
-fn retire_profile(
+async fn retire_profile(
     state: tauri::State<'_, AppState>,
     profile_id: String,
     profile_version: String,
 ) -> Result<(), String> {
-    state
-        .profiles
-        .retire(&profile_id, &profile_version)
-        .map_err(|error| error.to_string())
+    let store = state.profiles.clone();
+    catalog_task(move || store.retire(&profile_id, &profile_version)).await
 }
 
 #[tauri::command]
-fn export_profile_package(
+async fn export_profile_package(
     state: tauri::State<'_, AppState>,
     profile_id: String,
     profile_version: String,
     destination: String,
 ) -> Result<(), String> {
-    state
-        .profiles
-        .export_profile(&profile_id, &profile_version, &PathBuf::from(destination))
-        .map_err(|error| error.to_string())
+    let store = state.profiles.clone();
+    catalog_task(move || {
+        store.export_profile(&profile_id, &profile_version, &PathBuf::from(destination))
+    })
+    .await
 }
 
 #[tauri::command]
-fn import_profile_package(
+async fn import_profile_package(
     state: tauri::State<'_, AppState>,
     source: String,
 ) -> Result<profiles::AcquisitionProfile, String> {
-    state
-        .profiles
-        .import_profile(&PathBuf::from(source))
-        .map_err(|error| error.to_string())
+    let store = state.profiles.clone();
+    catalog_task(move || store.import_profile(&PathBuf::from(source))).await
 }
 
 #[tauri::command]
@@ -631,6 +678,7 @@ fn start_simulator_recording(
             error,
         )
     })?;
+    check_lab_duration(&profile, &duration)?;
     let calibration = checked_recording_calibration(&profile, calibration.unwrap_or_default())
         .map_err(|error| {
             StartRecordingFailure::new(
@@ -734,6 +782,18 @@ fn start_hardware_recording(
             error,
         )
     })?;
+    check_lab_duration(&profile, &duration)?;
+    if let Some(message) = profile.acquisition.firmware_configuration_issue() {
+        return Err(StartRecordingFailure::new(
+            "CHECK_LAB",
+            "lab_unsupported_by_firmware",
+            message,
+            format!(
+                "lab {} {} requests a configuration the WVU firmware does not accept",
+                profile.profile_id, profile.profile_version
+            ),
+        ));
+    }
     let firmware_allowed = firmware.is_acquisition_allowed(&port).map_err(|error| {
         StartRecordingFailure::new(
             "CHECK_FIRMWARE",
@@ -1089,6 +1149,7 @@ pub fn run() {
             restore_course_default_lab,
             set_active_lab_version,
             reset_local_lab_customizations,
+            get_catalog_status,
             get_profile_mode,
             set_profile_mode,
             retire_profile,

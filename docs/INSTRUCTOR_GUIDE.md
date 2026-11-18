@@ -2,7 +2,7 @@
 
 ## Instructor mode and Manage Labs
 
-Select Instructor mode, acknowledge the local authoring notice, then use **Manage Labs** next to the lab selector. Student mode sees active labs and normal acquisition only.
+Select Instructor mode, acknowledge the local authoring notice, then use **Manage Labs** next to the lab selector. Student mode sees active labs and normal acquisition only. Instructor mode is a safety step against accidental changes, not a password lock: anyone using the same Windows account can select it, and every mode change and catalog write is recorded in the `profiles` folder's audit logs.
 
 ## Edit safely
 
@@ -12,7 +12,7 @@ Select **Save changes** once to create the next revision and activate it. Cancel
 
 ## Course defaults and versions
 
-Factory labs are always available. A local instructor revision overrides the factory definition only after an explicit save. Use Restore course default to deliberately return to the factory configuration; it is not automatic.
+Factory labs are always available. A local instructor revision overrides the factory definition only after an explicit save. Use Restore course default to deliberately return to the factory configuration; it is not automatic. Retiring the active local revision of a factory lab makes the course default active again. **Reset local customizations** removes every local revision after saving a copy of the catalog (`lab_state.reset-<time>.json`); export any lab you want to keep first.
 
 ## Calibration and plots
 

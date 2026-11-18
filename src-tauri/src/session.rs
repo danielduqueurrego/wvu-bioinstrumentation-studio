@@ -4258,11 +4258,10 @@ fn build_initial_metadata(
     } = provenance;
     let mut digital_output_mapping = std::collections::BTreeMap::new();
     for output in profile.profile.acquisition.resolved_digital_outputs() {
-        let key = match output.label.to_ascii_lowercase().as_str() {
-            "green led" => "green".into(),
-            "red led" => "red".into(),
-            "ir led" => "ir".into(),
-            _ => output.label,
+        let key = match output.effective_pulse_ox_role() {
+            Some(role) => role.mapping_key().to_string(),
+            None if output.label.eq_ignore_ascii_case("green led") => "green".into(),
+            None => output.label,
         };
         digital_output_mapping.insert(key, output.pin);
     }
@@ -4502,19 +4501,17 @@ fn configure_payload(
             let inputs = settings.analog_inputs.as_ref().ok_or(SessionError::State(
                 "pulse-ox profile is missing its TX/RX analog inputs",
             ))?;
+            // The same RED/IR selection rule as profile validation: an
+            // explicit `pulse_ox_role`, otherwise the "Red LED"/"IR LED" label.
             let outputs = settings.resolved_digital_outputs();
-            let red = outputs
-                .iter()
-                .find(|output| output.label.eq_ignore_ascii_case("red led"))
+            let red = crate::profiles::pulse_ox_output(&outputs, crate::profiles::PulseOxRole::Red)
                 .ok_or(SessionError::State(
                     "pulse-ox profile is missing a RED output",
                 ))?;
-            let ir = outputs
-                .iter()
-                .find(|output| output.label.eq_ignore_ascii_case("ir led"))
+            let ir = crate::profiles::pulse_ox_output(&outputs, crate::profiles::PulseOxRole::Ir)
                 .ok_or(SessionError::State(
-                    "pulse-ox profile is missing an IR output",
-                ))?;
+                "pulse-ox profile is missing an IR output",
+            ))?;
             if red.pin == ir.pin
                 || red.behavior != crate::profiles::DigitalOutputBehavior::AcquisitionSequenced
                 || ir.behavior != crate::profiles::DigitalOutputBehavior::AcquisitionSequenced
@@ -6975,11 +6972,13 @@ mod tests {
                 pin: "D4".into(),
                 label: "Red LED".into(),
                 behavior: crate::profiles::DigitalOutputBehavior::AcquisitionSequenced,
+                pulse_ox_role: None,
             },
             crate::profiles::DigitalOutput {
                 pin: "D6".into(),
                 label: "IR LED".into(),
                 behavior: crate::profiles::DigitalOutputBehavior::AcquisitionSequenced,
+                pulse_ox_role: None,
             },
         ];
         pulse.acquisition.state_dwell_us = Some(2_000);
@@ -6987,6 +6986,75 @@ mod tests {
             configure_payload(&pulse.acquisition, Some(&capabilities))
                 .unwrap_or_else(|error| panic!("{error}")),
             vec![1, 14, 208, 7, 0, 0, 2, 2, 3, 4, 6]
+        );
+
+        // An explicit role wins over the label rule, in configuration and
+        // in the recorded output mapping alike.
+        pulse.acquisition.digital_outputs = vec![
+            crate::profiles::DigitalOutput {
+                pin: "D6".into(),
+                label: "660 nm emitter".into(),
+                behavior: crate::profiles::DigitalOutputBehavior::AcquisitionSequenced,
+                pulse_ox_role: Some(crate::profiles::PulseOxRole::Red),
+            },
+            crate::profiles::DigitalOutput {
+                pin: "D5".into(),
+                label: "RED LED".into(),
+                behavior: crate::profiles::DigitalOutputBehavior::AcquisitionSequenced,
+                pulse_ox_role: Some(crate::profiles::PulseOxRole::Ir),
+            },
+        ];
+        assert_eq!(
+            configure_payload(&pulse.acquisition, Some(&capabilities))
+                .unwrap_or_else(|error| panic!("{error}")),
+            vec![1, 14, 208, 7, 0, 0, 2, 2, 3, 6, 5]
+        );
+    }
+
+    #[test]
+    fn unchecking_the_legacy_green_output_really_turns_d4_off() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let store = crate::profiles::ProfileStore::with_root(dir.path().join("profiles"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(crate::profiles::ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let capabilities = FirmwareCapabilities {
+            supported_adc_resolutions: vec![12, 14],
+            max_analog_channels: 6,
+            supported_modes: 0x03,
+            supported_digital_output_mask: 0x07,
+            supported_rates_hz: vec![100, 200, 250, 500, 1_000],
+        };
+        let bp_id = "wvu.bmeg420l.blood_pressure.ppg.course.capture.v1";
+        let factory = store
+            .get_locked(bp_id)
+            .unwrap_or_else(|error| panic!("{error}"));
+        // The factory lab drives D4 HIGH while recording (mask bit 0x01).
+        assert_eq!(
+            configure_payload(&factory.acquisition, Some(&capabilities))
+                .unwrap_or_else(|error| panic!("{error}"))
+                .last()
+                .copied(),
+            Some(0x01)
+        );
+        let mut draft = store
+            .begin_lab_edit(bp_id)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(draft.acquisition.led_outputs.is_none());
+        // The instructor unchecks D4.
+        draft.acquisition.digital_outputs.clear();
+        let saved = store
+            .save_lab_draft(draft, Some("1.0.0".into()), "uncheck-d4-0001".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(saved.acquisition.led_outputs.is_none());
+        assert!(saved.acquisition.resolved_digital_outputs().is_empty());
+        assert_eq!(
+            configure_payload(&saved.acquisition, Some(&capabilities))
+                .unwrap_or_else(|error| panic!("{error}"))
+                .last()
+                .copied(),
+            Some(0x00)
         );
     }
 
