@@ -31,26 +31,31 @@ For pulse oximetry, the firmware waits the configured settling interval after ea
 
 If something goes wrong, the message under the recording bar names the problem and usually offers one button for the next step. If that does not help, open **Advanced details** at the bottom of the window and show it to your instructor.
 
-## Instructor-provided lab installer
+## Install a lab file
 
-If your instructor provides the Op Amp Lab installer, keep these two files in the same folder:
+Your instructor may give you a lab file (`.lab.json`) for a new or changed lab. Install it only when your instructor asks you to.
 
-- `install_op_amp_lab_profile.bat`
-- `install_op_amp_lab_profile.ps1`
+1. Make sure no recording is running. **Install lab file…** is disabled during a recording.
+2. In the **Lab** card, select **Install lab file…** under **Selected lab**, then choose the file.
+3. Read the question. It names the lab, its version, its inputs, and its rate.
+   - If the lab is new, it is added to your lab list.
+   - If it replaces a lab on your computer, the question says so, for example "This replaces General Analog — Development 2.0.0 on this computer. Your instructor can undo this with Restore course default."
+4. Select **Install** (or **Install and replace**) to continue, or **Cancel** to change nothing.
+5. The installed lab is selected, and the **Lab** card says what was installed.
 
-Close WVU Bioinstrumentation Studio, then double-click `install_op_amp_lab_profile.bat`. The installer window remains open so you can confirm whether installation succeeded.
+The application refuses a file that is damaged, a file that conflicts with a different lab of the same version on your computer, a lab your instructor retired on this computer, a course default file (meant for the next application version), and the older Op Amp Lab file. It says why before asking you anything. When the lab is already installed and selected, it says so and changes nothing; when it is installed but another version is in use, installing selects it again. If a file is refused, show the message to your instructor. Recordings you already made keep their own lab snapshot and are not changed.
 
-Alternatively, run the PowerShell installer directly from the folder containing it:
+## Op Amp Lab
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_op_amp_lab_profile.ps1
-```
+**Op Amp Lab** is built into the application. Select it in the **Lab** card like any other course lab. It records **Vmid** on A0 and **Vout** on A1 at 100 frames/s, and its CSV columns are `vmid_counts` and `vout_counts`, each with its `_V` voltage column. It does not replace **General Analog — Development**; both labs are listed.
 
-The script requires no administrator access and installs **Op Amp Lab 2.0.1** only for the current Windows user.
+The separate Op Amp Lab installer (`install_op_amp_lab_profile.bat` and `.ps1`) is no longer needed. Do not run it with this version: it would put the older copy back in place of General Analog.
 
-- **Lab list.** Op Amp Lab is a revision of **General Analog — Development**, so it takes that lab's place in your Lab list. The other labs are unchanged.
-- **Backup.** The script creates a backup before changing an existing catalog. The per-user catalog is stored under `%LOCALAPPDATA%\WVU Bioinstrumentation Studio\profiles`.
+If you ran that installer before, the application fixes your Lab list automatically the first time it starts:
 
-Reopen the application after the script reports success.
+- **What changes.** The older Op Amp Lab copy, which had taken General Analog's place, is retired, and **General Analog — Development** is back in the list. Your other labs, recordings, and calibrations are kept.
+- **Backup.** Before the change, the application saves a copy of your lab list as `lab_state.pre-migration-<date and time>.json` in `%LOCALAPPDATA%\WVU Bioinstrumentation Studio\profiles`.
+- **Notice.** The **Lab** card says what changed and where the backup is, until you close the application. This happens only once.
+- **Older recordings.** Recordings made with the older copy keep their own lab snapshot and are unchanged.
 
 Teaching use only — not a medical device.

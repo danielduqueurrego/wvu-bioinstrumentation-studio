@@ -9,7 +9,7 @@ Development is Windows-first. Install:
 - Git and Node.js 22 or later with npm (`package.json` `engines`; CI uses Node 22).
 - Rust through rustup with the MSVC host. `rust-toolchain.toml` pins the exact Rust version with rustfmt and Clippy; rustup installs it the first time cargo runs in the repository (or run `rustup toolchain install`). Change that pin deliberately and rerun every check, because a new Clippy can fail `-D warnings` on unchanged code.
 - The Visual Studio C++ build tools (MSVC) with a Windows 10/11 SDK, and the WebView2 runtime: the [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows).
-- PowerShell 7 (`pwsh`) for `scripts/build_student_release.ps1` and `scripts/package_op_amp_lab_installer.ps1`. The student lab installer and the other scripts also run in Windows PowerShell 5.1.
+- PowerShell 7 (`pwsh`) for `scripts/build_student_release.ps1`. The other scripts also run in Windows PowerShell 5.1.
 
 `scripts/check_environment.ps1` checks these read-only and exits with code 1 when something required is missing; `-ReportPath` saves a copy. An Arduino IDE is not required for the distributed application; developers who run hardware tools outside the app need the approved UNO R4 environment.
 
@@ -33,7 +33,7 @@ Build the frontend before `npm test`: a release-configuration test requires `bui
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on Windows with the pinned toolchain and a Rust build cache. Besides the checks above, it confirms that `scripts/install_op_amp_lab_profile.zip` matches its scripts and installs the Op Amp Lab profile into temporary catalogs with Windows PowerShell 5.1, PowerShell 7 and the `.bat` launcher, checking the installed profile hash, that an existing catalog keeps its other labs and is backed up exactly once, an unchanged catalog on a second run, and exit code 1 for an invalid catalog. Third-party actions are pinned to commit SHAs, with the release tag in a comment.
+`.github/workflows/ci.yml` runs on Windows with the pinned toolchain and a Rust build cache, and runs the checks above. Third-party actions are pinned to commit SHAs, with the release tag in a comment.
 
 `.github/workflows/audit.yml` runs weekly, on demand, and for pull requests that change a manifest or lockfile. `npm audit --omit=dev --audit-level=high` and `cargo audit` block; `npm audit` over all dependencies and the full `cargo audit` report are informational. The blocking `cargo audit` ignores only the reviewed `zip` 2.x advisories listed in that workflow, whose fixes need a semver-major `zip` upgrade; remove each ignore once `zip` is upgraded. `.github/dependabot.yml` opens weekly update pull requests for npm, Cargo and GitHub Actions, grouping minor and patch updates. Tauri npm packages and their crates arrive in separate npm and Cargo pull requests; when one moves to a new minor release, CI fails on the Tauri version check until both are updated together.
 
@@ -81,7 +81,8 @@ Use `npm run tauri build` for a production executable and installers. It runs th
 - `src/lib/*.ts`: pure TypeScript modules for messages, readiness, board state, plots, calibration, and storage, tested by the Vitest `*.test.ts` files beside them. [Architecture](ARCHITECTURE.md#frontend-structure) lists them.
 - `src-tauri/src/`: Rust acquisition, protocol, serial lease, lab catalog, calibration, runtime, and reference-firmware workflows.
 - `firmware/reference_unor4wifi/`: controlled UNO R4 WiFi reference firmware.
-- `profiles/`: immutable factory course-lab definitions.
+- `profiles/`: immutable factory course-lab definitions (`*.profile.json`, compiled in through `FACTORY_LAB_FILES` in `profiles.rs`) and `factory-labs.lock.json`, the append-only record of every factory lab version shipped (see [Factory labs](#factory-labs)).
+- `src-tauri/examples/factory_labs.rs`: the factory lab file tool behind `scripts/update_factory_labs.ps1` (`check`, `fix`, `promote`).
 - `docs/`: user, instructor, maintainer, protocol, and release documentation.
 - `src-tauri/nsis/`: the NSIS template the setup is built from, its unmodified upstream copy, and a README (see [Re-syncing the NSIS template](#re-syncing-the-nsis-template)).
 - `src-tauri/icons/`: only the icons `tauri.conf.json` `bundle.icon` lists (the Windows build uses `icon.ico`). If you regenerate them with `npm run tauri icon`, delete the Android, iOS and Microsoft Store (`Square*Logo.png`, `StoreLogo.png`) outputs it adds.
@@ -89,11 +90,29 @@ Use `npm run tauri build` for a production executable and installers. It runs th
 - `scripts/check_release_consistency.ps1`: version, firmware and runtime metadata check used by CI and the release script.
 - `scripts/check_environment.ps1`: read-only check of the development prerequisites.
 - `scripts/start_dev_sandbox.ps1`: `npm run tauri dev` with disposable app data.
-- `scripts/install_op_amp_lab_profile.ps1` and `.bat`: the student Op Amp Lab installer; `scripts/package_op_amp_lab_installer.ps1` rebuilds its ZIP (see below).
+- `scripts/update_factory_labs.ps1`: checks, re-hashes, or promotes factory lab files (PowerShell 7 and 5.1).
+- `src-tauri/src/testdata/op_amp_2.0.1_imported.lab.json`: the Op Amp Lab 2.0.1 that the retired v1.0.2 student installer embedded, byte for byte, for the hash and migration tests (see [Op Amp Lab migration](#op-amp-lab-migration)).
 
-## Student Op Amp Lab installer
+## Factory labs
 
-`scripts/install_op_amp_lab_profile.zip` is the student download. It contains `install_op_amp_lab_profile.bat` and then `install_op_amp_lab_profile.ps1`, both with CRLF line endings, stored uncompressed with a fixed timestamp, so the same scripts always give the same ZIP bytes. `.gitattributes` checks out `*.bat`, `*.cmd` and `*.ps1` with CRLF on every host. After changing either script, run `pwsh -NoProfile -File scripts\package_op_amp_lab_installer.ps1` and commit the regenerated ZIP with the change; CI runs it with `-Check` and fails on a stale ZIP. Keep both scripts ASCII so Windows PowerShell 5.1 reads them unchanged, and do not edit the embedded profile JSON: a Rust test checks its canonical hash, and any profile change needs a new locked version and hash.
+The factory (built-in) course labs are `profiles/*.profile.json`, compiled into the application by `FACTORY_LAB_FILES` in `src-tauri/src/profiles.rs` and verified against their canonical SHA-256 hash at startup. The hash covers the parsed lab, not the file's layout. Version policy P2 keeps factory and local versions apart:
+
+- A factory lab version is always `MAJOR.MINOR.0`; any change to a factory lab's content bumps MINOR (`X.Y+1.0`), and a published version never changes.
+- A local revision always has PATCH ≥ 1 (`next_revision_version`), so it never has a factory version's ID and version.
+- `required_firmware.build` is the minimum firmware build whose features the lab uses, and must be on the lab-firmware allow-list in `profiles.rs`. Labs that do not use a new build's features keep their build and hash.
+- `profiles/factory-labs.lock.json` is the append-only list of every factory lab version shipped (`profile_id`, `profile_version`, `canonical_hash`).
+
+Rust tests require every compiled-in lab to be in the lock with its hash, every `profiles/*.profile.json` to be compiled in, every factory lab to be `MAJOR.MINOR.0`, `built_in` and `locked`, no lock entry to repeat an ID and version, every lock entry to be held by a file in `profiles/` or `profiles/legacy/`, and the hashes of the labs v1.0.2 shipped to stay unchanged (the golden guard for the canonical serialization, read from the current or legacy file). `fix` and `promote` keep a replaced published version in `profiles/legacy/<file>_<version>.profile.json`; commit it with the lab file and the lock. Tests that need General Analog's version read it from the compiled-in lab (`general_default_version()`), so a new factory version does not break them. When you add a serde field to a lab type, give it a default and `skip_serializing_if` so existing labs keep their hashes and catalogs written by 1.0.x still load.
+
+Change a factory lab only with `scripts/update_factory_labs.ps1` (`check`, `fix <file> [--bump-minor]`, `promote <exported.lab.json>`); [Lab Configuration](LAB_CONFIGURATION.md#how-to-change-a-built-in-lab) walks through both workflows with examples. `check` exits with code 1 on any problem; the Rust test `the_repository_profiles_folder_passes_the_factory_lab_check` runs the same check in CI.
+
+## Op Amp Lab migration
+
+Op Amp Lab is a factory lab (`profiles/op_amp_course_capture.profile.json`, category `course_op_amp`, appended last in `FACTORY_LAB_FILES`). The v1.0.2 student installer (`install_op_amp_lab_profile.bat`/`.ps1`, its ZIP, and `package_op_amp_lab_installer.ps1`) and its CI steps were removed. `.gitattributes` still checks out `*.bat`, `*.cmd` and `*.ps1` with CRLF on every host.
+
+That installer stored Op Amp Lab as General Analog 2.0.1. `ProfileStore::with_root` runs startup migration `op_amp_builtin_v1` (`migrate_legacy_op_amp_lab` in `profiles.rs`) while it holds the catalog lock, never from `sync_with_disk`. It retires that revision when it is active and has one of the two published hashes, makes General Analog's course default active, keeps a `lab_state.pre-migration-<time>.json` copy, and reports `CatalogStatus.migration_notices`, which the Lab card shows in both modes (`catalogMigrationNotice` in `src/lib/lab-catalog.ts`; it never feeds the "Some labs could not be loaded" banner). The catalog's additive `applied_migrations` list records it (decided when a catalog is read, by the migration itself, or by an instructor's Import lab of the copy; never by a write while the copy is still selected and not migrated); [Lab Configuration](LAB_CONFIGURATION.md#catalog-file) gives the exact rules. Do not edit `src-tauri/src/testdata/op_amp_2.0.1_imported.lab.json`: the tests pin its hashes (`c73cc1f2…` as stored, `bcc08868…` as an instructor revision) and seed catalogs with it. A further one-time migration follows the same pattern: a new name in `applied_migrations`, run from `apply_startup_migrations`, with a backup before the write.
+
+The Simulator gives `course_op_amp` its own signals: Vmid near 2.5 V with a few millivolts of deterministic noise and Vout a 1 Hz sine around it.
 
 ## Re-syncing the NSIS template
 

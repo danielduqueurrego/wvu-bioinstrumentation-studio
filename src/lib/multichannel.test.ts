@@ -1,11 +1,16 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { initialChannelUnits, supportedDisplayUnits } from './calibration';
 import type { LabProfile } from './labs';
 import {
   assignChannelToPlot,
   channelColor,
   defaultPlotGroups,
   initialTraceVisibility,
+  isPulseOxProfile,
   labRevisionKey,
+  normalizePlotGroups,
   numberedVisiblePlotGroups,
   onePlotPerSignal,
   overlayAll,
@@ -228,5 +233,27 @@ describe('multi-channel UI helpers', () => {
     expect(labRevisionKey(twoChannels)).toBe('lab@1.0.0');
     expect(labRevisionKey({ ...twoChannels, profile_version: '1.0.1' })).not.toBe(labRevisionKey(twoChannels));
     expect(labRevisionKey(undefined)).toBe('');
+  });
+
+  it('treats the built-in Op Amp Lab as an ordinary two-channel analog lab', () => {
+    const opAmp = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'profiles', 'op_amp_course_capture.profile.json'), 'utf8')
+    ) as LabProfile;
+    expect(opAmp.category).toBe('course_op_amp');
+    expect(isPulseOxProfile(opAmp)).toBe(false);
+    const channels = plotChannelsFor(opAmp);
+    expect(channels.map((channel) => [channel.id, channel.label])).toEqual([['vmid', 'Vmid (A0)'], ['vout', 'Vout (A1)']]);
+    // Counts and volts, starting in counts, like any other analog channel.
+    expect(initialChannelUnits(channels, opAmp.category)).toEqual({ vmid: 'counts', vout: 'counts' });
+    for (const channel of channels) {
+      expect(supportedDisplayUnits(opAmp.category, channel.id, false, channel.allowed_conversions ?? [])).toEqual(['counts', 'volts']);
+    }
+    // The lab's plot defaults (one plot per signal) match the generic default.
+    const fromLab = normalizePlotGroups(
+      channels,
+      (opAmp.plot_defaults?.groups ?? []).map((group, index) => ({ id: `profile-${index + 1}`, channelIds: group.channel_ids }))
+    );
+    expect(fromLab.map((group) => group.channelIds)).toEqual([['vmid'], ['vout']]);
+    expect(defaultPlotGroups(opAmp.category, channels).map((group) => group.channelIds)).toEqual([['vmid'], ['vout']]);
   });
 });

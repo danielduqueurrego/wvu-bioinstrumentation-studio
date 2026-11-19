@@ -635,6 +635,46 @@ async fn import_profile_package(
     catalog_task(move || store.import_profile(&PathBuf::from(source))).await
 }
 
+/// Lab Manager "Save as course default file…" (Instructor mode, enforced by
+/// the store). Writes a factory lab file; the catalog is not changed.
+#[tauri::command]
+async fn export_course_default_file(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    profile_version: String,
+    destination: String,
+) -> Result<profiles::CourseDefaultExport, String> {
+    let store = state.profiles.clone();
+    catalog_task(move || {
+        store.export_course_default(&profile_id, &profile_version, &PathBuf::from(destination))
+    })
+    .await
+}
+
+/// "Install lab file…": reads a lab file and reports what installing it
+/// would do. Read-only; available in Student and Instructor mode.
+#[tauri::command]
+async fn inspect_lab_file(
+    state: tauri::State<'_, AppState>,
+    source: String,
+) -> Result<profiles::LabFileSummary, String> {
+    let store = state.profiles.clone();
+    catalog_task(move || store.inspect_lab_file(&PathBuf::from(source))).await
+}
+
+/// "Install lab file…": installs a lab file in Student or Instructor mode.
+/// Refused while a recording runs; a session state that cannot be read is
+/// treated as recording.
+#[tauri::command]
+async fn install_lab_file(
+    state: tauri::State<'_, AppState>,
+    source: String,
+) -> Result<profiles::AcquisitionProfile, String> {
+    let recording_active = state.session.recording_active().unwrap_or(true);
+    let store = state.profiles.clone();
+    catalog_task(move || store.install_lab_file(&PathBuf::from(source), recording_active)).await
+}
+
 #[tauri::command]
 fn list_calibrations(
     state: tauri::State<'_, AppState>,
@@ -1307,6 +1347,9 @@ pub fn run() {
             retire_profile,
             export_profile_package,
             import_profile_package,
+            export_course_default_file,
+            inspect_lab_file,
+            install_lab_file,
             list_calibrations,
             save_calibration,
             delete_calibration,
@@ -1410,11 +1453,7 @@ mod tests {
     }
 
     fn first_factory_lab() -> profiles::AcquisitionProfile {
-        profiles::built_in_profiles()
-            .unwrap_or_else(|error| panic!("{error}"))
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("no factory lab"))
+        profiles::factory_lab("wvu.bmeg420l.general.analog.development.v2")
     }
 
     #[test]

@@ -149,7 +149,7 @@ The session keeps up to 30,000 recent frames (30 s at 1 kHz). `get_recent_displa
 | `SetupCard` | Collapsible card with a one-line summary; the setup cards are read-only while recording |
 | `BoardPanel` | Board list, Refresh Board, state chip, the fitting action, More board actions (Verify, Restore, Repair Arduino tools), and the Last firmware operation card |
 | `FirmwareJobProgress` | Restore stepper (Prepare, Compile, Switch board to upload mode, Upload, Reconnect, Verify), the double-reset countdown, and Cancel restore |
-| `LabCard` | Operating mode (`OperatingModeControl`), Lab Manager (`LabManager`, Instructor mode only), lab selection, and lab details |
+| `LabCard` | Operating mode (`OperatingModeControl`), Lab Manager (`LabManager`, Instructor mode only), lab selection, **Install lab file…** (both modes), lab details, and a catalog migration notice (both modes) |
 | `SessionCard`, `DurationCard` | Output folder, recording note, lab acquisition settings; duration mode, presets, and the storage estimate |
 | `CalibrationCard`, `CalibrationDialog` | Vref and Vs, calibration selection, display units, and the linear-fit dialog |
 | `LiveSignalsPanel` | Live signals: `PlotToolbar` (Pause display, time-window chips) and one `LivePlot` (uPlot) per plot group, marker lines, and the SIMULATED DATA watermark |
@@ -175,6 +175,6 @@ The page's decisions live in pure TypeScript modules in `src/lib/`, tested by th
 
 ## Labs and runtime
 
-- Lab definitions describe course acquisition, display defaults, supported conversion types, allowed duration modes, and required firmware capabilities. Factory definitions in `profiles/` are immutable. Local instructor revisions are explicit records in a catalog file that is written atomically under a cross-process lock.
+- Lab definitions describe course acquisition, display defaults, supported conversion types, allowed duration modes, and required firmware capabilities. Factory definitions in `profiles/` are immutable. Local instructor revisions are explicit records in a catalog file that is written atomically under a cross-process lock. Apart from recovery after an interrupted save, the only write without a user action is a one-time startup migration at load, under that lock and after a backup copy (`op_amp_builtin_v1`, which retires the old Op Amp Lab copy of General Analog; see [Lab Configuration](LAB_CONFIGURATION.md#catalog-file)).
 - Start sends the lab's `profile_version`. The backend refuses to start if the active revision changed after the page loaded it, and the Lab Manager is disabled while recording.
 - The Arduino runtime ships inside the installer and is extracted under a cross-process lock to `%LOCALAPPDATA%\WVU-BMEG\rt`. The extracted files are checked at startup, and Repair Arduino tools re-extracts them. A failed Repair reports `previous_runtime_kept` after checking that the tools already in use are still complete on disk; the page then keeps their state, so Restore stays available. Production CLI processes are launched by Rust with hidden Windows console creation and no shell.

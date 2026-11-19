@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "profile_id": "wvu.bmeg420l.op_amp.course.capture.v1",
+  "profile_version": "1.0.0",
+  "display_name": "Op Amp Lab",
+  "category": "course_op_amp",
+  "status": "locked",
+  "source": "built_in",
+  "description": "Synchronized raw capture of Vmid (A0) and Vout (A1) for the BMEG 420L operational amplifiers lab.",
+  "target_board": "Arduino UNO R4 WiFi",
+  "fqbn": "arduino:renesas_uno:unor4wifi",
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 4, "build": "0x00010006", "device": "0x554E4F34" },
+  "acquisition": {
+    "analog_pin": "A0", "adc_resolution_bits": 14, "sample_rate_hz": 100,
+    "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
+    "acquisition_mode": "simultaneous",
+    "channels": [
+      { "pin": "A0", "id": "vmid", "label": "Vmid (A0)", "csv_name": "vmid_counts", "units": "ADC counts", "allowed_conversions": ["counts_volts"], "default_display_unit": "counts" },
+      { "pin": "A1", "id": "vout", "label": "Vout (A1)", "csv_name": "vout_counts", "units": "ADC counts", "allowed_conversions": ["counts_volts"], "default_display_unit": "counts" }
+    ]
+  },
+  "display": { "primary_quantity": "arduino_input_volts", "channel_label": "Op amp signals", "raw_units_label": "ADC counts", "voltage_units_label": "V", "voltage_reference_v": 5.0, "plot_min_v": 0.0, "plot_max_v": 5.0 },
+  "safety": { "bench_only": true, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Use simulator, UNO alone, or a safe 0–5 V bench signal for development."] },
+  "export": { "signal_name": "op_amp_course_capture", "include_profile_snapshot": true },
+  "plot_defaults": { "groups": [{ "channel_ids": ["vmid"] }, { "channel_ids": ["vout"] }] },
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "90113222d07df3e239b95666510ab77b77356bd5dc0ae04b7660d60d0faa579d" }
+}

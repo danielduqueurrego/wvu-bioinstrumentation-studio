@@ -1,5 +1,5 @@
 import { isTimedDurationValid, MIN_TIMED_SECONDS } from './duration';
-import type { LabProfile } from './labs';
+import type { LabListEntry, LabProfile } from './labs';
 
 export type LabDraftSession = {
   draft: LabProfile;
@@ -138,6 +138,8 @@ export type CatalogStatus = {
   recovered_from?: string | null;
   /** Unreadable leftovers of an interrupted save, renamed aside and kept. */
   kept_unreadable_files?: string[];
+  /** What a one-time startup migration changed in this launch (plain sentences). */
+  migration_notices?: string[];
   calibration_issues?: string[];
 };
 
@@ -180,4 +182,123 @@ export function catalogNotice(status: CatalogStatus | undefined, instructor: boo
       : `${calibrationIssues.length === 1 ? 'One saved calibration file' : `${calibrationIssues.length} saved calibration files`} could not be read and ${calibrationIssues.length === 1 ? 'was' : 'were'} skipped.`);
   }
   return parts.length ? parts.join(' ') : undefined;
+}
+
+/**
+ * What a startup migration changed in the local lab catalog during this
+ * launch (for example the Op Amp Lab copy retired when the Op Amp Lab became
+ * built in). It is information, not a problem: the Lab card shows it in
+ * both modes, and it never raises the "Some labs could not be loaded"
+ * banner that `catalogNotice` feeds.
+ */
+export function catalogMigrationNotice(status: CatalogStatus | undefined): string | undefined {
+  const notices = (status?.migration_notices ?? []).map((notice) => notice.trim()).filter(Boolean);
+  return notices.length ? notices.join(' ') : undefined;
+}
+
+/** `export_course_default_file` result ("Save as course default file…"). */
+export type CourseDefaultExport = {
+  path: string;
+  file_name: string;
+  profile_id: string;
+  display_name: string;
+  /** The factory version the file carries (MAJOR.MINOR.0). */
+  profile_version: string;
+  canonical_hash: string;
+  /** The course default this application ships for the lab, if any. */
+  replaces_version?: string | null;
+  /** The lab's factory file in the repository's `profiles` folder, if it has one. */
+  factory_file_name?: string | null;
+  /** The `FACTORY_LAB_FILES` line that compiles the file in. */
+  source_line: string;
+};
+
+/** The file name the Save dialog suggests for a course default file. */
+export function courseDefaultFileName(entry: LabListEntry): string {
+  return entry.course_default_file_name || `${entry.profile.profile_id}.profile.json`;
+}
+
+/**
+ * What to do with a course default file, shown in Lab Manager after it was
+ * saved. The steps are those of `docs/LAB_CONFIGURATION.md` ("How to change
+ * a built-in lab"). The file is not for students: every file saved from one
+ * build gets the same version, so Install lab file refuses it; the revision's
+ * Export is what students install until the new build.
+ */
+export function courseDefaultExportText(outcome: CourseDefaultExport): string {
+  const fileName = outcome.factory_file_name ?? outcome.file_name;
+  const placement = outcome.factory_file_name
+    ? `Copy it into the repository's profiles folder as ${fileName}, replacing course default ${outcome.replaces_version ?? 'file'} of this lab.`
+    : `Copy it into the repository's profiles folder as ${fileName}.`;
+  const steps = [
+    placement,
+    `Run scripts\\update_factory_labs.ps1 check and follow what it reports: fix records version ${outcome.profile_version} in factory-labs.lock.json.`,
+    ...(outcome.factory_file_name ? [] : [`Add ${outcome.source_line} at the end of FACTORY_LAB_FILES in src-tauri/src/profiles.rs.`]),
+    'Rebuild the application.'
+  ];
+  return `Saved ${outcome.display_name} ${outcome.profile_version} as a course default file: ${outcome.path}. To build it into the application: ${steps.map((step, index) => `${index + 1}. ${step}`).join(' ')} This file is not for students. To give them the change before the new build, Export this revision and share that .lab.json file.`;
+}
+
+/** One analog input of a lab file (`inspect_lab_file`). */
+export type LabFileChannel = { pin: string; label: string };
+
+/** The active lab that installing a lab file would replace (same lab ID). */
+export type LabFileReplacement = {
+  profile_id: string;
+  profile_version: string;
+  display_name: string;
+  /** The replaced lab is the shipped course default. */
+  course_default: boolean;
+  /** The lab ID has a shipped course default (Restore course default undoes the install). */
+  has_course_default: boolean;
+};
+
+/** `inspect_lab_file`: what "Install lab file…" would install. */
+export type LabFileSummary = {
+  profile_id: string;
+  profile_version: string;
+  display_name: string;
+  acquisition_mode: LabProfile['acquisition']['acquisition_mode'];
+  channels: LabFileChannel[];
+  sample_rate_hz: number;
+  adc_resolution_bits: number;
+  /**
+   * This exact version is installed and active, so installing changes nothing.
+   * (Installed but not active: no refusal, the install makes it active again.)
+   */
+  already_installed: boolean;
+  replaces?: LabFileReplacement | null;
+  /** Why installing the file would be refused (Rust's wording), if it would be. */
+  refusal?: string | null;
+};
+
+/** One line describing the lab in a lab file. */
+export function labFileDescription(summary: LabFileSummary): string {
+  const pulseox = summary.acquisition_mode === 'pulseox_4state';
+  const inputs = summary.channels.map((channel) => `${channel.pin} ${channel.label}`).join(', ') || 'no analog inputs';
+  const rate = pulseox ? `about ${summary.sample_rate_hz} cycles/s` : `${summary.sample_rate_hz} frames/s`;
+  return `${summary.display_name} ${summary.profile_version} (${pulseox ? 'pulse oximetry' : 'simultaneous analog'}: ${inputs}; ${rate}; ${summary.adc_resolution_bits}-bit ADC)`;
+}
+
+/** The Install lab file question: a warning when the file replaces a lab. */
+export function installConfirmation(summary: LabFileSummary): { message: string; kind: 'info' | 'warning'; okLabel: string } {
+  const lab = labFileDescription(summary);
+  const replaced = summary.replaces;
+  if (!replaced) {
+    return { message: `Install ${lab}? It is added to the lab list on this computer.`, kind: 'info', okLabel: 'Install' };
+  }
+  const undo = replaced.has_course_default
+    ? 'Your instructor can undo this with Restore course default.'
+    : 'Your instructor can undo this in Manage Labs by retiring the installed version or making the earlier version active.';
+  return {
+    message: `Install ${lab}? This replaces ${replaced.display_name} ${replaced.profile_version} on this computer. ${undo}`,
+    kind: 'warning',
+    okLabel: 'Install and replace'
+  };
+}
+
+/** The result of Install lab file, shown in the Lab card. */
+export function installOutcomeText(profile: LabProfile, replaced?: LabFileReplacement | null): string {
+  const replacement = replaced ? ` in place of ${replaced.display_name} ${replaced.profile_version}` : '';
+  return `Installed ${profile.display_name} ${profile.profile_version}${replacement}. It is now the selected lab.`;
 }

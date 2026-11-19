@@ -80,6 +80,11 @@ None of these can run without the real runtime ZIP and an Arduino UNO R4 WiFi. U
 - [ ] D4/D5/D6 read LOW after Stop, after a fault, and after the 5 s watchdog (for example, end the app's process mid-recording).
 - [ ] Pulse-ox RED/IR timing passes the [Release Checklist](RELEASE_CHECKLIST.md) pulse-ox criteria, and RED and IR are never HIGH together.
 
+**Labs (release-1.1-prep)**
+
+- [ ] On the maintainer's own catalog, the first start of a `release-1.1-prep` build retires the Op Amp Lab 2.0.1 copy, leaves a `lab_state.pre-migration-*.json` backup, and shows the migration notice in the Lab card. A second start shows no notice and makes no new backup.
+- [ ] The built-in Op Amp Lab records `vmid_counts` and `vout_counts` from A0 and A1 on hardware.
+
 **Docs**
 
 - [ ] Retake the README Board screenshot on hardware with the real runtime, then add it back to README's **Board** section. `docs/images/board-and-firmware.png` was removed because it predated the redesign.
@@ -92,7 +97,7 @@ None of these can run without the real runtime ZIP and an Arduino UNO R4 WiFi. U
 | Source, docs, scripts | Repository working tree and Git history | `master` is on GitHub. **`review-fixes` exists only on this computer** until it is pushed or bundled. |
 | Real offline Arduino runtime | `src-tauri/resources/arduino-runtime.zip` | Ignored by Git; required for genuine firmware restore and release packaging. **Currently the CI placeholder on this computer.** |
 | Instructor lab catalog | `%LOCALAPPDATA%\WVU Bioinstrumentation Studio\profiles\lab_state.json` | Local labs are not automatically uploaded to GitHub |
-| Catalog backups and audit logs | Same `profiles` directory (`lab_state.reset-*.json`, `lab_state.corrupt-*.json`, audit logs) | Preserve with the catalog |
+| Catalog backups and audit logs | Same `profiles` directory (`lab_state.reset-*.json`, `lab_state.corrupt-*.json`, `lab_state.pre-migration-*.json`, audit logs) | Preserve with the catalog |
 | Calibration presets | `%LOCALAPPDATA%\WVU Bioinstrumentation Studio\calibrations\*.json` | User-specific; preserve if present |
 | Project-folder preference | `%LOCALAPPDATA%\WVU Bioinstrumentation Studio\project-folder.json` | May need a new folder selection if the Windows username/path changes |
 | Application log | `%LOCALAPPDATA%\WVU Bioinstrumentation Studio\logs\application.log` | Diagnostic evidence, including rotated files if present |
@@ -154,7 +159,7 @@ git log -1 --oneline
 5. Select the new Project folder in the app. Old absolute paths in preferences and historical logs may refer to the former Windows account. Let the app prepare a fresh `%LOCALAPPDATA%\WVU-BMEG\rt`; its native-USB core shim is applied automatically.
 6. Authenticate GitHub and the coding agent again through their normal sign-in methods if required. No credentials are included in the recovery archive.
 
-The release script requires PowerShell 7 (`#Requires -Version 7.0`). The student lab installer deliberately supports Windows PowerShell 5.1.
+The release script requires PowerShell 7 (`#Requires -Version 7.0`). The other scripts also run in Windows PowerShell 5.1.
 
 ### Verify the irreplaceable asset
 
@@ -230,7 +235,8 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 | Worker lifecycle, serial diagnostics, cancellation, storage guard, finalization, display history | `src-tauri/src/session.rs`, `acquisition.rs` |
 | Protocol framing, CRC, sequences, per-record timestamps | `src-tauri/src/protocol.rs`, [USB Protocol](USB_PROTOCOL.md) |
 | BMEG/CSV/metadata | `src-tauri/src/recording.rs`, [Calibration and Units](CALIBRATION_AND_UNITS.md#recording-files) |
-| Profiles, local versions, transactional catalog | `src-tauri/src/profiles.rs`, factory `profiles/*.profile.json` |
+| Profiles, local versions, transactional catalog, startup migration `op_amp_builtin_v1` | `src-tauri/src/profiles.rs`, factory `profiles/*.profile.json`, `profiles/factory-labs.lock.json`, `src-tauri/src/testdata/` |
+| Factory lab file tool (version policy P2) | `scripts/update_factory_labs.ps1`, `src-tauri/examples/factory_labs.rs`, [Lab Configuration](LAB_CONFIGURATION.md#how-to-change-a-built-in-lab) |
 | Calibration conversion and presets | `src/lib/calibration*.ts`, `src/lib/components/CalibrationCard.svelte`, `CalibrationDialog.svelte`, `src-tauri/src/calibration.rs` |
 | Project/Output path validation | `src-tauri/src/project_paths.rs`, `src/lib/project-folder.ts` |
 | Restore, Verify, CLI process flags, runtime deployment | `src-tauri/src/firmware_workflow.rs`, `arduino_cli.rs`, `arduino_runtime.rs`, `reference_firmware.rs` |
@@ -328,36 +334,49 @@ For an existing native-USB WVU sketch, the app explicitly waits for the double r
 
 Three local restore logs provide positive evidence: `firmware_job_12_20260923_154231.json`, `firmware_job_1_20260923_161951.json`, and `firmware_job_1_20260930_151855.json`. Each reports stage `complete`, compatible verification, and the current `f3eb...` source hash. The last job moves from COM34 to COM35. This does not establish which physical step resolved every earlier attempt. Inspect those backed-up logs if the maintainer asks about new-board recovery again.
 
-## Local Op Amp Lab and student installation
+## Op Amp Lab: built in, and the migration of the old copy
 
-The saved local catalog has a locked instructor profile:
+On `release-1.1-prep`, **Op Amp Lab** is a factory lab with its own ID. It is the sixth entry, appended last in `FACTORY_LAB_FILES`:
+
+```text
+File:     profiles/op_amp_course_capture.profile.json
+ID:       wvu.bmeg420l.op_amp.course.capture.v1
+Version:  1.0.0 (canonical hash 90113222d07df3e239b95666510ab77b77356bd5dc0ae04b7660d60d0faa579d, in the lock)
+Category: course_op_amp (bench-only; no ECG/EMG acknowledgement)
+Inputs:   A0 vmid "Vmid (A0)" -> vmid_counts; A1 vout "Vout (A1)" -> vout_counts (counts/volts)
+Rate/ADC: 100 frames/s, 14 bit; plots [vmid], [vout]; export signal_name op_amp_course_capture
+Required: protocol 0.4, firmware build 0x00010006
+```
+
+The frontend has no category-specific code for it: units, plots, readiness, and summaries follow its fields, as for any simultaneous analog lab. The Simulator has a `course_op_amp` signal model (Vmid near 2.5 V with a few mV of deterministic noise; Vout a 1 Hz, 1.5 V sine around it).
+
+**The old copy.** Before this, the Op Amp Lab existed only as a local revision of General Analog:
 
 ```text
 ID:       wvu.bmeg420l.general.analog.development.v2
 Version:  2.0.1
 Name:     Op Amp Lab
-Inputs:   A0 (Vmid), A1 (Vout)
-Rate/ADC: 100 frames/s, 14 bit
-Required: protocol 0.4, firmware build 0x00010006
+Inputs:   A0 (id Vmid, csv a0_counts), A1 (id Vout, csv 01_counts)
+Hashes:   bcc08868305ca55e81920e3a5805b020cfa612a0374e75fd5a290fa11f918ad9 (instructor, in the maintainer's own catalog)
+          c73cc1f2941910696d88f934b7b4c09b8b110438a4886d7d799b13807f61471d (imported, as the v1.0.2 student installer stored it)
 ```
 
-It uses the factory **General Analog — Development** ID, so on a computer where it is active it replaces General Analog in the student Lab list. That ID choice is a deferred decision (below).
+The two hashes differ only by `source`. While active, that copy replaced General Analog in the Lab list. The student installer (`install_op_amp_lab_profile.bat`/`.ps1`/`.zip`), `package_op_amp_lab_installer.ps1`, and their CI steps were removed. The installer's embedded JSON is kept byte for byte, `\u` escapes included, as `src-tauri/src/testdata/op_amp_2.0.1_imported.lab.json`; Rust tests pin both hashes from it and seed migration catalogs with it.
 
-**Hashes.** The instructor canonical hash is `bcc08868305ca55e81920e3a5805b020cfa612a0374e75fd5a290fa11f918ad9`. The standalone student installer embeds the same profile with `source=imported`, as the application's Import operation does, which gives the hash `c73cc1f2941910696d88f934b7b4c09b8b110438a4886d7d799b13807f61471d`. That source-field change explains the different hash. A Rust test pins both the factory hashes and the installer's embedded profile hash.
+**Migration `op_amp_builtin_v1`** (`ProfileStore::apply_startup_migrations` / `migrate_legacy_op_amp_lab` in `profiles.rs`):
 
-**The installer.** The `.bat` and `.ps1` must stay together. Double-clicking the `.bat` requires no elevation and installs and activates version 2.0.1 for the current Windows user. The PowerShell script:
+- **When it runs.** Only from `with_root`, while it holds the catalog lock and the catalog loaded writable; never from `sync_with_disk`. It runs if the catalog's additive `applied_migrations` list lacks `op_amp_builtin_v1` and General Analog 2.0.1 with one of the two verified hashes is the active, unretired General Analog revision.
+- **What it does.**
+  1. Copies the catalog's bytes (`write_new_file_durably`: `create_new`, write, `sync_all`; no attributes, so a read-only catalog gives a writable copy) to `lab_state.pre-migration-<time>.json`, or reuses an existing `lab_state.pre-migration-*.json` with the same bytes (left by a start whose write failed). If the copy fails, nothing changes (`LAB_CATALOG_MIGRATION_DEFERRED`).
+  2. Retires 2.0.1 and activates General Analog's course default, then commits through the normal transactional write.
+  3. Logs `LAB_CATALOG_MIGRATED` (retired version and hash, active version, backup path) and writes a `lab_write_audit.log` line, operation `op_amp_builtin_v1`.
+  4. Adds `CatalogStatus.migration_notices`. The Lab card shows it in both modes through `catalogMigrationNotice` (`src/lib/lab-catalog.ts`); it does not raise the "Some labs could not be loaded" banner.
+- **Failures.** A failed commit keeps the migrated runtime for this launch (the notice says it was not saved) and logs `LAB_CATALOG_MIGRATION_NOT_SAVED`. A later write in that launch saves it; otherwise the next start migrates again. Without the lock, nothing is written and the next start tries again.
+- **The marker.** It is decided when a catalog is read, not when it is written (`settle_op_amp_builtin_migration`, called by `runtime_with_catalog` at startup and in `sync_with_disk`): a 2.0.1 copy that is already inactive or retired puts `op_amp_builtin_v1` in the in-memory `applied_migrations`. The migration itself and an instructor's **Import lab** of the copy (`install_package`) add it too. Writes persist exactly the in-memory set, so an instructor who restores or re-imports the copy keeps it, while a copy that is still selected and not migrated (a start without the lock, or a copy another program selected while the window was open) is never marked by a later write and is migrated at the next start. It is not written while the copy is absent, so a later run of the old installer is still caught. Reset local customizations clears it.
 
-- Preserves labs with other IDs
-- Backs up an existing catalog before a change
-- Rejects conflicting same-ID/version content
-- Verifies the embedded hash
-- Refuses installation while the app runs
+**On the maintainer's own PC** the migration also retires the maintainer's instructor copy (hash `bcc08868…`). It can be restored with **Restore** in Manage Labs, or from the `lab_state.pre-migration-*.json` backup. Hardware check: on that catalog the backup and the notice exist, and the built-in Op Amp Lab records `vmid_counts` and `vout_counts`.
 
-Explicit UTF-8 catalog reads and escaped non-ASCII JSON preserve hash consistency in PowerShell 5.1.
-
-**CI and packaging.** CI runs the install, hash, existing-catalog preservation and backup, idempotence, and invalid-catalog checks under Windows PowerShell 5.1, PowerShell 7, and the `.bat` launcher. After editing either script, rebuild the student ZIP with `pwsh -NoProfile -File scripts\package_op_amp_lab_installer.ps1`; CI fails on a stale ZIP.
-
-The instructor profile is not a factory definition in Git. Recover the private AppData catalog or use the embedded installer; do not assume a fresh clone contains all local instructor labs. Test changes against a temporary `-CatalogRoot`, not the maintainer's live catalog.
+Test catalog changes with temporary roots (the Rust tests) or `scripts\start_dev_sandbox.ps1`, never against the maintainer's live catalog.
 
 ## Deferred decisions
 
@@ -394,8 +413,8 @@ Still open: run the four upgrades from 1.0.2 in Windows Sandbox (NSIS to NSIS fr
 
 **Design**
 
-- The Op Amp Lab reuses the factory General Analog profile ID, so installing it hides General Analog. Its A1 channel also has `csv_name` `01_counts`. Options: document it as intended, re-issue it under its own ID, or ship it as a factory lab.
-- Numbering of local revisions versus future factory patches of the same ID
+- The Op Amp Lab's shared General Analog ID: resolved on `release-1.1-prep` by shipping it as a factory lab with its own ID (`wvu.bmeg420l.op_amp.course.capture.v1`, CSV fields `vmid_counts`/`vout_counts`), retiring the student installer, and migration `op_amp_builtin_v1` for catalogs where the old 2.0.1 copy is active; see [Op Amp Lab](#op-amp-lab-built-in-and-the-migration-of-the-old-copy). The old copy's `01_counts` field stays as it was in that stored revision.
+- Numbering of local revisions versus future factory patches of the same ID: resolved by version policy P2 (factory versions `MAJOR.MINOR.0`, edited revisions PATCH ≥ 1, `profiles/factory-labs.lock.json`); see [Lab Configuration](LAB_CONFIGURATION.md#factory-lab-versions). A new lab ID starts locally at 1.0.0, so `next_factory_lab_version` also counts the revision a factory version is made from (`promote`, "Save as course default file…"): a new lab saved as 1.0.x becomes factory 1.1.0. Every lock entry stays held by a file (`profiles/` or `profiles/legacy/<file>_<version>.profile.json`); `fix`/`promote` keep a replaced published version there (from the file, or from `git cat-file blob HEAD:profiles/<file>` in the example tool), and `check` reports a missing one. Install lab file refuses a `built_in` file that is not in the compiled lock with that hash (a course default file for a later build). A stored lab that still collides with a course default is kept and reported, never erased.
 - Non-ASCII Windows usernames in the extracted toolchain path
 - A recovery tool for `.bmeg.part` files
 - A CSV `elapsed_s` column and a separate markers CSV

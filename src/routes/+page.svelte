@@ -43,6 +43,7 @@
   import { durationRequest, type RecordingDurationRequest } from '$lib/duration';
   import {
     allowedDurationMode,
+    catalogMigrationNotice,
     catalogNotice,
     labDurationModes,
     labDurationRefusal,
@@ -376,6 +377,7 @@
   $: durationRefusal = labDurationRefusal(activeProfile, durationMode, timedSeconds);
   $: duration = durationRequest(durationMode, timedSeconds);
   $: catalogNoticeText = catalogNotice(catalogStatus, instructorModeActive);
+  $: catalogMigrationText = catalogMigrationNotice(catalogStatus);
   $: outputFolderError = relativeOutputFolderError(outputDirectory);
   // A failed verification deliberately leaves the session Faulted so its
   // diagnostics are available. Faulted does not own a serial handle and must
@@ -1605,6 +1607,7 @@
           pulseox={pulseoxProfile}
           {rateText}
           catalogNotice={catalogNoticeText}
+          migrationNotice={catalogMigrationText}
           locked={setupLocked}
           {modeChangeInFlight}
           onSelectLab={(profileId) => selectProfile(profileId)}

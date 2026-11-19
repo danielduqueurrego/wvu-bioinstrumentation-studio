@@ -5,7 +5,7 @@
   // function whose Promise is always truthy, so a negated check never cancels.
   import { confirm, open, save } from '@tauri-apps/plugin-dialog';
   import { estimatedPulseOxCycleRate, labConfigurationIssues, newChannel, normalizeEditorDraft, PULSEOX_PHASE_ORDER, pulseOxCycleRateHz, pulseOxDraft, pulseOxOutput, SIMULTANEOUS_RATES_HZ } from '$lib/lab-authoring';
-  import { beginEditSession, beginNewLabSession, labSaveErrorMessage, labSourceLabel, resetConfirmationText, resetOutcomeText, saveArguments, type CatalogStatus, type LabResetOutcome } from '$lib/lab-catalog';
+  import { beginEditSession, beginNewLabSession, courseDefaultExportText, courseDefaultFileName, labSaveErrorMessage, labSourceLabel, resetConfirmationText, resetOutcomeText, saveArguments, type CatalogStatus, type CourseDefaultExport, type LabResetOutcome } from '$lib/lab-catalog';
   import type { LabChannel as Channel, LabDigitalOutput as DigitalOutput, LabListEntry as LabEntry, LabPlotGroup as PlotGroup, LabProfile } from '$lib/labs';
   import Modal from './Modal.svelte';
 
@@ -33,6 +33,8 @@
   let saving = false;
   let duplicateId = '';
   let error = '';
+  /** What to do with a saved course default file; kept until the list reloads. */
+  let notice = '';
   let loading = false;
   // The error is not a live region (the page has exactly one, outside this
   // modal). Focus moves to it instead, so a screen reader reads it at once.
@@ -53,6 +55,7 @@
   async function refresh() {
     loading = true;
     error = '';
+    notice = '';
     try {
       labs = await invoke<LabEntry[]>('list_instructor_labs');
     } catch (reason) {
@@ -314,6 +317,23 @@
     } catch (reason) { error = String(reason); }
   }
 
+  /**
+   * Writes the revision as a factory lab file for the repository's profiles
+   * folder (next factory version, source built_in). Rust enforces
+   * Instructor mode; the catalog is not changed.
+   */
+  async function exportCourseDefault(entry: LabEntry) {
+    error = '';
+    notice = '';
+    const destination = await save({ defaultPath: courseDefaultFileName(entry), filters: [{ name: 'Course default lab file', extensions: ['profile.json'] }] });
+    if (!destination) return;
+    try {
+      const outcome = await invoke<CourseDefaultExport>('export_course_default_file', { profileId: entry.profile.profile_id, profileVersion: entry.profile.profile_version, destination });
+      notice = courseDefaultExportText(outcome);
+      onStatus(notice);
+    } catch (reason) { error = String(reason); }
+  }
+
   async function importLab() {
     if (blockedWhileRecording()) return;
     const source = await open({ multiple: false, filters: [{ name: 'BMEG lab configuration', extensions: ['json'] }] });
@@ -362,12 +382,13 @@
 <Modal open={visible} labelledBy="lab-manager-title" describedBy={error ? 'lab-manager-error' : undefined} onClose={closeManager} size="wide">
       <div class="manager-heading"><div><h2 id="lab-manager-title">Manage Labs</h2><p class="help">Instructor mode is a safety step against accidental changes, not a password lock. A saved lab must be supported by the connected WVU firmware before recording.</p></div><button type="button" onclick={closeManager}>Close</button></div>
       {#if error}<p id="lab-manager-error" class="error" tabindex="-1" bind:this={errorElement}>{error}</p>{/if}
+      {#if notice}<p class="notice course-default-notice">{notice}</p>{/if}
       {#if !draft}
         <div class="actions"><button type="button" class="gold" onclick={() => editLab()}>Edit selected lab</button><label>New/duplicate lab ID<input bind:value={duplicateId} placeholder="team2.custom.emg" /></label><button type="button" onclick={duplicateLab}>Duplicate selected lab</button><button type="button" onclick={createBlankLab}>Blank simultaneous lab</button><button type="button" onclick={importLab}>Import lab</button><button type="button" onclick={restoreDefault} disabled={!selectedProfile}>Restore course default</button><button type="button" class="danger" onclick={resetLocalCustomizations}>Reset local customizations</button></div>
         <section class="history" aria-label="Lab version history">
           <h3>Lab versions</h3>
           {#if loading}<p>Loading local lab history…</p>{:else}
-            <div class="history-table"><div class="history-head"><span>Name</span><span>Version</span><span>Source / status</span><span>Configuration</span><span>Actions</span></div>{#each labs as entry}<div class="history-row"><span title={entry.profile.profile_id}><strong>{entry.profile.display_name}</strong><small>{entry.profile.profile_id}</small></span><span>{entry.profile.profile_version}</span><span>{labSourceLabel(entry.profile.source)} · {entry.retired ? 'Retired' : entry.active ? 'Active' : 'Historical'}</span><span>{entry.profile.acquisition.acquisition_mode === 'pulseox_4state' ? 'Pulse oximetry — 4-state' : `${entry.profile.acquisition.channels?.length ?? 1} analog channel(s)`}; {entry.profile.acquisition.sample_rate_hz} Hz; {entry.profile.acquisition.adc_resolution_bits} bit</span><span class="row-actions"><button type="button" onclick={() => editLab(entry.profile.profile_id)} disabled={entry.retired}>Edit</button><button type="button" onclick={() => exportLab(entry)}>Export</button>{#if entry.retired}<button type="button" onclick={() => restore(entry)}>Restore</button>{:else if !entry.active}<button type="button" onclick={() => activate(entry)}>{entry.profile.source === 'built_in' ? 'Use factory default' : 'Make active'}</button>{/if}{#if entry.profile.source !== 'built_in' && !entry.retired}<button type="button" onclick={() => retire(entry)}>Retire</button>{/if}</span></div>{/each}</div>
+            <div class="history-table"><div class="history-head"><span>Name</span><span>Version</span><span>Source / status</span><span>Configuration</span><span>Actions</span></div>{#each labs as entry}<div class="history-row"><span title={entry.profile.profile_id}><strong>{entry.profile.display_name}</strong><small>{entry.profile.profile_id}</small></span><span>{entry.profile.profile_version}</span><span>{labSourceLabel(entry.profile.source)} · {entry.retired ? 'Retired' : entry.active ? 'Active' : 'Historical'}</span><span>{entry.profile.acquisition.acquisition_mode === 'pulseox_4state' ? 'Pulse oximetry — 4-state' : `${entry.profile.acquisition.channels?.length ?? 1} analog channel(s)`}; {entry.profile.acquisition.sample_rate_hz} Hz; {entry.profile.acquisition.adc_resolution_bits} bit</span><span class="row-actions"><button type="button" onclick={() => editLab(entry.profile.profile_id)} disabled={entry.retired}>Edit</button><button type="button" onclick={() => exportLab(entry)}>Export</button>{#if entry.profile.source !== 'built_in'}<button type="button" onclick={() => exportCourseDefault(entry)} title="Write this revision as a factory lab file for the repository's profiles folder">Save as course default file…</button>{/if}{#if entry.retired}<button type="button" onclick={() => restore(entry)}>Restore</button>{:else if !entry.active}<button type="button" onclick={() => activate(entry)}>{entry.profile.source === 'built_in' ? 'Use factory default' : 'Make active'}</button>{/if}{#if entry.profile.source !== 'built_in' && !entry.retired}<button type="button" onclick={() => retire(entry)}>Retire</button>{/if}</span></div>{/each}</div>
           {/if}
         </section>
       {:else}
@@ -387,7 +408,7 @@
   .authoring { margin-top: .8rem; padding-top: .8rem; border-top: 1px solid #d7dde2; }
   .manager-heading, .actions { display: flex; flex-wrap: wrap; gap: .7rem; align-items: end; justify-content: space-between; }
   .manager-heading h2, .manager-heading h3, .manager-heading h4 { margin: 0; } .manager-heading p { margin: .35rem 0 0; max-width: 74ch; }
-  .help { color: #4b5965; } .warning { border-left: 4px solid #EEAA00; background: #fff8e8; padding: .7rem; } .error { color: #8b1515; font-weight: 700; }
+  .help { color: #4b5965; } .warning { border-left: 4px solid #EEAA00; background: #fff8e8; padding: .7rem; } .error { color: #8b1515; font-weight: 700; } .notice { border-left: 4px solid #002855; background: #eef3f8; padding: .7rem; overflow-wrap: anywhere; }
   label { min-width: 0; display: grid; gap: .3rem; font-weight: 650; } input, select, textarea { min-width: 0; width: 100%; min-height: 2.35rem; border: 1px solid #8493a0; border-radius: .25rem; padding: .35rem .5rem; font: inherit; } textarea { min-height: 5rem; resize: vertical; }
   button { min-height: 2.4rem; border: 1px solid #002855; border-radius: .3rem; background: #fff; color: #002855; padding: .45rem .7rem; font: inherit; font-weight: 650; cursor: pointer; } button.gold { background: #EEAA00; color: #17222e; } button.danger { border-color: #8b1515; color: #8b1515; } button:disabled { cursor: not-allowed; opacity: .55; } button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid var(--focus-ring, #002855); outline-offset: 2px; box-shadow: 0 0 0 2px #fff; }
   .history, .subpanel { min-width: 0; margin-top: 1rem; padding: .8rem; border: 1px solid #d7dde2; border-radius: .3rem; background: #f9fbfc; } .history h3, .subpanel h3 { margin-top: 0; }

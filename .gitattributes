@@ -6,8 +6,6 @@ firmware/reference_unor4wifi/reference_unor4wifi.ino text eol=lf
 # Windows scripts are checked out with CRLF on every host. cmd.exe label
 # lookups (`goto :finish`) are unreliable in LF-only batch files, and CRLF is
 # the native format for Windows PowerShell 5.1. The repository still stores LF.
-# scripts/package_op_amp_lab_installer.ps1 builds the student ZIP from these
-# CRLF copies.
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf

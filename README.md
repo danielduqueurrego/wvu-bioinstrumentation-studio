@@ -7,7 +7,7 @@ Teaching use only — not a medical device. Follow BMEG 420L lab instructions an
 ## Capabilities
 
 - Automatic Arduino UNO R4 WiFi discovery, WVU firmware verification, and controlled firmware restoration with a guided restore window.
-- ECG capture; EMG + pressure capture; blood pressure + PPG capture; and raw four-state pulse-ox capture.
+- ECG capture; EMG + pressure capture; blood pressure + PPG capture; raw four-state pulse-ox capture; and Op Amp Lab capture (Vmid and Vout).
 - Synchronized acquisition of one to six analog channels with configurable plot grouping and per-trace visibility.
 - Color-coded legends for plots containing multiple visible signals, a synchronized 0.5–30 s live display window, and persistent newest-value labels in the selected display units.
 - Display-only decimation for longer live windows while recorded BMEG and CSV data remain full-rate.
@@ -131,6 +131,7 @@ See the concise [Student Quick Start](docs/STUDENT_QUICK_START.md) and the [Trou
 | Blood Pressure + PPG — Course Capture | A0 PPG, A1 MPXV, A2 XGZP; D4 green LED | 200 frames/s | 14 bit |
 | Pulse Oximetry — TX + RX Raw Capture | A0 TX, A1 RX; D5 red, D6 IR | about 250 cycles/s | 14 bit |
 | General Analog — Development | 1–6 inputs selected from A0–A5 | 1000 frames/s | 14 bit |
+| Op Amp Lab | A0 Vmid, A1 Vout | 100 frames/s | 14 bit |
 
 More detail is in [Lab Configuration](docs/LAB_CONFIGURATION.md). Instructors should use the [Instructor Guide](docs/INSTRUCTOR_GUIDE.md).
 

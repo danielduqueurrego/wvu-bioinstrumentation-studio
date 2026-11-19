@@ -17,6 +17,7 @@ const backend = vi.hoisted(() => ({
   calls: [] as Array<{ command: string; args: Record<string, unknown> }>,
   confirmAnswer: true,
   confirmMessages: [] as string[],
+  confirmOptions: [] as unknown[],
   openCalls: 0,
   openResult: null as string | null
 }));
@@ -42,7 +43,8 @@ vi.mock('uplot', () => ({
   }
 }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({
-  confirm: async (message: string) => {
+  confirm: async (message: string, options?: unknown) => {
+    backend.confirmOptions.push(options);
     backend.confirmMessages.push(message);
     return backend.confirmAnswer;
   },
@@ -93,6 +95,7 @@ const board = { port: 'COM5', name: 'Arduino UNO R4 WiFi', fqbn: 'arduino:renesa
 function installBackend() {
   backend.calls = [];
   backend.confirmMessages = [];
+  backend.confirmOptions = [];
   backend.confirmAnswer = true;
   backend.openCalls = 0;
   backend.openResult = null;
@@ -379,6 +382,17 @@ describe('Acquisition page against a fake backend', () => {
     await settle();
     expect(document.querySelector('[aria-labelledby="lab-manager-title"]')).toBeNull();
     expect(document.activeElement).toBe(manage);
+  });
+
+  it('shows a lab catalog migration notice in the Lab card in Student mode, not as a problem', async () => {
+    const notice = 'The Op Amp Lab is now built in. The older Op Amp Lab copy that replaced General Analog was retired; a backup was saved to C:\\Users\\Student\\AppData\\Local\\WVU Bioinstrumentation Studio\\profiles\\lab_state.pre-migration-20261118T120000.000Z.json.';
+    backend.handlers.get_catalog_status = () => ({ writable: true, skipped_labs: [], migration_notices: [notice], calibration_issues: [] });
+    await renderPage();
+    const shown = document.querySelector('#lab-card .migration-notice');
+    expect(shown?.textContent).toBe(notice);
+    expect(expanded('lab')).toBe(true);
+    expect(document.querySelectorAll('[data-problem]')).toHaveLength(0);
+    expect(document.body.textContent).not.toContain('Some labs could not be loaded');
   });
 
   it('uses the new wording and keeps the teaching-use notice', async () => {
@@ -1108,5 +1122,98 @@ describe('Acquisition page: board checks, Start feedback, and the recording layo
     show?.click();
     await settle();
     expect(document.activeElement?.id).toBe('result-title');
+  });
+});
+
+describe('Acquisition page: Install lab file', () => {
+  const source = 'C:\\Users\\Student\\Downloads\\general_week3.lab.json';
+  const week3 = { ...general, display_name: 'General Analog — Week 3', profile_version: '2.0.3', source: 'imported' } as LabProfile;
+  const summary = {
+    profile_id: general.profile_id, profile_version: '2.0.3', display_name: week3.display_name, acquisition_mode: 'simultaneous',
+    channels: [{ pin: 'A0', label: 'Vin' }, { pin: 'A1', label: 'Vout' }], sample_rate_hz: 1000, adc_resolution_bits: 14,
+    already_installed: false,
+    replaces: { profile_id: general.profile_id, profile_version: general.profile_version, display_name: general.display_name, course_default: true, has_course_default: true },
+    refusal: null as string | null
+  };
+  const installButton = () => buttonNamed('Install lab file…');
+  const installResult = () => document.querySelector('#lab-card .install-result')?.textContent ?? '';
+  let installed = false;
+
+  beforeEach(() => {
+    installed = false;
+    backend.openResult = source;
+    backend.handlers.inspect_lab_file = () => summary;
+    backend.handlers.install_lab_file = () => { installed = true; return week3; };
+    backend.handlers.list_acquisition_profiles = () => installed ? [week3, bp] : [general, bp];
+  });
+
+  it('lets a student install a lab file that replaces a course default after a warning, then selects it', async () => {
+    await renderPage();
+    chooseLab(bp);
+    await settle();
+    expect(document.querySelector('#lab-card .mode-badge')?.textContent).toBe('Student mode');
+    expect(installButton()?.disabled).toBe(false);
+
+    installButton()!.click();
+    await settle();
+    expect(backend.openCalls).toBe(1);
+    expect(backend.calls.find((call) => call.command === 'inspect_lab_file')?.args).toEqual({ source });
+    expect(backend.confirmMessages).toHaveLength(1);
+    expect(backend.confirmMessages[0]).toContain(`This replaces ${general.display_name} ${general.profile_version} on this computer. Your instructor can undo this with Restore course default.`);
+    expect(backend.confirmOptions[0]).toMatchObject({ title: 'Install lab file', kind: 'warning' });
+    expect(backend.calls.find((call) => call.command === 'install_lab_file')?.args).toEqual({ source });
+    // The list is reloaded and the installed lab is selected.
+    expect(labSelect().value).toBe(general.profile_id);
+    expect([...labSelect().options].map((option) => option.textContent)).toContain('General Analog — Week 3 — 2.0.3');
+    expect(installResult()).toBe(`Installed General Analog — Week 3 2.0.3 in place of ${general.display_name} ${general.profile_version}. It is now the selected lab.`);
+  });
+
+  it('installs nothing when the student cancels the question', async () => {
+    backend.confirmAnswer = false;
+    await renderPage();
+    installButton()!.click();
+    await settle();
+    expect(backend.confirmMessages).toHaveLength(1);
+    expect(backend.calls.map((call) => call.command)).not.toContain('install_lab_file');
+    expect(installResult()).toBe('');
+  });
+
+  it('shows a refusal without asking, and a conflict that Rust reports', async () => {
+    summary.refusal = 'A different lab with the same lab ID and version as General Analog — Week 3 2.0.3 is already installed on this computer, so this file was not installed. Ask your instructor for a lab file with a new version.';
+    try {
+      await renderPage();
+      installButton()!.click();
+      await settle();
+      expect(backend.confirmMessages).toHaveLength(0);
+      expect(backend.calls.map((call) => call.command)).not.toContain('install_lab_file');
+      expect(installResult()).toBe(summary.refusal);
+    } finally {
+      summary.refusal = null;
+    }
+
+    backend.handlers.install_lab_file = () => { throw 'a recording is running; install the lab file after it has finished'; };
+    installButton()!.click();
+    await settle();
+    expect(installResult()).toBe('The lab file was not installed: a recording is running; install the lab file after it has finished');
+    expect(labSelect().value).toBe(general.profile_id);
+    expect([...labSelect().options].map((option) => option.textContent)).not.toContain('General Analog — Week 3 — 2.0.3');
+  });
+
+  it('is offered in Instructor mode too and is disabled while recording', async () => {
+    backend.handlers.get_profile_mode = () => 'instructor_authoring';
+    await renderPage();
+    expect(installButton()?.disabled).toBe(false);
+
+    session = idleSession({
+      state: 'Acquiring', simulator: true, samples: 500, measured_rate_hz: 99.96, recording_active: true,
+      duration: { mode: 'timed', seconds: 60 }, elapsed_seconds: 5, remaining_seconds: 55,
+      display_origin_timestamp_us: 1_000_000, profile: { bench_notice_acknowledged: false, profile: general }
+    });
+    await settle(80);
+    expect(installButton()?.disabled).toBe(true);
+    expect(document.querySelector('#lab-card .install-row')?.textContent).toContain('when no recording is running');
+    installButton()!.click();
+    await settle();
+    expect(backend.openCalls).toBe(0);
   });
 });

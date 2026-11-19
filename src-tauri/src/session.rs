@@ -5207,6 +5207,17 @@ impl SimulatorIo {
                     }
                 }
             }
+            "course_op_amp" => {
+                // Op Amp Lab bench circuit: Vmid (A0) holds near mid-supply
+                // with a few millivolts of deterministic noise, and Vout (A1)
+                // swings around it at 1 Hz.
+                let noise =
+                    (f64::from(sequence.wrapping_mul(2_654_435_761) >> 24) / 255.0 - 0.5) * 0.01;
+                match field {
+                    0 => 2.5 + noise,
+                    _ => 2.5 + phase.sin() * 1.5 + noise,
+                }
+            }
             "course_pulseox" => {
                 let state = field % 4;
                 let dark = matches!(state, 1 | 3);
@@ -7475,6 +7486,7 @@ mod tests {
         for (category, fields, period) in [
             ("course_emg_force", 4u8, 1_000u32),
             ("course_pulseox", 8u8, 4_000u32),
+            ("course_op_amp", 2u8, 10_000u32),
         ] {
             let profile = profiles
                 .iter()
@@ -7536,6 +7548,36 @@ mod tests {
             assert_eq!(batch.sample_period_us, period);
             assert!(batch.samples.len() >= usize::from(fields));
         }
+    }
+
+    #[test]
+    fn simulator_op_amp_lab_has_a_steady_vmid_and_a_vout_swinging_around_it() {
+        let profile = built_in_profiles()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_op_amp")
+            .unwrap_or_else(|| panic!("missing Op Amp profile"))
+            .snapshot(false);
+        let rate = profile.profile.acquisition.sample_rate_hz;
+        let mut simulator = SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
+            .unwrap_or_else(|error| panic!("{error}"));
+        simulator.sample_period_us = 1_000_000 / rate;
+        let full_scale = f64::from((1u32 << profile.profile.acquisition.adc_resolution_bits) - 1);
+        let trace = |field: usize| -> Vec<f64> {
+            (0..rate * 2)
+                .map(|sequence| {
+                    f64::from(simulator.signal_counts(sequence, field)) * 5.0 / full_scale
+                })
+                .collect()
+        };
+        let (vmid, vout) = (trace(0), trace(1));
+        assert!(vmid.iter().all(|volts| (volts - 2.5).abs() < 0.01));
+        assert!(vmid.iter().any(|volts| (volts - vmid[0]).abs() > 0.0));
+        let low = vout.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = vout.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(low > 0.5 && high < 4.5 && high - low > 2.5, "{low} {high}");
+        let mean = vout.iter().sum::<f64>() / vout.len() as f64;
+        assert!((mean - 2.5).abs() < 0.05, "{mean}");
     }
 
     /// Requests a stop through the cancel flag (as the Stop button does) once

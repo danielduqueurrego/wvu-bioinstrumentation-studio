@@ -169,7 +169,7 @@ $pwsh = Invoke-Probe 'pwsh' @('-NoLogo', '-NoProfile', '-NonInteractive', '-Comm
 if ($pwsh -and $pwsh -match '^(\d+)\.' -and [int]$Matches[1] -ge 7) {
   Add-Result 'OK' 'PowerShell 7' $pwsh
 } else {
-  Add-Result 'WARN' 'PowerShell 7' 'pwsh 7 was not found. scripts/build_student_release.ps1 and scripts/package_op_amp_lab_installer.ps1 require it.'
+  Add-Result 'WARN' 'PowerShell 7' 'pwsh 7 was not found. scripts/build_student_release.ps1 requires it.'
 }
 
 # --- Arduino runtime archive --------------------------------------------------

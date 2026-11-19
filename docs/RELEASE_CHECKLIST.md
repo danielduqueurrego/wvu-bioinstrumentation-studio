@@ -78,7 +78,6 @@ Run these with the real runtime and an Arduino UNO R4 WiFi, using one applicatio
   - `dist\WVU-Bioinstrumentation-Studio-<version>\SHA256SUMS.txt` covers both installers. The same file is inside the ZIP.
   - `<zip>.sha256` beside the ZIP covers the ZIP.
   - Keep `...-build-info.txt` with the release records.
-- If the Op Amp Lab installer scripts changed, confirm `pwsh -NoProfile -File scripts\package_op_amp_lab_installer.ps1 -Check` passes.
 - Install the NSIS package on a clean or isolated Windows user if available. Confirm Program Files installation and standard-user operation.
 - The MSI ships beside NSIS for managed IT deployment. Test it on a separate clean machine, never on top of an NSIS installation. Confirm the [Installation](INSTALLATION.md) guidance (one installer type per computer) still holds.
 - Confirm uninstall preserves Project folders and recordings.

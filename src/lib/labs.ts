@@ -37,4 +37,8 @@ export type LabProfile = {
   associated_sketch?: { name: string; relative_path?: string; source_hash?: string; is_wvu_reference: boolean };
 };
 
-export type LabListEntry = { profile: LabProfile; active: boolean; retired: boolean };
+export type LabListEntry = {
+  profile: LabProfile; active: boolean; retired: boolean;
+  /** The file name "Save as course default file…" suggests (Rust: `course_default_file_name`). */
+  course_default_file_name?: string;
+};
