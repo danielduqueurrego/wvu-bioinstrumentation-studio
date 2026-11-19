@@ -1577,10 +1577,12 @@ pub struct LabFileReplacement {
     pub profile_id: String,
     pub profile_version: String,
     pub display_name: String,
-    /// The replaced lab is the course default this application ships.
+    /// The replaced lab is the course default this application ships, so
+    /// Restore course default undoes the install.
     pub course_default: bool,
-    /// The lab ID has a shipped course default, so Restore course default
-    /// undoes the install.
+    /// The lab ID has a shipped course default. Restore course default
+    /// selects that default, not a replaced local revision (which Make
+    /// active in Manage Labs brings back).
     pub has_course_default: bool,
 }
 
@@ -2610,7 +2612,11 @@ fn course_default_file_name(profile: &AcquisitionProfile) -> String {
 /// The next revision of a lab: one patch above the highest existing patch
 /// with the same ID and MAJOR.MINOR as the edit base, counting factory,
 /// retired, and skipped revisions, so a restored default or an older active
-/// revision can always be edited.
+/// revision can always be edited. General Analog 2.0.1 always counts as
+/// taken, on every computer: it is the Op Amp Lab copy that the retired
+/// v1.0.2 installer stored on student computers, where migration
+/// `op_amp_builtin_v1` keeps it (retired), so a different General Analog
+/// 2.0.1 from an instructor could never be installed there.
 fn next_revision_version(
     runtime: &ProfileRuntime,
     profile_id: &str,
@@ -2632,6 +2638,7 @@ fn next_revision_version(
         .cloned()
         .chain(runtime.retired.iter().cloned())
         .chain(runtime.skipped.iter().filter_map(SkippedEntry::key))
+        .chain(std::iter::once(legacy_op_amp_lab_key()))
         .filter(|(id, version)| id == profile_id && valid_semver(version))
         .filter_map(|(_, version)| version_key(&version))
         .filter(|(existing_major, existing_minor, _)| {
@@ -3460,10 +3467,11 @@ impl ProfileStore {
     /// "Install lab file…": installs a lab file in Student or Instructor
     /// mode, with Import lab's parsing, validation, and conflict rules. The
     /// lab is stored as `imported` and becomes the active version of its lab
-    /// ID, replacing the active one (a course default included); Restore
-    /// course default or Retire in Manage Labs undoes it. The same lab
-    /// stored but not active (for example after Restore course default) is
-    /// made active again. Refused while a recording runs
+    /// ID, replacing the active one (a course default included). Restore
+    /// course default undoes it when it replaced the course default;
+    /// otherwise Make active on the replaced revision in Manage Labs does.
+    /// The same lab stored but not active (for example after Restore course
+    /// default) is made active again. Refused while a recording runs
     /// (`recording_active`, from the session), while the catalog is
     /// unavailable, for the Op Amp Lab copy of the retired v1.0.2 installer,
     /// for a course default file that is not a shipped factory version, for
@@ -7301,6 +7309,81 @@ mod tests {
         assert!(pre_migration_backups(&root).is_empty());
     }
 
+    #[test]
+    fn general_analog_2_0_1_is_reserved_so_an_instructor_revision_installs_on_migrated_computers() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        // The instructor's computer never held the Op Amp Lab copy, and its
+        // first edit of General Analog 2.0.0 still skips 2.0.1.
+        assert_eq!(general_default_version(), "2.0.0");
+        let teacher = dir.path().join("teacher");
+        let export = exported_lab(&teacher, GENERAL_ID, None, |draft| {
+            draft.description = "Week 3 bench signals.".into();
+        });
+
+        // A student computer that ran the v1.0.2 Op Amp Lab installer: the
+        // migration retires the copy and keeps it in the catalog.
+        let root = dir.path().join("student");
+        write_catalog(
+            &root,
+            &[legacy_op_amp_json(ProfileSource::Imported)],
+            &[(GENERAL_ID, "2.0.1")],
+        );
+        let store = ProfileStore::with_root(root.clone()).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            catalog_json(&root)["retired"],
+            serde_json::json!([[GENERAL_ID, "2.0.1"]])
+        );
+
+        let summary = store
+            .inspect_lab_file(&export)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(summary.profile_id, GENERAL_ID);
+        assert_eq!(summary.profile_version, "2.0.2");
+        assert_eq!(summary.refusal, None);
+        let replaces = summary
+            .replaces
+            .unwrap_or_else(|| panic!("the file replaces General Analog's course default"));
+        assert_eq!(replaces.profile_version, general_default_version());
+        assert!(replaces.course_default);
+        let installed = store
+            .install_lab_file(&export, false)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(installed.profile_version, "2.0.2");
+        assert_eq!(
+            store
+                .get_locked(GENERAL_ID)
+                .map(|lab| lab.profile_version)
+                .ok(),
+            Some("2.0.2".to_string())
+        );
+        let written = catalog_json(&root);
+        assert_eq!(written["active_versions"][GENERAL_ID], "2.0.2");
+        assert_eq!(
+            written["retired"],
+            serde_json::json!([[GENERAL_ID, "2.0.1"]])
+        );
+
+        // The instructor's next edit continues at 2.0.3.
+        let instructor = instructor_store(&teacher.join("catalog"));
+        let mut draft = instructor
+            .begin_lab_edit(GENERAL_ID)
+            .unwrap_or_else(|error| panic!("{error}"));
+        draft.description = "Week 4 bench signals.".into();
+        let next = instructor
+            .save_lab_draft(draft, Some("2.0.2".into()), "reserve-next-0001".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(next.profile_version, "2.0.3");
+        // Other labs are numbered as before.
+        let mut ecg = instructor
+            .begin_lab_edit(ECG_ID)
+            .unwrap_or_else(|error| panic!("{error}"));
+        ecg.description.push_str(" Week 4.");
+        let ecg = instructor
+            .save_lab_draft(ecg, Some("1.0.0".into()), "reserve-ecg-0001".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(ecg.profile_version, "1.0.1");
+    }
+
     /// Another program holds `lab_state.json` open for reading only: the
     /// catalog can be read and copied but not replaced.
     #[cfg(windows)]
@@ -7887,9 +7970,18 @@ mod tests {
                 "csv-collide-0003".into(),
             )
             .unwrap_or_else(|error| panic!("{error}"));
+        // The next patch, skipping General Analog 2.0.1, which is reserved
+        // for the legacy Op Amp Lab copy (see `next_revision_version`).
         assert_eq!(
             version_key(&saved.profile_version),
-            version_key(&general_base).map(|(major, minor, patch)| (major, minor, patch + 1))
+            version_key(&general_base).map(|(major, minor, patch)| {
+                let next = if (major, minor, patch) == (2, 0, 0) {
+                    2
+                } else {
+                    patch + 1
+                };
+                (major, minor, next)
+            })
         );
 
         // A stored lab whose CSV name predates these rules still loads.

@@ -300,7 +300,7 @@ The firmware forces D4, D5, and D6 LOW in these cases:
 
 RED and IR are never HIGH together. Before `setup()` runs (power-up, reset, the bootloader, and a firmware upload), the sketch does not drive these pins.
 
-**Hardware watchdog.** Build `0x00010007` starts the RA4M1 hardware watchdog with 1000 ms as the last step of `setup()` and refreshes it first in every loop pass. The core's `WDT` library uses the nearest hardware timeout at or above the request: on the UNO R4 (PCLKB 24 MHz, divide-by-2048, 16,384 counts) that is about 1.4 s (1,398 ms). If the loop stalls, the board resets. The pins are then inputs, not driven, until `setup()` drives them LOW again; the desktop sees a silent or disconnected board, and the seven-second no-data safeguard ends the recording.
+**Hardware watchdog.** Build `0x00010007` starts the RA4M1 hardware watchdog with 1000 ms as the last step of `setup()` and refreshes it first in every loop pass. The core's `WDT` library uses the nearest hardware timeout at or above the request: on the UNO R4 (PCLKB 24 MHz, divide-by-2048, 16,384 counts) that is about 1.4 s (1,398 ms). If the loop stalls, the board resets. The pins are then inputs, not driven, until `setup()` drives them LOW again. The reset also removes the board's native USB port, so the desktop's next serial read fails and the recording ends within about a second, as a disconnection (or as a serial-connection fault if the board has already reappeared); the seven-second no-data safeguard applies only if the port stays open but silent. The raw recording is finalized either way.
 
 Acquisition requires HELLO, CAPABILITIES, PONG, valid CRCs, the expected firmware identity, an accepted CONFIGURE, and a confirmed START.
 

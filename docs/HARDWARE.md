@@ -29,7 +29,7 @@ All three outputs are active HIGH. The firmware drives them LOW in these cases:
 
 Before the sketch's `setup()` runs (power-up, reset, the bootloader, and a firmware upload), the firmware does not drive D4–D6.
 
-**Hardware watchdog.** The firmware also runs the RA4M1's hardware watchdog, started at the end of `setup()` and refreshed at the start of every loop pass. The sketch asks for 1000 ms; the core's `WDT` library rounds that up to the next hardware timeout, which on the UNO R4 (PCLKB 24 MHz, divide-by-2048, 16,384 counts) is about 1.4 s (1,398 ms). If the firmware goes about 1.4 s without a loop pass, the board resets. During the reset the pins are inputs (not driven HIGH), and `setup()` then drives them LOW again. The desktop sees the board stop sending data and ends the recording after its seven-second no-data safeguard.
+**Hardware watchdog.** The firmware also runs the RA4M1's hardware watchdog, started at the end of `setup()` and refreshed at the start of every loop pass. The sketch asks for 1000 ms; the core's `WDT` library rounds that up to the next hardware timeout, which on the UNO R4 (PCLKB 24 MHz, divide-by-2048, 16,384 counts) is about 1.4 s (1,398 ms). If the firmware goes about 1.4 s without a loop pass, the board resets. During the reset the pins are inputs (not driven HIGH), and `setup()` then drives them LOW again. The board's native USB port disappears during the reset, so the desktop ends the recording within about a second, as a disconnection (or as a serial-connection fault if the board has already reappeared). The seven-second no-data safeguard applies only if the port stays open but silent. The raw recording is finalized either way.
 
 **RED and IR are never HIGH together**, and the firmware itself enforces that rule:
 

@@ -13,7 +13,7 @@ body:
     attributes:
       label: Application version
       description: "Shown in Windows Settings > Apps > Installed apps, in the installer file name, or as app_version in a recording's .metadata.json."
-      placeholder: "1.0.2"
+      placeholder: "1.1.0"
     validations:
       required: true
   - type: dropdown
@@ -32,7 +32,7 @@ body:
     attributes:
       label: Firmware build
       description: "Open Advanced details (below the setup cards) and copy the Firmware build line. Write \"not shown\" if the line is missing."
-      placeholder: "65542"
+      placeholder: "65543"
     validations:
       required: true
   - type: input

@@ -8,7 +8,7 @@ Security fixes are made for the latest release line only: the newest `MAJOR.MINO
 
 | Version | Supported |
 | --- | --- |
-| Latest release line (for example `1.0.x` while 1.0.2 is the newest release) | Yes |
+| Latest release line (the newest `MAJOR.MINOR`, such as `1.1.x`) | Yes |
 | Older releases | No. Update to the latest release. |
 
 ## Reporting a vulnerability

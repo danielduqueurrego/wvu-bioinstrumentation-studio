@@ -190,8 +190,17 @@ describe('Install lab file', () => {
     expect(question.message).toContain('This replaces General Analog — Development 2.0.0 on this computer. Your instructor can undo this with Restore course default.');
     // A lab with no shipped course default is undone in Manage Labs instead.
     const local = installConfirmation({ ...summary, replaces: { ...summary.replaces!, course_default: false, has_course_default: false } });
-    expect(local.message).toContain('Your instructor can undo this in Manage Labs');
+    expect(local.message).toContain('Your instructor can undo this in Manage Labs by making General Analog — Development 2.0.0 active again.');
     expect(local.message).not.toContain('Restore course default');
+    // A replaced local revision of a lab with a course default: Restore course
+    // default would select the shipped default, not that revision.
+    const revision = installConfirmation({
+      ...summary,
+      replaces: { ...summary.replaces!, display_name: 'General Analog — Week 2', profile_version: '2.0.2', course_default: false, has_course_default: true }
+    });
+    expect(revision.kind).toBe('warning');
+    expect(revision.message).toContain('This replaces General Analog — Week 2 2.0.2 on this computer. Your instructor can undo this in Manage Labs by making General Analog — Week 2 2.0.2 active again.');
+    expect(revision.message).not.toContain('Restore course default');
   });
 
   it('asks plainly when the file adds a new lab', () => {

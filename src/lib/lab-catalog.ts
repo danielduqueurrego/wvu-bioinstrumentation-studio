@@ -247,9 +247,12 @@ export type LabFileReplacement = {
   profile_id: string;
   profile_version: string;
   display_name: string;
-  /** The replaced lab is the shipped course default. */
+  /** The replaced lab is the shipped course default (Restore course default undoes the install). */
   course_default: boolean;
-  /** The lab ID has a shipped course default (Restore course default undoes the install). */
+  /**
+   * The lab ID has a shipped course default. Restore course default selects that
+   * default, not a replaced local revision, so the undo wording uses `course_default`.
+   */
   has_course_default: boolean;
 };
 
@@ -291,9 +294,11 @@ export function installConfirmation(summary: LabFileSummary): { message: string;
   if (!replaced) {
     return { message: `Install ${lab}? It is added to the lab list on this computer.`, kind: 'info', okLabel: 'Install' };
   }
-  const undo = replaced.has_course_default
+  // Restore course default selects the shipped default, so it undoes the install
+  // only when that default is what the file replaces.
+  const undo = replaced.course_default
     ? 'Your instructor can undo this with Restore course default.'
-    : 'Your instructor can undo this in Manage Labs by retiring the installed version or making the earlier version active.';
+    : `Your instructor can undo this in Manage Labs by making ${replaced.display_name} ${replaced.profile_version} active again.`;
   return {
     message: `Install ${lab}? This replaces ${replaced.display_name} ${replaced.profile_version} on this computer. ${undo}`,
     kind: 'warning',

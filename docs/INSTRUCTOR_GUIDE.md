@@ -64,10 +64,10 @@ When a lab changes, the lab list in the main window refreshes. A Start always re
 
 Students can install a lab file themselves, without Instructor mode:
 
-1. On your computer, edit the lab in **Manage Labs** and select **Save changes as new version** (for example General Analog 2.0.1). Try it with the Simulator.
+1. On your computer, edit the lab in **Manage Labs** and select **Save changes as new version** (for example General Analog 2.0.2; General Analog skips 2.0.1, the version of the old Op Amp Lab copy that stays on computers that ran the v1.0.2 installer). Try it with the Simulator.
 2. Select **Export** on that revision and share the `.lab.json` file with the class, for example through the course page.
 3. Each student selects **Install lab file…** in the **Lab** card, under **Selected lab**, and chooses the file. The button is in Student and Instructor mode and is disabled while a recording runs.
-4. The application shows the lab's name, version, inputs, and rate, and asks before installing. When the file replaces a lab on that computer, including a shipped course default, the question is a warning: "This replaces <lab> on this computer. Your instructor can undo this with Restore course default."
+4. The application shows the lab's name, version, inputs, and rate, and asks before installing. When the file replaces a lab on that computer, the question is a warning that says how you can undo it. For a shipped course default: "This replaces <lab> on this computer. Your instructor can undo this with Restore course default." For a local or installed revision: "… Your instructor can undo this in Manage Labs by making <lab> active again."
 5. The installed lab is stored as **Imported**, becomes the active version of its lab ID, and is selected.
 
 The same rules as **Import lab** apply:
@@ -77,9 +77,9 @@ The same rules as **Import lab** apply:
 - Installing a version that is already installed and active changes nothing and says so. A version that is installed but not active (for example after **Restore course default**) is made active again. A version you retired is refused; **Restore** it in Manage Labs instead.
 - Installing is refused while the local lab catalog cannot be loaded.
 - A course default file (from **Save as course default file…**) is refused: it is for the next application build, not for students. Share the revision's **Export** instead.
-- The older Op Amp Lab file from the retired v1.0.2 installer is refused, because the Op Amp Lab is built in. **Import lab** in Manage Labs can still restore it deliberately.
+- The older Op Amp Lab file from the retired v1.0.2 installer is refused, because the Op Amp Lab is built in. **Import lab** in Manage Labs can still add it deliberately to a catalog that does not hold it; where the migration retired it, use **Restore** instead (see [Op Amp Lab](#op-amp-lab)).
 
-Each install is recorded in `lab_write_audit.log` as `student_install`, with the version it replaced. To undo it, select the lab and use **Restore course default**, or **Retire** the installed version in Manage Labs. For a lab with no course default, make the earlier version active.
+Each install is recorded in `lab_write_audit.log` as `student_install`, with the version it replaced. To undo it on that Windows account: when it replaced the shipped course default, select the lab and use **Restore course default** (or **Retire** the installed version in Manage Labs). When it replaced a local or installed revision, select **Make active** on that revision in Manage Labs; **Restore course default** would select the shipped default instead.
 
 ## Make a course default
 
@@ -88,7 +88,7 @@ A course default is a lab compiled into the application, so every computer gets 
 The file gets the same normalization as `scripts/update_factory_labs.ps1 promote`:
 
 - source `built_in` and status `locked`;
-- the next factory version: one MINOR above the lab's published versions and the revision's own version, with PATCH 0. For example General Analog 2.0.1 gives 2.1.0, and a new lab ID saved as 1.0.0 and edited to 1.0.2 gives 1.1.0, so the factory version never has the version of one of your local revisions;
+- the next factory version: one MINOR above the lab's published versions and the revision's own version, with PATCH 0. For example General Analog 2.0.2 gives 2.1.0, and a new lab ID saved as 1.0.0 and edited to 1.0.2 gives 1.1.0, so the factory version never has the version of one of your local revisions;
 - a fresh canonical hash, checked against the rules for a lab saved now.
 
 The file name must end in `.profile.json`. Saving the file does not change the lab catalog, and it is recorded in `lab_write_audit.log` as `course_default_export`. A revision with the same content as the shipped course default is refused, because there is nothing new to save.
@@ -114,7 +114,7 @@ The lab field `display.voltage_reference_v` is informational: conversions use th
 
 Use the **Board** card to refresh, verify, or restore the WVU reference firmware. Restore is available whenever a supported UNO R4 WiFi and the bundled Arduino tools are available, even when the firmware is outdated or silent.
 
-**After updating to this version, restore every board once.** This version uses WVU firmware build `0x00010007` (it adds the LED-sequenced pulse-ox mode), and the application accepts only its own build. A board restored by version 1.0.x shows **Older WVU firmware** until it is restored. **Update the application on every lab computer before you restore any board**: version 1.0.x meeting a restored board reports its firmware build as incompatible and points to restoring the firmware of version 1.0.x, which would put the older firmware back and undo the update for the next class. From this version on, an application older than a board's firmware says **Newer WVU firmware** and asks for the application to be updated.
+**After updating to this version, restore every board once.** This version uses WVU firmware build `0x00010007` (it adds the LED-sequenced pulse-ox mode), and the application accepts only its own build. A board restored by version 1.0.x shows **Older WVU firmware** until it is restored. **Update the application on every computer that connects to the course boards before you restore any board**: lab computers, your own and your TAs' laptops, and students' own installations. Have students install this version before the boards are restored. Version 1.0.x meeting a restored board reports **Firmware update required** and points to **Restore WVU Firmware**; do not restore from that computer, because it would put the older firmware back and undo the update for the next class. Update that computer instead. From this version on, an application older than a board's firmware says **Newer WVU firmware** and asks for the application to be updated.
 
 For a class recovery:
 
@@ -129,7 +129,7 @@ The Board card keeps the last firmware operation and its log path; **Copy diagno
 
 **Op Amp Lab** 1.0.0 is a factory course lab with its own lab ID, `wvu.bmeg420l.op_amp.course.capture.v1`. It records Vmid on A0 (`vmid_counts`) and Vout on A1 (`vout_counts`) at 100 frames/s with 14-bit ADC, one plot per signal, and counts or volts display. It is bench-only and needs no acknowledgement at Start. Edit, Duplicate, Export, and Restore course default work as for the other factory labs.
 
-The standalone v1.0.2 installer (`install_op_amp_lab_profile.bat` and `.ps1`) is retired; do not give it to students. It stored **Op Amp Lab 2.0.1** as a revision of **General Analog — Development** (same lab ID), so on those computers it replaced General Analog in the Lab list.
+The standalone v1.0.2 installer (`install_op_amp_lab_profile.bat` and `.ps1`) is retired; do not give it to students. It stored **Op Amp Lab 2.0.1** as a revision of **General Analog — Development** (same lab ID), so on those computers it replaced General Analog in the Lab list. That copy's CSV columns were `a0_counts`, `a0_V`, `01_counts`, and `01_V`; the built-in lab writes `vmid_counts`, `vmid_V`, `vout_counts`, and `vout_V`, so update analysis templates that use the old names. Recordings already made are unchanged.
 
 **One-time migration.** On the first start of this version, a catalog whose active General Analog revision is that copy (version 2.0.1, as installed by the script or saved as your own instructor revision) is changed once:
 
@@ -140,6 +140,6 @@ The standalone v1.0.2 installer (`install_op_amp_lab_profile.bat` and `.ps1`) is
 
 If the catalog cannot be written at that moment, this launch still shows the migrated lab list, says the change was not saved, and the next start tries again with the same backup. The migration never runs while the catalog is locked by another window or read-only, and it runs only once per catalog.
 
-To keep the old copy anyway, select **Restore** on Op Amp Lab 2.0.1 in Manage Labs (or bring it back with **Import lab**). The migration is recorded with the change, so your choice is kept at later starts. **Reset local customizations** removes the copy and the record.
+To keep the old copy anyway, select **Restore** on Op Amp Lab 2.0.1 in Manage Labs. (**Import lab** adds it only to a catalog that does not hold it, for example after **Reset local customizations**; on a migrated catalog it reports the copy as already installed.) The migration is recorded with the change, so your choice is kept at later starts. **Reset local customizations** removes the copy and the record.
 
 Teaching use only — not a medical device.

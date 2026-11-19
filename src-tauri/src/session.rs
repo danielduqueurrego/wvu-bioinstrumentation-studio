@@ -5633,10 +5633,17 @@ impl Write for SimulatorIo {
                     }
                     match payload[0] {
                         0 => {
+                            // `[0, bits, rate u32 LE, n, pin1..pinN, mask]`. As in the
+                            // firmware's `configureSimultaneous`, the whole payload is
+                            // checked before any state changes, and the mask may only
+                            // hold D4 (bit 0): no bit outside D4-D6, and never D5 red
+                            // or D6 IR.
                             let channel_count = payload[6];
+                            let mask = payload.get(7 + usize::from(channel_count)).copied();
                             if channel_count == 0
                                 || channel_count > 6
                                 || payload.len() != 8 + usize::from(channel_count)
+                                || mask.is_none_or(|mask| mask & !0x01 != 0)
                             {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidInput,
@@ -5651,7 +5658,7 @@ impl Write for SimulatorIo {
                                     payload[2], payload[3], payload[4], payload[5],
                                 ]);
                             self.channel_count = channel_count;
-                            self.output_mask = payload[7 + usize::from(self.channel_count)] & 0x07;
+                            self.output_mask = mask.unwrap_or_default();
                         }
                         1 => {
                             if payload.len() != 11 {
@@ -6994,6 +7001,70 @@ mod tests {
         assert_eq!(terminal.payload[38..42], 0u32.to_le_bytes());
         // One full 1000 us dwell of settle: the simulator keeps perfect time.
         assert_eq!(terminal.payload[42..46], 1_000u32.to_le_bytes());
+    }
+
+    #[test]
+    fn simulator_refuses_d5_and_d6_in_simultaneous_mode_like_the_firmware() {
+        let profile = default_general_profile().unwrap_or_else(|e| panic!("{e}"));
+        let command = |message_type: MessageType, payload: Vec<u8>| {
+            encode_frame(&Frame {
+                message_type,
+                flags: 0,
+                sequence: 1,
+                payload,
+            })
+            .unwrap_or_else(|error| panic!("{error:?}"))
+        };
+        // `[0, bits, rate, n, pins, mask]`: one channel on A0, 12 bit, 500 Hz.
+        let configure = |mask: u8| {
+            command(
+                MessageType::Configure,
+                [&[0u8, 12][..], &500u32.to_le_bytes(), &[1, 0, mask]].concat(),
+            )
+        };
+        let state = |simulator: &SimulatorIo| {
+            (
+                simulator.adc_resolution_bits,
+                simulator.sample_period_us,
+                simulator.channel_count,
+                simulator.output_mask,
+            )
+        };
+        // D5 red, D6 IR, both, or a bit outside D4-D6: refused, and nothing
+        // is reconfigured.
+        for mask in [0x02, 0x04, 0x06, 0x07, 0x08] {
+            let mut simulator =
+                SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
+                    .unwrap_or_else(|e| panic!("{e}"));
+            let before = state(&simulator);
+            assert!(
+                simulator.write_all(&configure(mask)).is_err(),
+                "mask {mask:#04x} must be refused"
+            );
+            assert_eq!(state(&simulator), before, "mask {mask:#04x}");
+        }
+        // No output, or D4 only: accepted and reported in STATUS.
+        for mask in [0x00, 0x01] {
+            let mut simulator =
+                SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
+                    .unwrap_or_else(|e| panic!("{e}"));
+            simulator.bytes.clear();
+            simulator
+                .write_all(&configure(mask))
+                .unwrap_or_else(|e| panic!("{e}"));
+            simulator
+                .write_all(&command(MessageType::Start, vec![]))
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(state(&simulator), (12, 2_000, 1, mask));
+            let bytes = simulator.bytes.drain(..).collect::<Vec<_>>();
+            let frames = FrameParser::default().push(&bytes);
+            assert_eq!(frames[0].message_type, MessageType::ConfigAck);
+            let status = frames
+                .iter()
+                .find(|frame| frame.message_type == MessageType::Status)
+                .unwrap_or_else(|| panic!("no START STATUS"));
+            assert_eq!(status.payload[1], mask);
+        }
     }
 
     #[test]

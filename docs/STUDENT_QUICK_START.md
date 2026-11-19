@@ -1,6 +1,6 @@
 # Student Quick Start
 
-1. Install WVU Bioinstrumentation Studio and connect the Arduino UNO R4 WiFi.
+1. Before your first lab, install the version of WVU Bioinstrumentation Studio that your instructor names (for example 1.1.0), over any older version, and connect the Arduino UNO R4 WiFi.
 2. Open the application and check the status in the **Board** card, for example **Ready on COM5**. The card always shows the one action that fits; **Verify Firmware** and **Restore WVU Firmware** are always available, as that action or under **More board actions**.
 3. If the Board card shows **No WVU firmware** or **Older WVU firmware**, select **Restore WVU Firmware** and follow the steps in the restore window. (**Newer WVU firmware** means the app on this computer is out of date: tell your instructor.)
    - Connect only this one UNO board.

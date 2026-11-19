@@ -143,7 +143,7 @@ Generated filenames start with the local date and time, then the selected lab's 
 
 Live plot windowing, trace visibility, legends, endpoint labels, and display decimation do not alter the recorded raw samples.
 
-Pulse oximetry schedules RED, DARK 1, IR, and DARK 2 on one absolute firmware timeline, reads every input of the lab at the end of each state, and preserves the raw measurements, the LED state of each row, and the actual timestamps. The firmware for this version is build `0x00010007`: after updating the app on every lab computer, restore each board once. Bounded acquisition and transmit queues keep packet construction and USB backpressure out of the sampling path and report overflow explicitly. The application does not subtract ambient states, calculate SpO2, calculate heart rate, or perform physiological interpretation.
+Pulse oximetry schedules RED, DARK 1, IR, and DARK 2 on one absolute firmware timeline, reads every input of the lab at the end of each state, and preserves the raw measurements, the LED state of each row, and the actual timestamps. The firmware for this version is build `0x00010007`: after updating the app on every computer that connects to the course boards (lab computers, instructors' laptops, and students' own installations), restore each board once. Bounded acquisition and transmit queues keep packet construction and USB backpressure out of the sampling path and report overflow explicitly. The application does not subtract ambient states, calculate SpO2, calculate heart rate, or perform physiological interpretation.
 
 ## Building from source
 
