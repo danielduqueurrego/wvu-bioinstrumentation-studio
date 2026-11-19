@@ -140,12 +140,17 @@ export function qualityLine(integrity: Integrity | undefined): { text: string; o
   const disordered = integrity.duplicate_sample_sequences + integrity.out_of_order_sample_sequences;
   const overflows = integrity.firmware_overflows + integrity.host_channel_overflows;
   // Batches the board flagged after skipping a sampling deadline: no sample
-  // is missing from the sequence, but time was skipped before them.
-  const flagged = integrity.overrun_flagged_records ?? 0;
+  // is missing from the sequence, but time was skipped before them. A backend
+  // that counts the dedicated 0x0010 flag reports it separately; before that,
+  // the 0x0004 count also covered skipped deadlines.
+  const flagged = integrity.deadline_skip_flagged_records ?? integrity.overrun_flagged_records ?? 0;
+  // Records whose LED state does not follow the RED, DARK 1, IR, DARK 2 order.
+  const ledStateMismatches = integrity.led_state_mismatches ?? 0;
   const disconnects = integrity.disconnect_events;
   const problems = [
     missing ? plural(missing, 'missing sample', 'missing samples') : '',
     damaged ? plural(damaged, 'damaged packet', 'damaged packets') : '',
+    ledStateMismatches ? plural(ledStateMismatches, 'sample with an unexpected LED state', 'samples with an unexpected LED state') : '',
     disordered ? plural(disordered, 'repeated or out-of-order sample', 'repeated or out-of-order samples') : '',
     overflows ? plural(overflows, 'buffer overflow', 'buffer overflows') : '',
     flagged ? plural(flagged, 'sample flagged for a timing overrun', 'samples flagged for a timing overrun') : '',
@@ -154,6 +159,39 @@ export function qualityLine(integrity: Integrity | undefined): { text: string; o
   return problems.length
     ? { text: `Check data quality: ${problems.join(' · ')}.`, ok: false }
     : { text: 'No missing, damaged, or out-of-order samples were detected.', ok: true };
+}
+
+const LED_STATE_NAMES = ['RED', 'DARK 1', 'IR', 'DARK 2'] as const;
+
+function perLedState(values: number[], unit = ''): string {
+  return values.map((value, index) => `${LED_STATE_NAMES[index] ?? `state ${index}`} ${formatCount(value)}${unit}`).join(', ');
+}
+
+/**
+ * Advanced details lines for the last recording's timing checks: the
+ * sampling deadlines the board skipped, the shortest LED settle before a
+ * pulse-ox sample (with its share of the dwell), and the per-LED-state
+ * interval checks. Empty when the backend reported none.
+ */
+export function recordingTimingDetails(summary: Summary | null | undefined): string[] {
+  const timing = summary?.timing_diagnostics;
+  if (!timing) return [];
+  const lines: string[] = [];
+  if (timing.firmware_skipped_deadlines != null) {
+    lines.push(`Sampling deadlines the board skipped: ${formatCount(timing.firmware_skipped_deadlines)}`);
+  }
+  if (timing.minimum_pulse_settle_us != null) {
+    const dwell = Number(summary?.profile?.profile.acquisition.state_dwell_us);
+    const share = dwell > 0 ? ` (${Math.round((100 * timing.minimum_pulse_settle_us) / dwell)}% of the ${formatCount(dwell)} µs dwell)` : '';
+    lines.push(`Shortest LED settle before a sample: ${formatCount(timing.minimum_pulse_settle_us)} µs${share}`);
+  }
+  if (timing.pulse_state_intervals_outside_tolerance) {
+    lines.push(`LED-state intervals outside ±5%: ${perLedState(timing.pulse_state_intervals_outside_tolerance)}`);
+  }
+  if (timing.pulse_state_maximum_error_us) {
+    lines.push(`Largest LED-state timing error: ${perLedState(timing.pulse_state_maximum_error_us, ' µs')}`);
+  }
+  return lines;
 }
 
 function durationText(summary: Summary): string {

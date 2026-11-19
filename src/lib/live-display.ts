@@ -10,6 +10,34 @@ export const HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS = 0.1;
 
 type DisplaySample = { sequence: number; timestamp_us: number; values: number[] };
 
+/**
+ * Which record value a plotted trace draws: `values[valueIndex]` of every
+ * record, or, for a trace of one LED state of an LED-sequenced channel, only
+ * of the records whose LED state (`values[0]`) is `ledState`.
+ */
+export type TraceSource = { valueIndex: number; ledState?: number };
+
+/** Whether a record belongs to a trace (always, unless the trace draws one LED state). */
+export function sampleInTrace(sample: { values: number[] }, source: TraceSource): boolean {
+  return source.ledState === undefined || sample.values[0] === source.ledState;
+}
+
+/**
+ * A trace's raw values, one per record: `null` where the record belongs to
+ * another LED state, so uPlot leaves a gap there (spanned by `spanGaps`).
+ */
+export function traceRawValues(samples: Array<{ values: number[] }>, source: TraceSource): Array<number | null> {
+  return samples.map((sample) => sampleInTrace(sample, source) ? (sample.values[source.valueIndex] ?? 0) : null);
+}
+
+/** The newest record a trace draws, for its endpoint badge (the last record of its LED state). */
+export function newestTraceSample<T extends { values: number[] }>(samples: T[], source: TraceSource): T | undefined {
+  for (let index = samples.length - 1; index >= 0; index -= 1) {
+    if (sampleInTrace(samples[index], source)) return samples[index];
+  }
+  return undefined;
+}
+
 function finiteNumber(value: string | number): number | undefined {
   if (typeof value === 'string' && !value.trim()) return undefined;
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -137,15 +165,20 @@ function median(values: number[]): number {
  * converging toward the next samples. Raw BMEG/CSV records are never changed.
  * The sequence check prevents this from re-running as the bounded plot window
  * advances or when plots are rearranged.
+ *
+ * Each trace is checked within its own LED state (`TraceSource.ledState`):
+ * an LED-sequenced record is compared only with later records of the same
+ * state, never with the other states' legitimately different values. A
+ * number is a trace at that value index across every record.
  */
-export function filterStartupDisplayTransient(
-  samples: DisplaySample[],
-  channelIndices: number[],
+export function filterStartupDisplayTransient<T extends DisplaySample>(
+  samples: T[],
+  traces: Array<number | TraceSource>,
   adcBits: number,
   hardwareSource: boolean,
   originTimestampUs?: number
-): DisplaySample[] {
-  if (!hardwareSource || !samples.length || !channelIndices.length) return samples;
+): T[] {
+  if (!hardwareSource || !samples.length || !traces.length) return samples;
 
   // Once the backend has exposed the first accepted frame, use elapsed time
   // rather than the first frame currently visible in the rolling window. This
@@ -161,14 +194,18 @@ export function filterStartupDisplayTransient(
   if (samples.length < 8 || samples[0]?.sequence !== 0) return samples;
   const fullScale = Math.max(1, (2 ** adcBits) - 1);
   const threshold = Math.max(32, fullScale * 0.02);
-  const stableSamples = samples.slice(4, 8);
-  const transient = channelIndices.some((channelIndex) => {
-    const first = samples[0]?.values[channelIndex];
+  const transient = traces.some((trace) => {
+    const source: TraceSource = typeof trace === 'number' ? { valueIndex: trace } : trace;
+    const channelIndex = source.valueIndex;
+    // Only the first record can be removed, so only a trace that draws it counts.
+    const series = source.ledState === undefined ? samples : samples.filter((sample) => sampleInTrace(sample, source));
+    if (series.length < 8 || series[0] !== samples[0]) return false;
+    const first = series[0]?.values[channelIndex];
     if (first === undefined) return false;
-    const stable = median(stableSamples.map((sample) => sample.values[channelIndex] ?? first));
+    const stable = median(series.slice(4, 8).map((sample) => sample.values[channelIndex] ?? first));
     const firstDistance = Math.abs(first - stable);
     if (firstDistance <= threshold) return false;
-    const approach = samples.slice(1, 4).map((sample) => Math.abs((sample.values[channelIndex] ?? first) - stable));
+    const approach = series.slice(1, 4).map((sample) => Math.abs((sample.values[channelIndex] ?? first) - stable));
     return approach.every((distance, index) => distance < firstDistance && (index === 0 || distance <= approach[index - 1] + threshold * 0.05));
   });
   return transient ? samples.slice(1) : samples;

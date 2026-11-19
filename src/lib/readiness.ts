@@ -56,6 +56,11 @@ export type ChecklistInput = {
   source: 'hardware' | 'simulator';
   selectedPort: string;
   firmwareReady: boolean;
+  /**
+   * The board answered with another WVU firmware build (the Board card's
+   * Older/Newer WVU firmware states). The Firmware item then names the fix.
+   */
+  firmwareMismatch?: 'older' | 'newer';
   /** A Faulted session that must be cleared before a hardware Start. */
   blockingFault: boolean;
   /**
@@ -87,7 +92,11 @@ export function readinessChecklist(input: ChecklistInput): ChecklistItem[] {
       ? { id: 'firmware', label: 'Firmware', status: 'fail', detail: 'select a board first', target: 'board-select' }
       : input.firmwareReady
         ? { id: 'firmware', label: 'Firmware', status: 'ok', detail: 'ready' }
-        : { id: 'firmware', label: 'Firmware', status: 'fail', detail: 'verify or restore', target: 'verify-firmware' };
+        : input.firmwareMismatch === 'older'
+          ? { id: 'firmware', label: 'Firmware', status: 'fail', detail: 'restore the WVU firmware', target: 'verify-firmware' }
+          : input.firmwareMismatch === 'newer'
+            ? { id: 'firmware', label: 'Firmware', status: 'fail', detail: 'update this app or restore', target: 'verify-firmware' }
+            : { id: 'firmware', label: 'Firmware', status: 'fail', detail: 'verify or restore', target: 'verify-firmware' };
 
   let lab: ChecklistItem;
   if (!input.labName) lab = { id: 'lab', label: 'Lab', status: 'fail', detail: 'choose a lab', target: 'lab-select' };

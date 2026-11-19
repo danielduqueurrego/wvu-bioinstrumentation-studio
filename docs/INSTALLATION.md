@@ -36,6 +36,10 @@ Project folders, recordings, calibration presets, local instructor customization
 
 After installation, normal board discovery, firmware verification and restoration, acquisition, calibration, and export work without Internet access. The application does not automatically update Arduino packages.
 
+## Boards after an update
+
+This version uses WVU firmware build `0x00010007`. A board restored by version 1.0.x shows **Older WVU firmware** and needs one **Restore WVU Firmware**. Update the application on every lab computer first, then restore each board once: a computer still on 1.0.x would put its older firmware back on a restored board (see [Troubleshooting](TROUBLESHOOTING.md#older-or-newer-wvu-firmware)).
+
 ## Uninstall
 
 Use Windows **Installed apps** or the Start-menu uninstall entry. Remove a Project folder manually only when its recordings are no longer needed.

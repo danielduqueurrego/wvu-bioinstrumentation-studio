@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { qualityLine, recordingResultView, stopReasonText } from './recording-result';
+import { qualityLine, recordingResultView, recordingTimingDetails, stopReasonText } from './recording-result';
 import { emptyIntegrity, type Summary } from './session-types';
 
 const summary = (overrides: Partial<Summary> = {}): Summary => ({
@@ -66,6 +66,18 @@ describe('Finished-recording card', () => {
       text: 'Check data quality: 10 samples flagged for a timing overrun.',
       ok: false
     });
+    // Build 0x00010007 flags skipped deadlines with 0x0010; its 0x0004 marks
+    // only a dropped batch, which the missing samples already report.
+    expect(qualityLine({ ...emptyIntegrity, overrun_flagged_records: 10, deadline_skip_flagged_records: 0 })).toEqual({
+      text: 'No missing, damaged, or out-of-order samples were detected.',
+      ok: true
+    });
+    expect(qualityLine({ ...emptyIntegrity, overrun_flagged_records: 0, deadline_skip_flagged_records: 1 }).text)
+      .toBe('Check data quality: 1 sample flagged for a timing overrun.');
+    expect(qualityLine({ ...emptyIntegrity, led_state_mismatches: 2 })).toEqual({
+      text: 'Check data quality: 2 samples with an unexpected LED state.',
+      ok: false
+    });
   });
 
   it('describes every stop reason in plain words, never as a raw code', () => {
@@ -74,5 +86,41 @@ describe('Finished-recording card', () => {
     for (const reason of ['user', 'timed_complete', 'application_close', 'disconnect', 'storage_guard', 'fault', 'something_new', undefined]) {
       expect(stopReasonText(reason), String(reason)).not.toMatch(/[a-z]+_[a-z]+/);
     }
+  });
+});
+
+describe('Advanced details: the last recording timing checks', () => {
+  const timing = {
+    requested_rate_hz: 1000, measured_rate_hz: 999.9, interval_count: 1999, median_interval_us: 1000, minimum_interval_us: 996,
+    maximum_interval_us: 1004, p99_interval_us: 1002, interval_tolerance_percent: 5, intervals_outside_tolerance: 0,
+    acquisition_queue_overflows: 0, timestamp_source: 'firmware'
+  };
+  const lab = { profile: { acquisition: { state_dwell_us: 1000 } } } as unknown as Summary['profile'];
+
+  it('lists skipped deadlines, the shortest LED settle with its share of the dwell, and the per-state checks', () => {
+    expect(recordingTimingDetails(summary({
+      profile: lab,
+      timing_diagnostics: {
+        ...timing, firmware_skipped_deadlines: 3, minimum_pulse_settle_us: 640,
+        pulse_state_intervals_outside_tolerance: [0, 1, 0, 2], pulse_state_maximum_error_us: [4, 60, 3, 1200]
+      }
+    }))).toEqual([
+      'Sampling deadlines the board skipped: 3',
+      'Shortest LED settle before a sample: 640 µs (64% of the 1,000 µs dwell)',
+      'LED-state intervals outside ±5%: RED 0, DARK 1 1, IR 0, DARK 2 2',
+      'Largest LED-state timing error: RED 4 µs, DARK 1 60 µs, IR 3 µs, DARK 2 1,200 µs'
+    ]);
+  });
+
+  it('shows only what the backend reported', () => {
+    // A simultaneous recording: no LED checks.
+    expect(recordingTimingDetails(summary({ timing_diagnostics: { ...timing, firmware_skipped_deadlines: 0 } })))
+      .toEqual(['Sampling deadlines the board skipped: 0']);
+    // A settle without a known dwell has no share.
+    expect(recordingTimingDetails(summary({ timing_diagnostics: { ...timing, minimum_pulse_settle_us: 900 } })))
+      .toEqual(['Shortest LED settle before a sample: 900 µs']);
+    expect(recordingTimingDetails(summary({ timing_diagnostics: { ...timing, firmware_skipped_deadlines: null, pulse_state_intervals_outside_tolerance: null } }))).toEqual([]);
+    expect(recordingTimingDetails(summary())).toEqual([]);
+    expect(recordingTimingDetails(undefined)).toEqual([]);
   });
 });

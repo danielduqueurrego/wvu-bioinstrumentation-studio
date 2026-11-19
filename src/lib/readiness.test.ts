@@ -34,6 +34,15 @@ describe('readiness checklist', () => {
     expect(byId({ ...ready, firmwareReady: false }).firmware).toMatchObject({ status: 'fail', target: 'verify-firmware' });
   });
 
+  it('names the fix for an older or newer WVU firmware build', () => {
+    expect(byId({ ...ready, firmwareReady: false, firmwareMismatch: 'older' }).firmware)
+      .toMatchObject({ status: 'fail', detail: 'restore the WVU firmware', target: 'verify-firmware' });
+    expect(byId({ ...ready, firmwareReady: false, firmwareMismatch: 'newer' }).firmware)
+      .toMatchObject({ status: 'fail', detail: 'update this app or restore', target: 'verify-firmware' });
+    // Ready firmware wins over a stale mismatch.
+    expect(byId({ ...ready, firmwareMismatch: 'newer' }).firmware.status).toBe('ok');
+  });
+
   it('points each lab-setting problem at its own control', () => {
     expect(byId({ ...ready, labName: undefined }).lab.target).toBe('lab-select');
     expect(byId({ ...ready, durationError: 'too short' }).lab.target).toBe('duration');

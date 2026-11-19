@@ -1,6 +1,6 @@
 # Maintainer and agent handoff
 
-Snapshot checked on **2026-11-18**. This document transfers project context. It is a dated snapshot, not a permanent statement about HEAD: inspect the current Git state and source before acting on a later request.
+Snapshot checked on **2026-11-18**; the firmware build `0x00010007` and pulse-ox 1.1.0 sections were added on **2026-11-19**. This document transfers project context. It is a dated snapshot, not a permanent statement about HEAD: inspect the current Git state and source before acting on a later request.
 
 ## Start here
 
@@ -20,7 +20,7 @@ The previous conversation is not required. Current source, manifests, logs, and 
 | `v1.0.1` commit | `7e729364c61fd9487de928faff0d43e42ec9d5f3` |
 | `v1.0.2` commit | `94c4bef7561cba3914a673c2c6a6f4bdaadf5b83` |
 | Application version | `1.0.2` in package, Cargo, Tauri, and release metadata (unchanged on `review-fixes`) |
-| Controlled firmware | Protocol `0.4`, build `0x00010006`, device ID `0x554E4F34`; the `.ino`, its SHA-256, the manifest, and `profiles/*.json` are unchanged on `review-fixes` |
+| Controlled firmware | Releases 1.0.0-1.0.2 and `review-fixes`: protocol `0.4`, build `0x00010006`, device ID `0x554E4F34`, `.ino` SHA-256 `f3eb3fec…`. On `release-1.1-prep`: protocol `0.4`, build **`0x00010007`**, same device ID, `.ino` SHA-256 `86221c10…` (see [Firmware build 0x00010007](#firmware-build-0x00010007-and-led-sequenced-pulse-ox)); every board needs one Restore, after every lab PC is updated |
 | Arduino tools | Releases 1.0.0-1.0.2: Arduino CLI `1.5.2-rc.1`, Renesas UNO core `1.6.0`, runtime bundle revision `3` (`4e068c54…`). On `release-1.1-prep`: Arduino CLI `1.6.0`, core `1.6.0`, runtime bundle revision `4` (`5baa8a5f…`), without OpenOCD and dfu-util |
 | Rust toolchain | `1.100.0`, pinned in `rust-toolchain.toml` |
 | First-party license | Apache-2.0; root `LICENSE` and package license metadata exist (root `NOTICE` added on `release-1.1-prep`) |
@@ -91,6 +91,18 @@ None of these can run without the real runtime ZIP and an Arduino UNO R4 WiFi. U
 
 - [ ] On the maintainer's own catalog, the first start of a `release-1.1-prep` build retires the Op Amp Lab 2.0.1 copy, leaves a `lab_state.pre-migration-*.json` backup, and shows the migration notice in the Lab card. A second start shows no notice and makes no new backup.
 - [ ] The built-in Op Amp Lab records `vmid_counts` and `vout_counts` from A0 and A1 on hardware.
+
+**Firmware build 0x00010007 and LED-sequenced pulse ox (release-1.1-prep)**
+
+- [ ] **Restore every board once.** A board restored by 1.0.2 (build `0x00010006`) shows **Older WVU firmware**; one Restore WVU Firmware (offline, revision 4) makes it **Ready**, and the restore log shows the `.ino` SHA-256 `86221c10…`. Before restoring boards in the lab, **update every lab PC**: a 1.0.2 PC reports a build-7 board as incompatible firmware and would restore build 6.
+- [ ] A 1.0.2 PC meeting a build-7 board reports incompatible firmware (expected; it confirms the rollout rule above). If a newer build is ever available, a 1.1 PC meeting it shows **Newer WVU firmware** and no Retry connection.
+- [ ] **Built-in pulse ox 1.1.0 at 1 ms.** A 60 s recording has 1000 rows/s within 1%, a median interval near 1000 µs, no interval outside ±5%, `led_state == record_sequence % 4` on every CSV row, `led_state_mismatches` 0, `firmware_skipped_deadlines` 0, `deadline_skip_flagged_records` 0, per-state checks 0, and `minimum_pulse_settle_us` ≥ 500 (≥ 50% of the dwell). TX and RX show the expected RED/DARK/IR/DARK levels with a finger or a bench light source.
+- [ ] **A 6-channel LED-sequenced lab** (an instructor lab on A0-A5, 1000 µs; for example a photodetector on A0 and bench voltages on A1-A5) passes the same checks, and every row holds all six channels. Measure the read spacing between channels (the docs estimate about 20 µs per `analogRead`, see [Hardware](HARDWARE.md#analog-inputs)) and correct the docs if it differs.
+- [ ] **Logic analyzer on D5 and D6** during a sequenced recording: each LED HIGH for one dwell per four-state cycle in the order RED, DARK 1, IR, DARK 2; D5 and D6 never HIGH together; both LOW after Stop, after a fault, and after the 5 s host-command watchdog.
+- [ ] **Legacy 4-state at 1 ms and 250 µs.** Install `profiles/legacy/pulseox_tx_rx_course_capture_1.0.0.profile.json` with **Install lab file…** (1000 µs) and record 60 s: about 250 cycles/s, no cycle interval outside ±5%, per-state checks 0. Then record a revision edited to 250 µs and note the per-state checks, skipped deadlines, and minimum settle (≥ 125 µs). **Restore course default** returns to 1.1.0.
+- [ ] **Minimum settle.** In every pulse-ox recording above, `minimum_pulse_settle_us` is at least 50% of the dwell.
+- [ ] **Watchdog soak.** A 30-minute six-channel sequenced recording completes with no board reset and no missing sequences, and an idle board connected for 30 minutes does not reset. (Optional: a sketch-level stall test is not part of the reference firmware; do not add a test hook to it.)
+- [ ] **CONFIGURE during acquisition.** The first Start after a board was left acquiring (forced app close) is clean, as for build 6.
 
 **Docs**
 
@@ -184,8 +196,11 @@ Arduino runtime revision 4 ZIP SHA-256 (193,000,375 bytes):
 Arduino runtime revision 3 ZIP SHA-256:
 4e068c540b485e8e7ceff29dac849db250b41efb56108b10edadfb033dc7d501
 
-Controlled reference .ino SHA-256 (build 0x00010006):
+Controlled reference .ino SHA-256 (build 0x00010006, releases 1.0.0-1.0.2):
 f3eb3fec0166189f66a8ddfeb058172a8d97a3c60d95d574b3234eecbd144aab
+
+Controlled reference .ino SHA-256 (build 0x00010007, release-1.1-prep):
+86221c104b8a7cf30bfbb0ac621cfdfebc8b08635ed0710df66db8fa4f5d681d
 ```
 
 ```powershell
@@ -198,7 +213,7 @@ Do not substitute a CI placeholder, download newer tools, or change the reviewed
 
 ## Runtime revision 4 and the third-party source bundles
 
-**Runtime.** `scripts/build_arduino_runtime.ps1` built revision 4 from the pinned Arduino CLI 1.6.0 release (`2769b9b2…`) and `arduino:renesas_uno@1.6.0`, removed OpenOCD and dfu-util (the UNO R4 WiFi uploads with bossac), and proved an offline compile of the reference sketch three times. The committed script carries the review fixes made after that build (default work folders and a guarded `-Force`, `-KeepUnusedTools`, relative paths, pinned built-in tool versions, `release/arduino-runtime-entries.json`, 59-character proofs); a validation rebuild with it passed all proofs (its ZIP differs, as every rebuild does). `src-tauri/examples/runtime_smoke.rs` compiled the `f3eb3fec…` sketch with the real ZIP offline: flash 58,644 bytes (22%), RAM 11,712 bytes (35%). `cli_config_text` now also writes `updater.enable_notification: false` and `network.cloud_api.skip_board_detection_calls: true`. [Developer Guide](DEVELOPER_GUIDE.md#bundled-arduino-runtime) has the rebuild recipe.
+**Runtime.** `scripts/build_arduino_runtime.ps1` built revision 4 from the pinned Arduino CLI 1.6.0 release (`2769b9b2…`) and `arduino:renesas_uno@1.6.0`, removed OpenOCD and dfu-util (the UNO R4 WiFi uploads with bossac), and proved an offline compile of the reference sketch three times. The committed script carries the review fixes made after that build (default work folders and a guarded `-Force`, `-KeepUnusedTools`, relative paths, pinned built-in tool versions, `release/arduino-runtime-entries.json`, 59-character proofs); a validation rebuild with it passed all proofs (its ZIP differs, as every rebuild does). `src-tauri/examples/runtime_smoke.rs` compiled the `f3eb3fec…` sketch with the real ZIP offline: flash 58,644 bytes (22%), RAM 11,712 bytes (35%); and later the build-`0x00010007` sketch `86221c10…`: flash about 60.1 kB (22%; 60,088 bytes in one scratch folder, 60,080 in two others, because the binary embeds source paths), RAM 12,344 bytes (37%), most of the increase being the 512-byte CRC table. `cli_config_text` now also writes `updater.enable_notification: false` and `network.cloud_api.skip_board_detection_calls: true`. [Developer Guide](DEVELOPER_GUIDE.md#bundled-arduino-runtime) has the rebuild recipe.
 
 **Path length.** GCC 7-2017q4 fails when the runtime root has 60 or more characters (59 compiles). `%LOCALAPPDATA%\WVU-BMEG\rt` is 35 characters plus the profile folder name, so profile folders longer than 24 characters fail; 1.0.2 has the same problem and no mitigation. `resolve_runtime_root` (`RUNTIME_ROOT_LENGTH_LIMIT` in `arduino_runtime.rs`) then uses `%ProgramData%\WVU-BMEG-<SHA-256 of the user SID, 12 hex>\rt`, created with a protected access list for the user, SYSTEM and Administrators; otherwise the page shows category `runtime_path_too_long` ("contact IT support"). The plan's 8.3 short-path step was dropped: Arduino CLI expands short paths back to the long path before running GCC (tested with `runtime_smoke`). The plan's `%ProgramData%\WVU-BMEG\<id>` layout with default permissions was changed to a per-user folder directly in `%ProgramData%` with a protected access list, because the default permissions let every local user add files (for example a `platform.local.txt` that changes compile commands) inside another user's runtime, and the first user to create `WVU-BMEG` would own the folder above everyone else's. An existing fallback folder is used only if its owner is the user, SYSTEM or Administrators, its access list is protected and its allow entries name only those three accounts, and it is not a link (junction). The debug-only `WVU_STUDIO_DEV_LOCAL_DATA` override is never redirected. The fallback's access-list code is unit-tested in a temporary folder only (creation, an unprotected folder, a protected folder that also allows Users, a junction); it has not run against the real `%ProgramData%` (see the hardware checklist). A profile folder name with characters outside the Windows ANSI code page is a separate, unmitigated limitation (see [Deferred decisions](#deferred-decisions)).
 
@@ -259,14 +274,14 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 | Recording bar, message center, setup cards, board panel, restore stepper, result card | `src/lib/components/RecordingBar.svelte`, `MessageCenter.svelte`, `SetupCard.svelte`, `BoardPanel.svelte`, `FirmwareJobProgress.svelte`, `RecordingResultCard.svelte` |
 | Plain-language texts and next actions; readiness; Source default | `src/lib/messages.ts`, `readiness.ts`, `recording-start.ts`, `source-select.ts` |
 | Live signals, plot lifecycle, legends, endpoint overlays, watermark | `src/lib/components/LiveSignalsPanel.svelte`, `PlotToolbar.svelte`, `LivePlot.svelte` |
-| Plot groups, colours, visibility; time window, warmup, ticks | `src/lib/multichannel.ts`, `live-display.ts` |
-| Lab card, Lab Manager, lab authoring | `src/lib/components/LabCard.svelte`, `LabManager.svelte`, `OperatingModeControl.svelte`, `src/lib/lab-catalog.ts`, `lab-authoring.ts` |
+| Plot groups, colours, visibility, record-to-trace mapping and LED-state traces; time window, warmup, ticks | `src/lib/multichannel.ts`, `live-display.ts` |
+| Lab card, Lab Manager, lab authoring | `src/lib/components/LabCard.svelte`, `LabManager.svelte`, `ChannelGridEditor.svelte`, `OperatingModeControl.svelte`, `src/lib/lab-catalog.ts`, `lab-authoring.ts` |
 | Tauri command boundary, startup, window close | `src-tauri/src/lib.rs`, `main.rs` |
 | Serial-ownership lease | `src-tauri/src/serial_lease.rs` |
 | Worker lifecycle, serial diagnostics, cancellation, storage guard, finalization, display history | `src-tauri/src/session.rs`, `acquisition.rs` |
 | Protocol framing, CRC, sequences, per-record timestamps | `src-tauri/src/protocol.rs`, [USB Protocol](USB_PROTOCOL.md) |
 | BMEG/CSV/metadata | `src-tauri/src/recording.rs`, [Calibration and Units](CALIBRATION_AND_UNITS.md#recording-files) |
-| Profiles, local versions, transactional catalog, startup migration `op_amp_builtin_v1` | `src-tauri/src/profiles.rs`, factory `profiles/*.profile.json`, `profiles/factory-labs.lock.json`, `src-tauri/src/testdata/` |
+| Profiles, local versions, transactional catalog, startup migration `op_amp_builtin_v1` | `src-tauri/src/profiles.rs`, factory `profiles/*.profile.json`, published earlier versions in `profiles/legacy/`, `profiles/factory-labs.lock.json`, `src-tauri/src/testdata/` |
 | Factory lab file tool (version policy P2) | `scripts/update_factory_labs.ps1`, `src-tauri/examples/factory_labs.rs`, [Lab Configuration](LAB_CONFIGURATION.md#how-to-change-a-built-in-lab) |
 | Calibration conversion and presets | `src/lib/calibration*.ts`, `src/lib/components/CalibrationCard.svelte`, `CalibrationDialog.svelte`, `src-tauri/src/calibration.rs` |
 | Project/Output path validation | `src-tauri/src/project_paths.rs`, `src/lib/project-folder.ts` |
@@ -282,7 +297,8 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 - The header, recording bar, message center, setup cards (Board, Project folder, Lab, Session setup, Recording duration, Calibration & Units), Live signals, and Last recording stay in one window.
 - **Source** starts on Simulator (practice). It switches to Hardware **once**, the first time firmware becomes ready on the selected port while nothing is recording. It never switches during or after a recording, or after the student chose a Source. Simulator plots carry the SIMULATED DATA watermark.
 - Raw ADC counts remain authoritative in BMEG/CSV. One synchronized 0.5–30 s live window (default 5 s), up to 30,000 retained display frames, and at most 2,000 requested display points keep plotting bounded.
-- Timestamp filtering and decimation always include the exact newest frame. Display changes, including Pause display, must not issue acquisition commands.
+- Timestamp filtering and decimation always include the exact newest frame. Display changes, including Pause display and **Show by LED state**, must not issue acquisition commands.
+- For LED-sequenced labs, display decimation keeps whole four-record cycles (by `record_sequence / 4`) so every LED state is sampled equally and a plot never aliases to one state, still within `max_points` and with the exact newest record last. A channel shown by LED state is four traces `led:<state>:<id>`, `null` outside their state with gaps spanned; units, calibration, and unit selectors are keyed by the parent channel; the startup-transient filter works per (value index, LED state). `split_by_led_state` is a display default only.
 - Multi-signal legends appear only with at least two visible signals in that plot. Endpoint values appear for each visible trace in its selected unit. Plot exceptions are isolated and logged as `PLOT_RENDER_FAIL`.
 - The time axis is elapsed recording seconds, not a calendar date. Hardware startup warmup is display-only; the initial raw sample remains in the recording.
 - The Live signals "Lab outputs" line lists the outputs the board is driven with (`resolvedDigitalOutputs`, which mirrors Rust's `resolved_digital_outputs`), so a stored legacy revision with only `led_outputs` still shows its D4.
@@ -290,7 +306,9 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 **Board and firmware**
 
 - Board Refresh, Verify, and Restore availability is independent of acquisition firmware readiness; Restore is a recovery path for unknown or outdated firmware.
-- Start readiness for Hardware is bound to `verified_port`: it requires a compatible board and a port match, and never consults the last restore. Any failure or job start clears it, including a Retry connection or hardware Start handshake on that port that proves other firmware (`non_protocol_bytes`, `wrong_protocol_version`, `missing_firmware_identity`, `incompatible_firmware_identity`; applied when the workflow status or Start readiness is next read).
+- Start readiness for Hardware is bound to `verified_port`: it requires a compatible board and a port match, and never consults the last restore. Any failure or job start clears it, including a Retry connection or hardware Start handshake on that port that proves other firmware (`non_protocol_bytes`, `wrong_protocol_version`, `missing_firmware_identity`, `incompatible_firmware_identity`, `older_wvu_firmware`, `newer_wvu_firmware`; applied when the workflow status or Start readiness is next read).
+- The handshake requires exactly `REFERENCE_FIRMWARE_BUILD`. The WVU device ID with another build of the same family (upper 16 bits equal, lower 16 bits nonzero) is `older_wvu_firmware` or `newer_wvu_firmware` (Board card **Older/Newer WVU firmware**, both with Restore; no Retry connection, because a retry gets the same answer); anything else stays `incompatible_firmware_identity`. Verify records them as `FirmwareErrorCategory::OlderWvuFirmware`/`NewerWvuFirmware`.
+- **Rollout rule:** update the app on every lab PC before restoring any board to a new firmware build, because an older app treats the newer board as incompatible and its Restore puts its own older build back.
 - Verify never uploads firmware. A Verify that cannot open the port reports `PortBusy` and keeps the previous compatibility.
 - After a failed or canceled restore, the board refresh follows a board that appeared on another port but does not verify it, so the Board card keeps the restore's failure and log. Advanced details always lists the last restore's result and log path. A student-initiated Verify still replaces the card.
 - A failed Repair Arduino tools reports `previous_runtime_kept` (the tools in use are still complete on disk); the page then keeps the tools' state, so Restore stays available.
@@ -312,7 +330,10 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 - `UntilStopped` is a real enum variant with no requested seconds.
 - Legitimate terminal paths include User, TimedComplete, Disconnect, ApplicationClose, StorageGuard, and actual acquisition faults.
 - Samples that cease for seven seconds trigger a diagnosed fault, not an automatic restart.
-- The host sends an **idle-safe STOP before every CONFIGURE**, so a board left acquiring is quiesced and its outputs go LOW before reconfiguration.
+- The host sends an **idle-safe STOP before every CONFIGURE**, so a board left acquiring is quiesced and its outputs go LOW before reconfiguration. Build `0x00010007` also stops by itself on a CONFIGURE during acquisition (terminal STATUS, outputs LOW); keep the host STOP anyway.
+- Each acquisition mode needs its own CAPABILITIES bit (`FirmwareCapabilities::supports_modes`; 0x01 simultaneous, 0x02 legacy 4-state, 0x04 LED-sequenced). Mode 2 CONFIGURE is `[2, bits, dwell u32, n, pins…, red, ir]`.
+- STATUS ≥ 42 bytes carries skipped deadlines and ≥ 46 bytes the minimum settle; both, like the per-phase checks, count only from the terminal STATUS of the current run. A 38-byte STATUS (build 6) still parses.
+- Sample flag `0x0004` (`overrun_flagged_records`) and `0x0010` (`deadline_skip_flagged_records`) are counted separately and never added to `firmware_overflows`. For LED-sequenced labs every record with `field[0] != sequence % 4` increments `led_state_mismatches`; the record is still stored unchanged.
 - Frames and ERRORs from before the START STATUS are not counted against the new recording.
 - After STOP, the host waits up to 300 ms for a **STATUS newer than STOP** (`acquiring = 0`, mask 0) and drains the tail. A mask that is already 0 proves nothing for labs without outputs. A STOP whose write timed out (`TimedOut`/`WouldBlock`), or that is unanswered after 100 ms, is resent at most twice; each resend extends the wait by up to 100 ms. Other write failures are not retried.
 
@@ -326,7 +347,10 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 **Firmware, provenance, and development**
 
 - The firmware uses RA4M1 native USB CDC. The compile recipe deliberately omits `NO_USB`, and `arduino_runtime.rs` adds the version-pinned `SerialUSB::write_raw` compatibility shim in the app-owned extracted core. Do not revert to the ESP32 bridge or patch an unrelated Arduino IDE installation.
-- Pulse-ox phase deadlines advance absolutely with `nextTickMicros += stateDwellUs`. ADC and record creation are isolated from frame encoding, CRC, and serial transmission by bounded queues and partial writes. Host recording retains actual per-record timestamps and per-state timing checks.
+- Pulse-ox phase deadlines advance absolutely with `nextTickMicros += stateDwellUs`. `scheduleNextPulseDeadline` then skips (and counts) deadlines until the new state's sample is at least `dwell / 2` after its LED edge; it lengthens a state and never advances `pulseState`. ADC and record creation are isolated from frame encoding, CRC, and serial transmission by bounded queues and partial writes (no `Serial.write`, `enqueueFrame`, `crc16`, or `serviceBatchEncoding` in `acquirePulseState`/`acquirePulseSequenced`, which a test checks). Host recording retains actual per-record timestamps and per-state timing checks.
+- Firmware build `0x00010007` keeps: `buildCrcTable()` as the first statement of `setup()`; `WDT.begin(1000)` last in `setup()` and `WDT.refresh()` first in `loop()`; at most 64 command bytes per pass with `Serial.read() < 0` ending the pass; encoding skipped within 120 µs of the next sample; simultaneous mode refusing any D5/D6 bit; each batch slot holding its own period and field count; START never purging queued sample frames. `MAX_FIELDS` stays 8 (mode 2 uses at most 7).
+- LED-sequenced records are `[led_state, ch1..chN]`, read while that state's LEDs are unchanged, with `record_sequence % 4 == led_state`. The CSV is `record_sequence,t_us,cycle_index,led_state,led_state_name,` plus the simultaneous channel columns (`plan_channel_columns`/`write_channel_values`); the legacy 4-state CSV and record layout are unchanged and stay supported.
+- The built-in pulse-ox lab is 1.1.0 in the LED-sequenced mode (`tx` A0, `rx` A1, both split, D5/D6, 1000 µs, build `0x00010007`, hash `8d8428e9…`); 1.0.0 (hash `019c25a6…`) stays published in `profiles/legacy/` and installable as a rollback. The other factory labs keep build `0x00010006` and their hashes, and `ACCEPTED_LAB_FIRMWARE_BUILDS` must keep every earlier build, or stored labs disappear.
 - MPXV uses `(Vout / Vsupply - 0.04) / 0.009` kPa and `kPa * 7.5006` mmHg. EMG pressure supports counts, volts, kPa, and mmHg. XGZP uses its selected local linear calibration, with at most one active preset per channel. The preset list follows the saved files (a preset deleted elsewhere is dropped with its selection; only the one this window just saved is kept while the list catches up), and it is read again when the window regains focus outside a recording. Pulse ox remains raw-only, with no ambient subtraction or physiological computations.
 - Tool-version provenance is best effort: versions are cached, and a failed query records `"unavailable"` instead of failing a recording or restore. Restore logs record `git_revision` from the `GIT_COMMIT` embedded at build time, or `null`.
 - `WVU_STUDIO_DEV_LOCAL_DATA` relocates the extracted runtime **in debug builds only**; release builds ignore it, and the runtime under it is never redirected.
@@ -411,19 +435,45 @@ The two hashes differ only by `source`. While active, that copy replaced General
 
 Test catalog changes with temporary roots (the Rust tests) or `scripts\start_dev_sandbox.ps1`, never against the maintainer's live catalog.
 
+## Firmware build 0x00010007 and LED-sequenced pulse ox
+
+On `release-1.1-prep` (2026-11-19; design approved by the maintainer on 2026-11-18) the reference firmware is build `0x00010007`, still protocol 0.4 and device ID `0x554E4F34`:
+
+```text
+.ino SHA-256: 86221c104b8a7cf30bfbb0ac621cfdfebc8b08635ed0710df66db8fa4f5d681d (LF, ASCII)
+Pinned in:    src-tauri/src/reference_firmware.rs (REFERENCE_SOURCE_SHA256),
+              release/release-manifest.json (reference_firmware_build, reference_firmware_source_sha256),
+              src-tauri/src/protocol.rs (REFERENCE_FIRMWARE_BUILD)
+HELLO/CAPABILITIES mode byte: 0x07 (simultaneous, legacy 4-state, LED-sequenced)
+STATUS: 46 bytes (skipped deadlines at 38, minimum settle at 42)
+Compile (runtime revision 4, offline): flash about 60.1 kB (22%; 60,080-60,088 B, varies with the build folder), RAM 12,344 B (37%)
+```
+
+[USB Protocol](USB_PROTOCOL.md) describes the protocol changes and [Hardware](HARDWARE.md#pulse-oximetry) the timing.
+
+**LED-sequenced mode** (`AcquisitionMode::PulseoxSequenced`, `"pulseox_sequenced"`, CONFIGURE mode 2). 1–6 channels of A0-A5, dwell 1000-5000 µs, rate `round(1e6 / dwell)`, distinct `acquisition_sequenced` RED/IR outputs on D4-D6 and no others, `required_firmware.build` ≥ `0x00010007` (checked before the hash), plot defaults covering every channel, channels in ADC counts. `split_by_led_state` is an optional, display-only channel flag (omitted when false, so existing hashes are unchanged) allowed only in this mode. Record fields are `["led_state", <csv names>]`; the BMEG header and sidecar carry `led_sequenced_layout`. The XGZP fit reads a sequenced channel one field later (after `led_state`), and calibration membership uses `resolved_channels()`, so `led_state` and LED-state trace IDs cannot be calibrated.
+
+**Built-in pulse-ox lab 1.1.0.** `profiles/pulseox_tx_rx_course_capture.profile.json` was edited to the sequenced mode and published with `scripts/update_factory_labs.ps1 fix … --bump-minor`, which appended `1.1.0` / `8d8428e9d5de1d07480417adf0c94a61f401009f6c59ad31109f33dbed4239cd` to the lock and kept the committed 1.0.0 byte for byte as `profiles/legacy/pulseox_tx_rx_course_capture_1.0.0.profile.json` (hash `019c25a6…`). Tests take 4-state coverage from that file (`legacy_pulse_ox_lab()` in `profiles.rs`); `sequenced_test_lab()` is built from it and must equal 1.1.0's acquisition, outputs, and plot defaults. Install lab file accepts the 1.0.0 file (it is a published factory version), so it is a rollback; Restore course default returns to 1.1.0. A PC whose instructor made a local 4-state pulse-ox revision active keeps it.
+
+**Rollout.** The host accepts exactly build `0x00010007`. Update the app on every lab PC first, then restore every board once from an updated PC: a 1.0.x PC reports a build-7 board as incompatible and its Restore puts build 6 back. 1.1 PCs show **Older WVU firmware** for build 1-6 boards and **Newer WVU firmware** for later builds of the family.
+
+**Not verified on hardware yet:** everything in the [hardware checklist](#hardware-verification-checklist-for-review-fixes) under "Firmware build 0x00010007". The sketch only compiled (offline, runtime revision 4); no board was used.
+
 ## Deferred decisions
 
 The 2026-11-17 review recorded these items. They need hardware, legal review, or the maintainer's decision, so this pass did not resolve them.
 
-**Firmware** (any `.ino` edit changes the pinned source SHA-256 in `reference_firmware.rs`, the release manifest, and the exact-string tests. It needs a new build ID, profile `required_firmware` updates, a bench test, and a Restore on every lab board. Bundle these items into one reviewed firmware build.)
+**Firmware** (any `.ino` edit changes the pinned source SHA-256 in `reference_firmware.rs`, the release manifest, and the exact-string tests. It needs a new build ID, profile `required_firmware` updates only for labs that use a new feature, a bench test, and a Restore on every lab board after every lab PC is updated.)
 
-- CONFIGURE received mid-acquisition changes the configuration without stopping. The host now sends an idle STOP first; the firmware option is to treat CONFIGURE while acquiring as an implicit stop, and to purge queued sample frames at START.
-- Count skipped sampling deadlines in the firmware itself, for example with a dedicated flag or counter. The host currently counts flagged records as `overrun_flagged_records`.
-- Pulse-ox settle time after a catch-up: a late state can leave the next state almost no settle time before sampling. A minimum-settle guard is the proposed fix.
-- Use a table-driven CRC to shorten batch encoding at short dwells.
-- Hardware watchdog, and a `readCommands` loop that cannot spin when `Serial.read()` returns -1.
-- Reject any D5/D6 bit in simultaneous-mode CONFIGURE. Today the firmware rejects only both together, and the desktop rejects D5/D6 HIGH-while-recording.
-- The `.ino` header comment describes the default course configuration as if pins and timing were fixed.
+Resolved on `release-1.1-prep` in build `0x00010007` (see [Firmware build 0x00010007](#firmware-build-0x00010007-and-led-sequenced-pulse-ox)); the bench tests are in the hardware checklist:
+
+- CONFIGURE received mid-acquisition now stops the acquisition first, like STOP. Queued sample frames are deliberately **not** purged at START (each batch slot keeps its own layout instead); the host STOP before CONFIGURE stays.
+- Skipped sampling deadlines have their own flag `0x0010` and a STATUS counter; `0x0004` means a dropped batch only.
+- A minimum-settle guard keeps every pulse-ox sample at least half a dwell after its LED edge, and STATUS reports the minimum observed settle.
+- Table-driven CRC; batch encoding waits while a sample is due within 120 µs.
+- Hardware watchdog (the sketch requests 1000 ms; the core's `WDT` library rounds it up to about 1.4 s, 1,398 ms, on the UNO R4); `readCommands` reads at most 64 bytes per pass and stops when `Serial.read()` returns -1.
+- Simultaneous-mode CONFIGURE rejects any D5/D6 bit.
+- The `.ino` header comment describes the three modes generically.
 
 **Release and legal**
 

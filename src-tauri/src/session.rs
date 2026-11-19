@@ -84,6 +84,9 @@ const HEADER_PROVENANCE_RESERVE_BYTES: usize = 2 * 1024;
 const CSV_ROW_PREFIX_BYTES: u64 = 34;
 /// ",65535" raw ADC counts.
 const CSV_COUNTS_FIELD_BYTES: u64 = 6;
+/// The LED-sequenced state columns: ",cycle_index" (<= 10 digits),
+/// ",led_state" (<= 5 digits), and ",led_state_name" (at most "UNKNOWN").
+const CSV_LED_STATE_COLUMNS_BYTES: u64 = 11 + 6 + 8;
 /// ",d.dddddd" volts with headroom for unusual reference voltages.
 const CSV_VOLTS_FIELD_BYTES: u64 = 12;
 /// A signed calibrated value with six decimals.
@@ -163,6 +166,97 @@ fn select_display_records(
     (0..max_points)
         .map(|index| records[start + index * last_offset / (max_points - 1)].clone())
         .collect()
+}
+
+/// LED states per LED-sequenced cycle (RED, DARK 1, IR, DARK 2).
+const LED_STATES_PER_CYCLE: usize = crate::profiles::LED_STATE_NAMES.len();
+
+/// Display decimation for an LED-sequenced lab, whose records each hold one
+/// LED state (`sequence % 4`). A stride over records could keep a single
+/// state (any multiple of 4 does), so whole LED cycles (`sequence / 4`) are
+/// kept instead, evenly spread over the window: every state is sampled
+/// equally. The newest cycle, complete or not, is always kept whole, so the
+/// exact newest record is still the last element, and at most `max_points`
+/// records are returned. A window that fits in `max_points` is returned
+/// whole, as in `select_display_records`, which this mirrors; it only reads
+/// the display cache.
+fn select_led_sequenced_display_records(
+    records: &VecDeque<SynchronizedRecord>,
+    window_seconds: f64,
+    max_points: usize,
+) -> Vec<SynchronizedRecord> {
+    let Some(latest) = records.back() else {
+        return Vec::new();
+    };
+    if max_points == 0 {
+        return Vec::new();
+    }
+    let window_us = (window_seconds * 1_000_000.0).round() as u64;
+    let earliest_timestamp = latest.timestamp_us.saturating_sub(window_us);
+    let start = records.partition_point(|record| record.timestamp_us < earliest_timestamp);
+    if records.len() - start <= max_points {
+        return records.range(start..).cloned().collect();
+    }
+    let cycle_of = |index: usize| records[index].sequence / LED_STATES_PER_CYCLE as u32;
+    // Runs of consecutive records of one LED cycle: (first index, length).
+    let mut cycles: Vec<(usize, usize)> = Vec::new();
+    for index in start..records.len() {
+        match cycles.last_mut() {
+            Some((first, length)) if cycle_of(*first) == cycle_of(index) => *length += 1,
+            _ => cycles.push((index, 1)),
+        }
+    }
+    let Some((&(newest_first, newest_length), earlier)) = cycles.split_last() else {
+        return Vec::new();
+    };
+    if newest_length > max_points {
+        // Too small a budget for a whole cycle: the newest records only.
+        return records
+            .range(records.len() - max_points..)
+            .cloned()
+            .collect();
+    }
+    // Complete cycles only, so all four states stay equally represented (the
+    // window's oldest cycle is usually cut). Should no earlier cycle be
+    // complete (records lost), the incomplete ones are used.
+    let complete: Vec<(usize, usize)> = earlier
+        .iter()
+        .copied()
+        .filter(|(_, length)| *length == LED_STATES_PER_CYCLE)
+        .collect();
+    let pool: &[(usize, usize)] = if complete.is_empty() {
+        earlier
+    } else {
+        &complete
+    };
+    let mut remaining = max_points - newest_length;
+    let wanted = (remaining / LED_STATES_PER_CYCLE).min(pool.len());
+    let chosen: Vec<(usize, usize)> = match wanted {
+        0 => Vec::new(),
+        _ if wanted == pool.len() => pool.to_vec(),
+        // One cycle: the one closest to the newest, so the plot stays
+        // continuous at its right edge.
+        1 => vec![pool[pool.len() - 1]],
+        _ => (0..wanted)
+            .map(|index| pool[index * (pool.len() - 1) / (wanted - 1)])
+            .collect(),
+    };
+    let mut selected = Vec::with_capacity(max_points);
+    for (first, length) in chosen {
+        // A cycle longer than four records (repeated sequences) must not
+        // push the result past the budget.
+        if length > remaining {
+            continue;
+        }
+        remaining -= length;
+        selected.extend(records.range(first..first + length).cloned());
+    }
+    selected.extend(
+        records
+            .range(newest_first..newest_first + newest_length)
+            .cloned(),
+    );
+    selected
 }
 
 /// Kept behind a small interface so storage guard behavior is deterministic in
@@ -348,6 +442,12 @@ pub enum ConnectionFailureCategory {
     WrongProtocolVersion,
     MissingFirmwareIdentity,
     IncompatibleFirmwareIdentity,
+    /// The board reported the WVU device ID with an older build of this
+    /// app's firmware family: Restore WVU Firmware updates it.
+    OlderWvuFirmware,
+    /// The board reported the WVU device ID with a newer build than this
+    /// app's reference firmware: the app on this computer is out of date.
+    NewerWvuFirmware,
     HandshakeIncomplete,
     /// A serial operation failed, but Windows still enumerated the selected
     /// port or the device identity could not be proven absent.
@@ -540,6 +640,11 @@ pub struct SessionSummary {
     /// Flush/rename/metadata problems while saving. `bmeg_path` names the raw
     /// file that was actually kept (a `.bmeg.part` if it could not be renamed).
     pub finalize_error: Option<String>,
+    /// The timing checks written to the metadata (intervals, per-state
+    /// pulse-ox checks, skipped deadlines, minimum LED settle), for Advanced
+    /// details. Omitted when none were computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing_diagnostics: Option<crate::recording::AcquisitionTimingDiagnostics>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1213,11 +1318,18 @@ impl SessionController {
         max_points: usize,
     ) -> Result<Vec<SynchronizedRecord>, SessionError> {
         let runtime = self.lock_runtime()?;
-        Ok(select_display_records(
-            &runtime.recent,
-            normalize_display_window_seconds(window_seconds),
-            normalize_display_max_points(max_points),
-        ))
+        let window_seconds = normalize_display_window_seconds(window_seconds);
+        let max_points = normalize_display_max_points(max_points);
+        // `recent` and `profile` are replaced together when a session begins.
+        let led_sequenced = runtime
+            .profile
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.profile.acquisition.is_led_sequenced());
+        Ok(if led_sequenced {
+            select_led_sequenced_display_records(&runtime.recent, window_seconds, max_points)
+        } else {
+            select_display_records(&runtime.recent, window_seconds, max_points)
+        })
     }
 
     pub fn is_recording(&self) -> Result<bool, SessionError> {
@@ -1548,6 +1660,19 @@ impl SessionController {
         seconds: u64,
         output_dir: &Path,
     ) -> Result<SessionSummary, SessionError> {
+        self.capture_simulator_profile_for_test(default_general_profile()?, seconds, output_dir)
+    }
+
+    /// A simulator recording of `profile` lasting `seconds` (shorter than a
+    /// lab's 10-second minimum is allowed here), through the production
+    /// capture path.
+    #[cfg(test)]
+    fn capture_simulator_profile_for_test(
+        &self,
+        profile: ProfileSnapshot,
+        seconds: u64,
+        output_dir: &Path,
+    ) -> Result<SessionSummary, SessionError> {
         let _lease = self.claim_serial(SerialOwner::Session)?;
         let duration = RecordingDuration::Timed { seconds };
         self.begin_session(
@@ -1555,11 +1680,11 @@ impl SessionController {
             "Simulator",
             "SIM",
             duration.clone(),
-            default_general_profile()?,
+            profile.clone(),
             RecordingCalibration::default(),
         )?;
         self.capture_simulator_worker(
-            default_general_profile()?,
+            profile,
             duration,
             output_dir.to_path_buf(),
             RecordingCalibration::default(),
@@ -2123,6 +2248,7 @@ impl SessionController {
         let (tx, rx) = sync_channel(4_096);
         let mut acquisition = AcquisitionController::new(tx);
         acquisition.set_expected_field_count(field_count);
+        acquisition.set_led_sequenced(profile.profile.acquisition.is_led_sequenced());
         crate::app_log::record("INFO", "HANDSHAKE_BEGIN");
         self.wait_for_handshake(io, &mut acquisition)
             .map_err(|error| {
@@ -2698,6 +2824,7 @@ impl SessionController {
             matches!(
                 profile.profile.acquisition.acquisition_mode,
                 crate::profiles::AcquisitionMode::Pulseox4State
+                    | crate::profiles::AcquisitionMode::PulseoxSequenced
             ),
         ));
         // The count of records actually in the BMEG. Without a sink failure
@@ -2778,6 +2905,7 @@ impl SessionController {
             final_digital_output_mask,
             csv_error,
             finalize_error,
+            timing_diagnostics: final_meta.timing_diagnostics.clone(),
         };
         self.note_runtime_error("SUMMARY", self.set_summary(summary));
         self.note_runtime_error("STOP_REASON", self.set_runtime_stop_reason(reason));
@@ -4150,12 +4278,8 @@ fn stop_is_confirmed(snapshot: &AcquisitionSnapshot, status_baseline: u64) -> bo
 /// calibration (see `export_bmeg_csv` for the column layout).
 fn estimated_csv_row_bytes(profile: &ProfileSnapshot, calibration: &RecordingCalibration) -> u64 {
     let acquisition = &profile.profile.acquisition;
-    match acquisition.acquisition_mode {
-        crate::profiles::AcquisitionMode::Pulseox4State => {
-            let fields = acquisition.record_field_names().len() as u64;
-            CSV_ROW_PREFIX_BYTES + fields * CSV_COUNTS_FIELD_BYTES
-        }
-        crate::profiles::AcquisitionMode::Simultaneous => acquisition
+    let channel_bytes = || {
+        acquisition
             .resolved_channels()
             .iter()
             .map(|channel| {
@@ -4168,7 +4292,18 @@ fn estimated_csv_row_bytes(profile: &ProfileSnapshot, calibration: &RecordingCal
                 CSV_COUNTS_FIELD_BYTES + CSV_VOLTS_FIELD_BYTES + derived * CSV_DERIVED_FIELD_BYTES
             })
             .sum::<u64>()
-            .saturating_add(CSV_ROW_PREFIX_BYTES),
+    };
+    match acquisition.acquisition_mode {
+        crate::profiles::AcquisitionMode::Pulseox4State => {
+            let fields = acquisition.record_field_names().len() as u64;
+            CSV_ROW_PREFIX_BYTES + fields * CSV_COUNTS_FIELD_BYTES
+        }
+        crate::profiles::AcquisitionMode::Simultaneous => {
+            channel_bytes().saturating_add(CSV_ROW_PREFIX_BYTES)
+        }
+        crate::profiles::AcquisitionMode::PulseoxSequenced => channel_bytes()
+            .saturating_add(CSV_ROW_PREFIX_BYTES)
+            .saturating_add(CSV_LED_STATE_COLUMNS_BYTES),
     }
 }
 
@@ -4192,8 +4327,9 @@ const BMEG_HEADER_RESERVE_BYTES: u64 = 64 * 1024;
 /// The CSV uses the same conservative per-row estimate as the storage guard.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecordingStorageEstimate {
-    /// Records per second; one pulse-ox record is a full RED/DARK 1/IR/DARK 2
-    /// cycle, so its rate follows the state dwell time.
+    /// Records per second; one legacy 4-state pulse-ox record is a full
+    /// RED/DARK 1/IR/DARK 2 cycle and one LED-sequenced record is one LED
+    /// state, so both rates follow the state dwell time.
     pub records_per_second: u64,
     pub bmeg_bytes_per_second: u64,
     pub csv_bytes_per_second: u64,
@@ -4221,6 +4357,12 @@ pub fn estimate_recording_storage(
             .state_dwell_us
             .filter(|dwell| *dwell > 0)
             .map(|dwell| 1_000_000u64.div_ceil(4 * u64::from(dwell)))
+            .unwrap_or(0),
+        // One record per LED state.
+        crate::profiles::AcquisitionMode::PulseoxSequenced => acquisition
+            .state_dwell_us
+            .filter(|dwell| *dwell > 0)
+            .map(|dwell| 1_000_000u64.div_ceil(u64::from(dwell)))
             .unwrap_or(0),
     };
     let field_count = acquisition.record_field_names().len();
@@ -4527,6 +4669,9 @@ fn build_initial_metadata(
         markers: Vec::new(),
         calibration: Some(calibration),
         record_layout: None,
+        led_sequenced_layout: crate::recording::LedSequencedLayout::for_acquisition(
+            &profile.profile.acquisition,
+        ),
         session_opened_utc: Some(opened),
         acquisition_started_utc: None,
         csv_error: None,
@@ -4612,6 +4757,19 @@ fn default_recording_note(simulator: bool, snapshot: &ProfileSnapshot) -> String
                 profile.display_name
             )
         }
+        crate::profiles::AcquisitionMode::PulseoxSequenced => {
+            let channels = profile
+                .acquisition
+                .resolved_channels()
+                .into_iter()
+                .map(|channel| format!("{} = {}", channel.pin, channel.label))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "Hardware recording for {}: {channels}; LED-sequenced pulse-ox acquisition, every channel read once in each LED state (RED, DARK 1, IR, DARK 2), one raw record per state.",
+                profile.display_name
+            )
+        }
         crate::profiles::AcquisitionMode::Simultaneous => {
             let channels = profile
                 .acquisition
@@ -4682,7 +4840,7 @@ fn configure_payload(
                 })?;
             validate_firmware_capabilities(
                 capabilities,
-                0x01,
+                FirmwareCapabilities::mode_bit(0),
                 pins.len(),
                 settings.adc_resolution_bits,
                 Some(settings.sample_rate_hz),
@@ -4698,62 +4856,25 @@ fn configure_payload(
             let inputs = settings.analog_inputs.as_ref().ok_or(SessionError::State(
                 "pulse-ox profile is missing its TX/RX analog inputs",
             ))?;
-            // The same RED/IR selection rule as profile validation: an
-            // explicit `pulse_ox_role`, otherwise the "Red LED"/"IR LED" label.
-            let outputs = settings.resolved_digital_outputs();
-            let red = crate::profiles::pulse_ox_output(&outputs, crate::profiles::PulseOxRole::Red)
-                .ok_or(SessionError::State(
-                    "pulse-ox profile is missing a RED output",
-                ))?;
-            let ir = crate::profiles::pulse_ox_output(&outputs, crate::profiles::PulseOxRole::Ir)
-                .ok_or(SessionError::State(
-                "pulse-ox profile is missing an IR output",
-            ))?;
-            if red.pin == ir.pin
-                || red.behavior != crate::profiles::DigitalOutputBehavior::AcquisitionSequenced
-                || ir.behavior != crate::profiles::DigitalOutputBehavior::AcquisitionSequenced
-            {
-                return Err(SessionError::State(
-                    "pulse-ox RED and IR must use distinct acquisition-sequenced outputs",
-                ));
-            }
-            let output_pin = |pin: &str| match pin {
-                "D4" => Ok(4),
-                "D5" => Ok(5),
-                "D6" => Ok(6),
-                _ => Err(SessionError::State(
-                    "pulse-ox profile digital output is unsupported",
-                )),
-            };
+            let leds = pulse_ox_leds(settings)?;
             let dwell = settings.state_dwell_us.ok_or(SessionError::State(
                 "pulse-ox profile is missing state dwell time",
             ))?;
             if !matches!(settings.adc_resolution_bits, 12 | 14)
-                || !(250..=5_000).contains(&dwell)
+                || !crate::profiles::PULSEOX_DWELL_RANGE_US.contains(&dwell)
                 || settings.analog_pins().len() != 2
-                || red.pin == ir.pin
             {
                 return Err(SessionError::State(
                     "profile requests an unsupported fixed pulse-ox configuration",
                 ));
             }
-            let output_mask = match (red.pin.as_str(), ir.pin.as_str()) {
-                ("D4", "D5") | ("D5", "D4") => 0x03,
-                ("D4", "D6") | ("D6", "D4") => 0x05,
-                ("D5", "D6") | ("D6", "D5") => 0x06,
-                _ => {
-                    return Err(SessionError::State(
-                        "pulse-ox profile digital output is unsupported",
-                    ))
-                }
-            };
             validate_firmware_capabilities(
                 capabilities,
-                0x02,
+                FirmwareCapabilities::mode_bit(1),
                 2,
                 settings.adc_resolution_bits,
                 None,
-                output_mask,
+                leds.output_mask,
             )?;
             payload.extend_from_slice(&[1, settings.adc_resolution_bits]);
             payload.extend_from_slice(&dwell.to_le_bytes());
@@ -4761,14 +4882,103 @@ fn configure_payload(
                 2,
                 pin_id(&inputs.tx)?,
                 pin_id(&inputs.rx)?,
-                output_pin(&red.pin)?,
-                output_pin(&ir.pin)?,
+                leds.red_pin,
+                leds.ir_pin,
             ]);
+        }
+        // `[2, bits, dwell u32 LE, n, pin1..pinN, red, ir]` (9 + n bytes).
+        // The firmware reads every pin in each LED state and records
+        // `[led_state, ch1..chN]`; outputs other than RED/IR stay LOW.
+        crate::profiles::AcquisitionMode::PulseoxSequenced => {
+            let pins: Result<Vec<_>, _> = settings
+                .analog_pins()
+                .iter()
+                .map(|pin| pin_id(pin))
+                .collect();
+            let pins = pins?;
+            let leds = pulse_ox_leds(settings)?;
+            let dwell = settings.state_dwell_us.ok_or(SessionError::State(
+                "pulse-ox profile is missing state dwell time",
+            ))?;
+            let mut unique = pins.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            if !(1..=6).contains(&pins.len())
+                || unique.len() != pins.len()
+                || !matches!(settings.adc_resolution_bits, 12 | 14)
+                || !crate::profiles::PULSEOX_SEQUENCED_DWELL_RANGE_US.contains(&dwell)
+            {
+                return Err(SessionError::State(
+                    "profile requests an unsupported LED-sequenced pulse-ox configuration",
+                ));
+            }
+            validate_firmware_capabilities(
+                capabilities,
+                FirmwareCapabilities::mode_bit(2),
+                pins.len(),
+                settings.adc_resolution_bits,
+                None,
+                leds.output_mask,
+            )?;
+            payload.extend_from_slice(&[2, settings.adc_resolution_bits]);
+            payload.extend_from_slice(&dwell.to_le_bytes());
+            payload.push(pins.len() as u8);
+            payload.extend_from_slice(&pins);
+            payload.extend_from_slice(&[leds.red_pin, leds.ir_pin]);
         }
     }
     Ok(payload)
 }
 
+/// The RED and IR outputs of a pulse-ox lab as CONFIGURE pin numbers (4–6),
+/// and the output mask the firmware drives with them.
+struct PulseOxLeds {
+    red_pin: u8,
+    ir_pin: u8,
+    output_mask: u8,
+}
+
+/// The same RED/IR selection rule as profile validation: an explicit
+/// `pulse_ox_role`, otherwise the "Red LED"/"IR LED" label. RED and IR must
+/// be distinct acquisition-sequenced outputs on D4, D5, or D6.
+fn pulse_ox_leds(
+    settings: &crate::profiles::AcquisitionSettings,
+) -> Result<PulseOxLeds, SessionError> {
+    let outputs = settings.resolved_digital_outputs();
+    let red = crate::profiles::pulse_ox_output(&outputs, crate::profiles::PulseOxRole::Red).ok_or(
+        SessionError::State("pulse-ox profile is missing a RED output"),
+    )?;
+    let ir = crate::profiles::pulse_ox_output(&outputs, crate::profiles::PulseOxRole::Ir).ok_or(
+        SessionError::State("pulse-ox profile is missing an IR output"),
+    )?;
+    if red.pin == ir.pin
+        || red.behavior != crate::profiles::DigitalOutputBehavior::AcquisitionSequenced
+        || ir.behavior != crate::profiles::DigitalOutputBehavior::AcquisitionSequenced
+    {
+        return Err(SessionError::State(
+            "pulse-ox RED and IR must use distinct acquisition-sequenced outputs",
+        ));
+    }
+    let output_pin = |pin: &str| match pin {
+        "D4" => Ok(4u8),
+        "D5" => Ok(5),
+        "D6" => Ok(6),
+        _ => Err(SessionError::State(
+            "pulse-ox profile digital output is unsupported",
+        )),
+    };
+    let red_pin = output_pin(&red.pin)?;
+    let ir_pin = output_pin(&ir.pin)?;
+    Ok(PulseOxLeds {
+        red_pin,
+        ir_pin,
+        // D4 is bit 0x01, D5 0x02, D6 0x04.
+        output_mask: (1 << (red_pin - 4)) | (1 << (ir_pin - 4)),
+    })
+}
+
+/// `required_mode` is the CAPABILITIES bit of the CONFIGURE mode
+/// (`FirmwareCapabilities::mode_bit`); the board must advertise that bit.
 fn validate_firmware_capabilities(
     capabilities: Option<&FirmwareCapabilities>,
     required_mode: u8,
@@ -4785,7 +4995,7 @@ fn validate_firmware_capabilities(
             "connected firmware did not report readable capabilities; use Verify Firmware or Restore WVU Firmware",
         ));
     };
-    if !capabilities.supports_mode(required_mode) {
+    if !capabilities.supports_modes(required_mode) {
         return Err(SessionError::State(
             "connected firmware does not support this acquisition mode",
         ));
@@ -4942,7 +5152,26 @@ fn firmware_identity_failure_category(
                 .then_some(ConnectionFailureCategory::IncompatibleFirmwareIdentity)
         }
         (None, _) | (_, None) => Some(ConnectionFailureCategory::MissingFirmwareIdentity),
+        (Some(build), Some(device)) if device == REFERENCE_DEVICE_ID => {
+            Some(wvu_build_mismatch(build))
+        }
         _ => Some(ConnectionFailureCategory::IncompatibleFirmwareIdentity),
+    }
+}
+
+/// Another build of the WVU firmware: the same family (the upper 16 bits,
+/// `0x0001` for every build so far) and a nonzero build number. An older
+/// one is updated by Restore WVU Firmware; a newer one means this computer's
+/// app is out of date. A build outside the family is not a WVU build this app
+/// knows, so it stays an incompatible identity.
+fn wvu_build_mismatch(build: u32) -> ConnectionFailureCategory {
+    const FAMILY_SHIFT: u32 = 16;
+    let same_family =
+        build >> FAMILY_SHIFT == REFERENCE_FIRMWARE_BUILD >> FAMILY_SHIFT && build & 0xffff != 0;
+    match build.cmp(&REFERENCE_FIRMWARE_BUILD) {
+        std::cmp::Ordering::Less if same_family => ConnectionFailureCategory::OlderWvuFirmware,
+        std::cmp::Ordering::Greater if same_family => ConnectionFailureCategory::NewerWvuFirmware,
+        _ => ConnectionFailureCategory::IncompatibleFirmwareIdentity,
     }
 }
 
@@ -4984,6 +5213,12 @@ fn recommended_action(category: &ConnectionFailureCategory) -> &'static str {
         }
         ConnectionFailureCategory::IncompatibleFirmwareIdentity => {
             "The board has a different WVU firmware version. Use Restore WVU Firmware."
+        }
+        ConnectionFailureCategory::OlderWvuFirmware => {
+            "The board has an older WVU firmware version. Use Restore WVU Firmware to update it."
+        }
+        ConnectionFailureCategory::NewerWvuFirmware => {
+            "The board has a newer WVU firmware version: this computer's app is older than the board's firmware. Update the app on this computer, or use Restore WVU Firmware to put this app's firmware back."
         }
         ConnectionFailureCategory::HandshakeIncomplete => {
             "The board did not finish connecting. Select Retry connection, then Verify Firmware. If it still fails, use Restore WVU Firmware."
@@ -5030,8 +5265,13 @@ struct SimulatorIo {
     profile_category: String,
     requested_duration_seconds: Option<u64>,
     sample_period_us: u32,
+    /// Fields per record (an LED-sequenced record's LED state included).
     channel_count: u8,
+    /// Legacy 4-state pulse-ox (mode 1): one 8-field record per LED cycle.
     pulseox: bool,
+    /// LED-sequenced pulse-ox (mode 2): one record `[seq % 4, ch1..chN]`
+    /// per LED state.
+    led_sequenced: bool,
     adc_resolution_bits: u8,
     output_mask: u8,
     /// Batches still emitted after STOP before the terminal STATUS, mirroring
@@ -5059,27 +5299,52 @@ impl SimulatorIo {
             sample_period_us: 1_000,
             channel_count: 1,
             pulseox: false,
+            led_sequenced: false,
             adc_resolution_bits: profile.profile.acquisition.adc_resolution_bits,
             output_mask: 0,
             post_stop_batches: 0,
             stop_batches_remaining: 0,
         };
+        // The reference firmware's HELLO and CAPABILITIES (build 0x00010007:
+        // mode bits 0x07, including the LED-sequenced mode).
         simulator.queue(
             MessageType::Hello,
             [
                 REFERENCE_FIRMWARE_BUILD.to_le_bytes().as_slice(),
                 REFERENCE_DEVICE_ID.to_le_bytes().as_slice(),
-                &[1, 14, 6, 0],
+                &[1, 14, 6, 0x07],
             ]
             .concat(),
         )?;
         simulator.queue(
             MessageType::Capabilities,
             vec![
-                12, 14, 6, 0x03, 0x07, 5, 100, 0, 200, 0, 250, 0, 244, 1, 232, 3,
+                12, 14, 6, 0x07, 0x07, 5, 100, 0, 200, 0, 250, 0, 244, 1, 232, 3,
             ],
         )?;
         Ok(simulator)
+    }
+
+    /// The reference firmware's 46-byte STATUS (build 0x00010007). The
+    /// simulator keeps perfect time: no overflows, per-state violations, or
+    /// skipped deadlines. A pulse-ox run's terminal STATUS reports one full
+    /// dwell of LED settle; the START STATUS, like the firmware's, reports
+    /// none sampled yet (`u32::MAX`).
+    fn status_payload(&self, acquiring: bool) -> Vec<u8> {
+        let mut payload = vec![0; 46];
+        payload[0] = u8::from(acquiring);
+        payload[1] = self.output_mask;
+        let minimum_settle_us = if acquiring || self.sample_sequence == 0 {
+            u32::MAX
+        } else if self.pulseox {
+            self.sample_period_us / 4
+        } else if self.led_sequenced {
+            self.sample_period_us
+        } else {
+            u32::MAX
+        };
+        payload[42..46].copy_from_slice(&minimum_settle_us.to_le_bytes());
+        payload
     }
 
     #[cfg(test)]
@@ -5160,7 +5425,7 @@ impl SimulatorIo {
         let mut samples = Vec::with_capacity(count as usize * usize::from(self.channel_count));
         for index in 0..count {
             for field in 0..self.channel_count {
-                samples.push(self.signal_counts(self.sample_sequence + index, usize::from(field)));
+                samples.push(self.record_counts(self.sample_sequence + index, usize::from(field)));
             }
         }
         let payload = SampleBatch {
@@ -5180,6 +5445,56 @@ impl SimulatorIo {
         .map_err(|error| SessionError::Protocol(format!("{error:?}")))?;
         self.sample_sequence = self.sample_sequence.wrapping_add(count);
         self.queue(MessageType::SampleBatch, payload)
+    }
+
+    /// Field `field` of record `sequence`. An LED-sequenced record is
+    /// `[led_state, ch1..chN]`, and the firmware's LED state is always
+    /// `sequence % 4`.
+    fn record_counts(&self, sequence: u32, field: usize) -> u16 {
+        match (self.led_sequenced, field) {
+            (true, 0) => (sequence % 4) as u16,
+            (true, channel) => self.led_sequenced_counts(sequence, channel - 1),
+            (false, _) => self.signal_counts(sequence, field),
+        }
+    }
+
+    /// A channel of an LED-sequenced record: its value depends on the LED
+    /// state of that record. A pulse-ox lab looks like a photodetector: the
+    /// lit states (RED, IR) sit above the dark level and carry a ~1.2 Hz
+    /// pulsatile component, larger on the receiving channels than on the
+    /// first (TX); DARK 1 and DARK 2 stay near the dark level. Another lab's
+    /// channels follow a slow waveform shifted up in RED and IR and down in
+    /// the dark states.
+    fn led_sequenced_counts(&self, sequence: u32, channel: usize) -> u16 {
+        let state = sequence % 4;
+        let seconds = f64::from(sequence) * f64::from(self.sample_period_us) / 1_000_000.0;
+        let pulse = (seconds * 1.2 * std::f64::consts::TAU).sin();
+        let volts = if self.profile_category == "course_pulseox" {
+            let (base, amplitude) = if channel == 0 {
+                (2.1, 0.03)
+            } else {
+                (2.8, 0.08)
+            };
+            match state {
+                0 => base + 0.25 + pulse * amplitude,
+                2 => base + 0.4 + pulse * amplitude * 1.5,
+                _ => 0.15,
+            }
+        } else {
+            let offset = match state {
+                0 => 0.3,
+                2 => 0.5,
+                _ => -0.4,
+            };
+            let frequency = 1.0 + channel as f64 * 0.5;
+            2.2 + offset + (seconds * frequency * std::f64::consts::TAU).sin() * 0.5
+        };
+        self.volts_to_counts(volts)
+    }
+
+    fn volts_to_counts(&self, volts: f64) -> u16 {
+        let full_scale = f64::from((1u32 << self.adc_resolution_bits) - 1);
+        (volts * full_scale / 5.0).round().clamp(0.0, full_scale) as u16
     }
 
     fn signal_counts(&self, sequence: u32, field: usize) -> u16 {
@@ -5232,8 +5547,7 @@ impl SimulatorIo {
             }
             _ => 2.5 + (phase * 2.0).sin() * 1.1,
         };
-        let full_scale = f64::from((1u32 << self.adc_resolution_bits) - 1);
-        (volts * full_scale / 5.0).round().clamp(0.0, full_scale) as u16
+        self.volts_to_counts(volts)
     }
 }
 
@@ -5280,7 +5594,7 @@ impl Read for SimulatorIo {
                 };
                 if self.stop_batches_remaining == 0 {
                     self.active = false;
-                    self.queue(MessageType::Status, vec![0, self.output_mask, 0, 0, 0, 0])
+                    self.queue(MessageType::Status, self.status_payload(false))
                         .map_err(|error| std::io::Error::other(error.to_string()))?;
                 }
             }
@@ -5331,6 +5645,7 @@ impl Write for SimulatorIo {
                             }
                             self.adc_resolution_bits = payload[1];
                             self.pulseox = false;
+                            self.led_sequenced = false;
                             self.sample_period_us = 1_000_000
                                 / u32::from_le_bytes([
                                     payload[2], payload[3], payload[4], payload[5],
@@ -5347,11 +5662,50 @@ impl Write for SimulatorIo {
                             }
                             self.adc_resolution_bits = payload[1];
                             self.pulseox = true;
+                            self.led_sequenced = false;
                             self.sample_period_us = u32::from_le_bytes([
                                 payload[2], payload[3], payload[4], payload[5],
                             ])
                             .saturating_mul(4);
                             self.channel_count = 8;
+                            self.output_mask = 0;
+                        }
+                        2 => {
+                            // `[2, bits, dwell u32 LE, n, pin1..pinN, red, ir]`,
+                            // checked like the firmware's `configurePulseSequenced`.
+                            let channels = payload[6];
+                            let dwell = u32::from_le_bytes([
+                                payload[2], payload[3], payload[4], payload[5],
+                            ]);
+                            let pins = payload.get(7..7 + usize::from(channels));
+                            let leds = payload.get(7 + usize::from(channels)..);
+                            let distinct_pins = pins.is_some_and(|pins| {
+                                pins.iter()
+                                    .enumerate()
+                                    .all(|(index, pin)| *pin <= 5 && !pins[..index].contains(pin))
+                            });
+                            let valid_leds = leds.is_some_and(|leds| {
+                                leds.len() == 2
+                                    && leds.iter().all(|pin| (4..=6).contains(pin))
+                                    && leds[0] != leds[1]
+                            });
+                            if !(1..=6).contains(&channels)
+                                || payload.len() != 9 + usize::from(channels)
+                                || !matches!(payload[1], 12 | 14)
+                                || !(1_000..=5_000).contains(&dwell)
+                                || !distinct_pins
+                                || !valid_leds
+                            {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "invalid simulator LED-sequenced layout",
+                                ));
+                            }
+                            self.adc_resolution_bits = payload[1];
+                            self.pulseox = false;
+                            self.led_sequenced = true;
+                            self.sample_period_us = dwell;
+                            self.channel_count = 1 + channels;
                             self.output_mask = 0;
                         }
                         _ => {
@@ -5379,7 +5733,7 @@ impl Write for SimulatorIo {
                     self.active = true;
                     self.stop_batches_remaining = 0;
                     self.next_batch_at = Instant::now();
-                    self.queue(MessageType::Status, vec![1, self.output_mask, 0, 0, 0, 0])
+                    self.queue(MessageType::Status, self.status_payload(true))
                 }
                 MessageType::Stop => {
                     self.output_mask = 0;
@@ -5389,7 +5743,7 @@ impl Write for SimulatorIo {
                         Ok(())
                     } else {
                         self.active = false;
-                        self.queue(MessageType::Status, vec![0, self.output_mask, 0, 0, 0, 0])
+                        self.queue(MessageType::Status, self.status_payload(false))
                     }
                 }
                 _ => Ok(()),
@@ -5881,6 +6235,8 @@ mod tests {
             Category::WrongProtocolVersion,
             Category::MissingFirmwareIdentity,
             Category::IncompatibleFirmwareIdentity,
+            Category::OlderWvuFirmware,
+            Category::NewerWvuFirmware,
             Category::HandshakeIncomplete,
             Category::SerialTransportError,
             Category::FirmwareProtocolError,
@@ -5984,12 +6340,12 @@ mod tests {
                 hello_payload: [
                     REFERENCE_FIRMWARE_BUILD.to_le_bytes().as_slice(),
                     REFERENCE_DEVICE_ID.to_le_bytes().as_slice(),
-                    &[1, 14, 6, 0],
+                    &[1, 14, 6, 0x07],
                 ]
                 .concat(),
                 // The reference firmware's v0.4 CAPABILITIES payload.
                 capabilities_payload: vec![
-                    12, 14, 6, 0x03, 0x07, 5, 100, 0, 200, 0, 250, 0, 244, 1, 232, 3,
+                    12, 14, 6, 0x07, 0x07, 5, 100, 0, 200, 0, 250, 0, 244, 1, 232, 3,
                 ],
             }
         }
@@ -6170,12 +6526,13 @@ mod tests {
         assert_eq!(diagnostics.bytes_received, 0);
     }
 
-    #[test]
-    fn handshake_rejects_an_incompatible_firmware_identity() {
+    /// Runs a handshake against a board that reports `build` and `device`.
+    fn handshake_category_for_identity(build: u32, device: u32) -> ConnectionDiagnostics {
         let (session, mut acquisition) = handshake_session();
         let mut io = HandshakeMock::new(Some(1));
-        io.hello_payload[0] = io.hello_payload[0].wrapping_sub(1);
-        assert!(session
+        io.hello_payload[..4].copy_from_slice(&build.to_le_bytes());
+        io.hello_payload[4..8].copy_from_slice(&device.to_le_bytes());
+        let error = session
             .wait_for_handshake_with_policy(
                 &mut io,
                 &mut acquisition,
@@ -6184,12 +6541,23 @@ mod tests {
                 1,
                 Duration::from_millis(1),
             )
-            .is_err());
-        let diagnostics = session
+            .err()
+            .unwrap_or_else(|| panic!("build {build:#010x} device {device:#010x} was accepted"));
+        assert!(error
+            .to_string()
+            .contains("firmware identity was not accepted"));
+        session
             .status()
             .unwrap_or_else(|e| panic!("{e}"))
             .connection_diagnostics
-            .unwrap_or_else(|| panic!("missing diagnostics"));
+            .unwrap_or_else(|| panic!("missing diagnostics"))
+    }
+
+    #[test]
+    fn handshake_rejects_an_incompatible_firmware_identity() {
+        // A device ID that is not the WVU board's, even with this app's build.
+        let diagnostics =
+            handshake_category_for_identity(REFERENCE_FIRMWARE_BUILD, REFERENCE_DEVICE_ID ^ 1);
         assert_eq!(
             diagnostics.failure_category,
             Some(ConnectionFailureCategory::IncompatibleFirmwareIdentity)
@@ -6197,6 +6565,51 @@ mod tests {
         assert_eq!(
             diagnostics.raw_byte_classification,
             "validated WVU binary frames"
+        );
+        // A WVU device ID with a build outside the known WVU family.
+        for build in [0, 0x0001_0000, 0x0002_0007, 0xffff_ffff] {
+            assert_eq!(
+                handshake_category_for_identity(build, REFERENCE_DEVICE_ID).failure_category,
+                Some(ConnectionFailureCategory::IncompatibleFirmwareIdentity),
+                "{build:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn handshake_says_whether_the_board_or_this_app_has_the_older_wvu_build() {
+        // Every earlier WVU build, including 0x00010006 of releases 1.0.x.
+        for build in 0x0001_0001..REFERENCE_FIRMWARE_BUILD {
+            let diagnostics = handshake_category_for_identity(build, REFERENCE_DEVICE_ID);
+            assert_eq!(
+                diagnostics.failure_category,
+                Some(ConnectionFailureCategory::OlderWvuFirmware),
+                "{build:#010x}"
+            );
+            assert!(diagnostics
+                .recommended_action
+                .contains("Restore WVU Firmware"));
+        }
+        for build in [REFERENCE_FIRMWARE_BUILD + 1, 0x0001_ffff] {
+            let diagnostics = handshake_category_for_identity(build, REFERENCE_DEVICE_ID);
+            assert_eq!(
+                diagnostics.failure_category,
+                Some(ConnectionFailureCategory::NewerWvuFirmware),
+                "{build:#010x}"
+            );
+            assert!(diagnostics
+                .recommended_action
+                .contains("Update the app on this computer"));
+        }
+        assert_eq!(
+            serde_json::to_value(ConnectionFailureCategory::OlderWvuFirmware)
+                .unwrap_or_else(|error| panic!("{error}")),
+            "older_wvu_firmware"
+        );
+        assert_eq!(
+            serde_json::to_value(ConnectionFailureCategory::NewerWvuFirmware)
+                .unwrap_or_else(|error| panic!("{error}")),
+            "newer_wvu_firmware"
         );
     }
 
@@ -6507,13 +6920,80 @@ mod tests {
 
     #[test]
     fn accelerated_pulseox_ten_minute_equivalent_soak_preserves_raw_cycles() {
+        // The legacy 4-state layout: one 8-field record per cycle.
+        let profile = crate::profiles::legacy_pulse_ox_lab().snapshot(false);
+        accelerated_multifield_soak(profile, 8, 250, 10 * 60 * 250);
+    }
+
+    #[test]
+    fn simulator_identifies_and_reports_status_as_firmware_build_seven() {
         let profile = built_in_profiles()
             .unwrap_or_else(|e| panic!("{e}"))
             .into_iter()
             .find(|candidate| candidate.category == "course_pulseox")
             .unwrap_or_else(|| panic!("missing pulse-ox course profile"))
             .snapshot(false);
-        accelerated_multifield_soak(profile, 8, 250, 10 * 60 * 250);
+        let mut simulator = SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut parser = FrameParser::default();
+        let mut drain = |simulator: &mut SimulatorIo| {
+            let bytes = simulator.bytes.drain(..).collect::<Vec<_>>();
+            parser.push(&bytes)
+        };
+        let identity = drain(&mut simulator);
+        assert_eq!(identity[0].message_type, MessageType::Hello);
+        assert_eq!(
+            identity[0].payload[..4],
+            REFERENCE_FIRMWARE_BUILD.to_le_bytes()
+        );
+        assert_eq!(identity[0].payload[11], 0x07);
+        assert_eq!(identity[1].message_type, MessageType::Capabilities);
+        assert_eq!(identity[1].payload[3], 0x07);
+
+        let command = |message_type: MessageType, payload: Vec<u8>| {
+            encode_frame(&Frame {
+                message_type,
+                flags: 0,
+                sequence: 0,
+                payload,
+            })
+            .unwrap_or_else(|error| panic!("{error:?}"))
+        };
+        let configure = [&[1u8, 14][..], &1_000u32.to_le_bytes(), &[2, 0, 1, 5, 6]].concat();
+        for frame in [
+            command(MessageType::Configure, configure),
+            command(MessageType::Start, vec![]),
+        ] {
+            simulator
+                .write_all(&frame)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let started = drain(&mut simulator);
+        let start_status = started
+            .iter()
+            .find(|frame| frame.message_type == MessageType::Status)
+            .unwrap_or_else(|| panic!("no START STATUS"));
+        assert_eq!(start_status.payload.len(), 46);
+        assert_eq!(start_status.payload[0], 1);
+        assert_eq!(start_status.payload[38..42], 0u32.to_le_bytes());
+        assert_eq!(start_status.payload[42..46], u32::MAX.to_le_bytes());
+
+        simulator
+            .queue_sample_batch()
+            .unwrap_or_else(|e| panic!("{e}"));
+        simulator
+            .write_all(&command(MessageType::Stop, vec![]))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let stopped = drain(&mut simulator);
+        let terminal = stopped
+            .iter()
+            .rfind(|frame| frame.message_type == MessageType::Status)
+            .unwrap_or_else(|| panic!("no terminal STATUS"));
+        assert_eq!(terminal.payload.len(), 46);
+        assert_eq!(terminal.payload[0], 0);
+        assert_eq!(terminal.payload[38..42], 0u32.to_le_bytes());
+        // One full 1000 us dwell of settle: the simulator keeps perfect time.
+        assert_eq!(terminal.payload[42..46], 1_000u32.to_le_bytes());
     }
 
     #[test]
@@ -7130,6 +7610,73 @@ mod tests {
     }
 
     #[test]
+    fn a_bp_fit_from_an_led_sequenced_recording_skips_the_led_state_field() {
+        // An LED-sequenced lab with the blood-pressure channels: its records
+        // are [led_state, mpxv, xgzp], so the channels are fields 1 and 2.
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let bp = built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_blood_pressure")
+            .unwrap_or_else(|| panic!("missing BP profile"))
+            .snapshot(false);
+        let mut lab = crate::profiles::sequenced_test_lab();
+        lab.category = "course_blood_pressure".into();
+        for (channel, id) in lab.acquisition.channels.iter_mut().zip(["mpxv", "xgzp"]) {
+            channel.id = id.into();
+            channel.csv_name = format!("{id}_counts");
+        }
+        lab.plot_defaults = crate::profiles::PlotDefaults::default();
+        lab.refresh_hash().unwrap_or_else(|e| panic!("{e}"));
+        lab.validate().unwrap_or_else(|e| panic!("{e}"));
+        let profile = lab.snapshot(false);
+        let bmeg = dir.path().join("sequenced-bp.bmeg");
+        let metadata = SessionController::default()
+            .initial_metadata(InitialMetadataRequest {
+                simulator: true,
+                source: "SIM",
+                bmeg: &bmeg,
+                duration: &RecordingDuration::Timed { seconds: 10 },
+                profile: &profile,
+                calibration: RecordingCalibration::default(),
+                recording_path_context: None,
+                recording_context: &RecordingContext::default(),
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let simulator = SimulatorIo::new(&bp, RecordingDuration::Timed { seconds: 10 })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut writer =
+            BmegWriter::create_synchronized(&bmeg, &metadata, 3).unwrap_or_else(|e| panic!("{e}"));
+        for sequence in 0..2_000u32 {
+            writer
+                .write_record(&SynchronizedRecord {
+                    sequence,
+                    timestamp_us: u64::from(sequence) * 5_000,
+                    status_flags: 0,
+                    counts: vec![
+                        (sequence % 4) as u16,
+                        simulator.signal_counts(sequence, 1),
+                        simulator.signal_counts(sequence, 2),
+                    ],
+                })
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        writer.finish().unwrap_or_else(|e| panic!("{e}"));
+        let fit =
+            crate::calibration::fit_xgzp_from_recording(&crate::calibration::XgzpFitRequest {
+                bmeg_path: bmeg.display().to_string(),
+                start_seconds: 2.0,
+                end_seconds: 8.0,
+                adc_reference_v: 5.0,
+                mpxv_sensor_supply_v: 5.0,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fit.fit.paired_samples, 1_201);
+        assert!((fit.fit.slope - 120.0).abs() < 0.25, "{}", fit.fit.slope);
+        assert!(fit.fit.r_squared > 0.999);
+    }
+
+    #[test]
     fn recording_metadata_snapshots_project_and_relative_trial_folder() {
         let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
         let session = SessionController::default();
@@ -7157,6 +7704,14 @@ mod tests {
 
     #[test]
     fn pulseox_metadata_uses_profile_mapping_instead_of_the_legacy_a0_note() {
+        let four_state = crate::profiles::legacy_pulse_ox_lab().snapshot(false);
+        let note = default_recording_note(false, &four_state);
+        assert!(note.contains("A0 TX and A1 RX"));
+        assert!(note.contains("RED, DARK 1, IR, DARK 2"));
+        assert!(!note.contains("floating/uncalibrated"));
+        assert!(!note.contains("no human signal"));
+
+        // The built-in pulse-ox lab 1.1.0 is LED-sequenced.
         let pulseox = built_in_profiles()
             .unwrap_or_else(|error| panic!("{error}"))
             .into_iter()
@@ -7164,10 +7719,10 @@ mod tests {
             .unwrap_or_else(|| panic!("missing pulse-ox profile"))
             .snapshot(false);
         let note = default_recording_note(false, &pulseox);
-        assert!(note.contains("A0 TX and A1 RX"));
-        assert!(note.contains("RED, DARK 1, IR, DARK 2"));
+        assert!(note.contains("A0 = TX; A1 = RX"), "{note}");
+        assert!(note.contains("LED-sequenced"), "{note}");
+        assert!(note.contains("RED, DARK 1, IR, DARK 2"), "{note}");
         assert!(!note.contains("floating/uncalibrated"));
-        assert!(!note.contains("no human signal"));
     }
 
     #[test]
@@ -7260,12 +7815,13 @@ mod tests {
         }
     }
 
-    /// What the reference firmware advertises in CAPABILITIES.
+    /// What the reference firmware advertises in CAPABILITIES (build
+    /// 0x00010007: all three modes).
     fn reference_capabilities() -> FirmwareCapabilities {
         FirmwareCapabilities {
             supported_adc_resolutions: vec![12, 14],
             max_analog_channels: 6,
-            supported_modes: 0x03,
+            supported_modes: 0x07,
             supported_digital_output_mask: 0x07,
             supported_rates_hz: vec![100, 200, 250, 500, 1_000],
         }
@@ -7292,12 +7848,20 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(bp, vec![0, 14, 200, 0, 0, 0, 3, 0, 1, 2, 1]);
+        // Pulse ox 1.1.0: LED-sequenced (mode 2), A0 and A1, RED D5, IR D6.
         let pulseox = configure_payload(
             &lookup("course_pulseox").acquisition,
             Some(&reference_capabilities()),
         )
         .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(pulseox, vec![1, 14, 232, 3, 0, 0, 2, 0, 1, 5, 6]);
+        assert_eq!(pulseox, vec![2, 14, 232, 3, 0, 0, 2, 0, 1, 5, 6]);
+        // Its published 1.0.0 (legacy 4-state, mode 1) still configures.
+        let four_state = configure_payload(
+            &crate::profiles::legacy_pulse_ox_lab().acquisition,
+            Some(&reference_capabilities()),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(four_state, vec![1, 14, 232, 3, 0, 0, 2, 0, 1, 5, 6]);
     }
 
     #[test]
@@ -7315,6 +7879,32 @@ mod tests {
             supported_rates_hz: vec![100, 200, 250, 500, 1_000],
         };
         assert!(configure_payload(&emg.acquisition, Some(&capabilities)).is_ok());
+
+        // Each mode needs its own CAPABILITIES bit; other bits do not stand in.
+        let without_simultaneous = FirmwareCapabilities {
+            supported_modes: 0x06,
+            ..capabilities.clone()
+        };
+        assert!(configure_payload(&emg.acquisition, Some(&without_simultaneous)).is_err());
+        let four_state = crate::profiles::legacy_pulse_ox_lab();
+        let without_four_state = FirmwareCapabilities {
+            supported_modes: 0x05,
+            ..capabilities.clone()
+        };
+        assert!(configure_payload(&four_state.acquisition, Some(&without_four_state)).is_err());
+        assert!(configure_payload(&four_state.acquisition, Some(&capabilities)).is_ok());
+        // The built-in pulse-ox lab 1.1.0 needs the LED-sequenced bit (0x04),
+        // which build 0x00010006 (modes 0x03) does not advertise.
+        let sequenced = profiles
+            .iter()
+            .find(|profile| profile.category == "course_pulseox")
+            .unwrap_or_else(|| panic!("missing pulse-ox profile"));
+        assert!(configure_payload(&sequenced.acquisition, Some(&capabilities)).is_err());
+        let with_sequenced = FirmwareCapabilities {
+            supported_modes: 0x04,
+            ..capabilities.clone()
+        };
+        assert!(configure_payload(&sequenced.acquisition, Some(&with_sequenced)).is_ok());
 
         let rate_limited = FirmwareCapabilities {
             supported_rates_hz: vec![100, 200, 250, 500],
@@ -7384,7 +7974,7 @@ mod tests {
             vec![0, 14, 250, 0, 0, 0, 3, 3, 4, 5, 1]
         );
 
-        let mut pulse = lookup("course_pulseox");
+        let mut pulse = crate::profiles::legacy_pulse_ox_lab();
         pulse.acquisition.analog_inputs = Some(crate::profiles::PulseOxInputs {
             tx: "A2".into(),
             rx: "A3".into(),
@@ -7483,16 +8073,32 @@ mod tests {
     #[test]
     fn simulator_emits_four_channel_and_eight_field_pulseox_records() {
         let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
-        for (category, fields, period) in [
-            ("course_emg_force", 4u8, 1_000u32),
-            ("course_pulseox", 8u8, 4_000u32),
-            ("course_op_amp", 2u8, 10_000u32),
-        ] {
-            let profile = profiles
+        let lookup = |category: &str| {
+            profiles
                 .iter()
                 .find(|profile| profile.category == category)
+                .cloned()
                 .unwrap_or_else(|| panic!("missing {category}"))
-                .snapshot(false);
+        };
+        for (category, lab, fields, period) in [
+            (
+                "course_emg_force",
+                lookup("course_emg_force"),
+                4u8,
+                1_000u32,
+            ),
+            // Pulse ox 1.0.0 (legacy 4-state): one 8-field record per cycle.
+            (
+                "pulse ox 1.0.0 (4-state)",
+                crate::profiles::legacy_pulse_ox_lab(),
+                8u8,
+                4_000u32,
+            ),
+            // Pulse ox 1.1.0 (LED-sequenced): [led_state, tx, rx] per state.
+            ("course_pulseox", lookup("course_pulseox"), 3u8, 1_000u32),
+            ("course_op_amp", lookup("course_op_amp"), 2u8, 10_000u32),
+        ] {
+            let profile = lab.snapshot(false);
             let mut simulator =
                 SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
                     .unwrap_or_else(|error| panic!("{error}"));
@@ -8766,12 +9372,9 @@ mod tests {
         assert_eq!(open.required_free_bytes, None);
         assert_eq!(open.csv_bytes_per_second, timed.csv_bytes_per_second);
 
-        // A pulse-ox record is one RED/DARK 1/IR/DARK 2 cycle of four dwells.
-        let mut pulseox = built_in_profiles()
-            .unwrap_or_else(|e| panic!("{e}"))
-            .into_iter()
-            .find(|profile| profile.category == "course_pulseox")
-            .unwrap_or_else(|| panic!("missing pulse-ox profile"));
+        // A legacy 4-state pulse-ox record is one RED/DARK 1/IR/DARK 2 cycle
+        // of four dwells.
+        let mut pulseox = crate::profiles::legacy_pulse_ox_lab();
         pulseox.acquisition.state_dwell_us = Some(1_000);
         let pulseox = pulseox.snapshot(false);
         let estimate = estimate_recording_storage(
@@ -8783,6 +9386,24 @@ mod tests {
         assert_eq!(
             estimate.bmeg_bytes_per_second,
             250 * synchronized_record_bytes(8) as u64
+        );
+        // The built-in pulse-ox lab 1.1.0 records one [led_state, tx, rx]
+        // record per 1000 µs LED state.
+        let sequenced = built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|profile| profile.category == "course_pulseox")
+            .unwrap_or_else(|| panic!("missing pulse-ox profile"))
+            .snapshot(false);
+        let estimate = estimate_recording_storage(
+            &sequenced,
+            &calibration,
+            &RecordingDuration::Timed { seconds: 10 },
+        );
+        assert_eq!(estimate.records_per_second, 1_000);
+        assert_eq!(
+            estimate.bmeg_bytes_per_second,
+            1_000 * synchronized_record_bytes(3) as u64
         );
     }
 
@@ -8813,5 +9434,608 @@ mod tests {
                     estimated_csv_row_bytes(&profile, &calibration)
                 )
         );
+    }
+
+    /// A six-channel LED-sequenced lab outside pulse oximetry: A5, A3, A1,
+    /// A0, A2, A4 in that order, 12-bit, 2.5 ms per LED state, and explicit
+    /// RED (D6) and IR (D4) roles with non-standard labels.
+    fn six_channel_sequenced_lab() -> crate::profiles::AcquisitionProfile {
+        use crate::profiles::{DigitalOutput, DigitalOutputBehavior, ProfileChannel, PulseOxRole};
+        let mut lab = crate::profiles::sequenced_test_lab();
+        lab.category = "development".into();
+        lab.acquisition.adc_resolution_bits = 12;
+        lab.acquisition.state_dwell_us = Some(2_500);
+        lab.acquisition.sample_rate_hz = 400;
+        lab.acquisition.channels = ["A5", "A3", "A1", "A0", "A2", "A4"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, pin)| ProfileChannel {
+                pin: pin.into(),
+                id: format!("ch{index}"),
+                label: format!("Channel {index}"),
+                csv_name: format!("ch{index}_counts"),
+                units: "ADC counts".into(),
+                allowed_conversions: vec!["counts_volts".into()],
+                default_display_unit: None,
+                default_visible: true,
+                split_by_led_state: index == 0,
+            })
+            .collect();
+        lab.acquisition.digital_outputs = vec![
+            DigitalOutput {
+                pin: "D6".into(),
+                label: "660 nm emitter".into(),
+                behavior: DigitalOutputBehavior::AcquisitionSequenced,
+                pulse_ox_role: Some(PulseOxRole::Red),
+            },
+            DigitalOutput {
+                pin: "D4".into(),
+                label: "940 nm emitter".into(),
+                behavior: DigitalOutputBehavior::AcquisitionSequenced,
+                pulse_ox_role: Some(PulseOxRole::Ir),
+            },
+        ];
+        lab.plot_defaults = crate::profiles::PlotDefaults::default();
+        lab.refresh_hash().unwrap_or_else(|error| panic!("{error}"));
+        lab.validate().unwrap_or_else(|error| panic!("{error}"));
+        lab
+    }
+
+    #[test]
+    fn led_sequenced_configuration_is_mode_two_with_every_pin_and_both_leds() {
+        let lab = crate::profiles::sequenced_test_lab();
+        // [2, bits, dwell u32 LE, n, pins, red, ir]: 14-bit, 1000 µs, A0/A1, D5/D6.
+        assert_eq!(
+            configure_payload(&lab.acquisition, Some(&reference_capabilities()))
+                .unwrap_or_else(|error| panic!("{error}")),
+            vec![2, 14, 232, 3, 0, 0, 2, 0, 1, 5, 6]
+        );
+        // 2500 µs is 0x09C4; pins in channel order; explicit roles win.
+        let six = six_channel_sequenced_lab();
+        let payload = configure_payload(&six.acquisition, Some(&reference_capabilities()))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            payload,
+            vec![2, 12, 0xC4, 0x09, 0, 0, 6, 5, 3, 1, 0, 2, 4, 6, 4]
+        );
+        assert_eq!(payload.len(), 9 + 6);
+
+        // The mode needs CAPABILITIES bit 0x04 (build 0x00010007); the
+        // simultaneous and 4-state bits do not stand in for it.
+        let build_six = FirmwareCapabilities {
+            supported_modes: 0x03,
+            ..reference_capabilities()
+        };
+        assert!(matches!(
+            configure_payload(&lab.acquisition, Some(&build_six)),
+            Err(SessionError::State(message)) if message.contains("acquisition mode")
+        ));
+        let sequenced_only = FirmwareCapabilities {
+            supported_modes: 0x04,
+            ..reference_capabilities()
+        };
+        assert!(configure_payload(&lab.acquisition, Some(&sequenced_only)).is_ok());
+        assert!(configure_payload(&lab.acquisition, None).is_err());
+        let five_channels = FirmwareCapabilities {
+            max_analog_channels: 5,
+            ..reference_capabilities()
+        };
+        assert!(configure_payload(&six.acquisition, Some(&five_channels)).is_err());
+
+        // Settings the firmware refuses are refused before CONFIGURE.
+        for dwell in [250, 999, 5_001] {
+            let mut settings = lab.acquisition.clone();
+            settings.state_dwell_us = Some(dwell);
+            assert!(
+                configure_payload(&settings, Some(&reference_capabilities())).is_err(),
+                "{dwell}"
+            );
+        }
+        let mut same_led = lab.acquisition.clone();
+        same_led.digital_outputs[1].pin = "D5".into();
+        assert!(configure_payload(&same_led, Some(&reference_capabilities())).is_err());
+        let mut no_ir = lab.acquisition.clone();
+        no_ir.digital_outputs.truncate(1);
+        assert!(configure_payload(&no_ir, Some(&reference_capabilities())).is_err());
+        let mut repeated_pin = lab.acquisition.clone();
+        repeated_pin.channels[1].pin = "A0".into();
+        assert!(configure_payload(&repeated_pin, Some(&reference_capabilities())).is_err());
+
+        // The legacy 4-state lab (pulse ox 1.0.0) still configures mode 1.
+        let legacy = crate::profiles::legacy_pulse_ox_lab();
+        assert_eq!(
+            configure_payload(&legacy.acquisition, Some(&reference_capabilities()))
+                .unwrap_or_else(|error| panic!("{error}")),
+            vec![1, 14, 232, 3, 0, 0, 2, 0, 1, 5, 6]
+        );
+    }
+
+    fn sequenced_display_records(count: u32, first_sequence: u32) -> VecDeque<SynchronizedRecord> {
+        (0..count)
+            .map(|offset| {
+                let sequence = first_sequence.wrapping_add(offset);
+                SynchronizedRecord {
+                    sequence,
+                    timestamp_us: 1_000 + u64::from(offset) * 1_000,
+                    status_flags: 0,
+                    counts: vec![(sequence % 4) as u16, offset as u16],
+                }
+            })
+            .collect()
+    }
+
+    fn led_state_counts(records: &[SynchronizedRecord]) -> [usize; 4] {
+        let mut counts = [0; 4];
+        for record in records {
+            counts[usize::from(record.counts[0])] += 1;
+        }
+        counts
+    }
+
+    #[test]
+    fn led_sequenced_decimation_keeps_whole_cycles_and_the_exact_newest_record() {
+        for (count, first_sequence) in [
+            (30_000, 0),
+            (30_001, 0),
+            (30_002, 0),
+            (30_003, 0),
+            // Across the u32 sequence wraparound (2^32 is a multiple of 4).
+            (12_345, u32::MAX - 6_000),
+        ] {
+            let records = sequenced_display_records(count, first_sequence);
+            let newest = records
+                .back()
+                .unwrap_or_else(|| panic!("no records"))
+                .clone();
+            for window in [30.0, 5.0, 0.5] {
+                for max_points in [2_000, 1_999, 1_001, 9, 8, 5, 4, 3, 1] {
+                    let selected =
+                        select_led_sequenced_display_records(&records, window, max_points);
+                    let case = format!("count={count} window={window} max={max_points}");
+                    assert!(selected.len() <= max_points, "{case}: {}", selected.len());
+                    assert_eq!(selected.last(), Some(&newest), "{case}");
+                    assert!(
+                        selected
+                            .windows(2)
+                            .all(|pair| pair[0].timestamp_us < pair[1].timestamp_us),
+                        "{case}"
+                    );
+                    let in_window: Vec<_> = records
+                        .iter()
+                        .filter(|record| {
+                            record.timestamp_us + (window * 1e6) as u64 >= newest.timestamp_us
+                        })
+                        .cloned()
+                        .collect();
+                    let earliest = in_window
+                        .first()
+                        .map(|record| record.timestamp_us)
+                        .unwrap_or_default();
+                    assert!(selected
+                        .iter()
+                        .all(|record| record.timestamp_us >= earliest));
+                    if in_window.len() <= max_points {
+                        // Not decimated: the whole window, as for other labs.
+                        assert_eq!(selected, in_window, "{case}");
+                        continue;
+                    }
+                    // Every record before the newest cycle belongs to a
+                    // whole RED, DARK 1, IR, DARK 2 cycle.
+                    let newest_cycle = newest.sequence / 4;
+                    let older: Vec<_> = selected
+                        .iter()
+                        .filter(|record| record.sequence / 4 != newest_cycle)
+                        .collect();
+                    assert_eq!(older.len() % 4, 0, "{case}");
+                    for cycle in older.chunks(4) {
+                        assert!(cycle
+                            .iter()
+                            .enumerate()
+                            .all(|(state, record)| usize::from(record.counts[0]) == state
+                                && record.sequence / 4 == cycle[0].sequence / 4));
+                    }
+                    let states = led_state_counts(&selected);
+                    let most = states.iter().max().copied().unwrap_or_default();
+                    let least = states.iter().min().copied().unwrap_or_default();
+                    assert!(most - least <= 1, "{case}: {states:?}");
+                    if max_points >= 8 {
+                        assert!(states.iter().all(|seen| *seen > 0), "{case}: {states:?}");
+                    }
+                }
+            }
+        }
+
+        // A plain record stride of four keeps a single LED state; whole
+        // cycles keep all four.
+        let records = sequenced_display_records(4_001, 0);
+        let strided = select_display_records(&records, 30.0, 1_001);
+        assert_eq!(led_state_counts(&strided), [1_001, 0, 0, 0]);
+        // 250 whole cycles, then the newest record (sequence 4000, RED: a
+        // cycle that has just begun).
+        let cycles = select_led_sequenced_display_records(&records, 30.0, 1_001);
+        assert_eq!(led_state_counts(&cycles), [251, 250, 250, 250]);
+        assert_eq!(cycles.len(), 1_001);
+        assert_eq!(cycles.last(), records.back());
+    }
+
+    #[test]
+    fn led_sequenced_decimation_stays_bounded_with_dropped_and_repeated_records() {
+        let mut records = sequenced_display_records(10_000, 0);
+        // Two dropped records and a repeated sequence (new timestamp).
+        records.retain(|record| record.sequence != 1_001 && record.sequence != 6_002);
+        let mut repeated = records[4_000].clone();
+        for record in records.iter_mut().skip(4_001) {
+            record.timestamp_us += 1_000;
+        }
+        repeated.timestamp_us += 500;
+        records.insert(4_001, repeated);
+        assert!(records
+            .iter()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|pair| pair[0].timestamp_us < pair[1].timestamp_us));
+        for max_points in [2_000, 1_001, 8, 5, 1] {
+            let selected = select_led_sequenced_display_records(&records, 30.0, max_points);
+            assert!(selected.len() <= max_points);
+            assert_eq!(selected.last(), records.back());
+        }
+    }
+
+    #[test]
+    fn display_samples_use_whole_led_cycles_only_for_led_sequenced_labs() {
+        let session = SessionController::default();
+        {
+            let mut runtime = session.lock_runtime().unwrap_or_else(|e| panic!("{e}"));
+            runtime.profile = Some(crate::profiles::sequenced_test_lab().snapshot(false));
+            runtime.recent = sequenced_display_records(4_001, 0);
+        }
+        let shown = session
+            .recent_display_samples(30.0, 1_001)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // 250 whole cycles and the newest record (RED).
+        assert_eq!(led_state_counts(&shown), [251, 250, 250, 250]);
+        {
+            let mut runtime = session.lock_runtime().unwrap_or_else(|e| panic!("{e}"));
+            runtime.profile = Some(default_general_profile().unwrap_or_else(|e| panic!("{e}")));
+        }
+        // Other labs keep the evenly strided record selection.
+        let shown = session
+            .recent_display_samples(30.0, 1_001)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(shown.len(), 1_001);
+        assert_eq!(led_state_counts(&shown), [1_001, 0, 0, 0]);
+    }
+
+    #[test]
+    fn simulator_emits_led_sequenced_records_whose_values_follow_the_led_state() {
+        for (lab, channels) in [
+            (crate::profiles::sequenced_test_lab(), 2usize),
+            (six_channel_sequenced_lab(), 6),
+        ] {
+            let profile = lab.snapshot(false);
+            let dwell = lab.acquisition.state_dwell_us.unwrap_or_default();
+            let mut simulator =
+                SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
+                    .unwrap_or_else(|error| panic!("{error}"));
+            let configure = configure_payload(&lab.acquisition, Some(&reference_capabilities()))
+                .unwrap_or_else(|error| panic!("{error}"));
+            for (sequence, message_type, payload) in [
+                (1, MessageType::Configure, configure),
+                (2, MessageType::Start, vec![]),
+            ] {
+                simulator
+                    .write_all(
+                        &encode_frame(&Frame {
+                            message_type,
+                            flags: 0,
+                            sequence,
+                            payload,
+                        })
+                        .unwrap_or_else(|error| panic!("{error:?}")),
+                    )
+                    .unwrap_or_else(|error| panic!("{error}"));
+            }
+            simulator.batch_interval = None;
+            simulator.max_fragment = 4_096;
+            let mut parser = FrameParser::default();
+            let mut buffer = [0u8; 4_096];
+            let mut records = Vec::new();
+            let target = 4 * 1_000_000 / dwell as usize;
+            while records.len() < target {
+                let read = simulator
+                    .read(&mut buffer)
+                    .unwrap_or_else(|error| panic!("{error}"));
+                for frame in parser.push(&buffer[..read]) {
+                    if frame.message_type != MessageType::SampleBatch {
+                        continue;
+                    }
+                    let batch = SampleBatch::from_payload(&frame.payload)
+                        .unwrap_or_else(|error| panic!("{error:?}"));
+                    assert_eq!(usize::from(batch.channel_count), 1 + channels);
+                    assert_eq!(batch.sample_period_us, dwell);
+                    for (index, fields) in batch
+                        .samples
+                        .chunks(usize::from(batch.channel_count))
+                        .enumerate()
+                    {
+                        let sequence = batch.first_sample_sequence + index as u32;
+                        assert_eq!(u32::from(fields[0]), sequence % 4);
+                        assert_eq!(
+                            batch.timestamps_us[index],
+                            u64::from(sequence) * u64::from(dwell)
+                        );
+                        records.push(fields.to_vec());
+                    }
+                }
+            }
+            // Lit states (RED, IR) read above the dark states on every channel.
+            for channel in 1..=channels {
+                let mean = |states: [u16; 2]| {
+                    let values: Vec<f64> = records
+                        .iter()
+                        .filter(|fields| states.contains(&fields[0]))
+                        .map(|fields| f64::from(fields[channel]))
+                        .collect();
+                    values.iter().sum::<f64>() / values.len() as f64
+                };
+                assert!(mean([0, 2]) > mean([1, 3]) + 100.0, "channel {channel}");
+            }
+            if lab.category == "course_pulseox" {
+                // A pulsatile component on the receiving channel in RED and
+                // IR; DARK 1 and DARK 2 are flat.
+                for (state, pulsatile) in [(0u16, true), (1, false), (2, true), (3, false)] {
+                    let values: Vec<u16> = records
+                        .iter()
+                        .filter(|fields| fields[0] == state)
+                        .map(|fields| fields[2])
+                        .collect();
+                    let spread = values.iter().max().copied().unwrap_or_default()
+                        - values.iter().min().copied().unwrap_or_default();
+                    assert_eq!(spread > 100, pulsatile, "state {state}: {spread}");
+                }
+            }
+            simulator
+                .write_all(
+                    &encode_frame(&Frame {
+                        message_type: MessageType::Stop,
+                        flags: 0,
+                        sequence: 3,
+                        payload: vec![],
+                    })
+                    .unwrap_or_else(|error| panic!("{error:?}")),
+                )
+                .unwrap_or_else(|error| panic!("{error}"));
+            let terminal = parser
+                .push(&simulator.bytes.drain(..).collect::<Vec<_>>())
+                .into_iter()
+                .rfind(|frame| frame.message_type == MessageType::Status)
+                .unwrap_or_else(|| panic!("no terminal STATUS"));
+            assert_eq!(terminal.payload[0], 0);
+            // One record per state: a full dwell of settle in a perfect simulator.
+            assert_eq!(terminal.payload[42..46], dwell.to_le_bytes());
+        }
+
+        // The simulator refuses a mode-2 layout the firmware refuses.
+        let lab = crate::profiles::sequenced_test_lab();
+        let profile = lab.snapshot(false);
+        let valid = configure_payload(&lab.acquisition, Some(&reference_capabilities()))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut refused = Vec::new();
+        let mut short_dwell = valid.clone();
+        short_dwell[2..6].copy_from_slice(&999u32.to_le_bytes());
+        refused.push(short_dwell);
+        let mut repeated_pin = valid.clone();
+        repeated_pin[8] = 0;
+        refused.push(repeated_pin);
+        let mut same_led = valid.clone();
+        same_led[10] = 5;
+        refused.push(same_led);
+        let mut truncated = valid.clone();
+        truncated.pop();
+        refused.push(truncated);
+        for payload in refused {
+            let mut simulator =
+                SimulatorIo::new(&profile, RecordingDuration::Timed { seconds: 10 })
+                    .unwrap_or_else(|error| panic!("{error}"));
+            let frame = encode_frame(&Frame {
+                message_type: MessageType::Configure,
+                flags: 0,
+                sequence: 1,
+                payload: payload.clone(),
+            })
+            .unwrap_or_else(|error| panic!("{error:?}"));
+            assert!(simulator.write_all(&frame).is_err(), "{payload:?}");
+        }
+    }
+
+    #[test]
+    fn simulated_led_sequenced_recording_is_one_row_per_led_state() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let session = SessionController::default();
+        let lab = crate::profiles::sequenced_test_lab();
+        let profile = lab.snapshot(false);
+        let summary = session
+            .capture_simulator_profile_for_test(profile.clone(), 2, dir.path())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(summary.samples, 2_000);
+        assert_eq!(summary.integrity.led_state_mismatches, 0);
+        assert_eq!(summary.integrity.crc_failures, 0);
+        assert_eq!(summary.integrity.missing_sample_sequences, 0);
+        assert_eq!(summary.integrity.invalid_frames, 0);
+
+        // Raw BMEG: [led_state, tx, rx], LED state = sequence % 4, and the
+        // layout in the header.
+        let mut reader =
+            BmegReader::open(Path::new(&summary.bmeg_path)).unwrap_or_else(|e| panic!("{e}"));
+        let layout = crate::recording::LedSequencedLayout::for_acquisition(&lab.acquisition);
+        assert_eq!(reader.metadata.led_sequenced_layout, layout);
+        let header_layout = reader
+            .metadata
+            .led_sequenced_layout
+            .clone()
+            .unwrap_or_else(|| panic!("no LED-sequenced layout in the header"));
+        assert_eq!(
+            header_layout.record_fields,
+            ["led_state", "tx_counts", "rx_counts"]
+        );
+        assert_eq!(
+            header_layout.led_state_names,
+            ["RED", "DARK1", "IR", "DARK2"]
+        );
+        assert_eq!(header_layout.states_per_cycle, 4);
+        assert_eq!(header_layout.state_dwell_us, 1_000);
+        assert_eq!(
+            reader.metadata.record_layout,
+            Some(RecordLayout::Synchronized { field_count: 3 })
+        );
+        let mut raw_records = 0u32;
+        while let Some(record) = reader.next_record().unwrap_or_else(|e| panic!("{e}")) {
+            assert_eq!(record.sequence, raw_records);
+            assert_eq!(u32::from(record.counts[0]), record.sequence % 4);
+            assert_eq!(record.timestamp_us, u64::from(record.sequence) * 1_000);
+            raw_records += 1;
+        }
+        assert_eq!(raw_records, 2_000);
+
+        // CSV: one row per LED state.
+        let csv = fs::read_to_string(&summary.csv_path).unwrap_or_else(|e| panic!("{e}"));
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some("record_sequence,t_us,cycle_index,led_state,led_state_name,tx_counts,tx_V,rx_counts,rx_V")
+        );
+        let rows: Vec<Vec<&str>> = lines.map(|line| line.split(',').collect()).collect();
+        assert_eq!(rows.len(), 2_000);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), 9);
+            assert_eq!(row[0], index.to_string());
+            assert_eq!(row[1], (index * 1_000).to_string());
+            assert_eq!(row[2], (index / 4).to_string());
+            assert_eq!(row[3], (index % 4).to_string());
+            assert_eq!(row[4], ["RED", "DARK1", "IR", "DARK2"][index % 4]);
+        }
+
+        // Metadata: the layout, the per-state timing checks, and the LED
+        // settle from the terminal STATUS.
+        let metadata = read_metadata(&summary.metadata_path);
+        assert_eq!(metadata.led_sequenced_layout, layout);
+        assert_eq!(metadata.integrity.led_state_mismatches, 0);
+        let timing = metadata
+            .timing_diagnostics
+            .unwrap_or_else(|| panic!("no timing diagnostics"));
+        assert_eq!(timing.requested_rate_hz, 1_000);
+        assert_eq!(timing.pulse_state_intervals_outside_tolerance, Some([0; 4]));
+        assert_eq!(timing.minimum_pulse_settle_us, Some(1_000));
+        assert_eq!(timing.firmware_skipped_deadlines, Some(0));
+        assert!(metadata.notes.contains("simulator"));
+        // The summary carries the same timing checks for Advanced details.
+        let summary_timing = summary
+            .timing_diagnostics
+            .as_ref()
+            .unwrap_or_else(|| panic!("no summary timing diagnostics"));
+        assert_eq!(summary_timing.minimum_pulse_settle_us, Some(1_000));
+        assert_eq!(summary_timing.firmware_skipped_deadlines, Some(0));
+        assert_eq!(
+            summary_timing.pulse_state_intervals_outside_tolerance,
+            Some([0; 4])
+        );
+
+        // The storage estimate is not smaller than the files.
+        let calibration = RecordingCalibration::default();
+        assert!(
+            fs::metadata(&summary.csv_path)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .len()
+                <= projected_csv_bytes(
+                    summary.samples,
+                    estimated_csv_row_bytes(&profile, &calibration)
+                )
+        );
+        assert!(
+            fs::metadata(&summary.bmeg_path)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .len()
+                <= summary.samples * synchronized_record_bytes(3) as u64
+                    + BMEG_HEADER_RESERVE_BYTES
+        );
+
+        // The live display keeps every LED state.
+        let shown = session
+            .recent_display_samples(30.0, 1_001)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(shown.len() <= 1_001);
+        assert!(led_state_counts(&shown).iter().all(|seen| *seen > 0));
+        assert_eq!(shown.last().map(|record| record.sequence), Some(1_999));
+    }
+
+    #[test]
+    fn led_sequenced_storage_estimate_counts_one_record_per_led_state() {
+        let calibration = RecordingCalibration::default();
+        let lab = crate::profiles::sequenced_test_lab();
+        let snapshot = lab.snapshot(false);
+        let row = CSV_ROW_PREFIX_BYTES
+            + CSV_LED_STATE_COLUMNS_BYTES
+            + 2 * (CSV_COUNTS_FIELD_BYTES + CSV_VOLTS_FIELD_BYTES);
+        assert_eq!(estimated_csv_row_bytes(&snapshot, &calibration), row);
+        let estimate = estimate_recording_storage(
+            &snapshot,
+            &calibration,
+            &RecordingDuration::Timed { seconds: 60 },
+        );
+        assert_eq!(estimate.records_per_second, 1_000);
+        assert_eq!(
+            estimate.bmeg_bytes_per_second,
+            1_000 * synchronized_record_bytes(3) as u64
+        );
+        assert_eq!(estimate.csv_bytes_per_second, 1_000 * row);
+        assert_eq!(
+            estimate.projected_bytes,
+            Some(
+                60_000 * synchronized_record_bytes(3) as u64
+                    + BMEG_HEADER_RESERVE_BYTES
+                    + projected_csv_bytes(60_000, row)
+            )
+        );
+
+        // 3 ms per state: ceil(1e6 / 3000) = 334 records/s.
+        let mut slow = lab.clone();
+        slow.acquisition.state_dwell_us = Some(3_000);
+        slow.acquisition.sample_rate_hz = 333;
+        assert_eq!(
+            estimate_recording_storage(
+                &slow.snapshot(false),
+                &calibration,
+                &RecordingDuration::UntilStopped
+            )
+            .records_per_second,
+            334
+        );
+
+        // A pressure calibration adds its kPa and mmHg columns.
+        let mut calibrated = RecordingCalibration::default();
+        calibrated.active_calibrations.push(
+            crate::calibration::fixed_mpxv_calibration(
+                lab.profile_id.clone(),
+                "rx".into(),
+                5.0,
+                5.0,
+            )
+            .unwrap_or_else(|e| panic!("{e}")),
+        );
+        assert_eq!(
+            estimated_csv_row_bytes(&snapshot, &calibrated),
+            row + 2 * CSV_DERIVED_FIELD_BYTES
+        );
+    }
+
+    #[test]
+    fn led_sequenced_hardware_note_names_every_channel_and_the_led_order() {
+        let note = default_recording_note(
+            false,
+            &crate::profiles::sequenced_test_lab().snapshot(false),
+        );
+        assert!(note.contains("A0 = TX; A1 = RX"), "{note}");
+        assert!(note.contains("LED-sequenced"), "{note}");
+        assert!(note.contains("RED, DARK 1, IR, DARK 2"), "{note}");
     }
 }

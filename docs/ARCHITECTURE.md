@@ -16,10 +16,10 @@ flowchart LR
 
 ## Acquisition and firmware
 
-- The firmware provides synchronized logical frames with measured per-record timestamps. Analog channels are read one after another within a frame, not electrically simultaneously.
-- Pulse-ox phase deadlines advance on one absolute timeline. Bounded raw-batch and transmit queues, plus partial-write service, keep sample deadlines independent of packet construction and USB backpressure.
-- Dropped batches and skipped deadlines are counted explicitly (`firmware_overflows`, `overrun_flagged_records`); see [USB Protocol](USB_PROTOCOL.md).
-- The Rust session owns serial I/O, packet validation, CRC and sequence accounting, full-rate storage, and finalization. Raw BMEG samples are authoritative. Plot grouping, visibility, units, legends, endpoint labels, and display decimation never reach acquisition or raw storage.
+- The firmware (build `0x00010007`) provides synchronized logical records with measured per-record timestamps, in three modes set by CONFIGURE: simultaneous analog (one record per frame), legacy pulse-ox 4-state (one 8-field record per RED/DARK 1/IR/DARK 2 cycle), and LED-sequenced pulse ox (one record per LED state: the state code, then 1–6 channels read while that state's LEDs are unchanged). Analog channels are read one after another within a record, not electrically simultaneously.
+- Pulse-ox state deadlines advance on one absolute timeline, and a minimum-settle guard keeps every state's sample at least half a dwell after its LED edge. Bounded raw-batch and transmit queues, partial-write service, a table-driven CRC, and batch encoding that waits while a sample is due keep sample deadlines independent of packet construction and USB backpressure. A hardware watchdog (1000 ms requested, which the core rounds up to about 1.4 s) resets a stalled board.
+- Dropped batches and skipped deadlines are counted explicitly and separately (`firmware_overflows`, `overrun_flagged_records`, `deadline_skip_flagged_records`, and the terminal STATUS's skipped-deadline count and minimum settle). For LED-sequenced labs the host checks `led_state == record_sequence % 4` on every record (`led_state_mismatches`). See [USB Protocol](USB_PROTOCOL.md).
+- The Rust session owns serial I/O, packet validation, CRC and sequence accounting, full-rate storage, and finalization. Raw BMEG samples are authoritative. Plot grouping, visibility, units, legends, endpoint labels, display decimation, and showing a channel by LED state never reach acquisition or raw storage.
 
 ## Backend structure
 
@@ -91,7 +91,8 @@ A hardware Start after a fault waits until Verify or **Clear connection** clears
 
 Firmware readiness is bound to a port:
 
-- `verified_port` is set by a successful Verify (or the verification at the end of a Restore). Any failed verification and the start of any firmware job clear it. So does a Retry connection or hardware Start handshake on that port whose `failure_category` proves other firmware (`non_protocol_bytes`, `wrong_protocol_version`, `missing_firmware_identity`, `incompatible_firmware_identity`); the workflow applies it when its status or Start readiness is next read.
+- `verified_port` is set by a successful Verify (or the verification at the end of a Restore). Any failed verification and the start of any firmware job clear it. So does a Retry connection or hardware Start handshake on that port whose `failure_category` proves other firmware (`non_protocol_bytes`, `wrong_protocol_version`, `missing_firmware_identity`, `incompatible_firmware_identity`, `older_wvu_firmware`, `newer_wvu_firmware`); the workflow applies it when its status or Start readiness is next read.
+- The handshake accepts only this application's firmware build. Another build of the WVU firmware family is `older_wvu_firmware` (Restore WVU Firmware updates the board) or `newer_wvu_firmware` (this computer's app is older than the board; update the app, or restore). Verify records them as the matching `FirmwareErrorCategory`, so the Board card shows **Older WVU firmware** or **Newer WVU firmware**; any other build stays `incompatible_firmware_identity`.
 - After a failed or canceled restore, the page refreshes the board list and follows a board that appeared on another port, but does not verify it, so the Board card keeps the restore's failure, log path, and advice. Advanced details always shows the last restore's result and log path.
 - A hardware Start requires a compatible result on the selected port, and that port must equal `verified_port`.
 - A Verify that cannot open the port reports `PortBusy` and keeps the previous compatibility result.
@@ -112,8 +113,8 @@ Restore runs as follows:
 A recording runs on one worker thread:
 
 1. **Handshake.** The worker opens the port and completes the handshake.
-2. **Quiesce.** It sends an idle-safe STOP.
-3. **Configure.** It sends CONFIGURE and waits for CONFIG_ACK.
+2. **Quiesce.** It sends an idle-safe STOP. (Build `0x00010007` also stops by itself on a CONFIGURE during acquisition; the STOP keeps older builds safe too.)
+3. **Configure.** It checks the lab against the board's CAPABILITIES (each mode needs its own mode bit) and sends CONFIGURE (mode 0, 1, or 2), then waits for CONFIG_ACK.
 4. **Open the raw file.** It creates `<name>.bmeg.part` (`create_new`, so an existing file is never truncated).
 5. **START.** It sends START and waits for a STATUS with `acquiring = 1`.
 6. **Capture.** The capture loop reads frames, writes validated records, and checks free space every 15 s. It PINGs every second and enforces the seven-second no-data safeguard. Sample batches (and the overflow and timing counters of STATUS frames) that arrive before the START STATUS are ignored because they belong to an earlier run, and an ERROR from an earlier session is logged, not counted.
@@ -136,7 +137,9 @@ A raw file is never deleted. Each failed step is logged as `FINALIZE_FAIL stage=
 
 ### Display data
 
-The session keeps up to 30,000 recent frames (30 s at 1 kHz). `get_recent_display_data` returns at most 2,000 points per request for the selected 0.5–30 s window. Decimation always includes the newest frame.
+The session keeps up to 30,000 recent frames (30 s at 1 kHz). `get_recent_display_data` returns at most 2,000 points per request for the selected 0.5–30 s window. Decimation always includes the newest frame. For LED-sequenced labs it keeps whole RED/DARK 1/IR/DARK 2 cycles (by `record_sequence / 4`), spread evenly over the window plus the newest cycle, so every LED state is sampled equally and a plot can never alias to one state; other labs use a record stride.
+
+The page turns records into traces with `plotChannelsFor` (`src/lib/multichannel.ts`): each trace has a `valueIndex` into the record and a `parentId` (its lab channel). An LED-sequenced channel shown by LED state becomes four traces, `led:<state>:<id>` ("TX — RED" …), each `null` outside its own state with gaps spanned; other channels are one trace at the full record rate. Units, calibration, and unit selectors are keyed by the parent channel. Showing a channel by LED state (the lab's `split_by_led_state` default, or **Show by LED state** in Live signals) is display only and issues no command.
 
 ## Frontend structure
 
@@ -149,10 +152,10 @@ The session keeps up to 30,000 recent frames (30 s at 1 kHz). `get_recent_displa
 | `SetupCard` | Collapsible card with a one-line summary; the setup cards are read-only while recording |
 | `BoardPanel` | Board list, Refresh Board, state chip, the fitting action, More board actions (Verify, Restore, Repair Arduino tools), and the Last firmware operation card |
 | `FirmwareJobProgress` | Restore stepper (Prepare, Compile, Switch board to upload mode, Upload, Reconnect, Verify), the double-reset countdown, and Cancel restore |
-| `LabCard` | Operating mode (`OperatingModeControl`), Lab Manager (`LabManager`, Instructor mode only), lab selection, **Install lab file…** (both modes), lab details, and a catalog migration notice (both modes) |
+| `LabCard` | Operating mode (`OperatingModeControl`), Lab Manager (`LabManager`, Instructor mode only, with `ChannelGridEditor` shared by the simultaneous and LED-sequenced editors), lab selection, **Install lab file…** (both modes), lab details, and a catalog migration notice (both modes) |
 | `SessionCard`, `DurationCard` | Output folder, recording note, lab acquisition settings; duration mode, presets, and the storage estimate |
 | `CalibrationCard`, `CalibrationDialog` | Vref and Vs, calibration selection, display units, and the linear-fit dialog |
-| `LiveSignalsPanel` | Live signals: `PlotToolbar` (Pause display, time-window chips) and one `LivePlot` (uPlot) per plot group, marker lines, and the SIMULATED DATA watermark |
+| `LiveSignalsPanel` | Live signals: `PlotToolbar` (Pause display, time-window chips), the display-only **Show by LED state** choices of an LED-sequenced lab, one `LivePlot` (uPlot) per plot group, marker lines, and the SIMULATED DATA watermark |
 | `RecordingResultCard` | Last recording: per-file ✓/✗, Copy path, Show in folder, and a quality summary |
 | `AdvancedDetails` | Raw diagnostics for instructors |
 | `Modal`, `CopyButton` | Accessible modal dialog (focus trap, Escape, focus return) and copy-to-clipboard |
@@ -167,7 +170,7 @@ The page's decisions live in pure TypeScript modules in `src/lib/`, tested by th
 | `firmware-job.ts` | The restore steps |
 | `source-select.ts` | The one-time automatic switch to Hardware |
 | `recording-result.ts`, `recording-status.ts` | The result card and the recording bar |
-| `live-display.ts`, `multichannel.ts` | The plot window, ticks, and colours |
+| `live-display.ts`, `multichannel.ts` | The plot window, ticks, and colours; record-to-trace mapping (`valueIndex`, `parentId`, LED-state traces) and the per-trace startup filter |
 | `calibration*.ts` | Calibration |
 | `storage.ts` | Storage |
 | `lab-catalog.ts`, `lab-authoring.ts` | The Lab Manager |

@@ -25,11 +25,21 @@ export type Integrity = {
   missing_sample_sequences: number; duplicate_sample_sequences: number; out_of_order_sample_sequences: number;
   firmware_overflows: number; host_channel_overflows: number; reconnects: number; disconnect_events: number;
   /**
-   * Records in batches the firmware flagged (0x0004) after skipping sampling
-   * deadlines or dropping a batch. Not part of `firmware_overflows`. Absent
-   * from older backends.
+   * Records in batches flagged 0x0004. Firmware build 0x00010007 sets it only
+   * on the batch after a dropped batch (already counted as missing samples
+   * and `firmware_overflows`); builds up to 0x00010006 also set it after a
+   * skipped sampling deadline. Not part of `firmware_overflows`. Absent from
+   * older backends.
    */
   overrun_flagged_records?: number;
+  /**
+   * Records in batches flagged 0x0010 (build 0x00010007 and later): the
+   * firmware skipped one or more sampling deadlines before them. Absent from
+   * older backends.
+   */
+  deadline_skip_flagged_records?: number;
+  /** LED-sequenced records whose LED state is not `sequence % 4`. Absent from older backends. */
+  led_state_mismatches?: number;
 };
 
 export const emptyIntegrity: Integrity = {
@@ -41,6 +51,25 @@ export const emptyIntegrity: Integrity = {
 
 export type ProfileSnapshot = { bench_notice_acknowledged: boolean; profile: LabProfile };
 
+/** Per LED state: RED, DARK 1, IR, DARK 2. */
+export type PerLedState = [number, number, number, number];
+
+/** Rust `AcquisitionTimingDiagnostics`: the timing checks written to a recording's metadata. */
+export type AcquisitionTiming = {
+  requested_rate_hz: number; measured_rate_hz: number; interval_count: number;
+  median_interval_us: number; minimum_interval_us: number; maximum_interval_us: number; p99_interval_us: number;
+  interval_tolerance_percent: number; intervals_outside_tolerance: number; acquisition_queue_overflows: number;
+  timestamp_source: string;
+  /** Pulse-ox labs: firmware-observed state intervals outside ±5% of the dwell. */
+  pulse_state_intervals_outside_tolerance?: PerLedState | null;
+  /** Pulse-ox labs: the largest firmware-observed dwell error (µs) per state. */
+  pulse_state_maximum_error_us?: PerLedState | null;
+  /** Sampling deadlines the board skipped (firmware build 0x00010007 and later). */
+  firmware_skipped_deadlines?: number | null;
+  /** Pulse-ox labs: the shortest time (µs) from an LED edge to that state's sample. */
+  minimum_pulse_settle_us?: number | null;
+};
+
 /** Rust `SessionSummary`: the last finalized recording. */
 export type Summary = {
   state: string; samples: number; packets: number; measured_rate_hz: number;
@@ -50,6 +79,8 @@ export type Summary = {
   integrity: Integrity; error?: string; profile?: ProfileSnapshot; calibration?: RecordingCalibration;
   active_digital_output_mask?: number; final_digital_output_mask?: number;
   csv_error?: string; finalize_error?: string;
+  /** The recording's timing checks (Advanced details). Absent from older backends. */
+  timing_diagnostics?: AcquisitionTiming | null;
 };
 
 export type ConnectionDiagnostics = {

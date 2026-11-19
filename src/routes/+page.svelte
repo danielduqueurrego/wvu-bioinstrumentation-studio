@@ -38,7 +38,7 @@
   import type { LabProfile } from '$lib/labs';
   import { connectionActions } from '$lib/connection-actions';
   import { commandErrorCategory, commandErrorDetail, commandErrorKeptPreviousTools, commandErrorRepairable, formatCommandError } from '$lib/errors';
-  import { resolvedDigitalOutputs } from '$lib/lab-authoring';
+  import { labRateLabel, labRateText, resolvedDigitalOutputs } from '$lib/lab-authoring';
   import { firmwareStepAnnouncement, firmwareStepIndex } from '$lib/firmware-job';
   import { durationRequest, type RecordingDurationRequest } from '$lib/duration';
   import {
@@ -52,11 +52,11 @@
     type CatalogStatus
   } from '$lib/lab-catalog';
   import {
+    fieldDisplayUnits,
     initialChannelUnits,
     isFixedMpxvChannel,
     reconcileChannelUnits,
     recordingCalibrationFor,
-    supportedDisplayUnits,
     type CalibrationPreset,
     type DisplayUnit,
     type RecordingCalibration
@@ -70,15 +70,20 @@
   } from '$lib/calibration-selection';
   import type { OperatingMode } from '$lib/operating-mode';
   import {
-    defaultPlotGroups,
+    initialPlotGroups,
     initialTraceVisibility,
+    isLedSequencedProfile,
     isPulseOxProfile,
     labRevisionKey,
-    normalizePlotGroups,
+    ledSplitChoices,
     numberedVisiblePlotGroups,
     plotChannelsFor,
+    plotLayoutKey,
     profileChannels,
+    remapTraceLayout,
+    unitChannelsFor,
     visibleChannelIds,
+    type PlotChannel,
     type PlotGroup,
     type VisibleChannelMap
   } from '$lib/multichannel';
@@ -240,8 +245,14 @@
   let benchNoticeAcknowledged = false;
   let instructorAcknowledgement = false;
   let traceVisibility: VisibleChannelMap = {};
-  let traceProfileKey = '';
+  // The plotted lab layout and traces the visibility, plots, and units were
+  // made for (see `syncPlotLayout`).
+  let traceLabKey = '';
+  let traceKey = '';
+  let tracedChannels: PlotChannel[] = [];
   let plotGroups: PlotGroup[] = [];
+  // Display-only "Show by LED state" choices of the plotted LED-sequenced lab.
+  let ledSplitOverrides: { labKey: string; values: Record<string, boolean> } = { labKey: '', values: {} };
   // Which setup cards are expanded (display-only). While a recording runs
   // they collapse, and `cardsSavedForRecording` holds the layout to restore.
   let cardOpen: CardOpenState = initialCardState(false);
@@ -295,7 +306,6 @@
   // The lab selected for the next recording (setup, calibration, Start).
   $: activeProfile = acquisitionProfiles.find((profile) => profile.profile_id === selectedProfileId);
   $: activeChannels = profileChannels(activeProfile);
-  $: pulseoxProfile = isPulseOxProfile(activeProfile);
   // A recording owns the session. Verify Firmware and Retry connection pass
   // through Connecting/Connected too; they are board checks, not recordings,
   // so they never collapse the setup, switch the plots, or count as a
@@ -313,41 +323,36 @@
   $: recordedLabKey = isActive ? labRevisionKey(session.profile?.profile) : '';
   $: plotProfile = recordedLabKey ? recordedLab() : activeProfile;
   $: plotPulseox = isPulseOxProfile(plotProfile);
-  $: plotChannels = plotChannelsFor(plotProfile);
+  $: plotLedSequenced = isLedSequencedProfile(plotProfile);
+  // The plotted lab's layout (lab, mode, channels); see `syncPlotLayout`.
+  $: plotLabKey = plotLayoutKey(plotProfile);
+  // "Show by LED state" choices apply to the lab they were made for only.
+  $: plotSplitOverrides = ledSplitOverrides.labKey === plotLabKey ? ledSplitOverrides.values : undefined;
+  $: plotChannels = plotChannelsFor(plotProfile, plotSplitOverrides);
+  $: plotLedSplitChoices = ledSplitChoices(plotProfile, plotSplitOverrides);
+  // The fields that have a display unit: lab channels (an LED-state trace
+  // uses its channel's unit) or the legacy raw pulse-ox fields.
+  $: unitChannels = unitChannelsFor(plotProfile);
   $: calibratableChannels = linearCalibrationChannels(activeChannels);
   $: hasMpxvChannel = activeChannels.some((channel) => isFixedMpxvChannel(activeProfile?.category, channel));
   $: if (!calibratableChannels.some((channel) => channel.id === calibrationChannelId)) {
     calibrationChannelId = calibratableChannels[0]?.id ?? '';
   }
-  $: plotProfileKey = `${plotProfile?.profile_id ?? ''}:${plotPulseox ? 'pulseox-raw' : 'analog'}:${plotChannels.map((channel) => channel.id).join('|')}`;
-  // Visibility is reset only when the plotted lab's display fields change.  It is
-  // never reconciled during a live checkbox toggle, which keeps checkbox DOM state and
-  // uPlot series derived from one authoritative map. Display-only: the selected
-  // calibration is reset by `selectProfile`, not here.
-  $: if (plotProfileKey !== traceProfileKey) {
-    traceProfileKey = plotProfileKey;
-    traceVisibility = initialTraceVisibility(plotChannels);
-    plotGroups = plotPulseox
-      ? defaultPlotGroups(plotProfile?.category, plotChannels)
-      : plotProfile?.plot_defaults?.groups?.length
-      ? normalizePlotGroups(plotChannels, plotProfile.plot_defaults.groups.map((group, index) => ({ id: `profile-${index + 1}`, channelIds: group.channel_ids })))
-      : defaultPlotGroups(plotProfile?.category, plotChannels);
-    // Each channel's default display unit from the lab, when it is offered.
-    channelUnits = initialChannelUnits(plotChannels, plotProfile?.category);
-  }
+  $: plotTraceKey = plotChannels.map((channel) => channel.id).join('|');
+  // `traceLabKey` is an argument so that `selectProfile` clearing it starts the layout again.
+  $: syncPlotLayout(plotLabKey, traceLabKey, plotTraceKey, plotProfile, plotChannels, unitChannels);
   $: visibleTraceIds = visibleChannelIds(plotChannels, traceVisibility);
   // Numbered by slot, so headings match the "Plot N" assignment selectors.
   $: renderedPlotGroups = numberedVisiblePlotGroups(plotChannels, plotGroups, traceVisibility);
   // Keep this as a reactive value used directly by the template.  A helper
   // called only from markup can hide its dependencies from Svelte's legacy
   // compiler and leave <option> elements stale after a calibration changes.
-  $: channelUnitOptions = Object.fromEntries(plotChannels.map((channel) => [
+  // Units are decided per field (`fieldDisplayUnits`), not by the lab category.
+  $: channelUnitOptions = Object.fromEntries(unitChannels.map((channel) => [
     channel.id,
-    supportedDisplayUnits(
-      plotProfile?.category,
-      channel.id,
+    fieldDisplayUnits(
+      channel,
       Boolean(activeXgzpCalibration && selectedXgzpCalibrationId && activeXgzpCalibration.channel_id === channel.id),
-      channel.allowed_conversions ?? [],
       activeXgzpCalibration?.channel_id === channel.id ? activeXgzpCalibration.output_units : 'mmHg'
     )
   ]));
@@ -404,8 +409,17 @@
     firmwareReady: firmwareReadyOnSelectedPort,
     checking: boardScanInFlight || verifyInFlight,
     firmwareJobActive: firmwareWorkflow.job?.active === true,
-    lastFailureCategory: firmwareWorkflow.last_failure?.category
+    lastFailureCategory: firmwareWorkflow.last_failure?.category,
+    // The latest handshake on this port, which can prove an older or newer
+    // WVU firmware build without a Verify (Retry connection or Start).
+    connectionFailureCategory: selectedPort
+      && session.connection_diagnostics?.selected_port?.toUpperCase() === selectedPort.toUpperCase()
+      ? session.connection_diagnostics.failure_category
+      : undefined
   });
+  $: boardFirmwareMismatch = boardPanelStatus.state === 'older_firmware'
+    ? 'older' as const
+    : boardPanelStatus.state === 'newer_firmware' ? 'newer' as const : undefined;
   $: lastFirmwareOp = lastFirmwareOperation(firmwareWorkflow);
   $: announceFirmwareStep(firmwareWorkflow.job);
   $: applySourceAutoSelect(firmwareReadyOnSelectedPort, isActive || startInFlight);
@@ -505,6 +519,7 @@
     source,
     selectedPort,
     firmwareReady: firmwareReadyOnSelectedPort,
+    firmwareMismatch: boardFirmwareMismatch,
     blockingFault,
     faultAction: faultShown ? problem?.nextAction : undefined,
     labName: activeProfile?.display_name,
@@ -583,11 +598,12 @@
   });
   $: projectCardSummary = projectSummary(projectFolder, projectFolderNotice);
   $: labCardSummary = labSummary(activeProfile, instructorModeActive);
-  $: rateText = activeProfile ? `${activeProfile.acquisition.sample_rate_hz} ${pulseoxProfile ? 'cycles/s' : 'frames/s'}` : '';
+  $: rateText = activeProfile ? labRateText(activeProfile.acquisition) : '';
+  $: rateLabel = activeProfile ? labRateLabel(activeProfile.acquisition) : 'Sample rate';
   $: sessionCardSummary = sessionSummary({ outputFolder: outputDirectory, note, rateText });
   $: durationCardSummary = durationSummary(durationMode, timedSeconds, !durationRefusal);
   $: calibrationCardSummary = calibrationSummary({
-    channelIds: plotChannels.map((channel) => channel.id),
+    channelIds: unitChannels.map((channel) => channel.id),
     units: channelUnits,
     calibrationLabel: activeXgzpCalibration?.label
   });
@@ -650,6 +666,49 @@
   /** The lab snapshot of the running recording (see `recordedLabKey`). */
   function recordedLab(): AcquisitionProfile | undefined {
     return session.profile?.profile ?? undefined;
+  }
+
+  /**
+   * Keeps the display layout in step with the plotted traces. Visibility,
+   * plots, and display units start again from the lab only when the plotted
+   * lab's layout changes; they are never reconciled during a live checkbox
+   * toggle, which keeps checkbox DOM state and uPlot series derived from one
+   * authoritative map. When only the traces change (a channel shown, or no
+   * longer shown, by LED state) the visibility and plots carry over and the
+   * units, keyed by lab channel, are kept. Display-only: the selected
+   * calibration is reset by `selectProfile`, not here.
+   */
+  function syncPlotLayout(
+    labKey: string,
+    currentLabKey: string,
+    nextTraceKey: string,
+    profile: AcquisitionProfile | undefined,
+    channels: PlotChannel[],
+    units: PlotChannel[]
+  ) {
+    if (labKey !== currentLabKey) {
+      traceLabKey = labKey;
+      traceKey = nextTraceKey;
+      tracedChannels = channels;
+      traceVisibility = initialTraceVisibility(channels);
+      // The lab's own default plots in every mode, else the mode's defaults.
+      plotGroups = initialPlotGroups(profile, channels);
+      // Each channel's default display unit from the lab, when it is offered.
+      channelUnits = initialChannelUnits(units);
+      return;
+    }
+    if (nextTraceKey === traceKey) return;
+    const remapped = remapTraceLayout(tracedChannels, plotGroups, traceVisibility, channels);
+    traceKey = nextTraceKey;
+    tracedChannels = channels;
+    traceVisibility = remapped.visibility;
+    plotGroups = remapped.groups;
+  }
+
+  /** A "Show by LED state" box changed. Display-only: no command is sent. */
+  function setLedSplit(channelId: string, split: boolean) {
+    const values = ledSplitOverrides.labKey === plotLabKey ? ledSplitOverrides.values : {};
+    ledSplitOverrides = { labKey: plotLabKey, values: { ...values, [channelId]: split } };
   }
 
   /** Collapses the setup cards while a recording runs and restores them afterwards. */
@@ -1250,7 +1309,7 @@
     benchNoticeAcknowledged = false;
     // Force a clean visibility map for the newly selected profile. The reactive
     // profile key also protects programmatic profile changes.
-    traceProfileKey = '';
+    traceLabKey = '';
     durationPreset = defaultDurationPreset(profile);
     if (options.announce !== false) {
       statusMessage = profile
@@ -1609,7 +1668,7 @@
           profiles={acquisitionProfiles}
           profile={activeProfile}
           channels={activeChannels}
-          pulseox={pulseoxProfile}
+          {rateLabel}
           {rateText}
           catalogNotice={catalogNoticeText}
           migrationNotice={catalogMigrationText}
@@ -1625,7 +1684,7 @@
       </SetupCard>
 
       <SetupCard id="session" title="Session setup" summary={sessionCardSummary} bind:open={cardOpen.session} locked={isActive}>
-        <SessionCard bind:outputDirectory bind:note profile={activeProfile} channels={activeChannels} pulseox={pulseoxProfile} {rateText} {effectiveOutputFolder} {outputFolderError} locked={setupLocked} />
+        <SessionCard bind:outputDirectory bind:note profile={activeProfile} channels={activeChannels} {rateLabel} {rateText} {effectiveOutputFolder} {outputFolderError} locked={setupLocked} />
       </SetupCard>
 
       <SetupCard id="duration" title="Recording duration" summary={durationCardSummary} bind:open={cardOpen.duration} locked={isActive}>
@@ -1658,12 +1717,13 @@
           bind:channelId={calibrationChannelId}
           bind:selectedCalibrationId={selectedXgzpCalibrationId}
           bind:activeCalibration={activeXgzpCalibration}
-          {plotChannels}
+          plotChannels={unitChannels}
           bind:channelUnits
           {channelUnitOptions}
           recordingCalibration={currentRecordingCalibration}
           category={activeProfile?.category}
           pulseox={plotPulseox}
+          ledSequenced={plotLedSequenced}
           locked={setupLocked}
           onCalibrate={() => calibrationDialogOpen = true}
           onStatus={(message) => statusMessage = message}
@@ -1692,6 +1752,9 @@
 {#snippet liveSignalsAndResult()}
   <LiveSignalsPanel
     pulseox={plotPulseox}
+    ledSequenced={plotLedSequenced}
+    ledSplitChoices={plotLedSplitChoices}
+    onLedSplitChange={setLedSplit}
     teachingNotice={liveFirst}
     arduino={`${session.board || 'Not connected'}${session.port ? ` (${session.port})` : ''}`}
     storage={formatStorage(freeBytes)}

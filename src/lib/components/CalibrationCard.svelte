@@ -37,12 +37,15 @@
     channelId: string;
     selectedCalibrationId: string;
     activeCalibration?: CalibrationPreset;
+    /** The fields with a display unit: lab channels (not their LED-state traces) or legacy raw pulse-ox fields. */
     plotChannels: Array<{ id: string; label: string }>;
     channelUnits: Record<string, DisplayUnit>;
     channelUnitOptions: Record<string, DisplayUnit[]>;
     recordingCalibration: RecordingCalibration;
     category?: string;
     pulseox: boolean;
+    /** An LED-sequenced pulse-ox lab: each channel's unit also applies to its LED-state traces. */
+    ledSequenced?: boolean;
     locked: boolean;
     onCalibrate: () => void;
     onStatus: (message: string) => void;
@@ -67,6 +70,7 @@
     recordingCalibration,
     category,
     pulseox,
+    ledSequenced = false,
     locked,
     onCalibrate,
     onStatus
@@ -247,6 +251,7 @@
   {#if hasMpxvChannel}<p class="help">MPXV uses P<sub>kPa</sub> = (Vout / Vs − 0.04) / 0.009 and P<sub>mmHg</sub> = 7.5006 × P<sub>kPa</sub>. A channel configured for generic linear calibration offers mmHg only after you save its local fit.</p>{/if}
   {#if category === 'course_emg_force'}<p class="help">The A3 conversion is labeled <strong>Pressure (kPa)</strong>; it does not infer muscular force.</p>{/if}
   {#if pulseox}<p class="help">Pulse-ox units apply directly to the eight raw LED-state values. No background subtraction or optical processing is applied.</p>{/if}
+  {#if ledSequenced}<p class="help">Each channel's unit also applies to its RED, DARK 1, IR, and DARK 2 traces. No background subtraction or optical processing is applied.</p>{/if}
 </div>
 
 <style>

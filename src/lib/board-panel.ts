@@ -8,7 +8,7 @@
  * not read the firmware status at all). This module only picks which action
  * is the prominent one.
  */
-import { firmwareFailureMessage, NO_FIRMWARE_FAILURES, type NextAction } from './messages';
+import { firmwareFailureMessage, NO_FIRMWARE_FAILURES, wvuFirmwareMismatch, type NextAction } from './messages';
 import type { FirmwareFailure, FirmwareJob, FirmwareWorkflowStatus } from './session-types';
 
 export type BoardState =
@@ -18,6 +18,8 @@ export type BoardState =
   | 'ready'
   | 'busy'
   | 'no_firmware'
+  | 'older_firmware'
+  | 'newer_firmware'
   | 'needs_attention'
   | 'not_checked';
 
@@ -54,6 +56,14 @@ export type BoardStatusInput = {
   firmwareJobActive: boolean;
   /** `FirmwareWorkflowStatus.last_failure.category`. */
   lastFailureCategory?: string | null;
+  /**
+   * `connection_diagnostics.failure_category` of the latest handshake on the
+   * selected port (Retry connection, a hardware Start, or Verify). A Retry
+   * or Start that proves another WVU firmware build withdraws readiness but
+   * leaves `last_failure` as it was, so this tells the chip which side is
+   * out of date.
+   */
+  connectionFailureCategory?: string | null;
 };
 
 const CLOSE_OTHER_APPS = 'Close Arduino IDE, Serial Monitor, or Arduino Cloud Agent';
@@ -94,6 +104,26 @@ export function boardStatus(input: BoardStatusInput): BoardStatus {
       tone: 'problem',
       hint: `Another program is using ${port}. ${CLOSE_OTHER_APPS}, then verify again.`,
       action: 'verify_after_close'
+    };
+  }
+  const mismatch = wvuFirmwareMismatch(category)
+    ?? (input.compatibility === 'verification_failed' ? wvuFirmwareMismatch(input.connectionFailureCategory) : undefined);
+  if (mismatch === 'older') {
+    return {
+      state: 'older_firmware',
+      label: 'Older WVU firmware',
+      tone: 'problem',
+      hint: `The board on ${port} has an older WVU firmware version than this app needs. Restore the WVU firmware to update it.`,
+      action: 'restore'
+    };
+  }
+  if (mismatch === 'newer') {
+    return {
+      state: 'newer_firmware',
+      label: 'Newer WVU firmware',
+      tone: 'problem',
+      hint: `This computer’s app is older than the firmware on ${port}. Update the app on this computer, or restore the WVU firmware to put this app’s firmware back on the board.`,
+      action: 'restore'
     };
   }
   if (

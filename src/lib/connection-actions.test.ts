@@ -37,6 +37,18 @@ describe('connection recovery actions', () => {
     })).toEqual({ canRetryHandshake: false });
   });
 
+  it('does not offer Retry connection for a board with an older or newer WVU firmware build', () => {
+    for (const failureCategory of ['older_wvu_firmware', 'newer_wvu_firmware']) {
+      expect(connectionActions({
+        source: 'hardware', active: false, selectedPort: 'COM12', failureCategory
+      })).toEqual({ canRetryHandshake: false });
+    }
+    // An unknown build still offers it, as before.
+    expect(connectionActions({
+      source: 'hardware', active: false, selectedPort: 'COM12', failureCategory: 'incompatible_firmware_identity'
+    })).toEqual({ canRetryHandshake: true });
+  });
+
   it('no longer offers the retired board reset', () => {
     expect(connectionActions({
       source: 'hardware', active: false, selectedPort: 'COM12', failureCategory: 'port_open_no_bytes'

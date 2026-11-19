@@ -5,6 +5,7 @@
   import LabManager from './LabManager.svelte';
   import OperatingModeControl from './OperatingModeControl.svelte';
   import { installConfirmation, installOutcomeText, type LabFileSummary } from '$lib/lab-catalog';
+  import { ledSequenceText } from '$lib/lab-authoring';
   import type { LabProfile } from '$lib/labs';
   import type { OperatingMode } from '$lib/operating-mode';
 
@@ -24,7 +25,8 @@
     profiles: LabProfile[];
     profile?: LabProfile;
     channels: Array<{ pin: string; label: string }>;
-    pulseox: boolean;
+    /** "Sample rate", "Cycle rate" (legacy 4-state pulse-ox), or "Record rate" (LED-sequenced). */
+    rateLabel: string;
     rateText: string;
     catalogNotice?: string;
     /** A startup catalog migration's notice, shown in both modes. */
@@ -49,7 +51,7 @@
     profiles,
     profile,
     channels,
-    pulseox,
+    rateLabel,
     rateText,
     catalogNotice,
     migrationNotice,
@@ -146,7 +148,7 @@
   {#if profile}
     <div class="profile-details">
       <span><strong>Channels</strong>{channels.map((channel) => channel.label).join('; ')}</span>
-      <span><strong>{pulseox ? 'Cycle rate' : 'Sample rate'}</strong>{rateText}</span>
+      <span><strong>{rateLabel}</strong>{rateText}</span>
       <span><strong>ADC</strong>{profile.acquisition.adc_resolution_bits} bit</span>
       <span><strong>Units</strong>ADC counts and Arduino input volts</span>
     </div>
@@ -154,7 +156,7 @@
       <summary>Lab details</summary>
       <div class="profile-details">
         <span><strong>Pin mapping</strong>{channels.map((channel) => `${channel.pin} = ${channel.label}`).join('; ')}</span>
-        {#if profile.acquisition.acquisition_mode === 'pulseox_4state'}<span><strong>Pulse-ox sequence</strong>RED → DARK → IR → DARK; {profile.acquisition.state_dwell_us} µs per state</span>{/if}
+        {#if ledSequenceText(profile.acquisition)}<span><strong>{profile.acquisition.acquisition_mode === 'pulseox_sequenced' ? 'LED sequence' : 'Pulse-ox sequence'}</strong>{ledSequenceText(profile.acquisition)}</span>{/if}
         {#if instructor}<span><strong>Instructor reference</strong>{profile.profile_id} / {profile.profile_version}</span>{/if}
       </div>
     </details>

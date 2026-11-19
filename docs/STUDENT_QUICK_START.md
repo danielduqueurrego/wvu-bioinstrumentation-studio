@@ -2,7 +2,7 @@
 
 1. Install WVU Bioinstrumentation Studio and connect the Arduino UNO R4 WiFi.
 2. Open the application and check the status in the **Board** card, for example **Ready on COM5**. The card always shows the one action that fits; **Verify Firmware** and **Restore WVU Firmware** are always available, as that action or under **More board actions**.
-3. If the Board card shows **No WVU firmware**, select **Restore WVU Firmware** and follow the steps in the restore window.
+3. If the Board card shows **No WVU firmware** or **Older WVU firmware**, select **Restore WVU Firmware** and follow the steps in the restore window. (**Newer WVU firmware** means the app on this computer is out of date: tell your instructor.)
    - Connect only this one UNO board.
    - If the window asks you to **press the RESET button twice quickly**, do so before the countdown ends.
    - Do not unplug the board while it says "Writing firmware".
@@ -27,7 +27,7 @@ While recording, plot changes are display-only and never change the underlying r
 - **Arranging.** You may rearrange plots, hide or show traces, or change supported units.
 - **Markers.** When instructed, use **Add marker** (with an optional short label). Each marker appears as a labelled line on the plots.
 
-For pulse oximetry, the firmware waits the configured settling interval after each RED, DARK 1, IR, or DARK 2 transition before recording the raw values for both detectors. It does not calculate SpO2, heart rate, or other physiological results.
+For pulse oximetry, the board steps the LEDs RED, DARK 1, IR, DARK 2. At the end of each state it records one row with the raw values of every input of the lab (TX and RX in the built-in lab), read while that state's LEDs are still set. In the CSV, `led_state_name` says which state each row belongs to (`RED`, `DARK1`, `IR`, or `DARK2`), so each state has a quarter of the rows. In the live plot, **Show by LED state** draws a signal as four traces, one per state, or as one trace; it changes the display only. The application does not calculate SpO2, heart rate, or other physiological results.
 
 If something goes wrong, the message under the recording bar names the problem and usually offers one button for the next step. If that does not help, open **Advanced details** at the bottom of the window and show it to your instructor.
 

@@ -3,15 +3,18 @@
   import LivePlot from './LivePlot.svelte';
   import PlotToolbar from './PlotToolbar.svelte';
   import { unitsForGroup, type DisplayUnit, type RecordingCalibration } from '$lib/calibration';
-  import { MAX_PLOT_TIME_WINDOW_SECONDS, normalizePlotTimeWindow, previewPlotTimeWindow } from '$lib/live-display';
+  import { MAX_PLOT_TIME_WINDOW_SECONDS, normalizePlotTimeWindow, previewPlotTimeWindow, sampleInTrace } from '$lib/live-display';
   import type { LabDigitalOutput } from '$lib/labs';
   import type { PlacedMarker } from '$lib/markers';
   import {
     assignChannelToPlot,
     onePlotPerSignal,
     overlayAll,
+    plotGroupHeading,
     setPlotGroupCount,
     setTraceVisibility,
+    traceParentId,
+    type LedSplitChoice,
     type PlotChannel,
     type PlotGroup,
     type VisibleChannelMap
@@ -28,7 +31,14 @@
   type RenderedGroup = { id: string; slot: number; channelIds: string[] };
 
   type Props = {
+    /** The legacy 4-state pulse-ox lab: eight raw TX/RX fields. */
     pulseox: boolean;
+    /** An LED-sequenced pulse-ox lab: one record per LED state. */
+    ledSequenced?: boolean;
+    /** Its channels' display-only "Show by LED state" choices. */
+    ledSplitChoices?: LedSplitChoice[];
+    /** A "Show by LED state" box changed. Display-only: never an acquisition command. */
+    onLedSplitChange?: (channelId: string, split: boolean) => void;
     /** "Teaching use only" shown with the plots (while they lead the page). */
     teachingNotice?: boolean;
     arduino: string;
@@ -47,6 +57,7 @@
     visibleCount: number;
     simulated: boolean;
     samples: Point[];
+    /** Display units by lab channel (a trace's `parentId`). */
     channelUnits: Record<string, DisplayUnit>;
     calibration: RecordingCalibration;
     adcBits: number;
@@ -64,6 +75,9 @@
 
   let {
     pulseox,
+    ledSequenced = false,
+    ledSplitChoices = [],
+    onLedSplitChange = () => {},
     teachingNotice = false,
     arduino,
     storage,
@@ -137,13 +151,16 @@
     .map((output) => `${output.pin} ${output.label} — ${output.behavior === 'acquisition_sequenced' ? 'Sequenced' : (outputMask ?? 0) & BIT_FOR_PIN[output.pin] ? 'HIGH' : 'LOW'}`)
     .join('; '));
 
-  // Samples at either ADC limit, per channel (display-only clipping hint).
+  // Samples at either ADC limit, per trace (display-only clipping hint). A
+  // trace of one LED state counts only the records of that state.
   const railCounts = $derived.by(() => {
     const fullScale = Math.pow(2, adcBits) - 1;
     const counts: Record<string, number> = {};
-    channels.forEach((channel, index) => {
+    channels.forEach((channel) => {
+      const source = { valueIndex: channel.valueIndex, ledState: channel.ledState };
       counts[channel.id] = samples.reduce((count, sample) => {
-        const value = sample.values[index];
+        if (!sampleInTrace(sample, source)) return count;
+        const value = sample.values[source.valueIndex];
         return count + (value === 0 || value === fullScale ? 1 : 0);
       }, 0);
     });
@@ -151,6 +168,11 @@
   });
 
   const labelOf = (id: string) => channels.find((channel) => channel.id === id)?.label ?? id;
+  // Units belong to the lab channel; a trace of one LED state uses its channel's.
+  const parentOf = (id: string) => {
+    const channel = channels.find((candidate) => candidate.id === id);
+    return channel ? traceParentId(channel) : id;
+  };
 
   function railText(channelIds: string[]): string {
     const total = channelIds.reduce((count, id) => count + (railCounts[id] ?? 0), 0);
@@ -161,7 +183,7 @@
 <!-- `studio-form` only where its form defaults are wanted: PlotToolbar and LivePlot keep their own styles. -->
 <section class="panel plot-panel" id="live-panel" aria-labelledby="live-title">
   <div class="plot-heading studio-form">
-    <h2 id="live-title">{pulseox ? 'Live signals — raw pulse-ox' : 'Live signals'}</h2>
+    <h2 id="live-title">{pulseox ? 'Live signals — raw pulse-ox' : ledSequenced ? 'Live signals — LED-sequenced pulse-ox' : 'Live signals'}</h2>
     <section class="metric-grid" aria-label="Recording details">
       <span><strong>Arduino</strong>{arduino}</span>
       <span><strong>Storage</strong>{storage}</span>
@@ -178,7 +200,16 @@
     {#each channels as channel}<label class="choice"><input type="checkbox" checked={traceVisibility[channel.id] !== false} onchange={(event) => traceVisibility = setTraceVisibility(traceVisibility, channel.id, event.currentTarget.checked)} /> {channel.label}</label>{/each}
     <span class="display-note">Display only: each plot autoscales to its unit; recording is unaffected.</span>
   </fieldset>
+  {#if ledSplitChoices.length}
+    <!-- Display-only: a box changes which traces are drawn, never the recording. -->
+    <fieldset class="led-split-controls">
+      <legend>Show by LED state</legend>
+      {#each ledSplitChoices as choice (choice.id)}<label class="choice"><input type="checkbox" checked={choice.split} onchange={(event) => onLedSplitChange(choice.id, event.currentTarget.checked)} /> {choice.label}</label>{/each}
+      <span class="display-note">Display only: four traces (RED, DARK 1, IR, DARK 2) instead of one; the recording is unaffected.</span>
+    </fieldset>
+  {/if}
   {#if pulseox}<p class="help">TX and RX plots show each raw RED, DARK 1, IR, and DARK 2 measurement. The eight raw values are recorded unchanged.</p>{/if}
+  {#if ledSequenced}<p class="help">Each record holds one LED state (RED, DARK 1, IR, or DARK 2) and every channel. A channel shown by LED state is drawn as four traces, each joining the records of its state; any other channel is drawn at the full record rate. The raw records are saved unchanged.</p>{/if}
   {#if !visibleCount}
     <p class="help">No traces are selected for display. Recording and export continue for every profile field.</p>
   {:else}
@@ -187,7 +218,7 @@
       {#each renderedGroups as group (group.id)}
         <div class="stacked-plot" role="group" aria-label={`Plot ${group.slot}: ${group.channelIds.map(labelOf).join(', ')}`}>
           {#if simulated}<div class="sim-watermark" aria-hidden="true"><span>SIMULATED DATA</span></div>{/if}
-          <div class="stacked-plot-heading"><strong>Plot {group.slot}: {group.channelIds.map(labelOf).join(' + ')}</strong><span>{unitsForGroup(group.channelIds, channelUnits, calibration)}{railText(group.channelIds)}</span></div>
+          <div class="stacked-plot-heading"><strong>Plot {group.slot}: {plotGroupHeading(channels, group.channelIds)}</strong><span>{unitsForGroup(group.channelIds.map(parentOf), channelUnits, calibration)}{railText(group.channelIds)}</span></div>
           <LivePlot {samples} {channels} visibleChannelIds={group.channelIds} {channelUnits} {calibration} {adcBits} {displayRevision} {timeOriginUs} {hardwareSource} {markers} {paused} {onPlotError} />
         </div>
       {/each}
@@ -220,9 +251,9 @@
   .plot-heading .metric-grid strong { display: inline; margin-right: .35rem; font-size: .72rem; }
   .teaching-line { margin: .4rem 0 0; padding: .25rem .6rem; border-left: 4px solid var(--wvu-gold); background: var(--warn-bg); font-size: .85rem; line-height: 1.35; }
   .help { margin: .5rem 0 0; color: var(--muted); }
-  .trace-controls { min-width: 0; border: 0; padding: 0; display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .8rem; margin: .1rem 0 .5rem; }
-  .trace-controls legend { float: left; margin: 0 .4rem 0 0; padding: 0; font-weight: 650; }
-  .trace-controls .choice { display: flex; align-items: center; gap: .4rem; font-size: .9rem; font-weight: 600; }
+  .trace-controls, .led-split-controls { min-width: 0; border: 0; padding: 0; display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .8rem; margin: .1rem 0 .5rem; }
+  .trace-controls legend, .led-split-controls legend { float: left; margin: 0 .4rem 0 0; padding: 0; font-weight: 650; }
+  .trace-controls .choice, .led-split-controls .choice { display: flex; align-items: center; gap: .4rem; font-size: .9rem; font-weight: 600; }
   .display-note { margin-left: auto; color: var(--muted); font-size: .85rem; }
   .stacked-plots { display: grid; gap: .7rem; min-width: 0; }
   .stacked-plot { position: relative; min-width: 0; min-height: 0; padding: .5rem .6rem; border: 1px solid var(--border); border-radius: .3rem; background: #f9fbfc; }

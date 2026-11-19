@@ -17,6 +17,7 @@ import {
   SIMULATOR_PORT,
   simulatorRecordingFault,
   STORAGE_REFUSED_BEFORE_START,
+  wvuFirmwareMismatch,
   type ProblemInput
 } from './messages';
 
@@ -156,6 +157,27 @@ describe('fault banner next action', () => {
     const version = fault({ faultOrigin: 'verification', failureCategory: 'wrong_protocol_version', port: 'COM5' });
     expect(version.headline).toBe('The board has a different WVU firmware version');
     expect(version.nextAction).toBe('restore_firmware');
+  });
+
+  it('says whether the board or this app is out of date for another WVU firmware build', () => {
+    for (const faultOrigin of ['verification', 'connection', 'recording']) {
+      const older = fault({ faultOrigin, failureCategory: 'older_wvu_firmware', port: 'COM5' });
+      expect(older.headline, faultOrigin).toBe('The board has an older WVU firmware version');
+      expect(older.sentence).toMatch(/Restore the WVU firmware/);
+      expect(older.nextAction).toBe('restore_firmware');
+      const newer = fault({ faultOrigin, failureCategory: 'newer_wvu_firmware', port: 'COM5' });
+      expect(newer.headline, faultOrigin).toBe('The board has a newer WVU firmware version');
+      expect(newer.sentence).toContain('This computer’s app is older than the board’s firmware.');
+      expect(newer.sentence).toContain('Update the app on this computer');
+      expect(newer.nextAction).toBe('restore_firmware');
+    }
+    // A Verify result names the same fix in the Board card's banner.
+    expect(FIRMWARE_FAILURE_MESSAGES.older_wvu_firmware).toEqual(CONNECTION_FAILURE_MESSAGES.older_wvu_firmware);
+    expect(FIRMWARE_FAILURE_MESSAGES.newer_wvu_firmware).toEqual(CONNECTION_FAILURE_MESSAGES.newer_wvu_firmware);
+    expect(wvuFirmwareMismatch('older_wvu_firmware')).toBe('older');
+    expect(wvuFirmwareMismatch('newer_wvu_firmware')).toBe('newer');
+    expect(wvuFirmwareMismatch('incompatible_firmware_identity')).toBeUndefined();
+    expect(wvuFirmwareMismatch(null)).toBeUndefined();
   });
 
   it('asks to verify again, not to retry the connection, when Verify found the port busy', () => {
@@ -338,6 +360,14 @@ describe('problem banner priority', () => {
     const failed = problemBanner({ ...quiet, board: { ...hardware, compatibility: 'verification_failed', lastFailureCategory: 'upload_failed' } });
     expect(failed?.headline).toBe('The firmware upload failed');
     expect(failed?.nextAction).toBe('restore_firmware');
+    // Verify found another WVU firmware build: not "No WVU firmware".
+    const newer = problemBanner({ ...quiet, board: { ...hardware, compatibility: 'verification_failed', lastFailureCategory: 'newer_wvu_firmware' } });
+    expect(newer?.headline).toBe('The board has a newer WVU firmware version');
+    expect(newer?.sentence).toContain('Update the app on this computer');
+    expect(newer?.nextAction).toBe('restore_firmware');
+    const older = problemBanner({ ...quiet, board: { ...hardware, compatibility: 'verification_failed', lastFailureCategory: 'older_wvu_firmware' } });
+    expect(older?.headline).toBe('The board has an older WVU firmware version');
+    expect(older?.nextAction).toBe('restore_firmware');
   });
 
   it('shows no board problem while the firmware is ready or a restore runs', () => {

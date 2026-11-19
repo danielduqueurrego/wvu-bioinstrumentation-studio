@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import uPlot from 'uplot';
-  import { visiblePlotSeries, shouldShowPlotLegend, type PlotSeries } from '$lib/multichannel';
+  import { visiblePlotSeries, shouldShowPlotLegend, traceParentId, type DisplayChannel } from '$lib/multichannel';
   import { displayedValue, displayUnitLabel, type DisplayUnit, type RecordingCalibration } from '$lib/calibration';
   import { markersInRange, type PlacedMarker } from '$lib/markers';
   import {
@@ -9,15 +9,26 @@
     formatElapsedSeconds,
     filterStartupDisplayTransient,
     layoutEndpointLabels,
+    newestTraceSample,
     plotAreaCssBounds,
-    MAX_RENDERED_DISPLAY_POINTS
+    traceRawValues,
+    MAX_RENDERED_DISPLAY_POINTS,
+    type TraceSource
   } from '$lib/live-display';
   import 'uplot/dist/uPlot.min.css';
 
-  type PlotChannel = { id: string; label: string; csv_name: string };
+  /**
+   * One trace: `valueIndex` picks its value in each record (by default its
+   * position in `channels`); a trace with `ledState` draws only the records of
+   * that LED state and is null, with the gap spanned, elsewhere. Units and
+   * calibrations are keyed by `parentId`, the lab channel.
+   */
+  type PlotChannel = DisplayChannel & { valueIndex?: number };
+  type Series = PlotChannel & { color: string };
   export let samples: Array<{ sequence: number; timestamp_us: number; values: number[] }> = [];
   export let channels: PlotChannel[] = [];
   export let visibleChannelIds: string[] = [];
+  /** Display units by lab channel (a trace's `parentId`). */
   export let channelUnits: Record<string, DisplayUnit> = {};
   export let calibration: RecordingCalibration = { adc_reference_v: 5, mpxv_sensor_supply_v: 5, channel_units: {}, active_calibrations: [] };
   export let adcBits = 12;
@@ -51,38 +62,54 @@
   let plotSignature = '';
   let failedSignature = '';
   let recoveryAttemptedSignature = '';
-  let activeSeries: PlotSeries[] = [];
+  let activeSeries: Series[] = [];
   let endpointLabels: EndpointLabel[] = [];
   let markerLines: MarkerLine[] = [];
   // The elapsed-time range of the data last given to uPlot.
   let dataRange: { min: number; max: number } | undefined;
 
-  function displayChannels(): PlotSeries[] {
+  function displayChannels(): Series[] {
     return activeSeries;
+  }
+
+  /** The record value (and LED state) a trace draws. */
+  function traceSource(channel: PlotChannel): TraceSource {
+    const valueIndex = channel.valueIndex ?? Math.max(0, channels.findIndex((candidate) => candidate.id === channel.id));
+    return { valueIndex, ledState: channel.ledState };
+  }
+
+  /**
+   * The startup-transient check of a trace. A full-rate trace of an
+   * LED-sequenced lab is checked within the first record's LED state, never
+   * against the other states' legitimately different values.
+   */
+  function transientSource(channel: PlotChannel): TraceSource {
+    const source = traceSource(channel);
+    return source.ledState === undefined && channel.ledSequenced && samples.length
+      ? { ...source, ledState: samples[0].values[0] }
+      : source;
+  }
+
+  function unitOf(channel: PlotChannel): DisplayUnit {
+    return channelUnits[traceParentId(channel)] ?? 'counts';
   }
 
   function chartData(): uPlot.AlignedData {
     const active = displayChannels();
-    const channelIndices = active
-      .map((channel) => channels.findIndex((candidate) => candidate.id === channel.id))
-      .filter((index) => index >= 0);
-    const filtered = filterStartupDisplayTransient(samples, channelIndices, adcBits, hardwareSource, timeOriginUs);
+    const filtered = filterStartupDisplayTransient(samples, active.map(transientSource), adcBits, hardwareSource, timeOriginUs);
     const bounded = filtered.slice(-maximum);
     const origin = timeOriginUs ?? bounded[0]?.timestamp_us ?? 0;
     const x = bounded.map((point) => Math.max(0, (point.timestamp_us - origin) / 1_000_000));
     dataRange = x.length ? { min: x[0], max: x[x.length - 1] } : undefined;
-    const values = active.map((channel) => {
-      const index = channels.findIndex((candidate) => candidate.id === channel.id);
-      return bounded.map((point) => {
-        const value = point.values[index] ?? 0;
-        return displayedValue(value, channel.id, channelUnits[channel.id] ?? 'counts', adcBits, calibration);
-      });
-    });
+    // A trace of one LED state is null at the other states' records.
+    const values = active.map((channel) => traceRawValues(bounded, traceSource(channel)).map((value) => value === null
+      ? null
+      : displayedValue(value, traceParentId(channel), unitOf(channel), adcBits, calibration)));
     return [x, ...values];
   }
 
   function currentSignature() {
-    return `${channels.map((channel) => channel.id).join('|')}/${visibleChannelIds.join('|')}/${JSON.stringify(channelUnits)}/${JSON.stringify(calibration)}/${adcBits}`;
+    return `${channels.map((channel) => `${channel.id}#${channel.valueIndex ?? ''}`).join('|')}/${visibleChannelIds.join('|')}/${JSON.stringify(channelUnits)}/${JSON.stringify(calibration)}/${adcBits}`;
   }
 
   function errorDetail(error: unknown): string {
@@ -147,13 +174,15 @@
           scales: { x: { time: false } },
           series: [
             {},
-            ...active.map((channel) => ({ label: channel.label, stroke: channel.color, width: 2 }))
+            // A trace of one LED state joins its own records across the
+            // other states' (null) points.
+            ...active.map((channel) => ({ label: channel.label, stroke: channel.color, width: 2, spanGaps: channel.ledState !== undefined }))
           ],
           // uPlot passes the tick spacing it chose as the 5th argument; the
           // label decimals follow it (0.25 s ticks need two decimals).
           axes: [{ values: (_u, splits, _axisIdx, _space, increment) => splits.map((value) => formatElapsedSeconds(value, increment)) }, {
-            label: new Set(active.map((channel) => displayUnitLabel(channelUnits[channel.id] ?? 'counts', calibration, channel.id))).size === 1
-              ? displayUnitLabel(channelUnits[active[0]?.id] ?? 'counts', calibration, active[0]?.id)
+            label: new Set(active.map((channel) => displayUnitLabel(unitOf(channel), calibration, traceParentId(channel)))).size === 1
+              ? displayUnitLabel(unitOf(active[0]), calibration, traceParentId(active[0]))
               : 'Mixed units'
           }],
           // The native uPlot legend is not consistently usable in the bundled
@@ -235,8 +264,9 @@
 
   /**
    * Endpoint values always use the newest exact frame returned by the bounded
-   * display query. They are converted solely for display; no endpoint overlay
-   * can alter acquisition, the serial transport, or the raw recording.
+   * display query; a trace of one LED state uses the newest record of that
+   * state. They are converted solely for display; no endpoint overlay can
+   * alter acquisition, the serial transport, or the raw recording.
    */
   function refreshEndpointLabels() {
     if (!plot || !activeSeries.length || !samples.length) {
@@ -244,21 +274,23 @@
       return;
     }
     const currentPlot = plot;
-    const newest = samples[samples.length - 1];
     // Badges are placed in CSS pixels; uPlot's bbox is in canvas pixels.
     const bounds = plotAreaCssBounds(currentPlot.bbox, uPlot.pxRatio);
-    const pending = activeSeries.map((channel) => {
-      const channelIndex = channels.findIndex((candidate) => candidate.id === channel.id);
-      const unit = channelUnits[channel.id] ?? 'counts';
-      const value = displayedValue(newest.values[channelIndex] ?? 0, channel.id, unit, adcBits, calibration);
-      return {
+    const pending = activeSeries.flatMap((channel) => {
+      const source = traceSource(channel);
+      const newest = newestTraceSample(samples, source);
+      if (!newest) return [];
+      const parent = traceParentId(channel);
+      const unit = unitOf(channel);
+      const value = displayedValue(newest.values[source.valueIndex] ?? 0, parent, unit, adcBits, calibration);
+      return [{
         id: channel.id,
         label: channel.label,
         color: channel.color,
-        value: formatLiveDisplayValue(value, unit, calibration, channel.id),
+        value: formatLiveDisplayValue(value, unit, calibration, parent),
         // CSS pixels from the top of the plotting area, which starts at bounds.top.
         naturalTop: bounds.top + currentPlot.valToPos(value, 'y')
-      };
+      }];
     });
     const positions = new Map(
       layoutEndpointLabels(pending, bounds.top, bounds.bottom)

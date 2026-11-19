@@ -179,6 +179,8 @@ describe('Install lab file', () => {
     expect(labFileDescription(summary)).toBe('General Analog — Week 3 2.0.3 (simultaneous analog: A0 Vin, A1 Vout; 500 frames/s; 14-bit ADC)');
     expect(labFileDescription({ ...summary, acquisition_mode: 'pulseox_4state', channels: [{ pin: 'A0', label: 'TX' }, { pin: 'A1', label: 'RX' }], sample_rate_hz: 250 }))
       .toContain('pulse oximetry: A0 TX, A1 RX; about 250 cycles/s');
+    expect(labFileDescription({ ...summary, acquisition_mode: 'pulseox_sequenced', channels: [{ pin: 'A0', label: 'TX' }, { pin: 'A1', label: 'RX' }], sample_rate_hz: 1000 }))
+      .toContain('(LED-sequenced pulse oximetry: A0 TX, A1 RX; 1000 records/s, one per LED state; 14-bit ADC)');
   });
 
   it('warns when the file replaces a lab and says how the instructor undoes it', () => {

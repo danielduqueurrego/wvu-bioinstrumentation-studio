@@ -18,11 +18,18 @@ pub const MAX_PAYLOAD_LEN: usize = 1024;
 
 /// Immutable identity expected from the controlled UNO R4 WiFi reference firmware.
 /// The matching values are encoded in `firmware/reference_unor4wifi`'s HELLO frame.
-pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0006;
+/// Build 0x00010007 keeps protocol 0.4 and adds the LED-sequenced mode (2),
+/// the 46-byte STATUS, and the skipped-deadline flag.
+pub const REFERENCE_FIRMWARE_BUILD: u32 = 0x0001_0007;
 pub const REFERENCE_DEVICE_ID: u32 = 0x554e_4f34;
 pub const SAMPLE_STATUS_ACQUIRING: u16 = 0x0001;
+/// Build 0x00010007 sets this only on the batch after a dropped batch.
+/// Builds up to 0x00010006 also set it after skipped sampling deadlines.
 pub const SAMPLE_STATUS_QUEUE_OVERFLOW: u16 = 0x0004;
 pub const SAMPLE_STATUS_EXPLICIT_TIMESTAMPS: u16 = 0x0008;
+/// Build 0x00010007 and later: the firmware skipped one or more sampling
+/// deadlines since the previous batch (no record and no sequence gap).
+pub const SAMPLE_STATUS_DEADLINE_SKIPPED: u16 = 0x0010;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -349,15 +356,25 @@ pub struct IntegrityCounters {
     pub reconnects: u64,
     pub disconnect_events: u64,
     /// Records in received sample batches that carry
-    /// `SAMPLE_STATUS_QUEUE_OVERFLOW`. The controlled firmware sets that flag
-    /// on the next batch after it skipped one or more sampling deadlines (no
-    /// record and no sequence gap) or dropped a full batch. Skipped deadlines
-    /// appear in no other counter, so this is counted separately and never
-    /// added to `firmware_overflows`, which would double count real queue
-    /// overflows. Every record of such a batch stores the flag in its BMEG
-    /// status field. Metadata written before this field existed reads as 0.
+    /// `SAMPLE_STATUS_QUEUE_OVERFLOW`. Firmware build 0x00010007 sets that
+    /// flag only on the batch after a dropped batch; builds up to 0x00010006
+    /// also set it after skipped sampling deadlines (no record and no
+    /// sequence gap). It is counted separately and never added to
+    /// `firmware_overflows`, which would double count real queue overflows.
+    /// Every record of such a batch stores the flag in its BMEG status field.
+    /// Metadata written before this field existed reads as 0.
     #[serde(default)]
     pub overrun_flagged_records: u64,
+    /// Records in received sample batches that carry
+    /// `SAMPLE_STATUS_DEADLINE_SKIPPED` (build 0x00010007 and later): the
+    /// firmware skipped one or more sampling deadlines before that batch.
+    /// Metadata written before this field existed reads as 0.
+    #[serde(default)]
+    pub deadline_skip_flagged_records: u64,
+    /// LED-sequenced pulse-ox records whose LED-state field is not
+    /// `sequence % 4`. Metadata written before this field existed reads as 0.
+    #[serde(default)]
+    pub led_state_mismatches: u64,
 }
 #[derive(Default)]
 pub struct IntegrityMonitor {
@@ -393,6 +410,9 @@ impl IntegrityMonitor {
         }
         if status_flags & SAMPLE_STATUS_QUEUE_OVERFLOW != 0 {
             self.counters.overrun_flagged_records += u64::from(count);
+        }
+        if status_flags & SAMPLE_STATUS_DEADLINE_SKIPPED != 0 {
+            self.counters.deadline_skip_flagged_records += u64::from(count);
         }
         if let Some(next) = self.sample_next {
             observe_sequence_delta(
@@ -574,11 +594,38 @@ mod tests {
     }
 
     #[test]
+    fn build_seven_deadline_skip_flags_are_counted_apart_from_dropped_batches() {
+        let mut monitor = IntegrityMonitor::default();
+        monitor.observe_samples(0, 10, SAMPLE_STATUS_ACQUIRING, Some(0));
+        // Two deadlines skipped before this batch.
+        monitor.observe_samples(
+            10,
+            10,
+            SAMPLE_STATUS_ACQUIRING | SAMPLE_STATUS_DEADLINE_SKIPPED,
+            Some(0),
+        );
+        // A dropped batch (records 20..30) marks the next one 0x0004.
+        monitor.observe_samples(
+            30,
+            4,
+            SAMPLE_STATUS_ACQUIRING | SAMPLE_STATUS_QUEUE_OVERFLOW,
+            Some(1),
+        );
+        assert_eq!(monitor.counters.deadline_skip_flagged_records, 10);
+        assert_eq!(monitor.counters.overrun_flagged_records, 4);
+        assert_eq!(monitor.counters.firmware_overflows, 1);
+        assert_eq!(monitor.counters.missing_sample_sequences, 10);
+        assert_eq!(monitor.counters.led_state_mismatches, 0);
+    }
+
+    #[test]
     fn integrity_counters_written_before_the_flag_counter_still_read() {
         let legacy = serde_json::to_value(IntegrityCounters::default())
             .map(|mut value| {
                 if let Some(object) = value.as_object_mut() {
                     object.remove("overrun_flagged_records");
+                    object.remove("deadline_skip_flagged_records");
+                    object.remove("led_state_mismatches");
                 }
                 value
             })
@@ -586,6 +633,8 @@ mod tests {
         let counters: IntegrityCounters =
             serde_json::from_value(legacy).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(counters.overrun_flagged_records, 0);
+        assert_eq!(counters.deadline_skip_flagged_records, 0);
+        assert_eq!(counters.led_state_mismatches, 0);
     }
 
     #[test]

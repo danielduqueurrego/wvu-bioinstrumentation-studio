@@ -7,12 +7,12 @@ Teaching use only — not a medical device. Follow BMEG 420L lab instructions an
 ## Capabilities
 
 - Automatic Arduino UNO R4 WiFi discovery, WVU firmware verification, and controlled firmware restoration with a guided restore window.
-- ECG capture; EMG + pressure capture; blood pressure + PPG capture; raw four-state pulse-ox capture; and Op Amp Lab capture (Vmid and Vout).
+- ECG capture; EMG + pressure capture; blood pressure + PPG capture; raw LED-sequenced pulse-ox capture (one row per RED/DARK/IR/DARK state, optionally with other analog signals); and Op Amp Lab capture (Vmid and Vout).
 - Synchronized acquisition of one to six analog channels with configurable plot grouping and per-trace visibility.
 - Color-coded legends for plots containing multiple visible signals, a synchronized 0.5–30 s live display window, and persistent newest-value labels in the selected display units.
 - Display-only decimation for longer live windows while recorded BMEG and CSV data remain full-rate.
 - Live plot time axes use elapsed recording seconds, starting at 0 for the first accepted frame; they are not calendar timestamps.
-- Firmware-measured timestamps are preserved for every synchronized record, including each completed pulse-ox cycle.
+- Firmware-measured timestamps are preserved for every synchronized record, including each pulse-ox LED state.
 - Counts, volts, MPXV pressure conversion, and student-created local linear calibration for supported channels.
 - Project-folder and trial-folder organization with automatic raw BMEG, CSV, and metadata output. Recording markers are preserved in metadata.
 - Every recording is finalized, even when it ends early. The metadata is written before the CSV, and a summary card shows which files were saved.
@@ -129,7 +129,7 @@ See the concise [Student Quick Start](docs/STUDENT_QUICK_START.md) and the [Trou
 | ECG — Course Capture | A0 ECG | 1000 frames/s | 14 bit |
 | EMG + Force — Course Capture | A0 raw EMG, A1 rectified EMG, A2 envelope, A3 pressure surrogate | 1000 frames/s | 14 bit |
 | Blood Pressure + PPG — Course Capture | A0 PPG, A1 MPXV, A2 XGZP; D4 green LED | 200 frames/s | 14 bit |
-| Pulse Oximetry — TX + RX Raw Capture | A0 TX, A1 RX; D5 red, D6 IR | about 250 cycles/s | 14 bit |
+| Pulse Oximetry — TX + RX Raw Capture | A0 TX, A1 RX; D5 red, D6 IR | 1000 rows/s (one per LED state) | 14 bit |
 | General Analog — Development | 1–6 inputs selected from A0–A5 | 1000 frames/s | 14 bit |
 | Op Amp Lab | A0 Vmid, A1 Vout | 100 frames/s | 14 bit |
 
@@ -143,7 +143,7 @@ Generated filenames start with the local date and time, then the selected lab's 
 
 Live plot windowing, trace visibility, legends, endpoint labels, and display decimation do not alter the recorded raw samples.
 
-Pulse oximetry schedules RED, DARK 1, IR, and DARK 2 on one absolute firmware timeline and preserves the resulting raw TX/RX measurements and actual cycle timestamps. Bounded acquisition and transmit queues keep packet construction and USB backpressure out of the sampling path and report overflow explicitly. The application does not subtract ambient states, calculate SpO2, calculate heart rate, or perform physiological interpretation.
+Pulse oximetry schedules RED, DARK 1, IR, and DARK 2 on one absolute firmware timeline, reads every input of the lab at the end of each state, and preserves the raw measurements, the LED state of each row, and the actual timestamps. The firmware for this version is build `0x00010007`: after updating the app on every lab computer, restore each board once. Bounded acquisition and transmit queues keep packet construction and USB backpressure out of the sampling path and report overflow explicitly. The application does not subtract ambient states, calculate SpO2, calculate heart rate, or perform physiological interpretation.
 
 ## Building from source
 

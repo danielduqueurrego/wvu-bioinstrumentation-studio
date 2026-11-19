@@ -7,20 +7,28 @@ import {
   assignChannelToPlot,
   channelColor,
   defaultPlotGroups,
+  initialPlotGroups,
   initialTraceVisibility,
+  isLedSequencedProfile,
   isPulseOxProfile,
   labRevisionKey,
+  ledSplitChoices,
+  ledTraceId,
   normalizePlotGroups,
   numberedVisiblePlotGroups,
   onePlotPerSignal,
   overlayAll,
   plotChannelsFor,
+  plotGroupHeading,
+  plotLayoutKey,
   profileChannels,
   PULSEOX_PLOT_CHANNELS,
+  remapTraceLayout,
   seriesColor,
   setPlotGroupCount,
   setTraceVisibility,
   shouldShowPlotLegend,
+  unitChannelsFor,
   visiblePlotSeries,
   visiblePlotGroups,
   visibleChannelIds,
@@ -244,9 +252,9 @@ describe('multi-channel UI helpers', () => {
     const channels = plotChannelsFor(opAmp);
     expect(channels.map((channel) => [channel.id, channel.label])).toEqual([['vmid', 'Vmid (A0)'], ['vout', 'Vout (A1)']]);
     // Counts and volts, starting in counts, like any other analog channel.
-    expect(initialChannelUnits(channels, opAmp.category)).toEqual({ vmid: 'counts', vout: 'counts' });
+    expect(initialChannelUnits(channels)).toEqual({ vmid: 'counts', vout: 'counts' });
     for (const channel of channels) {
-      expect(supportedDisplayUnits(opAmp.category, channel.id, false, channel.allowed_conversions ?? [])).toEqual(['counts', 'volts']);
+      expect(supportedDisplayUnits(channel.id, false, channel.allowed_conversions ?? [])).toEqual(['counts', 'volts']);
     }
     // The lab's plot defaults (one plot per signal) match the generic default.
     const fromLab = normalizePlotGroups(
@@ -255,5 +263,220 @@ describe('multi-channel UI helpers', () => {
     );
     expect(fromLab.map((group) => group.channelIds)).toEqual([['vmid'], ['vout']]);
     expect(defaultPlotGroups(opAmp.category, channels).map((group) => group.channelIds)).toEqual([['vmid'], ['vout']]);
+  });
+});
+
+describe('LED-sequenced plot traces (display-only)', () => {
+  // The built-in pulse-ox lab 1.0.0 (legacy 4-state), kept in profiles/legacy/.
+  const legacyPulse = JSON.parse(
+    readFileSync(resolve(process.cwd(), 'profiles', 'legacy', 'pulseox_tx_rx_course_capture_1.0.0.profile.json'), 'utf8')
+  ) as LabProfile;
+  // The built-in pulse-ox lab 1.1.0 as shipped.
+  const builtInSequenced = JSON.parse(
+    readFileSync(resolve(process.cwd(), 'profiles', 'pulseox_tx_rx_course_capture.profile.json'), 'utf8')
+  ) as LabProfile;
+  // The built-in 1.1.0 lab built from 1.0.0: tx (A0) and rx (A1), both shown by LED state.
+  const sequenced: LabProfile = {
+    ...legacyPulse,
+    profile_version: '1.1.0',
+    required_firmware: { ...legacyPulse.required_firmware, build: '0x00010007' },
+    acquisition: {
+      ...legacyPulse.acquisition,
+      acquisition_mode: 'pulseox_sequenced',
+      analog_inputs: undefined,
+      led_outputs: undefined,
+      sample_rate_hz: 1000,
+      state_dwell_us: 1000,
+      channels: [
+        { pin: 'A0', id: 'tx', label: 'TX', csv_name: 'tx_counts', units: 'ADC counts', allowed_conversions: ['counts_volts'], split_by_led_state: true },
+        { pin: 'A1', id: 'rx', label: 'RX', csv_name: 'rx_counts', units: 'ADC counts', allowed_conversions: ['counts_volts'], split_by_led_state: true }
+      ]
+    },
+    plot_defaults: { groups: [{ channel_ids: ['tx'] }, { channel_ids: ['rx'] }] }
+  };
+  const withSplit = (tx: boolean, rx: boolean): LabProfile => ({
+    ...sequenced,
+    acquisition: {
+      ...sequenced.acquisition,
+      channels: sequenced.acquisition.channels!.map((channel) => ({ ...channel, split_by_led_state: channel.id === 'tx' ? tx : rx }))
+    }
+  });
+  const opAmp = JSON.parse(
+    readFileSync(resolve(process.cwd(), 'profiles', 'op_amp_course_capture.profile.json'), 'utf8')
+  ) as LabProfile;
+
+  it('matches the built-in pulse-ox lab 1.1.0, whose 1.0.0 stays a legacy 4-state lab', () => {
+    expect(builtInSequenced.profile_version).toBe('1.1.0');
+    expect(builtInSequenced.acquisition).toEqual(sequenced.acquisition);
+    expect(builtInSequenced.plot_defaults).toEqual(sequenced.plot_defaults);
+    expect(builtInSequenced.required_firmware).toEqual(sequenced.required_firmware);
+    expect(isLedSequencedProfile(builtInSequenced)).toBe(true);
+    expect(isPulseOxProfile(legacyPulse)).toBe(true);
+    expect(legacyPulse.profile_version).toBe('1.0.0');
+    expect(plotChannelsFor(builtInSequenced).map((trace) => trace.label)).toEqual([
+      'TX — RED', 'TX — DARK 1', 'TX — IR', 'TX — DARK 2',
+      'RX — RED', 'RX — DARK 1', 'RX — IR', 'RX — DARK 2'
+    ]);
+  });
+
+  it('expands a channel shown by LED state into four traces and keeps the others at the full record rate', () => {
+    expect(isLedSequencedProfile(sequenced)).toBe(true);
+    expect(isPulseOxProfile(sequenced)).toBe(false);
+    const traces = plotChannelsFor(withSplit(true, false));
+    expect(traces.map((trace) => [trace.id, trace.label, trace.valueIndex, trace.ledState, trace.parentId])).toEqual([
+      ['led:0:tx', 'TX — RED', 1, 0, 'tx'],
+      ['led:1:tx', 'TX — DARK 1', 1, 1, 'tx'],
+      ['led:2:tx', 'TX — IR', 1, 2, 'tx'],
+      ['led:3:tx', 'TX — DARK 2', 1, 3, 'tx'],
+      ['rx', 'RX', 2, undefined, 'rx']
+    ]);
+    expect(traces.every((trace) => trace.ledSequenced)).toBe(true);
+    expect(ledTraceId(2, 'rx')).toBe('led:2:rx');
+    // The display-only choice overrides the lab's default either way.
+    expect(plotChannelsFor(sequenced, { tx: false }).map((trace) => trace.id))
+      .toEqual(['tx', 'led:0:rx', 'led:1:rx', 'led:2:rx', 'led:3:rx']);
+    expect(plotChannelsFor(withSplit(false, false), { rx: true }).map((trace) => trace.id))
+      .toEqual(['tx', 'led:0:rx', 'led:1:rx', 'led:2:rx', 'led:3:rx']);
+    expect(ledSplitChoices(sequenced, { rx: false })).toEqual([
+      { id: 'tx', label: 'TX', split: true },
+      { id: 'rx', label: 'RX', split: false }
+    ]);
+    expect(ledSplitChoices(legacyPulse)).toEqual([]);
+    expect(ledSplitChoices(opAmp)).toEqual([]);
+  });
+
+  it('maps every trace to its record value: its position, a legacy raw field, or 1 + the channel after the LED state', () => {
+    expect(plotChannelsFor(opAmp).map((trace) => [trace.id, trace.valueIndex, trace.parentId]))
+      .toEqual([['vmid', 0, 'vmid'], ['vout', 1, 'vout']]);
+    expect(plotChannelsFor(legacyPulse).map((trace) => trace.valueIndex)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(plotChannelsFor(legacyPulse).every((trace) => trace.rawPulseField && trace.parentId === trace.id)).toBe(true);
+    expect(plotChannelsFor(withSplit(false, false)).map((trace) => [trace.id, trace.valueIndex])).toEqual([['tx', 1], ['rx', 2]]);
+    // Units belong to the lab channels, never to their LED-state traces.
+    expect(unitChannelsFor(sequenced).map((field) => [field.id, field.valueIndex])).toEqual([['tx', 1], ['rx', 2]]);
+    expect(unitChannelsFor(legacyPulse).map((field) => field.id)).toEqual(PULSEOX_PLOT_CHANNELS.map((field) => field.id));
+    expect(unitChannelsFor(opAmp).map((field) => field.id)).toEqual(['vmid', 'vout']);
+    // Showing a channel by LED state does not change the lab's layout key.
+    expect(plotLayoutKey(sequenced)).toBe(plotLayoutKey(withSplit(false, true)));
+    expect(plotLayoutKey(sequenced)).not.toBe(plotLayoutKey(legacyPulse));
+    expect(plotLayoutKey(undefined)).toBe('');
+  });
+
+  it('starts with one plot per lab channel, a split channel keeping its four traces together', () => {
+    const traces = plotChannelsFor(withSplit(true, false));
+    // A pulse-ox category does not make the sequenced lab use the legacy TX/RX fields.
+    expect(defaultPlotGroups('course_pulseox', traces).map((group) => group.channelIds)).toEqual([
+      ['led:0:tx', 'led:1:tx', 'led:2:tx', 'led:3:tx'],
+      ['rx']
+    ]);
+    // Even an ECG-category sequenced lab gets one plot per channel.
+    expect(defaultPlotGroups('course_ecg', plotChannelsFor(withSplit(false, false))).map((group) => group.channelIds))
+      .toEqual([['tx'], ['rx']]);
+    // The legacy raw fields keep their TX and RX plots, whatever the category.
+    expect(defaultPlotGroups('development', [...PULSEOX_PLOT_CHANNELS]).map((group) => group.channelIds)).toEqual([
+      ['red_tx', 'dark1_tx', 'ir_tx', 'dark2_tx'],
+      ['red_rx', 'dark1_rx', 'ir_rx', 'dark2_rx']
+    ]);
+  });
+
+  it('honours the lab plot defaults in every mode, a channel ID standing for all of its traces', () => {
+    const overlay = { ...withSplit(true, true), plot_defaults: { groups: [{ channel_ids: ['rx', 'tx'] }] } };
+    expect(initialPlotGroups(overlay, plotChannelsFor(overlay)).map((group) => group.channelIds)).toEqual([[
+      'led:0:rx', 'led:1:rx', 'led:2:rx', 'led:3:rx', 'led:0:tx', 'led:1:tx', 'led:2:tx', 'led:3:tx'
+    ]]);
+    expect(initialPlotGroups(sequenced, plotChannelsFor(sequenced)).map((group) => group.channelIds)).toEqual([
+      ['led:0:tx', 'led:1:tx', 'led:2:tx', 'led:3:tx'],
+      ['led:0:rx', 'led:1:rx', 'led:2:rx', 'led:3:rx']
+    ]);
+    // Legacy 4-state: its own plot defaults (here, one overlay) are used too.
+    const legacyOverlay = { ...legacyPulse, plot_defaults: { groups: [{ channel_ids: PULSEOX_PLOT_CHANNELS.map((field) => field.id) }] } };
+    expect(initialPlotGroups(legacyOverlay, [...PULSEOX_PLOT_CHANNELS])).toHaveLength(1);
+    expect(initialPlotGroups(legacyPulse, [...PULSEOX_PLOT_CHANNELS]).map((group) => group.channelIds)).toEqual([
+      ['red_tx', 'dark1_tx', 'ir_tx', 'dark2_tx'],
+      ['red_rx', 'dark1_rx', 'ir_rx', 'dark2_rx']
+    ]);
+    // Simultaneous: the defaults' order is kept; without defaults, the mode's defaults apply.
+    const reversed = { ...opAmp, plot_defaults: { groups: [{ channel_ids: ['vout', 'vmid'] }] } };
+    expect(initialPlotGroups(reversed, plotChannelsFor(reversed)).map((group) => group.channelIds)).toEqual([['vout', 'vmid']]);
+    const noDefaults = { ...opAmp, plot_defaults: undefined };
+    expect(initialPlotGroups(noDefaults, plotChannelsFor(noDefaults)).map((group) => group.channelIds)).toEqual([['vmid'], ['vout']]);
+  });
+
+  it('carries visibility and plots over when a channel is shown, or no longer shown, by LED state', () => {
+    const before = plotChannelsFor(withSplit(false, false));
+    let groups = initialPlotGroups(sequenced, before);
+    let visibility = setTraceVisibility(initialTraceVisibility(before), 'rx', false);
+    expect(groups.map((group) => group.channelIds)).toEqual([['tx'], ['rx']]);
+
+    const split = plotChannelsFor(withSplit(true, true));
+    ({ groups, visibility } = remapTraceLayout(before, groups, visibility, split));
+    expect(groups.map((group) => group.channelIds)).toEqual([
+      ['led:0:tx', 'led:1:tx', 'led:2:tx', 'led:3:tx'],
+      ['led:0:rx', 'led:1:rx', 'led:2:rx', 'led:3:rx']
+    ]);
+    // A hidden channel's traces stay hidden; a visible one's are shown.
+    expect(visibleChannelIds(split, visibility)).toEqual(['led:0:tx', 'led:1:tx', 'led:2:tx', 'led:3:tx']);
+
+    // Hide one LED-state trace and move another; merging back keeps the first plot of the channel.
+    visibility = setTraceVisibility(visibility, 'led:1:tx', false);
+    groups = assignChannelToPlot(split, groups, 'led:3:tx', 1);
+    const after = plotChannelsFor(withSplit(false, true));
+    ({ groups, visibility } = remapTraceLayout(split, groups, visibility, after));
+    expect(groups.map((group) => group.channelIds)).toEqual([['tx'], ['led:0:rx', 'led:1:rx', 'led:2:rx', 'led:3:rx']]);
+    expect(visibility.tx).toBe(true);
+    expect(visibility['led:0:rx']).toBe(false);
+  });
+
+  it('colours LED-state traces by state, alternate channels in the lighter shade, and never by visibility', () => {
+    const traces = plotChannelsFor(withSplit(true, true));
+    const legacy = [...PULSEOX_PLOT_CHANNELS];
+    expect(channelColor(traces, 'led:0:tx')).toBe(channelColor(legacy, 'red_tx'));
+    expect(channelColor(traces, 'led:0:rx')).toBe(channelColor(legacy, 'red_rx'));
+    expect(channelColor(traces, 'led:2:tx')).toBe(channelColor(legacy, 'ir_tx'));
+    expect(new Set(traces.map((trace) => channelColor(traces, trace.id))).size).toBe(8);
+    // An unsplit channel keeps its position colour whether or not the other channel is split.
+    expect(channelColor(plotChannelsFor(withSplit(true, false)), 'rx')).toBe(seriesColor(1));
+    expect(channelColor(plotChannelsFor(withSplit(false, false)), 'rx')).toBe(seriesColor(1));
+    const all = visiblePlotSeries(traces, traces.map((trace) => trace.id));
+    const someHidden = visiblePlotSeries(traces, ['led:2:tx', 'led:3:rx']);
+    expect(someHidden.map((series) => series.color)).toEqual([
+      all.find((series) => series.id === 'led:2:tx')?.color,
+      all.find((series) => series.id === 'led:3:rx')?.color
+    ]);
+  });
+
+  it('never gives a full-rate channel a colour that reads as the RED or IR traces beside it', () => {
+    // Six channels: the first shown by LED state, the other five at the full record rate.
+    const six: LabProfile = {
+      ...sequenced,
+      acquisition: {
+        ...sequenced.acquisition,
+        channels: ['A0', 'A1', 'A2', 'A3', 'A4', 'A5'].map((pin, index) => ({
+          pin, id: `ch${index}`, label: `Channel ${index}`, csv_name: `ch${index}_counts`, units: 'ADC counts', allowed_conversions: ['counts_volts'],
+          ...(index === 0 ? { split_by_led_state: true } : {})
+        }))
+      }
+    };
+    const traces = plotChannelsFor(six);
+    const ledColours = traces.filter((trace) => trace.ledState !== undefined).map((trace) => channelColor(traces, trace.id));
+    const fullRate = traces.filter((trace) => trace.ledState === undefined).map((trace) => channelColor(traces, trace.id));
+    expect(new Set([...ledColours, ...fullRate]).size).toBe(9);
+    // Neither the red nor the purple of the general palette, which resemble RED and IR.
+    for (const colour of fullRate) expect([seriesColor(3), seriesColor(4)]).not.toContain(colour);
+    // Unsplit, every channel still has its own colour; simultaneous labs keep theirs.
+    const unsplit = plotChannelsFor(six, { ch0: false });
+    expect(new Set(unsplit.map((trace) => channelColor(unsplit, trace.id))).size).toBe(6);
+    expect(channelColor(unsplit, 'ch0')).toBe(seriesColor(0));
+    const opAmpTraces = plotChannelsFor(opAmp);
+    expect(opAmpTraces.map((trace) => channelColor(opAmpTraces, trace.id))).toEqual([seriesColor(0), seriesColor(1)]);
+  });
+
+  it('names the LED-state traces of a channel once in a plot heading', () => {
+    const traces = plotChannelsFor(withSplit(true, false));
+    expect(plotGroupHeading(traces, ['led:0:tx', 'led:1:tx', 'led:2:tx', 'led:3:tx'])).toBe('TX — RED, DARK 1, IR, DARK 2');
+    expect(plotGroupHeading(traces, ['led:0:tx', 'rx', 'led:2:tx'])).toBe('TX — RED, IR + RX');
+    expect(plotGroupHeading(traces, ['rx'])).toBe('RX');
+    const legacy = [...PULSEOX_PLOT_CHANNELS];
+    expect(plotGroupHeading(legacy, ['red_tx', 'ir_tx'])).toBe('TX Red + TX IR');
+    expect(plotGroupHeading(traces, ['missing'])).toBe('missing');
   });
 });

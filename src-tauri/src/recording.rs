@@ -7,7 +7,10 @@ use crate::{
         apply_linear, counts_to_volts, mpxv_kpa, mpxv_mmhg, CalibrationPreset, CalibrationType,
         RecordingCalibration, DEFAULT_ADC_REFERENCE_V, DEFAULT_MPXV_SUPPLY_V,
     },
-    profiles::ProfileSnapshot,
+    profiles::{
+        led_state_name, AcquisitionMode, AcquisitionSettings, ProfileChannel, ProfileSnapshot,
+        LED_STATE_NAMES,
+    },
     protocol::IntegrityCounters,
 };
 use chrono::{DateTime, Local, Utc};
@@ -20,8 +23,10 @@ use std::{
 };
 pub const BMEG_MAGIC: &[u8; 8] = b"BMEGREC1";
 pub const BMEG_RECORD_BYTES: usize = 14;
-/// Synchronized records carry at most eight u16 fields (pulse ox: TX/RX x
-/// RED, DARK 1, IR, DARK 2). The bound keeps one record encodable on the stack.
+/// Synchronized records carry at most eight u16 fields (legacy 4-state pulse
+/// ox: TX/RX x RED, DARK 1, IR, DARK 2; LED-sequenced pulse ox uses at most
+/// seven: the LED state and six channels). The bound keeps one record
+/// encodable on the stack.
 pub const MAX_SYNCHRONIZED_FIELDS: usize = 8;
 const SYNCHRONIZED_RECORD_PREFIX_BYTES: usize = 14;
 
@@ -181,6 +186,11 @@ pub struct RecordingMetadata {
     /// fall back to `protocol_version`/profile detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_layout: Option<RecordLayout>,
+    /// The field layout of an LED-sequenced pulse-ox recording (one record
+    /// per LED state, field 0 the LED state). Absent for other modes and for
+    /// files written before the mode existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub led_sequenced_layout: Option<LedSequencedLayout>,
     /// Host time when the recording session was prepared (before the
     /// handshake). `utc_start`/`local_start` are stamped immediately before
     /// START so they describe acquisition, not connection setup.
@@ -223,6 +233,16 @@ pub struct AcquisitionTimingDiagnostics {
     /// RED, DARK 1, IR, and DARK 2 respectively.
     #[serde(default)]
     pub pulse_state_maximum_error_us: Option<[u32; 4]>,
+    /// Sampling deadlines the firmware skipped during the run, from the
+    /// terminal STATUS of firmware build 0x00010007 and later. Absent when
+    /// that STATUS was not received or the firmware is older.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_skipped_deadlines: Option<u64>,
+    /// Shortest time in microseconds from an LED edge to the sample of that
+    /// pulse-ox state, from the same terminal STATUS. Absent for simultaneous
+    /// analog captures and when no pulse-ox state was sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_pulse_settle_us: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -282,6 +302,41 @@ pub struct SynchronizedRecord {
     pub timestamp_us: u64,
     pub status_flags: u16,
     pub counts: Vec<u16>,
+}
+
+/// How an LED-sequenced pulse-ox recording's records are laid out. It is
+/// written into the BMEG header and the metadata sidecar, so a reader does
+/// not have to derive it from the lab snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LedSequencedLayout {
+    /// The record fields in order: `led_state`, then each channel's raw ADC
+    /// counts (its CSV field name) in the lab's channel order.
+    pub record_fields: Vec<String>,
+    /// LED-state names by code (field 0): RED, DARK1, IR, DARK2.
+    pub led_state_names: Vec<String>,
+    /// LED states per cycle. A record's LED state is
+    /// `record_sequence % states_per_cycle` and its cycle is
+    /// `record_sequence / states_per_cycle` (the CSV's `cycle_index`).
+    pub states_per_cycle: u32,
+    /// Nominal duration of one LED state; one record is taken per state,
+    /// while that state's LED is still on.
+    pub state_dwell_us: u32,
+}
+
+impl LedSequencedLayout {
+    /// The layout of a recording of `acquisition`, or `None` when the lab
+    /// does not use the LED-sequenced mode.
+    pub fn for_acquisition(acquisition: &AcquisitionSettings) -> Option<Self> {
+        acquisition.is_led_sequenced().then(|| Self {
+            record_fields: acquisition.record_field_names(),
+            led_state_names: LED_STATE_NAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            states_per_cycle: LED_STATE_NAMES.len() as u32,
+            state_dwell_us: acquisition.state_dwell_us.unwrap_or_default(),
+        })
+    }
 }
 
 /// Raw record encoding. It is written into every new BMEG header so a reader
@@ -694,13 +749,122 @@ fn finish_csv(writer: BufWriter<File>) -> Result<(), RecordingError> {
     Ok(())
 }
 
-/// Loop-invariant export decisions for one simultaneous channel. Computing
-/// them once keeps per-record work to arithmetic and formatting.
+/// Loop-invariant export decisions for one channel (simultaneous or
+/// LED-sequenced). Computing them once keeps per-record work to arithmetic
+/// and formatting.
 struct ChannelCsvPlan<'a> {
     preset: Option<&'a CalibrationPreset>,
     emit_mmhg: bool,
 }
 
+/// The fixed leading CSV columns of a simultaneous recording.
+const SIMULTANEOUS_CSV_PREFIX: [&str; 2] = ["record_sequence", "t_us"];
+/// The fixed leading CSV columns of an LED-sequenced pulse-ox recording.
+const LED_SEQUENCED_CSV_PREFIX: [&str; 5] = [
+    "record_sequence",
+    "t_us",
+    "cycle_index",
+    "led_state",
+    "led_state_name",
+];
+
+/// Each channel's columns, in order: raw counts, `_V`, and the columns of
+/// its active calibration (MPXV kPa and, when shown, mmHg; or one linear
+/// calibration column). Shared by the simultaneous and LED-sequenced CSVs.
+fn plan_channel_columns<'a>(
+    channels: &[ProfileChannel],
+    calibration: &'a RecordingCalibration,
+) -> (Vec<CsvColumn>, Vec<ChannelCsvPlan<'a>>) {
+    let mut columns = Vec::new();
+    let mut plans = Vec::with_capacity(channels.len());
+    for channel in channels {
+        columns.push(CsvColumn::fixed(channel.csv_name.clone()));
+        columns.push(CsvColumn::fixed(voltage_column_name(&channel.csv_name)));
+        let preset = calibration.for_channel(&channel.id);
+        let emit_mmhg = channel.id == "mpxv"
+            || calibration
+                .channel_units
+                .get(&channel.id)
+                .is_some_and(|unit| unit == "mmhg");
+        if let Some(preset) = preset {
+            match preset.calibration_type {
+                CalibrationType::FixedFormula => {
+                    columns.push(CsvColumn::fixed(derived_column_name(
+                        &channel.csv_name,
+                        "kPa",
+                    )));
+                    if emit_mmhg {
+                        columns.push(CsvColumn::fixed(derived_column_name(
+                            &channel.csv_name,
+                            "mmHg",
+                        )));
+                    }
+                }
+                CalibrationType::Linear => {
+                    columns.push(CsvColumn::calibrated(
+                        &channel.csv_name,
+                        &preset.output_units,
+                    ));
+                }
+            }
+        }
+        plans.push(ChannelCsvPlan { preset, emit_mmhg });
+    }
+    (columns, plans)
+}
+
+/// The conversions a CSV applies to raw counts, fixed for the whole file.
+struct CsvConversion {
+    adc_bits: u8,
+    adc_reference_v: f64,
+    sensor_supply_v: f64,
+}
+
+/// Writes each channel's planned values: `,counts,volts` and its
+/// calibrated values. `counts` holds exactly one value per plan.
+fn write_channel_values(
+    writer: &mut impl Write,
+    counts: &[u16],
+    plans: &[ChannelCsvPlan<'_>],
+    conversion: &CsvConversion,
+) -> Result<(), RecordingError> {
+    if counts.len() != plans.len() {
+        return Err(RecordingError::InvalidRecordShape);
+    }
+    for (counts, plan) in counts.iter().copied().zip(plans) {
+        let volts = counts_to_volts(counts, conversion.adc_bits, conversion.adc_reference_v)
+            .map_err(|error| RecordingError::Csv(error.to_string()))?;
+        write!(writer, ",{counts},{volts:.6}")?;
+        if let Some(preset) = plan.preset {
+            match preset.calibration_type {
+                CalibrationType::FixedFormula => {
+                    let kpa = mpxv_kpa(volts, conversion.sensor_supply_v)
+                        .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                    write!(writer, ",{kpa:.6}")?;
+                    if plan.emit_mmhg {
+                        let mmhg = mpxv_mmhg(volts, conversion.sensor_supply_v)
+                            .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                        write!(writer, ",{mmhg:.6}")?;
+                    }
+                }
+                CalibrationType::Linear => {
+                    let value = apply_linear(volts, preset)
+                        .map_err(|error| RecordingError::Csv(error.to_string()))?;
+                    write!(writer, ",{value:.6}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Synchronized CSV export. The legacy 4-state pulse-ox CSV is
+/// `cycle_index,t_us,red_TX,…,dark2_RX` (raw counts only). A simultaneous
+/// CSV is `record_sequence,t_us` and each channel's planned columns. An
+/// LED-sequenced CSV is `record_sequence,t_us,cycle_index,led_state,
+/// led_state_name` and then the same channel columns: one row per LED state,
+/// `cycle_index = record_sequence / 4`, and a state code outside 0–3 written
+/// as-is with the name `UNKNOWN`.
 fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, RecordingError> {
     let snapshot = input
         .metadata
@@ -708,10 +872,7 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
         .clone()
         .ok_or(RecordingError::InvalidRecordShape)?;
     let fields = snapshot.profile.acquisition.record_field_names();
-    let pulseox = matches!(
-        snapshot.profile.acquisition.acquisition_mode,
-        crate::profiles::AcquisitionMode::Pulseox4State
-    );
+    let mode = snapshot.profile.acquisition.acquisition_mode.clone();
     let calibration = input.metadata.calibration.clone().unwrap_or_default();
     let adc_reference_v =
         if calibration.adc_reference_v.is_finite() && calibration.adc_reference_v > 0.0 {
@@ -726,54 +887,37 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
         } else {
             DEFAULT_MPXV_SUPPLY_V
         };
-    let adc_bits = input.metadata.adc_bits;
+    let conversion = CsvConversion {
+        adc_bits: input.metadata.adc_bits,
+        adc_reference_v,
+        sensor_supply_v,
+    };
     let mut writer = BufWriter::new(File::create(csv)?);
     // Per-channel decisions are fixed for the whole file. The column schema
     // (including the display-unit-dependent mmHg column) is unchanged here;
     // see the review note D-5 before altering it.
-    let mut channel_plans: Vec<ChannelCsvPlan<'_>> = Vec::new();
-    if pulseox {
-        writeln!(writer, "cycle_index,t_us,{}", fields.join(","))?;
-    } else {
-        let mut columns = Vec::new();
-        for channel in snapshot.profile.acquisition.resolved_channels() {
-            columns.push(CsvColumn::fixed(channel.csv_name.clone()));
-            columns.push(CsvColumn::fixed(voltage_column_name(&channel.csv_name)));
-            let preset = calibration.for_channel(&channel.id);
-            let emit_mmhg = channel.id == "mpxv"
-                || calibration
-                    .channel_units
-                    .get(&channel.id)
-                    .is_some_and(|unit| unit == "mmhg");
-            if let Some(preset) = preset {
-                match preset.calibration_type {
-                    CalibrationType::FixedFormula => {
-                        columns.push(CsvColumn::fixed(derived_column_name(
-                            &channel.csv_name,
-                            "kPa",
-                        )));
-                        if emit_mmhg {
-                            columns.push(CsvColumn::fixed(derived_column_name(
-                                &channel.csv_name,
-                                "mmHg",
-                            )));
-                        }
-                    }
-                    CalibrationType::Linear => {
-                        columns.push(CsvColumn::calibrated(
-                            &channel.csv_name,
-                            &preset.output_units,
-                        ));
-                    }
-                }
-            }
-            channel_plans.push(ChannelCsvPlan { preset, emit_mmhg });
+    let channels = snapshot.profile.acquisition.resolved_channels();
+    let (columns, channel_plans) = plan_channel_columns(&channels, &calibration);
+    match mode {
+        AcquisitionMode::Pulseox4State => {
+            writeln!(writer, "cycle_index,t_us,{}", fields.join(","))?;
         }
-        writeln!(
-            writer,
-            "record_sequence,t_us,{}",
-            csv_header_names(columns).join(",")
-        )?;
+        AcquisitionMode::Simultaneous => {
+            writeln!(
+                writer,
+                "{},{}",
+                SIMULTANEOUS_CSV_PREFIX.join(","),
+                csv_header_names(&SIMULTANEOUS_CSV_PREFIX, columns).join(",")
+            )?;
+        }
+        AcquisitionMode::PulseoxSequenced => {
+            writeln!(
+                writer,
+                "{},{}",
+                LED_SEQUENCED_CSV_PREFIX.join(","),
+                csv_header_names(&LED_SEQUENCED_CSV_PREFIX, columns).join(",")
+            )?;
+        }
     }
     let mut count = 0u64;
     while let Some(record) = input.next_record()? {
@@ -781,37 +925,27 @@ fn export_multichannel_csv(input: &mut BmegReader, csv: &Path) -> Result<u64, Re
             return Err(RecordingError::InvalidRecordShape);
         }
         write!(writer, "{},{}", record.sequence, record.timestamp_us)?;
-        if pulseox {
-            for counts in record.counts {
-                write!(writer, ",{counts}")?;
-            }
-        } else {
-            if record.counts.len() != channel_plans.len() {
-                return Err(RecordingError::InvalidRecordShape);
-            }
-            for (counts, plan) in record.counts.iter().copied().zip(&channel_plans) {
-                let volts = counts_to_volts(counts, adc_bits, adc_reference_v)
-                    .map_err(|error| RecordingError::Csv(error.to_string()))?;
-                write!(writer, ",{counts},{volts:.6}")?;
-                if let Some(preset) = plan.preset {
-                    match preset.calibration_type {
-                        CalibrationType::FixedFormula => {
-                            let kpa = mpxv_kpa(volts, sensor_supply_v)
-                                .map_err(|error| RecordingError::Csv(error.to_string()))?;
-                            write!(writer, ",{kpa:.6}")?;
-                            if plan.emit_mmhg {
-                                let mmhg = mpxv_mmhg(volts, sensor_supply_v)
-                                    .map_err(|error| RecordingError::Csv(error.to_string()))?;
-                                write!(writer, ",{mmhg:.6}")?;
-                            }
-                        }
-                        CalibrationType::Linear => {
-                            let value = apply_linear(volts, preset)
-                                .map_err(|error| RecordingError::Csv(error.to_string()))?;
-                            write!(writer, ",{value:.6}")?;
-                        }
-                    }
+        match mode {
+            AcquisitionMode::Pulseox4State => {
+                for counts in record.counts {
+                    write!(writer, ",{counts}")?;
                 }
+            }
+            AcquisitionMode::Simultaneous => {
+                write_channel_values(&mut writer, &record.counts, &channel_plans, &conversion)?;
+            }
+            AcquisitionMode::PulseoxSequenced => {
+                let (state, counts) = record
+                    .counts
+                    .split_first()
+                    .ok_or(RecordingError::InvalidRecordShape)?;
+                write!(
+                    writer,
+                    ",{},{state},{}",
+                    record.sequence / LED_STATE_NAMES.len() as u32,
+                    led_state_name(*state)
+                )?;
+                write_channel_values(&mut writer, counts, &channel_plans, &conversion)?;
             }
         }
         writer.write_all(b"\n")?;
@@ -851,14 +985,13 @@ impl CsvColumn {
     }
 }
 
-/// Final, unique, CSV-safe header names. The first column with a name keeps
-/// it; a later duplicate (for example a calibration in volts next to the
-/// `_V` column) is renamed, never silently repeated.
-fn csv_header_names(columns: Vec<CsvColumn>) -> Vec<String> {
-    let mut used: std::collections::BTreeSet<String> = ["record_sequence", "t_us"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+/// Final, unique, CSV-safe header names. The fixed leading columns keep
+/// their names, and so does the first column with a name; a later duplicate
+/// (for example a calibration in volts next to the `_V` column) is renamed,
+/// never silently repeated.
+fn csv_header_names(fixed: &[&str], columns: Vec<CsvColumn>) -> Vec<String> {
+    let mut used: std::collections::BTreeSet<String> =
+        fixed.iter().map(|name| name.to_string()).collect();
     let mut names = Vec::with_capacity(columns.len());
     for column in columns {
         let mut name = column.name;
@@ -1030,6 +1163,7 @@ mod tests {
             markers: Vec::new(),
             calibration: None,
             record_layout: None,
+            led_sequenced_layout: None,
             session_opened_utc: None,
             acquisition_started_utc: None,
             csv_error: None,
@@ -1147,6 +1281,7 @@ mod tests {
             markers: Vec::new(),
             calibration: None,
             record_layout: None,
+            led_sequenced_layout: None,
             session_opened_utc: None,
             acquisition_started_utc: None,
             csv_error: None,
@@ -1232,6 +1367,7 @@ mod tests {
             }],
             calibration: None,
             record_layout: None,
+            led_sequenced_layout: None,
             session_opened_utc: None,
             acquisition_started_utc: None,
             csv_error: None,
@@ -1315,12 +1451,8 @@ mod tests {
             .metadata
             .calibration
             .is_some());
-        let pulseox = crate::profiles::built_in_profiles()
-            .unwrap_or_else(|e| panic!("{e}"))
-            .into_iter()
-            .find(|profile| profile.category == "course_pulseox")
-            .unwrap_or_else(|| panic!("missing pulse-ox profile"))
-            .snapshot(false);
+        // The legacy 4-state layout (pulse ox 1.0.0): one 8-field cycle row.
+        let pulseox = crate::profiles::legacy_pulse_ox_lab().snapshot(false);
         metadata.profile_snapshot = Some(pulseox);
         metadata.calibration = None;
         metadata.adc_bits = 14;
@@ -1424,11 +1556,150 @@ mod tests {
             markers: Vec::new(),
             calibration: None,
             record_layout: None,
+            led_sequenced_layout: None,
             session_opened_utc: None,
             acquisition_started_utc: None,
             csv_error: None,
             finalize_error: None,
         }
+    }
+
+    #[test]
+    fn led_sequenced_csv_has_one_row_per_led_state_and_the_header_records_the_layout() {
+        let dir = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut lab = crate::profiles::sequenced_test_lab();
+        // A linear calibration of a channel whose CSV field is "led" would
+        // be named "led_state", a fixed column, so it is renamed.
+        lab.acquisition.channels[0].csv_name = "led".into();
+        let snapshot = lab.snapshot(false);
+        let layout = LedSequencedLayout::for_acquisition(&snapshot.profile.acquisition);
+        let mut metadata = layout_test_metadata(Some(snapshot.clone()), "0.4");
+        metadata.adc_bits = 14;
+        metadata.led_sequenced_layout = layout.clone();
+        let linear = |channel_id: &str, units: &str, slope: f64, offset: f64| {
+            crate::calibration::CalibrationPreset {
+                schema_version: 1,
+                calibration_id: format!("team.{channel_id}"),
+                profile_id: lab.profile_id.clone(),
+                channel_id: channel_id.into(),
+                calibration_type: crate::calibration::CalibrationType::Linear,
+                input_quantity: "volts".into(),
+                output_quantity: "other".into(),
+                output_units: units.into(),
+                parameters: BTreeMap::from([("slope".into(), slope), ("offset".into(), offset)]),
+                created_at: Utc::now(),
+                label: format!("Team {channel_id}"),
+            }
+        };
+        let presets = [
+            linear("tx", "state", 2.0, 0.0),
+            linear("rx", "mmHg", 100.0, -5.0),
+        ];
+        metadata.calibration = Some(RecordingCalibration {
+            adc_reference_v: 5.0,
+            mpxv_sensor_supply_v: 5.0,
+            channel_units: BTreeMap::new(),
+            active_calibrations: presets.to_vec(),
+        });
+        let bmeg = dir.path().join("sequenced.bmeg");
+        let csv = dir.path().join("sequenced.csv");
+        let mut writer =
+            BmegWriter::create_synchronized(&bmeg, &metadata, 3).unwrap_or_else(|e| panic!("{e}"));
+        // Sequence 5 carries a state code outside 0-3: written as-is, UNKNOWN.
+        let records = [
+            (0u32, [0u16, 4_000, 8_000]),
+            (1, [1, 100, 200]),
+            (2, [2, 4_100, 8_100]),
+            (3, [3, 110, 210]),
+            (4, [0, 4_200, 8_200]),
+            (5, [9, 120, 220]),
+        ];
+        for (sequence, counts) in records {
+            writer
+                .write_record(&SynchronizedRecord {
+                    sequence,
+                    timestamp_us: 1_000 + u64::from(sequence) * 1_000,
+                    status_flags: 1,
+                    counts: counts.to_vec(),
+                })
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        writer.finish().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            export_bmeg_csv(&bmeg, &csv).unwrap_or_else(|e| panic!("{e}")),
+            6
+        );
+        let text = std::fs::read_to_string(&csv).unwrap_or_else(|e| panic!("{e}"));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "record_sequence,t_us,cycle_index,led_state,led_state_name,led,led_V,led_cal_state,rx_counts,rx_V,rx_mmHg"
+        );
+        assert_eq!(lines.len(), 7);
+        let value = |counts: u16, preset: &crate::calibration::CalibrationPreset| {
+            let volts = counts_to_volts(counts, 14, 5.0).unwrap_or_else(|e| panic!("{e}"));
+            let calibrated = apply_linear(volts, preset).unwrap_or_else(|e| panic!("{e}"));
+            format!("{counts},{volts:.6},{calibrated:.6}")
+        };
+        for ((sequence, counts), line) in records.into_iter().zip(&lines[1..]) {
+            let name = ["RED", "DARK1", "IR", "DARK2"]
+                .get(usize::from(counts[0]))
+                .copied()
+                .unwrap_or("UNKNOWN");
+            assert_eq!(
+                *line,
+                format!(
+                    "{sequence},{},{},{},{name},{},{}",
+                    1_000 + sequence * 1_000,
+                    sequence / 4,
+                    counts[0],
+                    value(counts[1], &presets[0]),
+                    value(counts[2], &presets[1])
+                )
+            );
+        }
+        assert!(lines[6].starts_with("5,6000,1,9,UNKNOWN,120,"));
+
+        // The layout is in the BMEG header and in the metadata JSON.
+        let header = BmegReader::open(&bmeg).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(header.metadata.led_sequenced_layout, layout);
+        let layout = layout.unwrap_or_else(|| panic!("no LED-sequenced layout"));
+        assert_eq!(layout.record_fields, ["led_state", "led", "rx_counts"]);
+        assert_eq!(layout.led_state_names, ["RED", "DARK1", "IR", "DARK2"]);
+        assert_eq!(layout.states_per_cycle, 4);
+        assert_eq!(layout.state_dwell_us, 1_000);
+        let json = serde_json::to_value(&metadata).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            json["led_sequenced_layout"]["record_fields"][0],
+            "led_state"
+        );
+        // Other modes record no LED-sequenced layout, and their JSON has no
+        // key. Of the factory labs only pulse ox 1.1.0 is LED-sequenced.
+        let four_state = crate::profiles::legacy_pulse_ox_lab();
+        for profile in crate::profiles::built_in_profiles()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .chain([four_state])
+        {
+            let layout = LedSequencedLayout::for_acquisition(&profile.acquisition);
+            if profile.acquisition.is_led_sequenced() {
+                assert_eq!(profile.category, "course_pulseox");
+                let layout = layout.unwrap_or_else(|| panic!("no layout"));
+                assert_eq!(
+                    layout.record_fields,
+                    ["led_state", "tx_counts", "rx_counts"]
+                );
+                assert_eq!(layout.state_dwell_us, 1_000);
+            } else {
+                assert_eq!(layout, None, "{}", profile.profile_id);
+            }
+        }
+        let other = serde_json::to_value(layout_test_metadata(None, "0.4"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(other.get("led_sequenced_layout").is_none());
+        let read_back: RecordingMetadata =
+            serde_json::from_value(other).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(read_back.led_sequenced_layout, None);
     }
 
     #[test]
@@ -1653,6 +1924,7 @@ mod tests {
             markers: Vec::new(),
             calibration: None,
             record_layout: None,
+            led_sequenced_layout: None,
             session_opened_utc: None,
             acquisition_started_utc: None,
             csv_error: None,
@@ -1699,44 +1971,59 @@ mod tests {
     fn csv_header_names_stay_unique_and_cannot_break_the_header() {
         // Existing names are unchanged; a calibration in volts next to the
         // `_V` column and one in counts next to the raw column get `_cal_`.
-        let names = csv_header_names(vec![
-            CsvColumn::fixed("general_a0_counts".into()),
-            CsvColumn::fixed(voltage_column_name("general_a0_counts")),
-            CsvColumn::calibrated("general_a0_counts", "V"),
-        ]);
+        let names = csv_header_names(
+            &SIMULTANEOUS_CSV_PREFIX,
+            vec![
+                CsvColumn::fixed("general_a0_counts".into()),
+                CsvColumn::fixed(voltage_column_name("general_a0_counts")),
+                CsvColumn::calibrated("general_a0_counts", "V"),
+            ],
+        );
         assert_eq!(
             names,
             ["general_a0_counts", "general_a0_V", "general_a0_cal_V"]
         );
-        let names = csv_header_names(vec![
-            CsvColumn::fixed("x_counts".into()),
-            CsvColumn::fixed(voltage_column_name("x_counts")),
-            CsvColumn::calibrated("x_counts", "counts"),
-        ]);
+        let names = csv_header_names(
+            &SIMULTANEOUS_CSV_PREFIX,
+            vec![
+                CsvColumn::fixed("x_counts".into()),
+                CsvColumn::fixed(voltage_column_name("x_counts")),
+                CsvColumn::calibrated("x_counts", "counts"),
+            ],
+        );
         assert_eq!(names, ["x_counts", "x_V", "x_cal_counts"]);
         // The BP XGZP column keeps its documented name.
-        let names = csv_header_names(vec![
-            CsvColumn::fixed("xgzp_counts".into()),
-            CsvColumn::fixed(voltage_column_name("xgzp_counts")),
-            CsvColumn::calibrated("xgzp_counts", "mmHg"),
-        ]);
+        let names = csv_header_names(
+            &SIMULTANEOUS_CSV_PREFIX,
+            vec![
+                CsvColumn::fixed("xgzp_counts".into()),
+                CsvColumn::fixed(voltage_column_name("xgzp_counts")),
+                CsvColumn::calibrated("xgzp_counts", "mmHg"),
+            ],
+        );
         assert_eq!(names, ["xgzp_counts", "xgzp_V", "xgzp_mmHg"]);
         // Instructor names `x` and `x_V` (stored before the stricter rules).
-        let names = csv_header_names(vec![
-            CsvColumn::fixed("x".into()),
-            CsvColumn::fixed(voltage_column_name("x")),
-            CsvColumn::fixed("x_V".into()),
-            CsvColumn::fixed(voltage_column_name("x_V")),
-            CsvColumn::fixed("t_us".into()),
-        ]);
+        let names = csv_header_names(
+            &SIMULTANEOUS_CSV_PREFIX,
+            vec![
+                CsvColumn::fixed("x".into()),
+                CsvColumn::fixed(voltage_column_name("x")),
+                CsvColumn::fixed("x_V".into()),
+                CsvColumn::fixed(voltage_column_name("x_V")),
+                CsvColumn::fixed("t_us".into()),
+            ],
+        );
         assert_eq!(names, ["x", "x_V", "x_V_2", "x_V_V", "t_us_2"]);
         // Unsafe stored names are quoted and cannot run as formulas.
-        let names = csv_header_names(vec![
-            CsvColumn::fixed("Vout, filtered".into()),
-            CsvColumn::fixed("say \"hi\"".into()),
-            CsvColumn::fixed("=HYPERLINK(\"x\")".into()),
-            CsvColumn::fixed("-1".into()),
-        ]);
+        let names = csv_header_names(
+            &SIMULTANEOUS_CSV_PREFIX,
+            vec![
+                CsvColumn::fixed("Vout, filtered".into()),
+                CsvColumn::fixed("say \"hi\"".into()),
+                CsvColumn::fixed("=HYPERLINK(\"x\")".into()),
+                CsvColumn::fixed("-1".into()),
+            ],
+        );
         assert_eq!(
             names,
             [

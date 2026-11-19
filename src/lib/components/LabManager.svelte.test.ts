@@ -238,3 +238,231 @@ describe('LabManager Save as course default file', () => {
     unmount(component);
   });
 });
+
+describe('LabManager acquisition modes', () => {
+  // The built-in pulse-ox lab 1.0.0 (legacy 4-state), kept in profiles/legacy/.
+  const pulseLegacy = JSON.parse(
+    readFileSync(resolve(process.cwd(), 'profiles', 'legacy', 'pulseox_tx_rx_course_capture_1.0.0.profile.json'), 'utf8')
+  ) as LabProfile;
+  // The built-in pulse-ox lab 1.1.0 (LED-sequenced).
+  const pulseSequenced = JSON.parse(
+    readFileSync(resolve(process.cwd(), 'profiles', 'pulseox_tx_rx_course_capture.profile.json'), 'utf8')
+  ) as LabProfile;
+
+  function modeSelect(): HTMLSelectElement {
+    const select = [...document.querySelectorAll('label')]
+      .find((label) => label.textContent?.startsWith('Acquisition mode'))
+      ?.querySelector('select');
+    if (!select) throw new Error('mode select not found');
+    return select;
+  }
+
+  const options = () => [...modeSelect().options].map((option) => [option.value, option.textContent?.trim()]);
+
+  async function chooseMode(value: string) {
+    const select = modeSelect();
+    select.value = value;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    await settle();
+  }
+
+  const labelled = (label: string) => document.querySelector<HTMLInputElement | HTMLSelectElement>(`[aria-label="${label}"]`);
+
+  async function setDwell(value: string) {
+    const dwell = [...document.querySelectorAll('label')].find((label) => label.textContent?.startsWith('State dwell'))!.querySelector('input')!;
+    dwell.value = value;
+    dwell.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+  }
+
+  /** Saves the draft and returns what `save_lab_draft` received. */
+  async function saveAndCapture(): Promise<LabProfile | undefined> {
+    let saved: LabProfile | undefined;
+    backend.handlers.save_lab_draft = (args) => {
+      saved = args.draft as LabProfile;
+      return saved;
+    };
+    await click('Save changes as new version');
+    expect(document.querySelector('#lab-manager-error')).toBeNull();
+    return saved;
+  }
+
+  it('offers simultaneous and LED-sequenced pulse-ox, never the legacy mode, for a new or simultaneous lab', async () => {
+    const component = render();
+    await click('Manage Labs');
+    await click('Edit selected lab');
+    expect(options()).toEqual([
+      ['simultaneous', 'Simultaneous Analog'],
+      ['pulseox_sequenced', 'Pulse Oximetry — LED-sequenced']
+    ]);
+    // The simultaneous grid has no LED-state column.
+    expect(labelled('Channel 1 shown by LED state')).toBeNull();
+
+    await chooseMode('pulseox_sequenced');
+    expect(document.body.textContent).toContain('Pulse oximetry — LED-sequenced');
+    expect((labelled('Channel 1 ID') as HTMLInputElement).value).toBe('tx');
+    expect((labelled('Channel 2 ID') as HTMLInputElement).value).toBe('rx');
+    expect((labelled('Channel 1 shown by LED state') as HTMLInputElement).checked).toBe(true);
+    expect(document.querySelector('.estimate')?.textContent).toContain('1000 records/s');
+    expect(document.body.textContent).toContain('1000 rows/s for each channel (every row holds all 2 channels); 250 rows/s per LED state');
+    // Still no legacy 4-state mode.
+    expect(options().map(([value]) => value)).toEqual(['simultaneous', 'pulseox_sequenced']);
+
+    // The dwell sets the record rate; a third channel can be added.
+    const dwell = [...document.querySelectorAll('label')].find((label) => label.textContent?.startsWith('State dwell'))!.querySelector('input')!;
+    dwell.value = '2500';
+    dwell.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect(document.body.textContent).toContain('400 rows/s for each channel');
+    await click('Add channel');
+    expect(labelled('Channel 3 pin')?.value).toBe('A2');
+    expect((labelled('Channel 3 shown by LED state') as HTMLInputElement).checked).toBe(false);
+
+    let saved: LabProfile | undefined;
+    backend.handlers.save_lab_draft = (args) => {
+      saved = args.draft as LabProfile;
+      return saved;
+    };
+    await click('Save changes as new version');
+    expect(document.querySelector('#lab-manager-error')).toBeNull();
+    expect(saved?.acquisition).toMatchObject({
+      acquisition_mode: 'pulseox_sequenced', state_dwell_us: 2500, sample_rate_hz: 400, adc_resolution_bits: 14,
+      digital_outputs: [
+        { pin: 'D5', label: 'Red LED', behavior: 'acquisition_sequenced' },
+        { pin: 'D6', label: 'IR LED', behavior: 'acquisition_sequenced' }
+      ]
+    });
+    expect(saved?.acquisition.analog_inputs).toBeUndefined();
+    expect(saved?.acquisition.channels?.map((channel) => [channel.pin, channel.id, channel.split_by_led_state === true]))
+      .toEqual([['A0', 'tx', true], ['A1', 'rx', true], ['A2', 'channel_1', false]]);
+    expect(saved?.required_firmware.build).toBe('0x00010007');
+    expect(saved?.plot_defaults?.groups).toEqual([{ channel_ids: ['tx'] }, { channel_ids: ['rx'] }, { channel_ids: ['channel_1'] }]);
+    unmount(component);
+  });
+
+  it('keeps the legacy 4-state mode available only while editing a lab that uses it', async () => {
+    backend.handlers.begin_lab_edit = () => structuredClone(pulseLegacy);
+    const component = render();
+    await click('Manage Labs');
+    await click('Edit selected lab');
+    expect(options()).toEqual([
+      ['simultaneous', 'Simultaneous Analog'],
+      ['pulseox_sequenced', 'Pulse Oximetry — LED-sequenced'],
+      ['pulseox_4state', 'Pulse Oximetry — legacy 4-state']
+    ]);
+    expect(modeSelect().value).toBe('pulseox_4state');
+    expect(document.body.textContent).toContain('Pulse oximetry — legacy 4-state');
+
+    // Trying another mode keeps the way back to the lab's own mode.
+    await chooseMode('pulseox_sequenced');
+    expect(options().map(([value]) => value)).toContain('pulseox_4state');
+    await chooseMode('simultaneous');
+    expect(labelled('Channel 1 shown by LED state')).toBeNull();
+    expect(options().map(([value]) => value)).toContain('pulseox_4state');
+    unmount(component);
+  });
+
+  it('edits the built-in pulse-ox lab 1.1.0 in the LED-sequenced mode, with no legacy option', async () => {
+    backend.handlers.begin_lab_edit = () => structuredClone(pulseSequenced);
+    const component = render();
+    await click('Manage Labs');
+    await click('Edit selected lab');
+    expect(modeSelect().value).toBe('pulseox_sequenced');
+    expect(options().map(([value]) => value)).toEqual(['simultaneous', 'pulseox_sequenced']);
+    expect((labelled('Channel 1 ID') as HTMLInputElement).value).toBe('tx');
+    expect((labelled('Channel 2 ID') as HTMLInputElement).value).toBe('rx');
+    expect((labelled('Channel 1 shown by LED state') as HTMLInputElement).checked).toBe(true);
+    expect((labelled('Channel 2 shown by LED state') as HTMLInputElement).checked).toBe(true);
+    expect(document.body.textContent).toContain('1000 rows/s for each channel (every row holds all 2 channels); 250 rows/s per LED state');
+    unmount(component);
+  });
+
+  it('gives the rows per LED state from the dwell, not from the rounded record rate', async () => {
+    backend.handlers.begin_lab_edit = () => structuredClone(pulseSequenced);
+    const component = render();
+    await click('Manage Labs');
+    await click('Edit selected lab');
+    // 1e6 / 1500 µs is stored as 667 records/s; each state gets 1e6 / 6000 ≈ 166.67 rows/s, not 667 / 4.
+    await setDwell('1500');
+    expect(document.body.textContent).toContain('667 rows/s for each channel (every row holds all 2 channels); about 166.7 rows/s per LED state');
+    await setDwell('3000');
+    expect(document.body.textContent).toContain('333 rows/s for each channel (every row holds all 2 channels); about 83.3 rows/s per LED state');
+    // A fractional dwell is refused by the editor before Rust sees it.
+    await setDwell('1000.5');
+    backend.handlers.save_lab_draft = () => { throw new Error('must not be called'); };
+    await click('Save changes as new version');
+    expect(document.querySelector('#lab-manager-error')?.textContent).toContain('dwell must be 1000–5000 µs, in whole microseconds');
+    expect(commands()).not.toContain('save_lab_draft');
+    unmount(component);
+  });
+
+  it('saves an edited legacy 4-state lab in its own mode and record layout', async () => {
+    backend.handlers.begin_lab_edit = () => structuredClone(pulseLegacy);
+    const component = render();
+    await click('Manage Labs');
+    await click('Edit selected lab');
+    await setDwell('500');
+    expect(document.querySelector('.estimate')?.textContent).toContain('500.0 cycles/s nominal');
+    const saved = await saveAndCapture();
+    expect(saved?.acquisition).toMatchObject({
+      acquisition_mode: 'pulseox_4state', channels: [], analog_inputs: { tx: 'A0', rx: 'A1' }, state_dwell_us: 500, sample_rate_hz: 500,
+      digital_outputs: [
+        { pin: 'D5', label: 'Red LED', behavior: 'acquisition_sequenced' },
+        { pin: 'D6', label: 'IR LED', behavior: 'acquisition_sequenced' }
+      ]
+    });
+    expect(saved?.acquisition.led_outputs).toBeUndefined();
+    expect(saved?.required_firmware.build).toBe('0x00010006');
+    unmount(component);
+  });
+
+  it('restores the opened firmware build when a draft leaves the LED-sequenced mode', async () => {
+    // A simultaneous lab (0x00010006) tried as LED-sequenced (0x00010007) and switched back.
+    let component = render();
+    await click('Manage Labs');
+    await click('Edit selected lab');
+    await chooseMode('pulseox_sequenced');
+    await chooseMode('simultaneous');
+    expect((await saveAndCapture())?.required_firmware.build).toBe('0x00010006');
+    unmount(component);
+    document.body.replaceChildren();
+
+    // The same for a legacy 4-state lab.
+    backend.handlers.begin_lab_edit = () => structuredClone(pulseLegacy);
+    component = render();
+    await click('Manage Labs');
+    await click('Edit selected lab');
+    await chooseMode('pulseox_sequenced');
+    await chooseMode('pulseox_4state');
+    const legacy = await saveAndCapture();
+    expect(legacy?.acquisition.acquisition_mode).toBe('pulseox_4state');
+    expect(legacy?.required_firmware.build).toBe('0x00010006');
+    unmount(component);
+    document.body.replaceChildren();
+
+    // A lab opened in the LED-sequenced mode keeps the build it names.
+    backend.handlers.begin_lab_edit = () => structuredClone(pulseSequenced);
+    component = render();
+    await click('Manage Labs');
+    await click('Edit selected lab');
+    await chooseMode('simultaneous');
+    expect((await saveAndCapture())?.required_firmware.build).toBe('0x00010007');
+    unmount(component);
+  });
+
+  it('refuses to save a sequenced draft that breaks a Rust rule, before asking Rust', async () => {
+    const component = render();
+    await click('Manage Labs');
+    await click('Edit selected lab');
+    await chooseMode('pulseox_sequenced');
+    const csv = labelled('Channel 2 CSV field') as HTMLInputElement;
+    csv.value = 'led_state';
+    csv.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    backend.handlers.save_lab_draft = () => { throw new Error('must not be called'); };
+    await click('Save changes as new version');
+    expect(document.querySelector('#lab-manager-error')?.textContent).toContain('CSV column "led_state"');
+    expect(commands()).not.toContain('save_lab_draft');
+    unmount(component);
+  });
+});

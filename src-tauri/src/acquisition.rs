@@ -111,6 +111,8 @@ impl TimingAccumulator {
             timestamp_source: "firmware_per_record".into(),
             pulse_state_intervals_outside_tolerance,
             pulse_state_maximum_error_us,
+            firmware_skipped_deadlines: None,
+            minimum_pulse_settle_us: None,
         }
     }
 }
@@ -223,8 +225,17 @@ impl FirmwareCapabilities {
         self.supported_rates_hz.contains(&rate_hz)
     }
 
-    pub fn supports_mode(&self, mode_bit: u8) -> bool {
-        self.supported_modes & mode_bit != 0
+    /// True when every bit of `mode_bits` is advertised: `0x01`
+    /// simultaneous analog, `0x02` legacy pulse-ox 4-state, `0x04`
+    /// LED-sequenced pulse-ox (build 0x00010007 and later). An empty request
+    /// is not a mode and is never supported.
+    pub fn supports_modes(&self, mode_bits: u8) -> bool {
+        mode_bits != 0 && self.supported_modes & mode_bits == mode_bits
+    }
+
+    /// CAPABILITIES mode bit of CONFIGURE mode `mode` (0, 1, 2, ...).
+    pub fn mode_bit(mode: u8) -> u8 {
+        1u8.checked_shl(u32::from(mode)).unwrap_or(0)
     }
 }
 
@@ -258,10 +269,23 @@ pub struct AcquisitionController {
     /// was parsed. The START STATUS carries zeroed per-phase counters, so
     /// without the terminal one the per-phase checks are unknown, not zero.
     final_phase_timing_received: bool,
+    /// STATUS bytes 38..42 (build 0x00010007 and later): sampling deadlines
+    /// the firmware skipped since START.
+    firmware_skipped_deadlines: Option<u32>,
+    /// STATUS bytes 42..46: the minimum observed LED settle in microseconds,
+    /// `u32::MAX` when no pulse-ox state was sampled.
+    minimum_pulse_settle_us: Option<u32>,
+    /// True only after a terminal STATUS of this run carried bytes 38..42,
+    /// so the two values above are final rather than the START STATUS's
+    /// reset values.
+    final_deadline_timing_received: bool,
     /// Synchronized fields per record configured for this capture. A batch
     /// with a different channel count is counted as invalid instead of being
     /// handed to the raw writer, which would reject the record shape.
     expected_field_count: Option<usize>,
+    /// LED-sequenced pulse-ox capture: field 0 of every record is the LED
+    /// state, which the firmware steps so that `led_state == sequence % 4`.
+    led_sequenced: bool,
     /// Frames the host rejected after a valid CRC (unparseable batch payload,
     /// non-increasing timestamp, wrong field count). Kept separately because
     /// `invalid_frames` is refreshed from the parser after every read.
@@ -296,7 +320,11 @@ impl AcquisitionController {
             pulse_state_intervals_outside_tolerance: [0; 4],
             pulse_state_maximum_error_us: [0; 4],
             final_phase_timing_received: false,
+            firmware_skipped_deadlines: None,
+            minimum_pulse_settle_us: None,
+            final_deadline_timing_received: false,
             expected_field_count: None,
+            led_sequenced: false,
             rejected_frames: 0,
         }
     }
@@ -330,6 +358,13 @@ impl AcquisitionController {
     }
     pub fn set_expected_field_count(&mut self, field_count: usize) {
         self.expected_field_count = Some(field_count);
+    }
+    /// Checks every recorded record of an LED-sequenced capture: its LED
+    /// state (field 0) must be `sequence % 4`. A record that disagrees is
+    /// still recorded unchanged (raw data stay authoritative) and counted in
+    /// `led_state_mismatches`.
+    pub fn set_led_sequenced(&mut self, led_sequenced: bool) {
+        self.led_sequenced = led_sequenced;
     }
     pub fn stop(&mut self) {
         self.state = AcquisitionState::Idle;
@@ -393,6 +428,9 @@ impl AcquisitionController {
                     // of the new run.
                     self.monitor.reset_sample_baseline();
                     self.final_phase_timing_received = false;
+                    self.firmware_skipped_deadlines = None;
+                    self.minimum_pulse_settle_us = None;
+                    self.final_deadline_timing_received = false;
                     self.state = AcquisitionState::Running;
                 }
                 // Counters from a STATUS of a previous run are not this
@@ -426,6 +464,23 @@ impl AcquisitionController {
                             ]);
                         }
                         self.final_phase_timing_received = acquiring == Some(false);
+                    }
+                    if frame.payload.len() >= 42 {
+                        self.firmware_skipped_deadlines = Some(u32::from_le_bytes([
+                            frame.payload[38],
+                            frame.payload[39],
+                            frame.payload[40],
+                            frame.payload[41],
+                        ]));
+                        self.minimum_pulse_settle_us = (frame.payload.len() >= 46).then(|| {
+                            u32::from_le_bytes([
+                                frame.payload[42],
+                                frame.payload[43],
+                                frame.payload[44],
+                                frame.payload[45],
+                            ])
+                        });
+                        self.final_deadline_timing_received = acquiring == Some(false);
                     }
                 }
             }
@@ -476,12 +531,19 @@ impl AcquisitionController {
                 continue;
             }
             let timestamp_us = record.timestamp_us;
-            let first_counts = record.counts.first().copied();
+            // The first channel's counts: field 1 of an LED-sequenced record.
+            let first_counts = record.counts.get(usize::from(self.led_sequenced)).copied();
+            let led_state_mismatch = self.led_sequenced
+                && record.counts.first().map(|state| u32::from(*state))
+                    != Some(record.sequence % 4);
             match self.sender.try_send(record) {
                 Ok(()) => {
                     self.sample_count += 1;
                     self.timing.observe(timestamp_us, batch.sample_period_us);
                     self.last_counts = first_counts;
+                    if led_state_mismatch {
+                        self.monitor.counters.led_state_mismatches += 1;
+                    }
                 }
                 Err(TrySendError::Full(_)) => self.monitor.counters.host_channel_overflows += 1,
                 Err(TrySendError::Disconnected(_)) => {
@@ -519,21 +581,30 @@ impl AcquisitionController {
         }
     }
 
-    /// Per-phase pulse-ox checks are reported only when the terminal STATUS
-    /// of this run was received. Otherwise (fault, disconnect, simulator) they
-    /// are `None`, meaning unavailable, rather than a false claim of zero.
+    /// Per-phase pulse-ox checks, skipped deadlines, and the minimum LED
+    /// settle are reported only when the terminal STATUS of this run was
+    /// received (skipped deadlines and settle only from build 0x00010007 and
+    /// later). Otherwise (fault, disconnect, older firmware) they are `None`,
+    /// meaning unavailable, rather than a false claim of zero.
     pub fn timing_diagnostics(
         &self,
         requested_rate_hz: u32,
         include_pulse_state_timing: bool,
     ) -> AcquisitionTimingDiagnostics {
         let per_phase = include_pulse_state_timing && self.final_phase_timing_received;
-        self.timing.diagnostics(
+        let mut diagnostics = self.timing.diagnostics(
             requested_rate_hz,
             self.monitor.counters.firmware_overflows,
             per_phase.then_some(self.pulse_state_intervals_outside_tolerance),
             per_phase.then_some(self.pulse_state_maximum_error_us),
-        )
+        );
+        if self.final_deadline_timing_received {
+            diagnostics.firmware_skipped_deadlines = self.firmware_skipped_deadlines.map(u64::from);
+            diagnostics.minimum_pulse_settle_us = self
+                .minimum_pulse_settle_us
+                .filter(|settle| include_pulse_state_timing && *settle != u32::MAX);
+        }
+        diagnostics
     }
 }
 #[cfg(test)]
@@ -826,6 +897,96 @@ mod tests {
         assert_eq!(rx.try_iter().count(), 2);
     }
 
+    fn led_sequenced_batch(first: u32, states: &[u16]) -> Vec<u8> {
+        SampleBatch {
+            first_sample_sequence: first,
+            sample_period_us: 1_000,
+            channel_count: 3,
+            timestamps_us: (0..states.len() as u64)
+                .map(|index| 1_000 + index * 1_000)
+                .collect(),
+            samples: states
+                .iter()
+                .enumerate()
+                .flat_map(|(index, state)| [*state, 100 + index as u16, 200 + index as u16])
+                .collect(),
+            status_flags: crate::protocol::SAMPLE_STATUS_ACQUIRING,
+            acquisition_queue_overflows: Some(0),
+        }
+        .to_payload()
+        .unwrap_or_else(|error| panic!("{error:?}"))
+    }
+
+    #[test]
+    fn led_sequenced_records_are_checked_against_sequence_mod_four() {
+        let (tx, rx) = sync_channel(64);
+        let mut controller = AcquisitionController::new(tx);
+        controller.set_expected_field_count(3);
+        controller.set_led_sequenced(true);
+        controller
+            .configure()
+            .unwrap_or_else(|error| panic!("{error}"));
+        controller.start().unwrap_or_else(|error| panic!("{error}"));
+        // Sequences 6..=11 must carry states 2, 3, 0, 1, 2, 3. Sequence 9
+        // says 3 and sequence 11 says 7 (not a state at all).
+        controller.ingest_bytes(&encoded(
+            MessageType::SampleBatch,
+            0,
+            led_sequenced_batch(6, &[2, 3, 0, 3, 2, 7]),
+        ));
+        let records = rx.try_iter().collect::<Vec<_>>();
+        // Raw data stay authoritative: every record is recorded unchanged.
+        assert_eq!(records.len(), 6);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.counts[0])
+                .collect::<Vec<_>>(),
+            [2, 3, 0, 3, 2, 7]
+        );
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.integrity.led_state_mismatches, 2);
+        // The last value shown is the first channel's, not the LED state.
+        assert_eq!(snapshot.last_counts, Some(105));
+
+        // `sequence % 4` stays continuous across the u32 wraparound.
+        let (tx, rx) = sync_channel(64);
+        let mut wrapping = AcquisitionController::new(tx);
+        wrapping.set_expected_field_count(3);
+        wrapping.set_led_sequenced(true);
+        wrapping
+            .configure()
+            .unwrap_or_else(|error| panic!("{error}"));
+        wrapping.start().unwrap_or_else(|error| panic!("{error}"));
+        wrapping.ingest_bytes(&encoded(
+            MessageType::SampleBatch,
+            0,
+            led_sequenced_batch(u32::MAX - 1, &[2, 3, 0, 1]),
+        ));
+        assert_eq!(rx.try_iter().count(), 4);
+        assert_eq!(wrapping.snapshot().integrity.led_state_mismatches, 0);
+
+        // Other modes never check field 0.
+        let (tx, rx) = sync_channel(64);
+        let mut simultaneous = AcquisitionController::new(tx);
+        simultaneous.set_expected_field_count(3);
+        simultaneous
+            .configure()
+            .unwrap_or_else(|error| panic!("{error}"));
+        simultaneous
+            .start()
+            .unwrap_or_else(|error| panic!("{error}"));
+        simultaneous.ingest_bytes(&encoded(
+            MessageType::SampleBatch,
+            0,
+            led_sequenced_batch(6, &[2, 3, 0, 3, 2, 7]),
+        ));
+        assert_eq!(rx.try_iter().count(), 6);
+        let snapshot = simultaneous.snapshot();
+        assert_eq!(snapshot.integrity.led_state_mismatches, 0);
+        assert_eq!(snapshot.last_counts, Some(7));
+    }
+
     #[test]
     fn config_ack_and_status_frames_are_counted_for_command_baselines() {
         let (tx, _rx) = sync_channel(4);
@@ -876,10 +1037,138 @@ mod tests {
             .expect("capabilities");
         assert_eq!(parsed.supported_adc_resolutions, vec![12, 14]);
         assert_eq!(parsed.max_analog_channels, 6);
-        assert!(parsed.supports_mode(0x01));
-        assert!(parsed.supports_mode(0x02));
+        assert!(parsed.supports_modes(0x01));
+        assert!(parsed.supports_modes(0x02));
+        assert!(parsed.supports_modes(0x03));
+        // Build 0x00010006 advertises 0x03: no LED-sequenced mode.
+        assert!(!parsed.supports_modes(0x04));
+        assert!(!parsed.supports_modes(0x05));
+        assert!(!parsed.supports_modes(0));
         assert!(parsed.supports_rate(1_000));
         assert_eq!(parsed.supported_digital_output_mask, 0x07);
+    }
+
+    #[test]
+    fn build_seven_capabilities_advertise_every_mode_bit_by_bit() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        controller.ingest_bytes(&encoded(
+            MessageType::Capabilities,
+            0,
+            vec![
+                12, 14, 6, 0x07, 0x07, 5, 100, 0, 200, 0, 250, 0, 244, 1, 232, 3,
+            ],
+        ));
+        let parsed = controller
+            .snapshot()
+            .firmware_capabilities
+            .expect("capabilities");
+        for mode in 0..3 {
+            assert!(parsed.supports_modes(FirmwareCapabilities::mode_bit(mode)));
+        }
+        assert_eq!(FirmwareCapabilities::mode_bit(2), 0x04);
+        assert!(parsed.supports_modes(0x07));
+        assert!(!parsed.supports_modes(0x08));
+        assert_eq!(FirmwareCapabilities::mode_bit(8), 0);
+    }
+
+    fn build_seven_status(
+        acquiring: u8,
+        skipped_deadlines: u32,
+        minimum_settle_us: u32,
+        violations: [u32; 4],
+    ) -> Vec<u8> {
+        let mut payload = extended_status(acquiring, 0, 0, violations, [0; 4]);
+        payload.extend_from_slice(&skipped_deadlines.to_le_bytes());
+        payload.extend_from_slice(&minimum_settle_us.to_le_bytes());
+        assert_eq!(payload.len(), 46);
+        payload
+    }
+
+    #[test]
+    fn terminal_build_seven_status_reports_skipped_deadlines_and_minimum_settle() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        controller
+            .configure()
+            .unwrap_or_else(|error| panic!("{error}"));
+        controller
+            .arm_start()
+            .unwrap_or_else(|error| panic!("{error}"));
+        // The START STATUS carries reset values: not final.
+        controller.ingest_bytes(&encoded(
+            MessageType::Status,
+            0,
+            build_seven_status(1, 0, u32::MAX, [0; 4]),
+        ));
+        let running = controller.timing_diagnostics(250, true);
+        assert_eq!(running.firmware_skipped_deadlines, None);
+        assert_eq!(running.minimum_pulse_settle_us, None);
+
+        controller.ingest_bytes(&encoded(
+            MessageType::Status,
+            1,
+            build_seven_status(0, 3, 512, [0, 1, 0, 0]),
+        ));
+        let pulse = controller.timing_diagnostics(250, true);
+        assert_eq!(pulse.firmware_skipped_deadlines, Some(3));
+        assert_eq!(pulse.minimum_pulse_settle_us, Some(512));
+        assert_eq!(
+            pulse.pulse_state_intervals_outside_tolerance,
+            Some([0, 1, 0, 0])
+        );
+        // Simultaneous analog: skipped deadlines, but no LED settle.
+        let analog = controller.timing_diagnostics(1_000, false);
+        assert_eq!(analog.firmware_skipped_deadlines, Some(3));
+        assert_eq!(analog.minimum_pulse_settle_us, None);
+    }
+
+    #[test]
+    fn build_seven_status_without_a_sampled_pulse_state_or_from_older_firmware_reports_none() {
+        let (tx, _rx) = sync_channel(4);
+        let mut controller = AcquisitionController::new(tx);
+        controller
+            .configure()
+            .unwrap_or_else(|error| panic!("{error}"));
+        controller
+            .arm_start()
+            .unwrap_or_else(|error| panic!("{error}"));
+        controller.ingest_bytes(&encoded(
+            MessageType::Status,
+            0,
+            build_seven_status(1, 0, u32::MAX, [0; 4]),
+        ));
+        controller.ingest_bytes(&encoded(
+            MessageType::Status,
+            1,
+            build_seven_status(0, 0, u32::MAX, [0; 4]),
+        ));
+        let none_sampled = controller.timing_diagnostics(250, true);
+        assert_eq!(none_sampled.firmware_skipped_deadlines, Some(0));
+        assert_eq!(none_sampled.minimum_pulse_settle_us, None);
+
+        // Build 0x00010006's 38-byte STATUS has neither field.
+        let (tx, _rx) = sync_channel(4);
+        let mut older = AcquisitionController::new(tx);
+        older.configure().unwrap_or_else(|error| panic!("{error}"));
+        older.arm_start().unwrap_or_else(|error| panic!("{error}"));
+        older.ingest_bytes(&encoded(
+            MessageType::Status,
+            0,
+            extended_status(1, 0, 0, [0; 4], [0; 4]),
+        ));
+        older.ingest_bytes(&encoded(
+            MessageType::Status,
+            1,
+            extended_status(0, 0, 0, [0; 4], [0; 4]),
+        ));
+        let timing = older.timing_diagnostics(250, true);
+        assert_eq!(timing.pulse_state_intervals_outside_tolerance, Some([0; 4]));
+        assert_eq!(timing.firmware_skipped_deadlines, None);
+        assert_eq!(timing.minimum_pulse_settle_us, None);
+        let json = serde_json::to_value(&timing).unwrap_or_else(|error| panic!("{error}"));
+        assert!(json.get("firmware_skipped_deadlines").is_none());
+        assert!(json.get("minimum_pulse_settle_us").is_none());
     }
 
     #[test]

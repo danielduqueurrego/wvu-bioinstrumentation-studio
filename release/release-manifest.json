@@ -4,7 +4,7 @@
   "arduino_cli_version": "1.6.0",
   "arduino_core": "1.6.0",
   "firmware_protocol": "0.4",
-  "reference_firmware_build": "0x00010006",
-  "reference_firmware_source_sha256": "f3eb3fec0166189f66a8ddfeb058172a8d97a3c60d95d574b3234eecbd144aab",
+  "reference_firmware_build": "0x00010007",
+  "reference_firmware_source_sha256": "86221c104b8a7cf30bfbb0ac621cfdfebc8b08635ed0710df66db8fa4f5d681d",
   "arduino_runtime_archive_sha256": "5baa8a5fc7fc0c2ae7fd9f49de1876d76859067af6d56e9b56546a88a5d02def"
 }

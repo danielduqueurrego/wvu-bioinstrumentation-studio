@@ -1,4 +1,4 @@
-import type { LabAcquisition, LabChannel, LabDigitalOutput, LabProfile } from './labs';
+import type { LabAcquisition, LabAcquisitionMode, LabChannel, LabDigitalOutput, LabPlotGroup, LabProfile } from './labs';
 
 export const PULSEOX_PHASE_ORDER = ['RED ON', 'DARK 1', 'IR ON', 'DARK 2'] as const;
 
@@ -7,8 +7,31 @@ export const SIMULTANEOUS_RATES_HZ = [100, 200, 250, 500, 1000] as const;
 /** Pulse-ox state dwell accepted by the controlled firmware (µs). */
 export const PULSEOX_DWELL_MIN_US = 250;
 export const PULSEOX_DWELL_MAX_US = 5000;
-/** Fixed CSV columns a channel's CSV field may not reuse. */
-export const RESERVED_CSV_COLUMNS = ['record_sequence', 't_us', 'cycle_index'] as const;
+/**
+ * LED-state dwell of the LED-sequenced mode (µs); the same range as
+ * `PULSEOX_SEQUENCED_DWELL_RANGE_US` in profiles.rs. Every state reads every
+ * channel, so the shortest dwell is longer than the legacy mode's.
+ */
+export const PULSEOX_SEQUENCED_DWELL_MIN_US = 1000;
+export const PULSEOX_SEQUENCED_DWELL_MAX_US = 5000;
+/** The first WVU firmware build with the LED-sequenced mode (`SEQUENCED_MIN_FIRMWARE_BUILD`). */
+export const SEQUENCED_MIN_FIRMWARE_BUILD = 0x0001_0007;
+/** A lab reads at most this many analog channels (A0–A5). */
+export const MAX_ANALOG_CHANNELS = 6;
+/** LED-state names by state code, as the CSV's `led_state_name` column writes them. */
+export const LED_STATE_NAMES = ['RED', 'DARK1', 'IR', 'DARK2'] as const;
+/** The LED states as the page names them, by state code. */
+export const LED_STATE_LABELS = ['RED', 'DARK 1', 'IR', 'DARK 2'] as const;
+/** Fixed CSV columns a channel's CSV field may not reuse (`led_state` and
+ * `led_state_name` are the LED-sequenced CSV's state columns). The same list
+ * as `RESERVED_CSV_COLUMNS` in profiles.rs. */
+export const RESERVED_CSV_COLUMNS = [
+  'record_sequence',
+  't_us',
+  'cycle_index',
+  'led_state',
+  'led_state_name'
+] as const;
 
 /** Text limits for a revision being saved now; the same values as profiles.rs. */
 export const MAX_PROFILE_ID_CHARS = 128;
@@ -31,6 +54,113 @@ export function estimatedPulseOxCycleRate(stateDwellUs: number): number {
 /** The stored cycle rate for a dwell: `round(1e6 / (4 × dwell))`, as in Rust. */
 export function pulseOxCycleRateHz(stateDwellUs: number): number {
   return stateDwellUs > 0 ? Math.round(1_000_000 / (4 * stateDwellUs)) : 0;
+}
+
+/**
+ * The stored LED-sequenced record rate for a dwell: one record per LED
+ * state, `round(1e6 / dwell)` records/s (`pulse_ox_sequenced_rate_hz`).
+ */
+export function pulseOxSequencedRateHz(stateDwellUs: number): number {
+  return stateDwellUs > 0 ? Math.round(1_000_000 / stateDwellUs) : 0;
+}
+
+/**
+ * Whether a dwell is one the LED-sequenced mode accepts: a whole number of
+ * microseconds in range (Rust stores `state_dwell_us` as a u32).
+ */
+export function isSequencedDwell(stateDwellUs: number | undefined): boolean {
+  const dwell = Number(stateDwellUs);
+  return Number.isInteger(dwell) && dwell >= PULSEOX_SEQUENCED_DWELL_MIN_US && dwell <= PULSEOX_SEQUENCED_DWELL_MAX_US;
+}
+
+/** Whether a dwell is one the legacy 4-state mode accepts (a whole number of µs, as Rust's u32). */
+export function isPulseOxDwell(stateDwellUs: number | undefined): boolean {
+  const dwell = Number(stateDwellUs);
+  return Number.isInteger(dwell) && dwell >= PULSEOX_DWELL_MIN_US && dwell <= PULSEOX_DWELL_MAX_US;
+}
+
+/** A `required_firmware.build` text as a number, like Rust's `parse_hex` (NaN when invalid). */
+export function parseFirmwareBuild(build: string | undefined): number {
+  const digits = (build ?? '').replace(/^(0x)+/, '');
+  if (!/^\+?[0-9A-Fa-f]+$/.test(digits)) return Number.NaN;
+  const value = Number.parseInt(digits, 16);
+  return value <= 0xFFFF_FFFF ? value : Number.NaN;
+}
+
+/** A firmware build as a lab names it, for example `0x00010007`. */
+export function formatFirmwareBuild(build: number): string {
+  return `0x${build.toString(16).toUpperCase().padStart(8, '0')}`;
+}
+
+/** The lab's build, raised to the first build with the LED-sequenced mode when it is older. */
+function atLeastSequencedBuild(build: string): string {
+  return parseFirmwareBuild(build) >= SEQUENCED_MIN_FIRMWARE_BUILD ? build : formatFirmwareBuild(SEQUENCED_MIN_FIRMWARE_BUILD);
+}
+
+const MODE_LABELS: Record<LabAcquisitionMode, string> = {
+  simultaneous: 'Simultaneous Analog',
+  pulseox_sequenced: 'Pulse Oximetry — LED-sequenced',
+  pulseox_4state: 'Pulse Oximetry — legacy 4-state'
+};
+
+/** The name of an acquisition mode in Lab Manager. */
+export function labModeLabel(mode: LabAcquisitionMode): string {
+  return MODE_LABELS[mode] ?? mode;
+}
+
+export type LabModeOption = { value: LabAcquisitionMode; label: string };
+
+/**
+ * Lab Manager's acquisition modes. A new pulse-ox lab uses the LED-sequenced
+ * mode; the legacy 4-state mode is offered only while editing a lab that
+ * already uses it (`modesInUse`: the mode the edited lab was opened with,
+ * and the draft's current mode).
+ */
+export function labModeOptions(...modesInUse: Array<LabAcquisitionMode | undefined>): LabModeOption[] {
+  const modes: LabAcquisitionMode[] = ['simultaneous', 'pulseox_sequenced'];
+  if (modesInUse.includes('pulseox_4state')) modes.push('pulseox_4state');
+  return modes.map((value) => ({ value, label: labModeLabel(value) }));
+}
+
+/** The lab's rate label: a cycle, record, or frame rate. */
+export function labRateLabel(acquisition: Pick<LabAcquisition, 'acquisition_mode'>): string {
+  if (acquisition.acquisition_mode === 'pulseox_4state') return 'Cycle rate';
+  if (acquisition.acquisition_mode === 'pulseox_sequenced') return 'Record rate';
+  return 'Sample rate';
+}
+
+/** The lab's rate with its unit. */
+export function labRateText(acquisition: Pick<LabAcquisition, 'acquisition_mode' | 'sample_rate_hz'>): string {
+  const rate = acquisition.sample_rate_hz;
+  if (acquisition.acquisition_mode === 'pulseox_4state') return `${rate} cycles/s`;
+  if (acquisition.acquisition_mode === 'pulseox_sequenced') return `${rate} records/s (one per LED state)`;
+  return `${rate} frames/s`;
+}
+
+/**
+ * The lab's rate with its unit only, for a narrow field beside its label
+ * (an LED-sequenced lab's "(one per LED state)" is left to `labRateText`).
+ */
+export function labRateShortText(acquisition: Pick<LabAcquisition, 'acquisition_mode' | 'sample_rate_hz'>): string {
+  if (acquisition.acquisition_mode === 'pulseox_sequenced') return `${acquisition.sample_rate_hz} records/s`;
+  return labRateText(acquisition);
+}
+
+/** One phrase describing a lab's acquisition (Lab Manager's version history). */
+export function labConfigurationText(acquisition: Pick<LabAcquisition, 'acquisition_mode' | 'channels'>): string {
+  if (acquisition.acquisition_mode === 'pulseox_4state') return 'Pulse oximetry — legacy 4-state';
+  const count = acquisition.channels?.length ?? 1;
+  if (acquisition.acquisition_mode === 'pulseox_sequenced') return `Pulse oximetry — LED-sequenced, ${count} channel(s)`;
+  return `${count} analog channel(s)`;
+}
+
+/** The LED sequence of a pulse-ox lab, or '' for other labs. */
+export function ledSequenceText(acquisition: Pick<LabAcquisition, 'acquisition_mode' | 'state_dwell_us'>): string {
+  if (acquisition.acquisition_mode === 'pulseox_4state') return `RED → DARK → IR → DARK; ${acquisition.state_dwell_us} µs per state`;
+  if (acquisition.acquisition_mode === 'pulseox_sequenced') {
+    return `RED → DARK 1 → IR → DARK 2, every channel read in each state; ${acquisition.state_dwell_us} µs per state`;
+  }
+  return '';
 }
 
 /** ASCII-only lower case, so the label rule matches Rust's `eq_ignore_ascii_case`. */
@@ -94,6 +224,51 @@ export function pulseOxDraft(profile: LabProfile): LabProfile {
   };
 }
 
+/** A raw-count channel of an LED-sequenced draft, drawn by LED state by default. */
+function sequencedChannel(pin: string, id: string, label: string): LabChannel {
+  return {
+    pin,
+    id,
+    label,
+    csv_name: `${id}_counts`,
+    units: 'ADC counts',
+    allowed_conversions: ['counts_volts'],
+    default_visible: true,
+    split_by_led_state: true
+  };
+}
+
+/**
+ * The LED-sequenced pulse-ox configuration a new pulse-ox lab starts with:
+ * `tx` on A0 and `rx` on A1 (both shown by LED state), D5 RED and D6 IR, a
+ * 1000 µs dwell (1000 records/s), one plot per channel, and at least the
+ * firmware build that has the mode. Rust normalizes a saved draft the same way.
+ */
+export function pulseOxSequencedDraft(profile: LabProfile): LabProfile {
+  const channels = [sequencedChannel('A0', 'tx', 'TX'), sequencedChannel('A1', 'rx', 'RX')];
+  return {
+    ...profile,
+    required_firmware: { ...profile.required_firmware, build: atLeastSequencedBuild(profile.required_firmware.build) },
+    acquisition: {
+      ...profile.acquisition,
+      acquisition_mode: 'pulseox_sequenced',
+      analog_pin: 'A0',
+      channels,
+      analog_inputs: undefined,
+      adc_resolution_bits: 14,
+      sample_rate_hz: pulseOxSequencedRateHz(1000),
+      state_dwell_us: 1000,
+      // The explicit list is authoritative; the legacy shorthand is not written.
+      led_outputs: undefined,
+      digital_outputs: [
+        { pin: 'D5', label: 'Red LED', behavior: 'acquisition_sequenced' },
+        { pin: 'D6', label: 'IR LED', behavior: 'acquisition_sequenced' }
+      ]
+    },
+    plot_defaults: defaultPlotGroups(channels)
+  };
+}
+
 /** The default simultaneous channel for a pin, numbered so it is unique. */
 export function newChannel(pin: string, existing: LabChannel[]): LabChannel {
   const index = nextChannelIndex(existing);
@@ -120,14 +295,28 @@ export function nextChannelIndex(channels: LabChannel[]): number {
 
 /**
  * The editor's view of a draft (the backend already normalizes drafts the
- * same way): explicit outputs only, no channels in pulse-ox mode, and at
- * least one channel plus plot defaults in simultaneous mode.
+ * same way): explicit outputs only; no channels in the legacy 4-state mode;
+ * in the LED-sequenced mode the record rate that follows from the dwell, no
+ * legacy TX/RX inputs, and at least the firmware build with the mode; and at
+ * least one channel plus plot defaults in the other modes.
  */
 export function normalizeEditorDraft(draft: LabProfile): LabProfile {
   const acquisition = draft.acquisition;
   const digital_outputs = resolvedDigitalOutputs(acquisition);
   if (acquisition.acquisition_mode === 'pulseox_4state') {
     return { ...draft, acquisition: { ...acquisition, channels: [], led_outputs: undefined, digital_outputs } };
+  }
+  if (acquisition.acquisition_mode === 'pulseox_sequenced') {
+    const channels = acquisition.channels?.length ? acquisition.channels : pulseOxSequencedDraft(draft).acquisition.channels ?? [];
+    const sample_rate_hz = isSequencedDwell(acquisition.state_dwell_us)
+      ? pulseOxSequencedRateHz(Number(acquisition.state_dwell_us))
+      : acquisition.sample_rate_hz;
+    return {
+      ...draft,
+      required_firmware: { ...draft.required_firmware, build: atLeastSequencedBuild(draft.required_firmware.build) },
+      acquisition: { ...acquisition, channels, sample_rate_hz, analog_inputs: undefined, led_outputs: undefined, digital_outputs },
+      plot_defaults: draft.plot_defaults?.groups?.length ? draft.plot_defaults : defaultPlotGroups(channels)
+    };
   }
   const channels = acquisition.channels?.length ? acquisition.channels : [newChannel(acquisition.analog_pin || 'A0', [])];
   return {
@@ -227,40 +416,112 @@ export function labConfigurationIssues(profile: LabProfile): string[] {
     if ((acquisition.digital_outputs ?? []).some((output) => (output as RoleAwareOutput).pulse_ox_role)) {
       issues.push('A pulse-ox RED/IR role can be set only in a pulse-ox lab.');
     }
+  } else if (acquisition.acquisition_mode === 'pulseox_sequenced') {
+    // Mirrors `validate_led_sequenced`: every rule applies when a lab loads.
+    const channels = acquisition.channels ?? [];
+    if (channels.length < 1 || channels.length > MAX_ANALOG_CHANNELS) issues.push('An LED-sequenced pulse-ox lab needs one through six analog channels.');
+    duplicateIssue(channels.map((channel) => channel.pin), 'analog pin', issues);
+    duplicateIssue(channels.map((channel) => channel.id), 'channel ID', issues);
+    duplicateIssue(channels.map((channel) => channel.label), 'channel label', issues, false);
+    duplicateIssue(channels.map((channel) => channel.csv_name), 'CSV field name', issues);
+    if (channels.some((channel) => channel.units !== 'ADC counts')) issues.push('Each channel of an LED-sequenced lab records raw ADC counts.');
+    issues.push(...csvColumnIssues(channels));
+    const dwell = Number(acquisition.state_dwell_us);
+    if (!acquisition.state_dwell_us || !isSequencedDwell(dwell)) {
+      issues.push(`The LED-state dwell must be ${PULSEOX_SEQUENCED_DWELL_MIN_US}–${PULSEOX_SEQUENCED_DWELL_MAX_US} µs, in whole microseconds.`);
+    } else if (Number(acquisition.sample_rate_hz) !== pulseOxSequencedRateHz(dwell)) {
+      issues.push(`The record rate must follow the LED-state dwell: ${pulseOxSequencedRateHz(dwell)} records/s for ${dwell} µs per state.`);
+    }
+    issues.push(...pulseOxOutputIssues(acquisition.digital_outputs ?? []));
+    if (!(parseFirmwareBuild(profile.required_firmware?.build) >= SEQUENCED_MIN_FIRMWARE_BUILD)) {
+      issues.push(`LED-sequenced pulse-ox labs require WVU firmware build ${formatFirmwareBuild(SEQUENCED_MIN_FIRMWARE_BUILD)} or later.`);
+    }
+    issues.push(...plotDefaultsIssues(profile.plot_defaults?.groups ?? [], channels.map((channel) => channel.id)));
   } else {
     const inputs = acquisition.analog_inputs;
     if (!inputs || inputs.tx === inputs.rx) issues.push('Pulse oximetry needs distinct TX and RX analog pins.');
-    const outputs = acquisition.digital_outputs ?? [];
-    for (const role of ['red', 'ir'] as const) {
-      if (outputs.filter((output) => (output as RoleAwareOutput).pulse_ox_role === role).length > 1) {
-        issues.push('Each pulse-ox role (RED, IR) may be assigned to only one output.');
-        break;
-      }
-    }
-    const red = pulseOxOutput(outputs, 'red');
-    const ir = pulseOxOutput(outputs, 'ir');
-    if (!red || !ir || red.pin === ir.pin) issues.push('Pulse oximetry needs distinct sequenced Red and IR output pins.');
-    else if (outputs.some((output) => output.pin !== red.pin && output.pin !== ir.pin)) {
-      issues.push('Pulse-ox labs may define only their RED and IR outputs; remove the other outputs.');
-    }
+    issues.push(...pulseOxOutputIssues(acquisition.digital_outputs ?? []));
     const dwell = Number(acquisition.state_dwell_us);
-    if (!acquisition.state_dwell_us || dwell < PULSEOX_DWELL_MIN_US || dwell > PULSEOX_DWELL_MAX_US) {
-      issues.push('Pulse-ox state dwell must be 250–5000 µs.');
+    if (!acquisition.state_dwell_us || !isPulseOxDwell(dwell)) {
+      issues.push(`Pulse-ox state dwell must be ${PULSEOX_DWELL_MIN_US}–${PULSEOX_DWELL_MAX_US} µs, in whole microseconds.`);
     } else if (Number(acquisition.sample_rate_hz) !== pulseOxCycleRateHz(dwell)) {
       issues.push(`The pulse-ox cycle rate must follow the state dwell: ${pulseOxCycleRateHz(dwell)} cycles/s for ${dwell} µs per state.`);
     }
     if (acquisition.channels?.length) issues.push('Pulse-ox labs must not define analog channels.');
+  }
+  if (acquisition.acquisition_mode !== 'pulseox_sequenced' && (acquisition.channels ?? []).some((channel) => channel.split_by_led_state)) {
+    issues.push('Show by LED state is available only in an LED-sequenced pulse-ox lab.');
   }
   if (![12, 14].includes(Number(acquisition.adc_resolution_bits))) issues.push('ADC resolution must be 12 or 14 bit.');
   issues.push(...textIssues(profile));
   return issues;
 }
 
-function duplicateIssue(values: string[], label: string, issues: string[]) {
+/**
+ * The RED/IR output rules of both pulse-ox modes (Rust: one output per
+ * explicit role, distinct acquisition-sequenced RED and IR outputs on D4–D6,
+ * and no other outputs).
+ */
+function pulseOxOutputIssues(outputs: LabDigitalOutput[]): string[] {
+  const issues: string[] = [];
+  for (const role of ['red', 'ir'] as const) {
+    if (outputs.filter((output) => (output as RoleAwareOutput).pulse_ox_role === role).length > 1) {
+      issues.push('Each pulse-ox role (RED, IR) may be assigned to only one output.');
+      break;
+    }
+  }
+  const red = pulseOxOutput(outputs, 'red');
+  const ir = pulseOxOutput(outputs, 'ir');
+  const usable = (output: LabDigitalOutput | undefined) => output?.behavior === 'acquisition_sequenced' && ['D4', 'D5', 'D6'].includes(output.pin);
+  if (!red || !ir || red.pin === ir.pin || !usable(red) || !usable(ir)) issues.push('Pulse oximetry needs distinct sequenced Red and IR output pins.');
+  else if (outputs.some((output) => output.pin !== red.pin && output.pin !== ir.pin)) {
+    issues.push('Pulse-ox labs may define only their RED and IR outputs; remove the other outputs.');
+  }
+  return issues;
+}
+
+/** Mirrors `validate_plot_defaults`: no defaults, or every channel in exactly one non-empty plot. */
+export function plotDefaultsIssues(groups: LabPlotGroup[], channelIds: string[]): string[] {
+  if (!groups.length) return [];
+  const known = new Set(channelIds);
+  const assigned = new Set<string>();
+  const invalid = groups.some((group) => !group.channel_ids.length
+    || group.channel_ids.some((id) => !known.has(id) || assigned.has(id) || !assigned.add(id)));
+  return invalid || assigned.size !== known.size
+    ? ['The default plots must show every channel in exactly one plot.']
+    : [];
+}
+
+function duplicateIssue(values: string[], label: string, issues: string[], unique = true) {
   const clean = values.map((value) => value.trim()).filter(Boolean);
-  if (new Set(clean).size !== clean.length || clean.length !== values.length) issues.push(`Each ${label} must be present and unique.`);
+  if ((unique && new Set(clean).size !== clean.length) || clean.length !== values.length) {
+    issues.push(unique ? `Each ${label} must be present and unique.` : `Each ${label} must be present.`);
+  }
 }
 
 export function defaultPlotGroups(channels: LabChannel[]) {
   return { groups: channels.map((channel) => ({ channel_ids: [channel.id] })) };
+}
+
+/**
+ * The editor's default plots for a draft's channels: each channel in exactly
+ * one plot, empty plots dropped, and a channel without a plot in its own.
+ */
+export function normalizeDraftPlotGroups(channels: LabChannel[], groups: LabPlotGroup[]): LabPlotGroup[] {
+  const ids = new Set(channels.map((channel) => channel.id));
+  const seen = new Set<string>();
+  const result = groups
+    .map((group) => ({ channel_ids: group.channel_ids.filter((id) => ids.has(id) && !seen.has(id) && Boolean(seen.add(id))) }))
+    .filter((group) => group.channel_ids.length);
+  for (const channel of channels) if (!seen.has(channel.id)) result.push({ channel_ids: [channel.id] });
+  return result;
+}
+
+/** Moves one channel to default plot `plotNumber` (1-based), creating plots up to it. */
+export function assignDraftPlotNumber(channels: LabChannel[], groups: LabPlotGroup[], channelId: string, plotNumber: number): LabPlotGroup[] {
+  const requested = Math.max(1, Math.min(channels.length, Math.floor(Number(plotNumber)) || 1));
+  const result = normalizeDraftPlotGroups(channels, groups).map((group) => ({ channel_ids: group.channel_ids.filter((id) => id !== channelId) }));
+  while (result.length < requested) result.push({ channel_ids: [] });
+  result[requested - 1].channel_ids.push(channelId);
+  return result.filter((group) => group.channel_ids.length);
 }

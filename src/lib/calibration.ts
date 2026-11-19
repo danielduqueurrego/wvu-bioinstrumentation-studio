@@ -79,14 +79,29 @@ function listsConversions(allowedConversions: string[] | undefined): allowedConv
   return Array.isArray(allowedConversions) && allowedConversions.length > 0;
 }
 
+/**
+ * One field that has a display unit: a lab channel (whose four LED-state
+ * traces share it), or a legacy 4-state raw pulse-ox field (`rawPulseField`).
+ */
+export type UnitField = { id: string; allowed_conversions?: string[]; rawPulseField?: boolean };
+
+/**
+ * The display units one field offers, decided by the field itself, never by
+ * the lab's category: a legacy raw pulse-ox field offers counts and volts
+ * only; any other channel (an LED-sequenced lab's included) follows its
+ * `allowed_conversions`.
+ */
+export function fieldDisplayUnits(field: UnitField, hasLinearCalibration = false, linearOutputUnits = 'mmHg'): DisplayUnit[] {
+  if (field.rawPulseField) return ['counts', 'volts'];
+  return supportedDisplayUnits(field.id, hasLinearCalibration, field.allowed_conversions ?? [], linearOutputUnits);
+}
+
 export function supportedDisplayUnits(
-  category: string | undefined,
   channelId: string,
   hasLinearCalibration: boolean,
   allowedConversions: string[] = [],
   linearOutputUnits = 'mmHg'
 ): DisplayUnit[] {
-  if (category === 'course_pulseox') return ['counts', 'volts'];
   if (allowedConversions.includes('mpxv_pressure')) return ['counts', 'volts', 'kpa', 'mmhg'];
   if (allowedConversions.includes('linear_calibration')) {
     const calibratedUnit: DisplayUnit = linearOutputUnits.trim().toLowerCase() === 'mmhg'
@@ -192,12 +207,11 @@ export function unitsForGroup(
  * Display-only: raw counts are recorded whatever the unit.
  */
 export function initialChannelUnits(
-  channels: Array<{ id: string; default_display_unit?: string | null; allowed_conversions?: string[] }>,
-  category?: string
+  channels: Array<UnitField & { default_display_unit?: string | null }>
 ): Record<string, DisplayUnit> {
   return Object.fromEntries(channels.map((channel) => {
     const wanted = channel.default_display_unit?.trim().toLowerCase() ?? '';
-    const offered = supportedDisplayUnits(category, channel.id, false, channel.allowed_conversions ?? []);
+    const offered = fieldDisplayUnits(channel);
     const unit = offered.find((candidate) => candidate === wanted) ?? 'counts';
     return [channel.id, unit];
   }));

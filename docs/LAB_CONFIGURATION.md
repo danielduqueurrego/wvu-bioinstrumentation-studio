@@ -9,13 +9,25 @@ Course labs are versioned acquisition definitions. Every recording embeds a snap
 | ECG — Course Capture | A0 ECG | 1000 frames/s | 14 bit | ECG |
 | EMG + Force — Course Capture | A0 raw EMG, A1 rectified, A2 envelope, A3 pressure | 1000 frames/s | 14 bit | one plot per signal |
 | Blood Pressure + PPG — Course Capture | A0 PPG, A1 MPXV, A2 XGZP, D4 green | 200 frames/s | 14 bit | PPG, MPXV, XGZP |
-| Pulse Oximetry — TX + RX Raw Capture | A0 TX, A1 RX, D5 red, D6 IR | about 250 cycles/s | 14 bit | TX raw phases; RX raw phases |
+| Pulse Oximetry — TX + RX Raw Capture (1.1.0, LED-sequenced) | A0 TX, A1 RX, D5 red, D6 IR | 1000 records/s (one per LED state; 250/s per state) | 14 bit | TX by LED state; RX by LED state |
 | General Analog — Development | 1–6 unique A0–A5 inputs | 1000 frames/s | 14 bit | one plot per selected input |
 | Op Amp Lab | A0 Vmid, A1 Vout | 100 frames/s | 14 bit | Vmid; Vout |
 
 Op Amp Lab (`wvu.bmeg420l.op_amp.course.capture.v1`, category `course_op_amp`) is a bench-only factory lab since this release. Its CSV fields are `vmid_counts` and `vout_counts`, and both channels offer counts and volts. It replaces the Op Amp Lab 2.0.1 that the retired v1.0.2 student installer stored under General Analog's lab ID; see [Catalog file](#catalog-file) for the one-time migration of that copy.
 
-The pulse-ox lab uses a fixed `RED → DARK 1 → IR → DARK 2` sequence with a 1000 µs nominal dwell. The firmware advances phase deadlines on one absolute schedule rather than scheduling from the end of ADC and bookkeeping work. RED and IR are never driven HIGH at the same time. Each completed cycle carries its measured timestamp; the requested cycle rate remains configuration metadata rather than a replacement for measured timing.
+The pulse-ox lab (`wvu.bmeg420l.pulseox.txrx.raw.course.capture.v1`) is version **1.1.0** and uses the **LED-sequenced** mode (`pulseox_sequenced`): the LEDs step `RED → DARK 1 → IR → DARK 2` with a 1000 µs dwell, and at the end of every state the board reads both photodetectors (TX on A0, RX on A1) and records one row: `[led_state, tx_counts, rx_counts]`. Both channels are shown by LED state in the live plot by default. It needs firmware build `0x00010007`, so every board needs one **Restore WVU Firmware** after the update. Its notices, export name, and category are those of 1.0.0, and it still calculates nothing: raw RED/DARK/IR/DARK values only, no SpO2.
+
+Version 1.0.0 used the legacy 4-state mode (`pulseox_4state`: one 8-field record per cycle, about 250 cycles/s). It is published and stays in `profiles/legacy/pulseox_tx_rx_course_capture_1.0.0.profile.json`. It is not compiled in, but **Install lab file…** accepts that file as a rollback, and **Restore course default** returns to 1.1.0.
+
+In both modes the firmware advances state deadlines on one absolute schedule rather than scheduling from the end of ADC and bookkeeping work, and RED and IR are never driven HIGH at the same time. Each record carries its measured timestamp; the requested rate remains configuration metadata rather than a replacement for measured timing.
+
+An LED-sequenced recording's CSV has one row per LED state, with the state in two columns before the channels. For the built-in lab the header is:
+
+```text
+record_sequence,t_us,cycle_index,led_state,led_state_name,tx_counts,tx_V,rx_counts,rx_V
+```
+
+[Calibration and Units](CALIBRATION_AND_UNITS.md#csv) describes every column.
 
 Recording metadata preserves the selected profile's bench-only status, human-connection authorization, course-notice acknowledgement, and non-medical validation status. The acquisition screen does not ask students to classify the connected signal separately.
 
@@ -25,13 +37,13 @@ Factory labs are compiled into the application from `profiles/*.profile.json` (t
 
 - **A factory lab version is always `MAJOR.MINOR.0`.** Any change to a factory lab's content, including a notice, a channel label, or the firmware requirement, is published as the next MINOR version (`X.Y+1.0`). A published version never changes.
 - **An edited lab always has PATCH ≥ 1.** **Save changes as new version** numbers a revision one patch above the highest revision with the same MAJOR.MINOR. A new lab (Duplicate, Blank) starts locally at 1.0.0 under its own new lab ID, so when such a lab becomes a factory lab, its first factory version is one MINOR above the revision it was made from: a lab saved as 1.0.0 and edited to 1.0.2 is built in as 1.1.0. Either way a factory version never has the ID and version of a local revision.
-- **`required_firmware.build` is the minimum WVU firmware build whose features the lab uses**, not the build current when the lab was written. It must be a build the application accepts (an allow-list in `profiles.rs`). When a newer firmware build ships, factory labs that do not use its new features keep their build, version, and hash.
+- **`required_firmware.build` is the minimum WVU firmware build whose features the lab uses**, not the build current when the lab was written. It must be a build the application accepts (`ACCEPTED_LAB_FIRMWARE_BUILDS` in `profiles.rs`: `0x00010007` and every earlier build down to `0x00010001`). When a newer firmware build ships, factory labs that do not use its new features keep their build, version, and hash: with build `0x00010007`, the five other factory labs still name `0x00010006`, and only the LED-sequenced pulse-ox lab 1.1.0 names `0x00010007`. The connected board must still run exactly this application's build (see [Troubleshooting](TROUBLESHOOTING.md#older-or-newer-wvu-firmware)).
 - **`profiles/factory-labs.lock.json` records every factory lab version ever shipped** as `profile_id`, `profile_version`, and `canonical_hash`, one entry per line. It is append-only: an entry that has been committed is never changed or removed. (Before you commit, `git restore profiles/factory-labs.lock.json` undoes an entry the tool appended for a change you are discarding.)
 - **Every published version stays available as a file**: the lab's current file in `profiles/`, or an earlier version in `profiles/legacy/<file>_<version>.profile.json` (for example `profiles/legacy/ecg_course_capture_1.0.0.profile.json`). Legacy files are not compiled in and must match their lock entries. `fix` and `promote` keep the version a file held there before they replace it, so you do not copy it yourself.
 
 Rust tests enforce this: every compiled-in lab is in the lock with the same hash and is the newest locked version of its lab; every `profiles/*.profile.json` is compiled in; every factory lab is `MAJOR.MINOR.0`, `built_in`, and `locked`; the lock lists no ID and version twice; every lock entry is held by a file; and the hashes of the labs v1.0.2 shipped stay unchanged (read from their current or legacy files), which guards the canonical serialization every stored lab and recording snapshot was hashed with.
 
-When a lab PC updates to a release with a new factory version (for example ECG 1.1.0), a local revision that an instructor made active (for example 1.0.2) stays active; **Restore course default** switches to the new factory version, and editing that creates 1.1.1.
+When a lab PC updates to a release with a new factory version (for example ECG 1.1.0), a local revision that an instructor made active (for example 1.0.2) stays active; **Restore course default** switches to the new factory version, and editing that creates 1.1.1. The pulse-ox lab follows the same rule: a PC whose instructor made a local 4-state revision active keeps recording in the legacy 4-state mode (build `0x00010007` still supports it) until **Restore course default** selects 1.1.0.
 
 ## How to change a built-in lab
 
@@ -149,13 +161,24 @@ In Instructor mode, **Manage Labs** lists the catalog. **Edit**, **Duplicate sel
 
 Reading, selecting, acquiring, plotting, calibrating, or navigating does not create a version. Manage Labs is unavailable while a recording runs. Start sends the version of the lab the page shows, and the backend refuses to start if a different revision has become active.
 
+The **Acquisition mode** menu offers **Simultaneous Analog** and **Pulse Oximetry — LED-sequenced**. **Pulse Oximetry — legacy 4-state** appears only while editing a lab that already uses that mode (an older local pulse-ox revision, or the 1.0.0 file installed as a rollback), so existing 4-state labs can still be edited; new pulse-ox labs use the LED-sequenced mode.
+
 For simultaneous analog labs, an instructor can configure one to six unique A0–A5 channels, machine-safe channel/CSV names, rate, supported ADC resolution, conversion capability, visibility, and plot assignment. D4/D5/D6 can be configured only with supported safe behaviors: LOW, HIGH while recording, or the fixed pulse-ox sequence. The saved output list is exactly what is driven: an unchecked output stays LOW.
+
+For **LED-sequenced** pulse-ox labs the same channel grid is used, with at most six channels and an extra **By LED state** column, plus:
+
+- **RED output** and **IR output** (two different pins of D4–D6, both `acquisition_sequenced`; no other output);
+- **State dwell (µs)** (1000–5000), which sets the record rate: `round(1,000,000 / dwell)` records/s, shown as rows per second for each channel and per LED state;
+- the CSV columns the lab will write.
+
+Choosing the mode for a lab starts from TX on A0 and RX on A1 (`tx_counts`, `rx_counts`), both shown by LED state, 14-bit, 1000 µs, D5 RED and D6 IR. Add channels for other signals (A2–A5, for example a pressure sensor or a second photodetector); a channel added later is not shown by LED state unless you tick it. **By LED state** (`split_by_led_state`) is display only: it decides whether the live plot draws the channel as four traces (RED, DARK 1, IR, DARK 2) or as one trace at the full record rate. It never changes acquisition, the recorded data, or the CSV, and students can change it during a recording with **Show by LED state** in Live signals.
 
 Rules for a revision saved or imported now (labs that are already installed keep loading unchanged):
 
-- CSV fields use 1–64 letters, digits, or underscores (for example `01_counts`). Every generated column must be distinct, ignoring case: the raw field, its `_V` column, and the `_kPa`/`_mmHg` columns of an MPXV-capable channel, and none may reuse `record_sequence`, `t_us`, or `cycle_index`. If a student's linear calibration unit would repeat an existing column (for example volts next to `_V`), the CSV names that column `<name>_cal_<unit>`; unsafe names in older labs are quoted in the CSV header.
-- Simultaneous frame rates are the firmware's 100, 200, 250, 500, or 1000 frames/s. The pulse-ox cycle rate is `round(1,000,000 / (4 × dwell))` and dwell is 250–5000 µs.
-- Pulse-ox labs have no analog channels and only their RED and IR outputs. Pulse-ox acquisition never used a channel list, so the unused `Channel 1 / A0` that the v1.0.2 editor stored in pulse-ox labs is dropped when such a package is imported (and when the lab is next edited); it is not a reason to refuse the package. RED/IR come from an optional `pulse_ox_role` (`"red"`/`"ir"`) on the output; without it, the label `Red LED` / `IR LED` (any letter case) decides.
+- CSV fields use 1–64 letters, digits, or underscores (for example `01_counts`). Every generated column must be distinct, ignoring case: the raw field, its `_V` column, and the `_kPa`/`_mmHg` columns of an MPXV-capable channel, and none may reuse `record_sequence`, `t_us`, `cycle_index`, `led_state`, or `led_state_name`. If a student's linear calibration unit would repeat an existing column (for example volts next to `_V`), the CSV names that column `<name>_cal_<unit>`; unsafe names in older labs are quoted in the CSV header. (A stored lab that already uses `led_state` or `led_state_name` still loads; only a revision saved now must rename it.)
+- Simultaneous frame rates are the firmware's 100, 200, 250, 500, or 1000 frames/s. The legacy 4-state cycle rate is `round(1,000,000 / (4 × dwell))` and dwell is 250–5000 µs. The LED-sequenced record rate is `round(1,000,000 / dwell)` and dwell is 1000–5000 µs. Dwell is a whole number of microseconds in both modes; each LED state gets `1,000,000 / (4 × dwell)` rows/s.
+- LED-sequenced labs have 1–6 channels with unique pins, IDs, and CSV names, all in `ADC counts`; distinct `acquisition_sequenced` RED and IR outputs on D4–D6 and no other output; `required_firmware.build` `0x00010007` or later (checked before the lab's hash, so an older build is named as the reason); and plot defaults, if any, that put every channel in exactly one plot. `split_by_led_state` is allowed only in this mode.
+- Legacy 4-state pulse-ox labs have no analog channels and only their RED and IR outputs. That mode never used a channel list, so the unused `Channel 1 / A0` that the v1.0.2 editor stored in pulse-ox labs is dropped when such a package is imported (and when the lab is next edited); it is not a reason to refuse the package. In both pulse-ox modes, RED/IR come from an optional `pulse_ox_role` (`"red"`/`"ir"`) on the output; without it, the label `Red LED` / `IR LED` (any letter case) decides.
 - Names, labels, descriptions, and safety notices have length limits.
 - `display.voltage_reference_v` must be positive but is informational only. Conversions use the ADC reference voltage entered in the Calibration & Units card (see [Calibration and Units](CALIBRATION_AND_UNITS.md#raw-data)).
 

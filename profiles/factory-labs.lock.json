@@ -4,5 +4,6 @@
   { "profile_id": "wvu.bmeg420l.emg.force.course.capture.v1", "profile_version": "1.0.0", "canonical_hash": "cd0af7cf4a1ca25d8a5988f630825a30d7015aa6a40ef282af10f225e1ae60b8" },
   { "profile_id": "wvu.bmeg420l.blood_pressure.ppg.course.capture.v1", "profile_version": "1.0.0", "canonical_hash": "fbd4a5b6f210271694694feaac54876c44c6b09f8525f2f4e84f7c88f0bb266f" },
   { "profile_id": "wvu.bmeg420l.pulseox.txrx.raw.course.capture.v1", "profile_version": "1.0.0", "canonical_hash": "019c25a69ef6e5b361774acc668915066c7113a7b58170c906a8049a69198bd0" },
-  { "profile_id": "wvu.bmeg420l.op_amp.course.capture.v1", "profile_version": "1.0.0", "canonical_hash": "90113222d07df3e239b95666510ab77b77356bd5dc0ae04b7660d60d0faa579d" }
+  { "profile_id": "wvu.bmeg420l.op_amp.course.capture.v1", "profile_version": "1.0.0", "canonical_hash": "90113222d07df3e239b95666510ab77b77356bd5dc0ae04b7660d60d0faa579d" },
+  { "profile_id": "wvu.bmeg420l.pulseox.txrx.raw.course.capture.v1", "profile_version": "1.1.0", "canonical_hash": "8d8428e9d5de1d07480417adf0c94a61f401009f6c59ad31109f33dbed4239cd" }
 ]

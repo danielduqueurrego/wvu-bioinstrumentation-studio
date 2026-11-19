@@ -2,7 +2,20 @@
 export type LabChannel = {
   pin: string; id: string; label: string; csv_name: string; units: string;
   allowed_conversions?: string[]; default_display_unit?: string; default_visible?: boolean;
+  /**
+   * LED-sequenced labs only, and display-only: the live plot starts by
+   * drawing this channel as one trace per LED state. Absent when false.
+   */
+  split_by_led_state?: boolean;
 };
+
+/**
+ * `simultaneous`: 1–6 channels in every frame. `pulseox_4state`: the legacy
+ * TX/RX pulse-ox mode, one 8-field record per RED/DARK 1/IR/DARK 2 cycle.
+ * `pulseox_sequenced`: the LED-sequenced pulse-ox mode (firmware build
+ * 0x00010007), one record `[led_state, ch1..chN]` per LED state.
+ */
+export type LabAcquisitionMode = 'simultaneous' | 'pulseox_4state' | 'pulseox_sequenced';
 
 export type LabDigitalOutput = {
   pin: string;
@@ -15,7 +28,7 @@ export type LabPlotGroup = { channel_ids: string[] };
 export type LabAcquisition = {
   analog_pin: string; adc_resolution_bits: number; sample_rate_hz: number;
   allowed_duration_modes: string[]; timed_presets_seconds: number[]; minimum_custom_duration_seconds: number;
-  acquisition_mode: 'simultaneous' | 'pulseox_4state'; channels?: LabChannel[];
+  acquisition_mode: LabAcquisitionMode; channels?: LabChannel[];
   analog_inputs?: { tx: string; rx: string };
   led_outputs?: { green?: string | null; red?: string | null; ir?: string | null };
   state_dwell_us?: number;

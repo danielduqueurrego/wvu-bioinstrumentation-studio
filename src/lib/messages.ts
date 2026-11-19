@@ -44,6 +44,8 @@ export type ConnectionFailureCategory =
   | 'wrong_protocol_version'
   | 'missing_firmware_identity'
   | 'incompatible_firmware_identity'
+  | 'older_wvu_firmware'
+  | 'newer_wvu_firmware'
   | 'handshake_incomplete'
   | 'serial_transport_error'
   | 'firmware_protocol_error'
@@ -71,12 +73,40 @@ export type FirmwareErrorCategory =
   | 'manual_reset_required'
   | 'protocol_verification_failed'
   | 'wrong_firmware_identity'
+  | 'older_wvu_firmware'
+  | 'newer_wvu_firmware'
   | 'canceled'
   | 'upload_cannot_be_canceled'
   | 'tool_timed_out'
   | 'internal_error';
 
 const CLOSE_OTHER_APPS = 'Close Arduino IDE, Serial Monitor, or Arduino Cloud Agent';
+
+/**
+ * The board answered with the WVU device ID but another firmware build than
+ * this app's. Older: Restore WVU Firmware updates the board. Newer: this
+ * computer's app is the out-of-date side, so updating the app is the real fix;
+ * Restore puts this app's (older) firmware back on the board.
+ */
+const OLDER_WVU_FIRMWARE: PlainMessage = {
+  headline: 'The board has an older WVU firmware version',
+  sentence: 'Restore the WVU firmware to update the board for this app.',
+  nextAction: 'restore_firmware'
+};
+const NEWER_WVU_FIRMWARE: PlainMessage = {
+  headline: 'The board has a newer WVU firmware version',
+  sentence: 'This computer’s app is older than the board’s firmware. Update the app on this computer, or restore the WVU firmware to put this app’s firmware back on the board.',
+  nextAction: 'restore_firmware'
+};
+
+/**
+ * Which side is out of date when the board reported another WVU firmware
+ * build. The Rust connection and firmware-operation categories use the same
+ * names (`older_wvu_firmware`, `newer_wvu_firmware`).
+ */
+export function wvuFirmwareMismatch(category: string | null | undefined): 'older' | 'newer' | undefined {
+  return category === 'older_wvu_firmware' ? 'older' : category === 'newer_wvu_firmware' ? 'newer' : undefined;
+}
 
 export const CONNECTION_FAILURE_MESSAGES: Record<ConnectionFailureCategory, PlainMessage> = {
   port_busy: {
@@ -114,6 +144,8 @@ export const CONNECTION_FAILURE_MESSAGES: Record<ConnectionFailureCategory, Plai
     sentence: 'Restore the WVU firmware to update it.',
     nextAction: 'restore_firmware'
   },
+  older_wvu_firmware: OLDER_WVU_FIRMWARE,
+  newer_wvu_firmware: NEWER_WVU_FIRMWARE,
   handshake_incomplete: {
     headline: 'The board did not finish connecting',
     sentence: 'Retry the connection. If it fails again, verify or restore the firmware.',
@@ -250,6 +282,8 @@ export const FIRMWARE_FAILURE_MESSAGES: Record<FirmwareErrorCategory, PlainMessa
     sentence: 'Restore the WVU firmware before recording.',
     nextAction: 'restore_firmware'
   },
+  older_wvu_firmware: OLDER_WVU_FIRMWARE,
+  newer_wvu_firmware: NEWER_WVU_FIRMWARE,
   canceled: {
     headline: 'The firmware restore was canceled',
     sentence: 'Reconnect the board if needed, then restore the WVU firmware again.',
@@ -311,6 +345,8 @@ const RESTORE_CATEGORIES = new Set<string>([
   'wrong_protocol_version',
   'missing_firmware_identity',
   'incompatible_firmware_identity',
+  'older_wvu_firmware',
+  'newer_wvu_firmware',
   'lab_not_supported_by_firmware'
 ]);
 

@@ -11,8 +11,11 @@ import {
   HARDWARE_STARTUP_DISPLAY_WARMUP_SECONDS,
   formatLiveDisplayValue,
   layoutEndpointLabels,
+  newestTraceSample,
   normalizePlotTimeWindow,
-  previewPlotTimeWindow
+  previewPlotTimeWindow,
+  sampleInTrace,
+  traceRawValues
 } from './live-display';
 
 describe('live display helpers', () => {
@@ -174,5 +177,56 @@ describe('live display helpers', () => {
       { id: 'bottom', naturalTop: 155 }
     ], 0, 180);
     expect(labels.map((label) => label.top)).toEqual([25, 90, 155]);
+  });
+});
+
+describe('LED-sequenced traces (display-only)', () => {
+  // Records [led_state, tx, rx]: the LED state is sequence % 4.
+  const levels = [3_000, 500, 2_000, 520];
+  const records = Array.from({ length: 12 }, (_, sequence) => ({
+    sequence,
+    timestamp_us: sequence * 1_000,
+    values: [sequence % 4, levels[sequence % 4] + sequence, 7_000 + sequence]
+  }));
+
+  it('draws a trace of one LED state as null at the other states, and a full-rate trace at every record', () => {
+    expect(traceRawValues(records.slice(0, 6), { valueIndex: 1, ledState: 0 })).toEqual([3_000, null, null, null, 3_004, null]);
+    expect(traceRawValues(records.slice(0, 6), { valueIndex: 1, ledState: 2 })).toEqual([null, null, 2_002, null, null, null]);
+    expect(traceRawValues(records.slice(0, 3), { valueIndex: 2 })).toEqual([7_000, 7_001, 7_002]);
+    // A record without that value keeps the old behaviour (0), never another field.
+    expect(traceRawValues([{ values: [0] }], { valueIndex: 1, ledState: 0 })).toEqual([0]);
+    expect(sampleInTrace(records[5], { valueIndex: 1, ledState: 1 })).toBe(true);
+    expect(sampleInTrace(records[5], { valueIndex: 1, ledState: 2 })).toBe(false);
+    expect(sampleInTrace(records[5], { valueIndex: 1 })).toBe(true);
+  });
+
+  it('puts each endpoint badge on the newest record of its own LED state', () => {
+    expect(newestTraceSample(records, { valueIndex: 1, ledState: 0 })?.sequence).toBe(8);
+    expect(newestTraceSample(records, { valueIndex: 1, ledState: 3 })?.sequence).toBe(11);
+    expect(newestTraceSample(records, { valueIndex: 2 })?.sequence).toBe(11);
+    expect(newestTraceSample(records.slice(0, 2), { valueIndex: 1, ledState: 2 })).toBeUndefined();
+  });
+
+  it('checks the startup transient within each LED state, never across states', () => {
+    const steady = Array.from({ length: 32 }, (_, sequence) => ({
+      sequence,
+      timestamp_us: sequence * 1_000,
+      values: [sequence % 4, [12_000, 400, 9_000, 420][sequence % 4]]
+    }));
+    // Checked across every record, the states' different levels would look like a transient.
+    expect(filterStartupDisplayTransient(steady, [1], 14, true)).toHaveLength(31);
+    // Within each LED state, the steady levels are kept.
+    for (const ledState of [0, 1, 2, 3]) {
+      expect(filterStartupDisplayTransient(steady, [{ valueIndex: 1, ledState }], 14, true)).toBe(steady);
+    }
+    // A real settling RED transient on the first record is still removed.
+    const settling = steady.map((record) => record.sequence % 4 === 0
+      ? { ...record, values: [0, [9_000, 11_200, 11_800, 11_950, 12_000, 12_000, 12_000, 12_000][record.sequence / 4]] }
+      : record);
+    const filtered = filterStartupDisplayTransient(settling, [{ valueIndex: 1, ledState: 0 }], 14, true);
+    expect(filtered[0]?.sequence).toBe(1);
+    expect(filtered).toHaveLength(31);
+    // A trace of another LED state does not draw the first record, so it never removes it.
+    expect(filterStartupDisplayTransient(settling, [{ valueIndex: 1, ledState: 2 }], 14, true)).toBe(settling);
   });
 });

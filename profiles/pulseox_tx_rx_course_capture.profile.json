@@ -1,27 +1,29 @@
 {
   "schema_version": 1,
   "profile_id": "wvu.bmeg420l.pulseox.txrx.raw.course.capture.v1",
-  "profile_version": "1.0.0",
+  "profile_version": "1.1.0",
   "display_name": "Pulse Oximetry — TX + RX Raw Capture",
   "category": "course_pulseox",
   "status": "locked",
   "source": "built_in",
-  "description": "Fixed RED/DARK/IR/DARK raw transmission and reflectance capture for later offline processing.",
+  "description": "LED-sequenced RED/DARK/IR/DARK raw capture of the transmission (TX, A0) and reflectance (RX, A1) photodetectors, one row per LED state, for later offline processing.",
   "target_board": "Arduino UNO R4 WiFi",
   "fqbn": "arduino:renesas_uno:unor4wifi",
-  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 4, "build": "0x00010006", "device": "0x554E4F34" },
+  "required_firmware": { "protocol_major": 0, "protocol_minor_min": 4, "build": "0x00010007", "device": "0x554E4F34" },
   "acquisition": {
-    "analog_pin": "A0", "adc_resolution_bits": 14, "sample_rate_hz": 250,
+    "analog_pin": "A0", "adc_resolution_bits": 14, "sample_rate_hz": 1000,
     "allowed_duration_modes": ["timed", "until_stopped"], "timed_presets_seconds": [10, 30, 60, 300, 600], "minimum_custom_duration_seconds": 10,
-    "acquisition_mode": "pulseox_4state",
-    "analog_inputs": { "tx": "A0", "rx": "A1" },
-    "led_outputs": { "green": null, "red": "D5", "ir": "D6" },
+    "acquisition_mode": "pulseox_sequenced",
+    "channels": [
+      { "pin": "A0", "id": "tx", "label": "TX", "csv_name": "tx_counts", "units": "ADC counts", "allowed_conversions": ["counts_volts"], "split_by_led_state": true },
+      { "pin": "A1", "id": "rx", "label": "RX", "csv_name": "rx_counts", "units": "ADC counts", "allowed_conversions": ["counts_volts"], "split_by_led_state": true }
+    ],
     "digital_outputs": [{ "pin": "D5", "label": "Red LED", "behavior": "acquisition_sequenced" }, { "pin": "D6", "label": "IR LED", "behavior": "acquisition_sequenced" }],
     "state_dwell_us": 1000
   },
-  "display": { "primary_quantity": "arduino_input_volts", "channel_label": "Raw TX + RX photodetector states", "raw_units_label": "ADC counts", "voltage_units_label": "V", "voltage_reference_v": 5.0, "plot_min_v": 0.0, "plot_max_v": 5.0 },
+  "display": { "primary_quantity": "arduino_input_volts", "channel_label": "Raw TX + RX photodetectors by LED state", "raw_units_label": "ADC counts", "voltage_units_label": "V", "voltage_reference_v": 5.0, "plot_min_v": 0.0, "plot_max_v": 5.0 },
   "safety": { "bench_only": false, "human_connection_authorized": false, "not_medical_device": true, "notices": ["Teaching use only — not a medical device.", "Follow the BMEG 420L lab instructions and instructor safety procedures.", "Raw RED/DARK/IR/DARK variables are preserved; no SpO2, perfusion index, or heart rate is calculated."] },
   "export": { "signal_name": "pulseox_tx_rx_raw_course_capture", "include_profile_snapshot": true },
-  "plot_defaults": { "groups": [{ "channel_ids": ["red_tx", "dark1_tx", "ir_tx", "dark2_tx"] }, { "channel_ids": ["red_rx", "dark1_rx", "ir_rx", "dark2_rx"] }] },
-  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "019c25a69ef6e5b361774acc668915066c7113a7b58170c906a8049a69198bd0" }
+  "plot_defaults": { "groups": [{ "channel_ids": ["tx"] }, { "channel_ids": ["rx"] }] },
+  "integrity": { "canonical_hash_algorithm": "SHA-256", "canonical_hash": "8d8428e9d5de1d07480417adf0c94a61f401009f6c59ad31109f33dbed4239cd" }
 }

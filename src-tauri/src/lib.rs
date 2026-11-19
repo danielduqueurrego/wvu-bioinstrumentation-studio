@@ -1520,6 +1520,34 @@ mod tests {
     }
 
     #[test]
+    fn an_led_sequenced_lab_calibrates_its_channels_not_its_led_state_traces() {
+        // Sequenced labs have real channels, so `resolved_channels` decides
+        // calibration membership exactly as for simultaneous labs.
+        let lab = profiles::sequenced_test_lab();
+        let preset = |channel_id: &str| {
+            let mut calibration = calibration::RecordingCalibration::default();
+            calibration.active_calibrations.push(
+                calibration::fixed_mpxv_calibration(
+                    lab.profile_id.clone(),
+                    channel_id.into(),
+                    5.0,
+                    5.0,
+                )
+                .unwrap_or_else(|error| panic!("{error}")),
+            );
+            calibration
+        };
+        assert!(checked_recording_calibration(&lab, preset("rx")).is_ok());
+        assert!(checked_recording_calibration(&lab, preset("tx")).is_ok());
+        for not_a_channel in ["red_rx", "led:0:rx", "led_state", "raw"] {
+            assert!(
+                checked_recording_calibration(&lab, preset(not_a_channel)).is_err(),
+                "{not_a_channel}"
+            );
+        }
+    }
+
+    #[test]
     fn a_channel_may_have_only_one_active_calibration() {
         let blood_pressure = profiles::built_in_profiles()
             .unwrap_or_else(|error| panic!("{error}"))

@@ -18,6 +18,16 @@ Select the detected board and use **Verify Firmware**. If the Board card then sh
 - **If the upload fails.** If the restore reports that the upload failed, close Arduino IDE, Serial Monitor, and Arduino Cloud Agent. Press the board's RESET button twice quickly, select **Refresh Board**, and restore again.
 - **Results.** The **Last firmware operation** card in the Board card keeps the result of the last restore or failed verification: what happened, what to do next, the final COM port, and the log file. **Copy diagnostics** copies the details, including the technical codes, for your instructor.
 
+## Older or newer WVU firmware
+
+The board runs the WVU firmware, but not the build this app needs. The app accepts exactly its own build (build `0x00010007` for this version), so **every board needs one Restore WVU Firmware** after the app is updated. Retry connection is not offered, because a retry gets the same answer.
+
+- **Older WVU firmware.** The message says **The board has an older WVU firmware version**. Select **Restore WVU Firmware** to update the board; follow the steps in [No WVU firmware](#no-wvu-firmware-firmware-update-required), including the double reset.
+- **Newer WVU firmware.** The message says **The board has a newer WVU firmware version**: this computer's app is older than the firmware on the board, usually because another lab computer was updated first and restored the board. Update the app on this computer. **Restore WVU Firmware** also works, but it puts this app's older firmware back on the board, and an updated computer will then ask for a restore again.
+- **Version 1.0.x.** The app versions 1.0.0 to 1.0.2 do not know these messages: with a board restored by a newer app they report that the board's firmware build is incompatible and point to installing the firmware for their own version. Restoring there puts the old firmware back. Update that computer instead.
+
+**Rollout rule for instructors and IT:** update the app on **every** lab computer first, then restore each board once from an updated computer. Until both are done, a board and a computer that disagree show one of these messages and Start stays unavailable. A Simulator recording still works.
+
 ## Arduino port is busy
 
 The Board card shows **Port busy**. A board that was already **Ready** keeps its chip; the message under the recording bar or the **Last firmware operation** card says **Another program is using the board** instead. Close Arduino IDE, Serial Monitor, Serial Plotter, or Arduino Cloud Agent, and reconnect the board if necessary. Then select **Close other serial apps, then Verify** (or **Verify Firmware**). A busy port does not mean the firmware is wrong; do not restore because of it.
@@ -100,7 +110,7 @@ The collapsed **Advanced details** section contains firmware/protocol, connectio
 
 ## Live plot starts with a brief jump
 
-The first hardware ADC conversion can settle after a recording starts. When that first frame is an identifiable converging transient, the live display omits it so the y-axis remains readable. The raw `.bmeg` and `.csv` files still retain every acquired sample. Live x-axis labels are elapsed recording seconds beginning at 0.
+The first hardware ADC conversion can settle after a recording starts. When that first frame is an identifiable converging transient, the live display omits it so the y-axis remains readable. In an LED-sequenced pulse-ox lab this check compares samples of the same LED state only, so the normal step between RED and DARK rows is never taken for a transient. The raw `.bmeg` and `.csv` files still retain every acquired sample. Live x-axis labels are elapsed recording seconds beginning at 0.
 
 ## Plots say SIMULATED DATA
 

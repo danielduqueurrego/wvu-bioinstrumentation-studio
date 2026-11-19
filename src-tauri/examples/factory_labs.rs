@@ -12,7 +12,7 @@ use std::{
 };
 use wvu_bioinstrumentation_studio_lib::profiles::{
     factory_lab_check, factory_lab_source_line, factory_lab_sources, promote_lab_file,
-    rehash_factory_file, FACTORY_LAB_FILE_SUFFIX, FACTORY_LAB_LOCK_FILE,
+    rehash_factory_file, FACTORY_LAB_FILE_SUFFIX, FACTORY_LAB_LEGACY_FOLDER, FACTORY_LAB_LOCK_FILE,
 };
 
 const USAGE: &str = "\
@@ -137,9 +137,16 @@ fn check(profiles_dir: &Path) -> ExitCode {
         println!("  {line}");
     }
     if report.is_ok() {
+        // Legacy files (earlier published versions) are checked but not compiled in.
+        let legacy_prefix = format!("{FACTORY_LAB_LEGACY_FOLDER}/");
+        let legacy = report
+            .labs
+            .iter()
+            .filter(|line| line.starts_with(&legacy_prefix))
+            .count();
         println!(
-            "OK: {} factory lab file(s) checked; all are compiled in and recorded in {FACTORY_LAB_LOCK_FILE}.",
-            report.labs.len()
+            "OK: {} compiled-in factory lab file(s) and {legacy} legacy file(s) in {FACTORY_LAB_LEGACY_FOLDER}/ checked; all are recorded in {FACTORY_LAB_LOCK_FILE}.",
+            report.labs.len() - legacy
         );
         ExitCode::SUCCESS
     } else {

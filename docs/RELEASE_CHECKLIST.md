@@ -28,19 +28,23 @@
 - Use the real, hash-pinned `src-tauri/resources/arduino-runtime.zip`. The CI placeholder satisfies source checks only and must never be packaged or used for hardware tests. Verify it:
   - `(Get-FileHash src-tauri\resources\arduino-runtime.zip -Algorithm SHA256).Hash.ToLowerInvariant()` equals `arduino_runtime_archive_sha256` in `release/release-manifest.json` (runtime revision 4: `5baa8a5fc7fc0c2ae7fd9f49de1876d76859067af6d56e9b56546a88a5d02def`).
   - `pwsh -NoProfile -File scripts\audit_bundled_runtime_notices.ps1 -ArchivePath src-tauri\resources\arduino-runtime.zip` passes.
-  - `cargo run --manifest-path src-tauri\Cargo.toml --example runtime_smoke -- C:\wvu-smoke` prints `PASS`: the runtime compiles the reference sketch offline. Record the flash and RAM use, then delete `C:\wvu-smoke`.
+  - `cargo run --manifest-path src-tauri\Cargo.toml --example runtime_smoke -- C:\wvu-smoke` prints `PASS`: the runtime compiles the reference sketch offline. Record the flash and RAM use (build `0x00010007` with runtime revision 4: flash about 60.1 kB, 22%; RAM 12,344 bytes, 37%). The exact flash count varies by a few bytes with the build folder (60,080–60,088 bytes so far), because the binary embeds source paths, so a small difference does not mean the sketch changed; the source SHA-256 that `runtime_smoke` prints is the check. Then delete `C:\wvu-smoke`.
 
 ## Functional smoke
 
 - Confirm board discovery, firmware verification, and firmware restore work without external console windows.
 - Record a short ECG session, a second session without restart, and a short multi-channel EMG session.
-- Confirm raw pulse-ox fields, safe LED behavior, absolute phase scheduling, measured per-cycle timestamps, and explicit acquisition-queue overflow accounting with the appropriate hardware setup.
-- At a 1000 µs pulse-state dwell, confirm that a physical 60-second capture:
-  - Has a median cycle interval near 4000 µs
-  - Remains within 1% of 250 cycles/s
-  - Has no cycle interval outside ±5%
-  - Has no cycle-index-modulo-10 timing pattern
-- Confirm final metadata reports zero per-state intervals outside ±5% for RED, DARK 1, IR, and DARK 2; review each state's maximum absolute timing error.
+- Confirm raw pulse-ox fields, safe LED behavior, absolute state scheduling, measured per-record timestamps, and explicit acquisition-queue overflow and skipped-deadline accounting with the appropriate hardware setup, in both pulse-ox modes.
+- **LED-sequenced (built-in pulse-ox lab 1.1.0, 1000 µs dwell).** Confirm that a physical 60-second capture:
+  - Has a median record interval near 1000 µs and remains within 1% of 1000 records/s
+  - Has no record interval outside ±5%, and no pattern by `record_sequence` modulo 10 (the batch size) or modulo 4
+  - Has `led_state` equal to `record_sequence % 4` on every CSV row and `integrity.led_state_mismatches` 0
+  - Has `timing_diagnostics.firmware_skipped_deadlines` 0, `integrity.deadline_skip_flagged_records` 0, and `integrity.overrun_flagged_records` 0
+  - Has `timing_diagnostics.minimum_pulse_settle_us` at least 500 (50% of the dwell)
+- **LED-sequenced with six channels** (an instructor lab on A0–A5 at 1000 µs): the same checks pass, and the CSV has the six channels' columns on every row.
+- **Legacy 4-state** (the 1.0.0 file from `profiles/legacy/`, installed with **Install lab file…**, and a copy edited to a 250 µs dwell): at 1000 µs, the median cycle interval is near 4000 µs, within 1% of 250 cycles/s, with no cycle interval outside ±5% and no cycle-index-modulo-10 timing pattern; at 250 µs, record the per-state checks, skipped deadlines, and minimum settle (at least 125 µs). Return to 1.1.0 with **Restore course default** afterwards.
+- Confirm final metadata reports zero per-state intervals outside ±5% for RED, DARK 1, IR, and DARK 2 at 1000 µs in both modes; review each state's maximum absolute timing error.
+- With a logic analyzer on D5 and D6 during an LED-sequenced recording: each LED is HIGH for one dwell per four-state cycle in the order RED, DARK 1, IR, DARK 2, and D5 and D6 are never HIGH together; both are LOW after Stop.
 - Confirm final metadata timing diagnostics agree with the recorded timestamps and that optional recording notes are preserved exactly.
 - Confirm new BMEG, CSV, and metadata filenames identify the lab and contain no development-phase label.
 - Open Instructor Manage Labs and verify that reading/selecting labs creates no version.
@@ -75,6 +79,12 @@ Run these with the real runtime and an Arduino UNO R4 WiFi, using one applicatio
 
 - D4/D5/D6 read LOW after Stop, after a fault, and after the 5 s watchdog. To trigger the watchdog, end the app's process during a recording.
 - Pulse-ox RED and IR timing is correct, and RED and IR are never HIGH together (scope or logic analyzer).
+- **Hardware watchdog soak.** A 30-minute LED-sequenced recording (six channels, 1000 µs) completes with no board reset, no missing sequences, and the checks above. The board does not reset while idle for 30 minutes either.
+
+**Firmware rollout**
+
+- A board running build `0x00010006` (restored by 1.0.2) shows **Older WVU firmware** on this release; one **Restore WVU Firmware** makes it **Ready**, and the restore log shows the build `0x00010007` source SHA-256 from `release/release-manifest.json`.
+- The release notes tell instructors to **update the app on every lab computer first, then restore every board once**: a 1.0.x computer reports a restored board as incompatible firmware and would restore build `0x00010006`.
 
 ## Installer and distribution
 

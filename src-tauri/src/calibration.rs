@@ -335,14 +335,19 @@ pub fn fit_xgzp_from_recording(request: &XgzpFitRequest) -> Result<XgzpFit, Cali
         return Err(CalibrationError::WrongProfile);
     }
     let channels = snapshot.profile.acquisition.resolved_channels();
+    // Record field of each channel: an LED-sequenced record starts with its
+    // LED state, so its channels follow at fields 1..=N.
+    let first_channel_field = usize::from(snapshot.profile.acquisition.is_led_sequenced());
     let mpxv = channels
         .iter()
         .position(|channel| channel.id == "mpxv")
-        .ok_or(CalibrationError::MissingBpChannels)?;
+        .ok_or(CalibrationError::MissingBpChannels)?
+        + first_channel_field;
     let xgzp = channels
         .iter()
         .position(|channel| channel.id == "xgzp")
-        .ok_or(CalibrationError::MissingBpChannels)?;
+        .ok_or(CalibrationError::MissingBpChannels)?
+        + first_channel_field;
     let recorded = reader.metadata.calibration.as_ref();
     let recording_adc_reference_v = recorded.map(|calibration| calibration.adc_reference_v);
     let recording_mpxv_sensor_supply_v =

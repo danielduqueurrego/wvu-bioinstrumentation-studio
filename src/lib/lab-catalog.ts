@@ -274,10 +274,14 @@ export type LabFileSummary = {
 
 /** One line describing the lab in a lab file. */
 export function labFileDescription(summary: LabFileSummary): string {
-  const pulseox = summary.acquisition_mode === 'pulseox_4state';
+  const mode = summary.acquisition_mode;
   const inputs = summary.channels.map((channel) => `${channel.pin} ${channel.label}`).join(', ') || 'no analog inputs';
-  const rate = pulseox ? `about ${summary.sample_rate_hz} cycles/s` : `${summary.sample_rate_hz} frames/s`;
-  return `${summary.display_name} ${summary.profile_version} (${pulseox ? 'pulse oximetry' : 'simultaneous analog'}: ${inputs}; ${rate}; ${summary.adc_resolution_bits}-bit ADC)`;
+  const [kind, rate] = mode === 'pulseox_4state'
+    ? ['pulse oximetry', `about ${summary.sample_rate_hz} cycles/s`]
+    : mode === 'pulseox_sequenced'
+      ? ['LED-sequenced pulse oximetry', `${summary.sample_rate_hz} records/s, one per LED state`]
+      : ['simultaneous analog', `${summary.sample_rate_hz} frames/s`];
+  return `${summary.display_name} ${summary.profile_version} (${kind}: ${inputs}; ${rate}; ${summary.adc_resolution_bits}-bit ADC)`;
 }
 
 /** The Install lab file question: a warning when the file replaces a lab. */

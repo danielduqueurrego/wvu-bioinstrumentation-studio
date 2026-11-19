@@ -31,14 +31,26 @@ vi.mock('@tauri-apps/api/core', () => ({
   }
 }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: async () => () => undefined }));
-// happy-dom has no canvas; the plots are not under test here.
+type FakePlotRecord = {
+  options: { series: Array<{ label?: string; spanGaps?: boolean }> };
+  data: Array<Array<number | null>>;
+  destroyed: boolean;
+};
+// Every plot the page created, with the series and data uPlot was given.
+const plots = vi.hoisted(() => ({ created: [] as FakePlotRecord[] }));
+// happy-dom has no canvas; uPlot is replaced by a recorder.
 vi.mock('uplot', () => ({
   default: class FakePlot {
     static pxRatio = 1;
     bbox = { left: 0, top: 0, width: 300, height: 200 };
-    setData() {}
+    record: FakePlotRecord;
+    constructor(options: FakePlotRecord['options'], data: FakePlotRecord['data']) {
+      this.record = { options, data, destroyed: false };
+      plots.created.push(this.record);
+    }
+    setData(data: FakePlotRecord['data']) { this.record.data = data; }
     setSize() {}
-    destroy() {}
+    destroy() { this.record.destroyed = true; }
     valToPos() { return 0; }
   }
 }));
@@ -180,6 +192,7 @@ async function renderPage() {
 beforeEach(() => {
   vi.useRealTimers();
   installBackend();
+  plots.created = [];
   // uPlot needs layout APIs happy-dom does not provide; the page isolates plot errors.
   globalThis.ResizeObserver ??= class { observe() {} disconnect() {} unobserve() {} } as unknown as typeof ResizeObserver;
   window.matchMedia ??= (() => ({ matches: false, addEventListener() {}, removeEventListener() {} })) as unknown as typeof window.matchMedia;
@@ -455,7 +468,11 @@ const ACQUISITION_COMMANDS = ['start_profile_simulator_recording', 'start_profil
  * port is never opened: the session faults with port_busy, the command
  * fails, and the board's firmware status is left as it was.
  */
-function withBoard(compatible: boolean, checkMs = 25, failure: 'port_open_no_bytes' | 'port_busy' = 'port_open_no_bytes') {
+function withBoard(
+  compatible: boolean,
+  checkMs = 25,
+  failure: 'port_open_no_bytes' | 'port_busy' | 'older_wvu_firmware' | 'newer_wvu_firmware' = 'port_open_no_bytes'
+) {
   backend.handlers.list_boards = () => [board];
   backend.handlers.verify_wvu_reference_firmware = async ({ port }) => {
     const before = { ...session, last_error: null, fault_origin: null, port: port as string, board: 'Arduino UNO R4 WiFi' };
@@ -479,14 +496,21 @@ function withBoard(compatible: boolean, checkMs = 25, failure: 'port_open_no_byt
     }
     session = { ...before, state: 'Connected', recording_active: false };
     await pause();
+    // Another WVU firmware build answers the handshake but is not accepted;
+    // Verify records it under the same category name.
+    const otherBuild = failure === 'older_wvu_firmware' || failure === 'newer_wvu_firmware';
     session = compatible
       ? { ...before, state: 'Disconnected', recording_active: false, connection_diagnostics: null }
-      : faulted('port_open_no_bytes', 'firmware did not respond');
+      : otherBuild
+        ? faulted(failure, 'firmware identity was not accepted')
+        : faulted('port_open_no_bytes', 'firmware did not respond');
     firmwareStatus = compatible
       ? { compatibility: 'wvu_protocol_compatible', job: null, verified_port: port, last_failure: null }
       : {
           compatibility: 'verification_failed', job: null, verified_port: null,
-          last_failure: { category: 'protocol_verification_failed', stage: 'verifying_firmware', title: 'Firmware verification failed', explanation: 'The board did not answer with the WVU protocol.', recommended_action: 'Restore.', technical_details: 'no HELLO' }
+          last_failure: otherBuild
+            ? { category: failure, stage: 'verifying_firmware', title: 'Other WVU firmware', explanation: 'The returning sketch did not prove the required controlled WVU protocol identity.', recommended_action: 'Backend text.', technical_details: `diagnostics: ${failure}` }
+            : { category: 'protocol_verification_failed', stage: 'verifying_firmware', title: 'Firmware verification failed', explanation: 'The board did not answer with the WVU protocol.', recommended_action: 'Restore.', technical_details: 'no HELLO' }
         };
     return { declared_kind: 'wvu_protocol_reference', compatible, explanation: compatible ? 'compatible' : 'no reply' };
   };
@@ -823,6 +847,37 @@ describe('Acquisition page: board checks, Start feedback, and the recording layo
     expect(banner?.textContent).not.toMatch(/retry/i);
     expect(document.querySelector('#message-action-button')?.textContent?.trim()).toBe('Verify Firmware');
     expect(boardState()).toContain('Port busy');
+  });
+
+  it('says which side is out of date when Verify finds another WVU firmware build', async () => {
+    withBoard(false, 25, 'newer_wvu_firmware');
+    await renderPage();
+    expect(session).toMatchObject({ state: 'Faulted', fault_origin: 'verification', connection_diagnostics: { failure_category: 'newer_wvu_firmware' } });
+    const boardState = () => document.querySelector('[data-testid="board-state"]')?.textContent;
+    expect(boardState()).toContain('Newer WVU firmware');
+    expect(document.body.textContent).toContain('Update the app on this computer');
+    document.querySelector<HTMLInputElement>('input[value="hardware"]')?.click();
+    await settle();
+    const banner = document.querySelector('[data-problem]');
+    expect(banner?.textContent).toContain('The board has a newer WVU firmware version');
+    expect(banner?.textContent).toContain('This computer’s app is older than the board’s firmware.');
+    expect(banner?.textContent).not.toMatch(/No WVU firmware/);
+    expect(document.querySelector('#message-action-button')?.textContent?.trim()).toBe('Restore WVU Firmware');
+    const firmwareItem = [...document.querySelectorAll('.readiness li')].find((item) => item.textContent?.includes('Firmware'));
+    expect(firmwareItem?.textContent).toContain('update this app or restore');
+    expect(boardState()).toContain('Newer WVU firmware');
+  });
+
+  it('asks to restore a board that Verify finds with an older WVU firmware build', async () => {
+    withBoard(false, 25, 'older_wvu_firmware');
+    await renderPage();
+    expect(document.querySelector('[data-testid="board-state"]')?.textContent).toContain('Older WVU firmware');
+    document.querySelector<HTMLInputElement>('input[value="hardware"]')?.click();
+    await settle();
+    expect(document.querySelector('[data-problem]')?.textContent).toContain('The board has an older WVU firmware version');
+    expect(document.querySelector('#message-action-button')?.textContent?.trim()).toBe('Restore WVU Firmware');
+    const firmwareItem = [...document.querySelectorAll('.readiness li')].find((item) => item.textContent?.includes('Firmware'));
+    expect(firmwareItem?.textContent).toContain('restore the WVU firmware');
   });
 
   it('reports a failed Verify after a Simulator recording as a board problem, not as that recording', async () => {
@@ -1215,5 +1270,99 @@ describe('Acquisition page: Install lab file', () => {
     installButton()!.click();
     await settle();
     expect(backend.openCalls).toBe(0);
+  });
+});
+
+describe('Acquisition page: an LED-sequenced pulse-ox recording', () => {
+  // The built-in pulse-ox lab 1.0.0 (legacy 4-state), kept in profiles/legacy/.
+  const legacyPulse = profile('legacy/pulseox_tx_rx_course_capture_1.0.0.profile.json');
+  // The built-in 1.1.0 lab, with only TX shown by LED state.
+  const sequenced: LabProfile = {
+    ...legacyPulse,
+    profile_version: '1.1.0',
+    required_firmware: { ...legacyPulse.required_firmware, build: '0x00010007' },
+    acquisition: {
+      ...legacyPulse.acquisition,
+      acquisition_mode: 'pulseox_sequenced',
+      analog_inputs: undefined,
+      led_outputs: undefined,
+      sample_rate_hz: 1000,
+      state_dwell_us: 1000,
+      channels: [
+        { pin: 'A0', id: 'tx', label: 'TX', csv_name: 'tx_counts', units: 'ADC counts', allowed_conversions: ['counts_volts'], split_by_led_state: true },
+        { pin: 'A1', id: 'rx', label: 'RX', csv_name: 'rx_counts', units: 'ADC counts', allowed_conversions: ['counts_volts'] }
+      ]
+    },
+    plot_defaults: { groups: [{ channel_ids: ['tx'] }, { channel_ids: ['rx'] }] }
+  };
+  // [led_state, tx, rx]: the LED state is sequence % 4; TX depends on it.
+  const records = Array.from({ length: 16 }, (_, sequence) => ({
+    sequence, timestamp_us: sequence * 1_000, values: [sequence % 4, 1_000 * (sequence % 4) + sequence, 5_000 + sequence], status_flags: 0
+  }));
+  const livePlots = () => plots.created.filter((plot) => !plot.destroyed);
+  const labelsOf = (plot: FakePlotRecord) => plot.options.series.slice(1).map((series) => series.label);
+  const plotWith = (label: string) => livePlots().find((plot) => labelsOf(plot).includes(label));
+
+  beforeEach(() => {
+    session = idleSession({
+      state: 'Acquiring', simulator: true, recording_active: true, duration: { mode: 'until_stopped' },
+      display_origin_timestamp_us: 0, profile: { bench_notice_acknowledged: false, profile: sequenced }
+    });
+    backend.handlers.get_recent_display_data = () => records;
+  });
+
+  it('draws a channel shown by LED state as four state traces and the other channel at the full record rate', async () => {
+    await renderPage();
+    expect(document.getElementById('live-title')?.textContent).toBe('Live signals — LED-sequenced pulse-ox');
+    expect(livePlots().map(labelsOf)).toEqual([['TX — RED', 'TX — DARK 1', 'TX — IR', 'TX — DARK 2'], ['RX']]);
+
+    // Each TX trace holds only its own LED state's records (null elsewhere, gaps spanned).
+    const tx = plotWith('TX — RED')!;
+    expect(tx.options.series.slice(1).every((series) => series.spanGaps === true)).toBe(true);
+    for (const state of [0, 1, 2, 3]) {
+      expect(tx.data[state + 1]).toEqual(records.map((record) => record.values[0] === state ? record.values[1] : null));
+    }
+    // RX follows every record, from its own field (after the LED state).
+    const rx = plotWith('RX')!;
+    expect(rx.options.series[1]?.spanGaps).toBe(false);
+    expect(rx.data[1]).toEqual(records.map((record) => record.values[2]));
+    expect(rx.data[0]).toEqual(records.map((record) => record.timestamp_us / 1_000_000));
+
+    // Endpoint badges: each LED-state trace shows the newest record of its own state.
+    const badges = [...document.querySelectorAll('.endpoint-label')].map((badge) => badge.getAttribute('aria-label'));
+    expect(badges).toEqual(['TX — RED: 12', 'TX — DARK 1: 1013', 'TX — IR: 2014', 'TX — DARK 2: 3015', 'RX: 5015']);
+
+    // Units are chosen per lab channel, not per LED-state trace.
+    const units = [...document.querySelectorAll('[aria-label="Per-channel display units"] label')].map((label) => label.firstChild?.textContent?.trim());
+    expect(units).toEqual(['TX', 'RX']);
+    const visible = [...document.querySelectorAll('.trace-controls label')].map((label) => label.textContent?.trim());
+    expect(visible).toEqual(['TX — RED', 'TX — DARK 1', 'TX — IR', 'TX — DARK 2', 'RX']);
+
+    // Plot headings name a channel's LED states once.
+    const headings = [...document.querySelectorAll('.stacked-plot-heading strong')].map((heading) => heading.textContent);
+    expect(headings).toEqual(['Plot 1: TX — RED, DARK 1, IR, DARK 2', 'Plot 2: RX']);
+  });
+
+  it('shows a channel by LED state from a display-only box, keeping its plot and sending no command', async () => {
+    await renderPage();
+    const box = (label: string) => [...document.querySelectorAll('.led-split-controls label')]
+      .find((candidate) => candidate.textContent?.trim() === label)?.querySelector('input');
+    expect(box('TX')?.checked).toBe(true);
+    expect(box('RX')?.checked).toBe(false);
+    backend.calls = [];
+    box('RX')!.click();
+    await settle();
+    expect(livePlots().map(labelsOf)).toEqual([
+      ['TX — RED', 'TX — DARK 1', 'TX — IR', 'TX — DARK 2'],
+      ['RX — RED', 'RX — DARK 1', 'RX — IR', 'RX — DARK 2']
+    ]);
+    expect(plotWith('RX — IR')!.data[3]).toEqual(records.map((record) => record.values[0] === 2 ? record.values[2] : null));
+    box('TX')!.click();
+    await settle();
+    expect(livePlots().map(labelsOf)).toEqual([['TX'], ['RX — RED', 'RX — DARK 1', 'RX — IR', 'RX — DARK 2']]);
+    expect(plotWith('TX')!.data[1]).toEqual(records.map((record) => record.values[1]));
+    // Display only: no acquisition command, and the recording keeps running.
+    expect(backend.calls.filter((call) => ACQUISITION_COMMANDS.includes(call.command))).toEqual([]);
+    expect(buttonNamed('Stop recording')).toBeDefined();
   });
 });

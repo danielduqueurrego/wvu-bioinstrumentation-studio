@@ -4,6 +4,7 @@ import {
   calibrationById,
   countsToVoltsForAdc,
   displayedValue,
+  fieldDisplayUnits,
   initialChannelUnits,
   isFixedMpxvChannel,
   mpxvKpa,
@@ -49,7 +50,7 @@ describe('course calibration display helpers', () => {
 
   it('uses the profile-declared MPXV capability for the EMG pressure channel', () => {
     expect(
-      supportedDisplayUnits('course_emg_force', 'pressure', false, ['counts_volts', 'mpxv_pressure'])
+      supportedDisplayUnits('pressure', false, ['counts_volts', 'mpxv_pressure'])
     ).toEqual(['counts', 'volts', 'kpa', 'mmhg']);
 
     const volts = 2.5;
@@ -60,13 +61,13 @@ describe('course calibration display helpers', () => {
   });
 
   it('only exposes XGZP mmHg when an active linear calibration exists', () => {
-    expect(supportedDisplayUnits('course_blood_pressure', 'xgzp', false)).toEqual(['counts', 'volts']);
-    expect(supportedDisplayUnits('course_blood_pressure', 'xgzp', true)).toEqual(['counts', 'volts', 'mmhg']);
+    expect(supportedDisplayUnits('xgzp', false)).toEqual(['counts', 'volts']);
+    expect(supportedDisplayUnits('xgzp', true)).toEqual(['counts', 'volts', 'mmhg']);
   });
 
   it('keeps an instructor-declared generic linear channel in its named engineering units', () => {
     expect(
-      supportedDisplayUnits('development', 'load_cell', true, ['linear_calibration'], 'grams')
+      supportedDisplayUnits('load_cell', true, ['linear_calibration'], 'grams')
     ).toEqual(['counts', 'volts', 'calibrated']);
   });
 
@@ -144,12 +145,30 @@ describe('a lab’s default display units', () => {
       { id: 'xgzp', default_display_unit: 'mmhg', allowed_conversions: ['counts_volts', 'linear_calibration'] },
       { id: 'a0', default_display_unit: 'furlongs' },
       { id: 'a1' }
-    ], 'course_blood_pressure')).toEqual({ ppg: 'volts', mpxv: 'mmhg', xgzp: 'counts', a0: 'counts', a1: 'counts' });
+    ])).toEqual({ ppg: 'volts', mpxv: 'mmhg', xgzp: 'counts', a0: 'counts', a1: 'counts' });
   });
 
   it('keeps pulse-ox traces in counts or volts only', () => {
-    expect(initialChannelUnits([{ id: 'tx_red', default_display_unit: 'kpa' }, { id: 'rx_red', default_display_unit: 'Volts' }], 'course_pulseox'))
-      .toEqual({ tx_red: 'counts', rx_red: 'volts' });
+    expect(initialChannelUnits([
+      { id: 'red_tx', default_display_unit: 'kpa', allowed_conversions: ['mpxv_pressure'], rawPulseField: true },
+      { id: 'red_rx', default_display_unit: 'Volts', rawPulseField: true }
+    ])).toEqual({ red_tx: 'counts', red_rx: 'volts' });
+  });
+
+  it('decides the units per field, not by the lab category', () => {
+    // A legacy 4-state raw field: counts and volts, whatever it lists.
+    expect(fieldDisplayUnits({ id: 'red_tx', allowed_conversions: ['mpxv_pressure'], rawPulseField: true })).toEqual(['counts', 'volts']);
+    // An LED-sequenced lab's channels follow their own conversions, so a
+    // pulse-ox-category lab may still have an MPXV or a calibrated channel.
+    expect(fieldDisplayUnits({ id: 'cuff', allowed_conversions: ['counts_volts', 'mpxv_pressure'] })).toEqual(['counts', 'volts', 'kpa', 'mmhg']);
+    expect(fieldDisplayUnits({ id: 'tx', allowed_conversions: ['counts_volts'] })).toEqual(['counts', 'volts']);
+    expect(fieldDisplayUnits({ id: 'load', allowed_conversions: ['linear_calibration'] })).toEqual(['counts', 'volts']);
+    expect(fieldDisplayUnits({ id: 'load', allowed_conversions: ['linear_calibration'] }, true, 'N')).toEqual(['counts', 'volts', 'calibrated']);
+    expect(fieldDisplayUnits({ id: 'load', allowed_conversions: ['linear_calibration'] }, true, 'mmHg')).toEqual(['counts', 'volts', 'mmhg']);
+    expect(initialChannelUnits([
+      { id: 'tx', default_display_unit: 'volts', allowed_conversions: ['counts_volts'] },
+      { id: 'cuff', default_display_unit: 'mmhg', allowed_conversions: ['counts_volts', 'mpxv_pressure'] }
+    ])).toEqual({ tx: 'volts', cuff: 'mmhg' });
   });
 });
 
@@ -181,13 +200,13 @@ describe('the recording calibration snapshot', () => {
   it('follows a lab’s declared conversions even when a channel reuses a course ID', () => {
     // An instructor channel named 'mpxv' that allows only counts/volts.
     expect(isFixedMpxvChannel('development', { id: 'mpxv', allowed_conversions: ['counts_volts'] })).toBe(false);
-    expect(supportedDisplayUnits('development', 'mpxv', false, ['counts_volts'])).toEqual(['counts', 'volts']);
-    expect(supportedDisplayUnits('development', 'xgzp', true, ['counts_volts'])).toEqual(['counts', 'volts']);
+    expect(supportedDisplayUnits('mpxv', false, ['counts_volts'])).toEqual(['counts', 'volts']);
+    expect(supportedDisplayUnits('xgzp', true, ['counts_volts'])).toEqual(['counts', 'volts']);
     expect(acceptsLinearCalibration({ id: 'xgzp', allowed_conversions: ['counts_volts'] })).toBe(false);
     expect(acceptsLinearCalibration({ id: 'load', allowed_conversions: ['linear_calibration'] })).toBe(true);
     // A legacy lab snapshot without the list keeps the course-ID rules.
     expect(acceptsLinearCalibration({ id: 'xgzp' })).toBe(true);
-    expect(supportedDisplayUnits('course_blood_pressure', 'mpxv', false)).toEqual(['counts', 'volts', 'kpa', 'mmhg']);
+    expect(supportedDisplayUnits('mpxv', false)).toEqual(['counts', 'volts', 'kpa', 'mmhg']);
   });
 
   it('gives a channel at most one active calibration', () => {

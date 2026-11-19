@@ -1,8 +1,6 @@
 //! Versioned, validated acquisition profiles. SHA-256 here detects accidental
 //! modification; it is explicitly not an authorship signature or access-control mechanism.
-use crate::protocol::{
-    PROTOCOL_MAJOR, PROTOCOL_MINOR, REFERENCE_DEVICE_ID, REFERENCE_FIRMWARE_BUILD,
-};
+use crate::protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR, REFERENCE_DEVICE_ID};
 use crate::recording::{derived_column_name, voltage_column_name, RecordingDuration};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -28,8 +26,43 @@ pub const SUPPORTED_DIGITAL_OUTPUT_PINS: [&str; 3] = ["D4", "D5", "D6"];
 pub const RECOMMENDED_SAMPLE_RATES_HZ: [u32; 5] = [100, 200, 250, 500, 1_000];
 /// Pulse-ox state dwell accepted by the controlled firmware, in microseconds.
 pub const PULSEOX_DWELL_RANGE_US: std::ops::RangeInclusive<u32> = 250..=5_000;
-/// Fixed CSV columns that a channel's CSV field may not reuse.
-pub const RESERVED_CSV_COLUMNS: [&str; 3] = ["record_sequence", "t_us", "cycle_index"];
+/// LED-state dwell of the LED-sequenced pulse-ox mode (CONFIGURE mode 2), in
+/// microseconds. Every state reads every configured pin, so its dwell is
+/// longer than the legacy 4-state mode's minimum.
+pub const PULSEOX_SEQUENCED_DWELL_RANGE_US: std::ops::RangeInclusive<u32> = 1_000..=5_000;
+/// The first firmware build with the LED-sequenced mode. A sequenced lab must
+/// name it (or a later accepted build) as its `required_firmware.build`.
+pub const SEQUENCED_MIN_FIRMWARE_BUILD: u32 = 0x0001_0007;
+/// Field 0 of every LED-sequenced record, and its CSV column.
+pub const LED_STATE_FIELD: &str = "led_state";
+/// LED-state names by state code (`led_state`, which is `record_sequence % 4`).
+pub const LED_STATE_NAMES: [&str; 4] = ["RED", "DARK1", "IR", "DARK2"];
+/// The CSV name of an LED-state code outside 0–3.
+pub const UNKNOWN_LED_STATE_NAME: &str = "UNKNOWN";
+/// `required_firmware.build` values a lab may name. It is the minimum feature
+/// build the lab needs; the board itself must run this app's reference build
+/// (`REFERENCE_FIRMWARE_BUILD`). Every earlier WVU build stays listed: the
+/// factory labs and most local labs name 0x00010006, and a lab whose build is
+/// missing here fails validation and disappears from the catalog.
+pub const ACCEPTED_LAB_FIRMWARE_BUILDS: [u32; 7] = [
+    0x0001_0007,
+    0x0001_0006,
+    0x0001_0005,
+    0x0001_0004,
+    0x0001_0003,
+    0x0001_0002,
+    0x0001_0001,
+];
+/// Fixed CSV columns that a channel's CSV field may not reuse. `led_state`
+/// and `led_state_name` are the LED-sequenced CSV's state columns.
+/// `lab-authoring.ts` mirrors this list.
+pub const RESERVED_CSV_COLUMNS: [&str; 5] = [
+    "record_sequence",
+    "t_us",
+    "cycle_index",
+    "led_state",
+    "led_state_name",
+];
 /// Text limits for a revision being saved or imported now. Stored labs are
 /// never rejected by these limits; the recording header budget still applies.
 pub const MAX_PROFILE_ID_CHARS: usize = 128;
@@ -101,8 +134,15 @@ pub struct FirmwareRequirement {
 #[serde(rename_all = "snake_case")]
 pub enum AcquisitionMode {
     Simultaneous,
+    /// Legacy pulse-ox: TX/RX read in RED, DARK 1, IR, DARK 2, one 8-field
+    /// record per cycle (CONFIGURE mode 1).
     #[serde(rename = "pulseox_4state")]
     Pulseox4State,
+    /// LED-sequenced pulse-ox: the LEDs step RED, DARK 1, IR, DARK 2 and
+    /// every state reads all of the lab's channels, one record
+    /// `[led_state, ch1..chN]` per state (CONFIGURE mode 2, build 0x00010007).
+    #[serde(rename = "pulseox_sequenced")]
+    PulseoxSequenced,
 }
 
 fn default_acquisition_mode() -> AcquisitionMode {
@@ -127,6 +167,12 @@ pub struct ProfileChannel {
         skip_serializing_if = "is_default_visible"
     )]
     pub default_visible: bool,
+    /// Display only, and only in an LED-sequenced lab: the live plot shows
+    /// this channel as one trace per LED state by default. It never changes
+    /// acquisition or the recorded data. Omitted when false, so the canonical
+    /// bytes (and hashes) of existing labs do not change.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub split_by_led_state: bool,
 }
 
 fn default_visible() -> bool {
@@ -134,6 +180,9 @@ fn default_visible() -> bool {
 }
 fn is_default_visible(value: &bool) -> bool {
     *value
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -216,6 +265,24 @@ pub fn pulse_ox_cycle_rate_hz(state_dwell_us: u32) -> u32 {
     }
     let dwell = u64::from(state_dwell_us);
     u32::try_from((500_000 + dwell) / (2 * dwell)).unwrap_or(u32::MAX)
+}
+
+/// Nominal LED-sequenced record rate for a state dwell: one record per LED
+/// state, `round(1e6 / dwell)` records/s (1000 for a 1000 µs dwell).
+pub fn pulse_ox_sequenced_rate_hz(state_dwell_us: u32) -> u32 {
+    if state_dwell_us == 0 {
+        return 0;
+    }
+    let dwell = u64::from(state_dwell_us);
+    u32::try_from((2_000_000 + dwell) / (2 * dwell)).unwrap_or(u32::MAX)
+}
+
+/// The CSV name of an LED-state code: RED, DARK1, IR, DARK2, or UNKNOWN.
+pub fn led_state_name(state: u16) -> &'static str {
+    LED_STATE_NAMES
+        .get(usize::from(state))
+        .copied()
+        .unwrap_or(UNKNOWN_LED_STATE_NAME)
 }
 
 /// CSV field names for new or imported revisions: 1–64 ASCII letters,
@@ -311,6 +378,7 @@ impl AcquisitionSettings {
             allowed_conversions: Vec::new(),
             default_display_unit: None,
             default_visible: true,
+            split_by_led_state: false,
         }]
     }
 
@@ -328,12 +396,25 @@ impl AcquisitionSettings {
             .into_iter()
             .map(str::to_string)
             .collect(),
+            AcquisitionMode::PulseoxSequenced => std::iter::once(LED_STATE_FIELD.to_string())
+                .chain(
+                    self.resolved_channels()
+                        .into_iter()
+                        .map(|channel| channel.csv_name),
+                )
+                .collect(),
         }
+    }
+
+    /// True for the LED-sequenced pulse-ox mode, whose record field 0 is the
+    /// LED state and whose records follow `sequence % 4`.
+    pub fn is_led_sequenced(&self) -> bool {
+        self.acquisition_mode == AcquisitionMode::PulseoxSequenced
     }
 
     pub fn analog_pins(&self) -> Vec<String> {
         match self.acquisition_mode {
-            AcquisitionMode::Simultaneous => self
+            AcquisitionMode::Simultaneous | AcquisitionMode::PulseoxSequenced => self
                 .resolved_channels()
                 .into_iter()
                 .map(|channel| channel.pin)
@@ -436,6 +517,13 @@ impl AcquisitionSettings {
                     .is_some_and(|dwell| PULSEOX_DWELL_RANGE_US.contains(&dwell)) =>
             {
                 Some("This lab's pulse-ox state dwell is not supported by the WVU firmware (250-5000 µs). Ask your instructor to update the lab.")
+            }
+            AcquisitionMode::PulseoxSequenced
+                if !self
+                    .state_dwell_us
+                    .is_some_and(|dwell| PULSEOX_SEQUENCED_DWELL_RANGE_US.contains(&dwell)) =>
+            {
+                Some("This lab's LED-state dwell is not supported by the WVU firmware (1000-5000 µs). Ask your instructor to update the lab.")
             }
             _ => None,
         }
@@ -698,6 +786,18 @@ impl AcquisitionProfile {
                     ],
                 )?;
             }
+            AcquisitionMode::PulseoxSequenced => self.validate_led_sequenced()?,
+        }
+        if self.acquisition.acquisition_mode != AcquisitionMode::PulseoxSequenced
+            && self
+                .acquisition
+                .channels
+                .iter()
+                .any(|channel| channel.split_by_led_state)
+        {
+            return Err(ProfileError::Validation(
+                "Show by LED state is available only in an LED-sequenced pulse-ox lab".into(),
+            ));
         }
         let outputs = self.acquisition.resolved_digital_outputs();
         let mut output_pins = BTreeSet::new();
@@ -788,15 +888,7 @@ impl AcquisitionProfile {
         }
         if self.required_firmware.protocol_major != PROTOCOL_MAJOR
             || self.required_firmware.protocol_minor_min > PROTOCOL_MINOR
-            || ![
-                REFERENCE_FIRMWARE_BUILD,
-                0x0001_0005,
-                0x0001_0004,
-                0x0001_0003,
-                0x0001_0002,
-                0x0001_0001,
-            ]
-            .contains(&parse_hex(&self.required_firmware.build)?)
+            || !ACCEPTED_LAB_FIRMWARE_BUILDS.contains(&parse_hex(&self.required_firmware.build)?)
             || parse_hex(&self.required_firmware.device)? != REFERENCE_DEVICE_ID
         {
             return Err(ProfileError::Validation(
@@ -823,6 +915,101 @@ impl AcquisitionProfile {
             self.verify_integrity()?;
         }
         Ok(())
+    }
+
+    /// The LED-sequenced pulse-ox rules. The mode is new in firmware build
+    /// 0x00010007, so no stored lab predates them and all of them apply when
+    /// a lab is loaded (`validate`), including the CSV-column rules that
+    /// other modes check only for a revision saved now. The firmware build is
+    /// checked here, before the hash.
+    fn validate_led_sequenced(&self) -> Result<(), ProfileError> {
+        let acquisition = &self.acquisition;
+        let channels = &acquisition.channels;
+        let mut ids = BTreeSet::new();
+        let mut csv_names = BTreeSet::new();
+        if channels.is_empty()
+            || channels.len() > SUPPORTED_ANALOG_PINS.len()
+            || channels.iter().any(|channel| {
+                channel.id.trim().is_empty()
+                    || channel.label.trim().is_empty()
+                    || channel.csv_name.trim().is_empty()
+                    || channel.units != "ADC counts"
+            })
+            || !channels
+                .iter()
+                .all(|channel| ids.insert(channel.id.clone()))
+            || !channels
+                .iter()
+                .all(|channel| csv_names.insert(channel.csv_name.clone()))
+        {
+            return Err(ProfileError::Validation(
+                "LED-sequenced pulse-ox labs require 1 to 6 uniquely named raw-count channels and CSV fields"
+                    .into(),
+            ));
+        }
+        self.check_csv_columns()?;
+        let Some(dwell) = acquisition
+            .state_dwell_us
+            .filter(|dwell| PULSEOX_SEQUENCED_DWELL_RANGE_US.contains(dwell))
+        else {
+            return Err(ProfileError::Validation(
+                "the LED-sequenced state dwell must be 1000 to 5000 µs".into(),
+            ));
+        };
+        let expected = pulse_ox_sequenced_rate_hz(dwell);
+        if acquisition.sample_rate_hz != expected {
+            return Err(ProfileError::Validation(format!(
+                "the LED-sequenced record rate must follow the state dwell: {expected} records/s for {dwell} µs per state"
+            )));
+        }
+        let outputs = acquisition.resolved_digital_outputs();
+        for role in [PulseOxRole::Red, PulseOxRole::Ir] {
+            if outputs
+                .iter()
+                .filter(|output| output.pulse_ox_role == Some(role))
+                .count()
+                > 1
+            {
+                return Err(ProfileError::Validation(
+                    "each pulse-ox role (RED, IR) may be assigned to only one output".into(),
+                ));
+            }
+        }
+        let red = pulse_ox_output(&outputs, PulseOxRole::Red);
+        let ir = pulse_ox_output(&outputs, PulseOxRole::Ir);
+        let Some((red, ir)) = red.zip(ir).filter(|(red, ir)| {
+            red.pin != ir.pin
+                && [red, ir].iter().all(|output| {
+                    output.behavior == DigitalOutputBehavior::AcquisitionSequenced
+                        && SUPPORTED_DIGITAL_OUTPUT_PINS.contains(&output.pin.as_str())
+                })
+        }) else {
+            return Err(ProfileError::Validation(
+                "LED-sequenced pulse-ox labs require distinct acquisition-sequenced RED and IR outputs on D4, D5, or D6"
+                    .into(),
+            ));
+        };
+        if outputs
+            .iter()
+            .any(|output| output.pin != red.pin && output.pin != ir.pin)
+        {
+            return Err(ProfileError::Validation(
+                "pulse-ox labs may define only their RED and IR outputs; remove the other outputs (the firmware keeps them LOW in this mode)"
+                    .into(),
+            ));
+        }
+        if parse_hex(&self.required_firmware.build)? < SEQUENCED_MIN_FIRMWARE_BUILD {
+            return Err(ProfileError::Validation(format!(
+                "LED-sequenced pulse-ox labs require WVU firmware build 0x{SEQUENCED_MIN_FIRMWARE_BUILD:08X} or later"
+            )));
+        }
+        validate_plot_defaults(
+            &self.plot_defaults,
+            &channels
+                .iter()
+                .map(|channel| channel.id.clone())
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// Stricter rules for a revision created now by Save or Import. Stored
@@ -892,6 +1079,9 @@ impl AcquisitionProfile {
                     ));
                 }
             }
+            // Every LED-sequenced rule is a load-time rule
+            // (`validate_led_sequenced`), already checked above.
+            AcquisitionMode::PulseoxSequenced => {}
         }
         Ok(())
     }
@@ -1079,6 +1269,74 @@ pub(crate) fn factory_lab(profile_id: &str) -> AcquisitionProfile {
 #[cfg(test)]
 pub(crate) fn factory_lab_count() -> usize {
     FACTORY_LAB_FILES.len()
+}
+
+/// The built-in pulse-ox lab's published 1.0.0 file (legacy 4-state mode),
+/// kept in `profiles/legacy/` since 1.1.0 moved to the LED-sequenced mode.
+/// It is not compiled into the application; tests use it for 4-state
+/// coverage.
+#[cfg(test)]
+pub(crate) const LEGACY_PULSE_OX_LAB_TEXT: &str =
+    include_str!("../../profiles/legacy/pulseox_tx_rx_course_capture_1.0.0.profile.json");
+
+/// The built-in pulse-ox lab 1.0.0 as published: legacy 4-state mode, TX A0
+/// and RX A1, D5 RED and D6 IR, a 1000 µs dwell (250 cycles/s), build
+/// 0x00010006. Locked, `built_in`, with its published hash.
+#[cfg(test)]
+pub(crate) fn legacy_pulse_ox_lab() -> AcquisitionProfile {
+    let lab: AcquisitionProfile =
+        serde_json::from_str(LEGACY_PULSE_OX_LAB_TEXT).unwrap_or_else(|error| panic!("{error}"));
+    lab.validate().unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        lab.acquisition.acquisition_mode,
+        AcquisitionMode::Pulseox4State
+    );
+    lab
+}
+
+/// A locked LED-sequenced pulse-ox lab for tests, built from the legacy
+/// 4-state lab 1.0.0 (so it does not follow later edits of the factory
+/// file): `tx` (A0) and `rx` (A1) channels, both shown by LED state, D5 RED
+/// and D6 IR, a 1000 µs dwell, and build 0x00010007. Its acquisition,
+/// outputs and plot defaults are those of the built-in pulse-ox lab 1.1.0
+/// (a test checks this).
+#[cfg(test)]
+pub(crate) fn sequenced_test_lab() -> AcquisitionProfile {
+    let mut lab = legacy_pulse_ox_lab();
+    lab.required_firmware.build = format!("0x{SEQUENCED_MIN_FIRMWARE_BUILD:08X}");
+    let acquisition = &mut lab.acquisition;
+    acquisition.acquisition_mode = AcquisitionMode::PulseoxSequenced;
+    acquisition.analog_inputs = None;
+    acquisition.led_outputs = None;
+    acquisition.state_dwell_us = Some(1_000);
+    acquisition.sample_rate_hz = 1_000;
+    acquisition.channels = [("A0", "tx", "TX"), ("A1", "rx", "RX")]
+        .into_iter()
+        .map(|(pin, id, label)| ProfileChannel {
+            pin: pin.into(),
+            id: id.into(),
+            label: label.into(),
+            csv_name: format!("{id}_counts"),
+            units: "ADC counts".into(),
+            allowed_conversions: vec!["counts_volts".into()],
+            default_display_unit: None,
+            default_visible: true,
+            split_by_led_state: true,
+        })
+        .collect();
+    lab.plot_defaults = PlotDefaults {
+        groups: vec![
+            PlotDefaultGroup {
+                channel_ids: vec!["tx".into()],
+            },
+            PlotDefaultGroup {
+                channel_ids: vec!["rx".into()],
+            },
+        ],
+    };
+    lab.refresh_hash().unwrap_or_else(|error| panic!("{error}"));
+    lab.validate().unwrap_or_else(|error| panic!("{error}"));
+    lab
 }
 
 #[derive(Clone)]
@@ -2099,20 +2357,40 @@ fn remove_catalog_leftovers(root: &Path) {
 }
 
 /// Makes an editor draft use the explicit output list (an empty list is
-/// authoritative) and the pulse-ox shape the editor shows: no analog
-/// channels, and the cycle rate that follows from the dwell.
+/// authoritative) and the pulse-ox shape the editor shows: for the legacy
+/// 4-state mode no analog channels and the cycle rate that follows from the
+/// dwell; for the LED-sequenced mode the record rate that follows from the
+/// dwell, no legacy TX/RX inputs, and at least the firmware build that has
+/// the mode.
 fn normalize_authoring_draft(draft: &mut AcquisitionProfile) {
     drop_inert_pulse_ox_channels(draft);
     let acquisition = &mut draft.acquisition;
     acquisition.digital_outputs = acquisition.resolved_digital_outputs();
     acquisition.led_outputs = None;
-    if acquisition.acquisition_mode == AcquisitionMode::Pulseox4State {
-        if let Some(dwell) = acquisition
-            .state_dwell_us
-            .filter(|dwell| PULSEOX_DWELL_RANGE_US.contains(dwell))
-        {
-            acquisition.sample_rate_hz = pulse_ox_cycle_rate_hz(dwell);
+    match acquisition.acquisition_mode {
+        AcquisitionMode::Pulseox4State => {
+            if let Some(dwell) = acquisition
+                .state_dwell_us
+                .filter(|dwell| PULSEOX_DWELL_RANGE_US.contains(dwell))
+            {
+                acquisition.sample_rate_hz = pulse_ox_cycle_rate_hz(dwell);
+            }
         }
+        AcquisitionMode::PulseoxSequenced => {
+            if let Some(dwell) = acquisition
+                .state_dwell_us
+                .filter(|dwell| PULSEOX_SEQUENCED_DWELL_RANGE_US.contains(dwell))
+            {
+                acquisition.sample_rate_hz = pulse_ox_sequenced_rate_hz(dwell);
+            }
+            acquisition.analog_inputs = None;
+            if !parse_hex(&draft.required_firmware.build)
+                .is_ok_and(|build| build >= SEQUENCED_MIN_FIRMWARE_BUILD)
+            {
+                draft.required_firmware.build = format!("0x{SEQUENCED_MIN_FIRMWARE_BUILD:08X}");
+            }
+        }
+        AcquisitionMode::Simultaneous => {}
     }
 }
 
@@ -3139,7 +3417,7 @@ impl ProfileStore {
                 })
             });
         let channels = match profile.acquisition.acquisition_mode {
-            AcquisitionMode::Simultaneous => profile
+            AcquisitionMode::Simultaneous | AcquisitionMode::PulseoxSequenced => profile
                 .acquisition
                 .resolved_channels()
                 .into_iter()
@@ -4951,6 +5229,67 @@ impl serde_json::ser::Formatter for FactoryJsonFormatter {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn labs_keep_every_earlier_firmware_build_after_the_reference_build_moves_on() {
+        let reference = crate::protocol::REFERENCE_FIRMWARE_BUILD;
+        assert!(ACCEPTED_LAB_FIRMWARE_BUILDS.contains(&reference));
+        assert_eq!(reference, 0x0001_0007);
+        // Without these, every factory lab (0x00010006) and every older local
+        // lab would fail validation and disappear from the catalog.
+        for build in 0x0001_0001..reference {
+            assert!(
+                ACCEPTED_LAB_FIRMWARE_BUILDS.contains(&build),
+                "{build:#010x}"
+            );
+        }
+        let base = built_in_profiles()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("no factory lab"));
+        for build in ACCEPTED_LAB_FIRMWARE_BUILDS {
+            let mut lab = base.clone();
+            lab.required_firmware.build = format!("0x{build:08X}");
+            lab.refresh_hash()
+                .unwrap_or_else(|error| panic!("{build:#010x}: {error}"));
+            lab.validate()
+                .unwrap_or_else(|error| panic!("{build:#010x}: {error}"));
+        }
+        for build in [0x0001_0000u32, 0x0001_0008, 0x0002_0001] {
+            let mut lab = base.clone();
+            lab.required_firmware.build = format!("0x{build:08X}");
+            lab.refresh_hash()
+                .unwrap_or_else(|error| panic!("{build:#010x}: {error}"));
+            let error = lab
+                .validate()
+                .err()
+                .unwrap_or_else(|| panic!("{build:#010x} was accepted"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("incompatible controlled firmware identity"),
+                "{build:#010x}: {error}"
+            );
+        }
+        // The factory labs still name 0x00010006, so their hashes are
+        // unchanged; only the LED-sequenced pulse-ox lab 1.1.0 needs the
+        // build that added its mode.
+        for profile in built_in_profiles().unwrap_or_else(|error| panic!("{error}")) {
+            let expected = if profile.acquisition.is_led_sequenced() {
+                format!("0x{SEQUENCED_MIN_FIRMWARE_BUILD:08X}")
+            } else {
+                "0x00010006".to_string()
+            };
+            assert_eq!(
+                profile.required_firmware.build, expected,
+                "{}",
+                profile.profile_id
+            );
+        }
+        assert_eq!(factory_lab(PULSE_ID).required_firmware.build, "0x00010007");
+    }
+
     #[test]
     fn builtin_hashes_are_deterministic() {
         let profiles = built_in_profiles().unwrap_or_else(|error| panic!("{error}"));
@@ -5068,15 +5407,27 @@ mod tests {
                 .and_then(|outputs| outputs.green.as_deref()),
             Some("D4")
         );
+        // Pulse ox 1.1.0: one record per LED state with every channel.
         let pulseox = lookup("course_pulseox");
         assert_eq!(
             pulseox.acquisition.acquisition_mode,
-            AcquisitionMode::Pulseox4State
+            AcquisitionMode::PulseoxSequenced
         );
         assert_eq!(pulseox.acquisition.analog_pins(), ["A0", "A1"]);
-        assert_eq!(pulseox.acquisition.record_field_names().len(), 8);
+        assert_eq!(
+            pulseox.acquisition.record_field_names(),
+            ["led_state", "tx_counts", "rx_counts"]
+        );
         assert_eq!(pulseox.acquisition.state_dwell_us, Some(1_000));
+        assert_eq!(pulseox.acquisition.sample_rate_hz, 1_000);
         assert_eq!(pulseox.acquisition.adc_resolution_bits, 14);
+        // Its published 1.0.0 (legacy 4-state): one 8-field record per cycle.
+        let four_state = legacy_pulse_ox_lab();
+        assert_eq!(four_state.acquisition.analog_pins(), ["A0", "A1"]);
+        assert_eq!(four_state.acquisition.record_field_names().len(), 8);
+        assert_eq!(four_state.acquisition.state_dwell_us, Some(1_000));
+        assert_eq!(four_state.acquisition.sample_rate_hz, 250);
+        assert_eq!(four_state.acquisition.adc_resolution_bits, 14);
         let general = lookup("development");
         assert_eq!(general.acquisition.adc_resolution_bits, 14);
         let op_amp = lookup("course_op_amp");
@@ -5096,7 +5447,7 @@ mod tests {
         assert!(profile.validate().is_err());
         // Each rule is checked on a correctly rehashed profile, so the
         // assertion cannot pass merely because the hash no longer matches.
-        let factory_pulseox = factory_lab(PULSE_ID);
+        let factory_pulseox = legacy_pulse_ox_lab();
         let mut out_of_range = factory_pulseox.clone();
         out_of_range.acquisition.state_dwell_us = Some(200);
         out_of_range
@@ -5129,6 +5480,406 @@ mod tests {
         assert!(ecg.validate_for_authoring().is_err());
         assert!(ecg.acquisition.firmware_configuration_issue().is_some());
     }
+    /// `lab` after `change`, rehashed, so a refusal cannot come from a stale hash.
+    fn rehashed(
+        lab: &AcquisitionProfile,
+        change: impl FnOnce(&mut AcquisitionProfile),
+    ) -> AcquisitionProfile {
+        let mut copy = lab.clone();
+        change(&mut copy);
+        copy.refresh_hash()
+            .unwrap_or_else(|error| panic!("{error}"));
+        copy
+    }
+
+    #[test]
+    fn led_sequenced_labs_record_the_led_state_and_every_channel() {
+        let lab = sequenced_test_lab();
+        assert!(lab.acquisition.is_led_sequenced());
+        assert!(lab.validate_for_authoring().is_ok());
+        assert_eq!(
+            lab.acquisition.record_field_names(),
+            ["led_state", "tx_counts", "rx_counts"]
+        );
+        assert_eq!(lab.acquisition.analog_pins(), ["A0", "A1"]);
+        assert_eq!(lab.acquisition.firmware_configuration_issue(), None);
+        let json = serde_json::to_value(&lab).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(json["acquisition"]["acquisition_mode"], "pulseox_sequenced");
+        assert_eq!(
+            json["acquisition"]["channels"][0]["split_by_led_state"],
+            true
+        );
+        let parsed: AcquisitionProfile =
+            serde_json::from_value(json).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(parsed, lab);
+        parsed.validate().unwrap_or_else(|error| panic!("{error}"));
+
+        // An unsplit channel omits the flag: existing labs keep their bytes.
+        // The only LED-sequenced factory lab is pulse ox 1.1.0.
+        let mut sequenced = Vec::new();
+        for profile in built_in_profiles().unwrap_or_else(|error| panic!("{error}")) {
+            let bytes = profile
+                .canonical_bytes()
+                .unwrap_or_else(|error| panic!("{error}"));
+            let split = String::from_utf8_lossy(&bytes).contains("split_by_led_state");
+            assert_eq!(
+                split,
+                profile.acquisition.is_led_sequenced(),
+                "{}",
+                profile.profile_id
+            );
+            if profile.acquisition.is_led_sequenced() {
+                sequenced.push(profile.profile_id.clone());
+            }
+        }
+        assert_eq!(sequenced, [PULSE_ID]);
+        let bytes = legacy_pulse_ox_lab()
+            .canonical_bytes()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("split_by_led_state"));
+        assert_eq!(pulse_ox_sequenced_rate_hz(1_000), 1_000);
+        assert_eq!(pulse_ox_sequenced_rate_hz(2_500), 400);
+        assert_eq!(pulse_ox_sequenced_rate_hz(3_000), 333);
+        assert_eq!(pulse_ox_sequenced_rate_hz(5_000), 200);
+        assert_eq!(
+            [0, 1, 2, 3, 4, 9].map(led_state_name),
+            ["RED", "DARK1", "IR", "DARK2", "UNKNOWN", "UNKNOWN"]
+        );
+    }
+
+    #[test]
+    fn led_sequenced_labs_refuse_bad_channels_dwell_rate_outputs_and_old_firmware() {
+        use DigitalOutputBehavior::{AcquisitionSequenced, AlwaysLow, HighWhileRecording};
+        let lab = sequenced_test_lab();
+        let refused: Vec<(&str, AcquisitionProfile)> = vec![
+            (
+                "no channels",
+                rehashed(&lab, |lab| lab.acquisition.channels.clear()),
+            ),
+            (
+                "repeated pin",
+                rehashed(&lab, |lab| lab.acquisition.channels[1].pin = "A0".into()),
+            ),
+            (
+                "unsupported pin",
+                rehashed(&lab, |lab| lab.acquisition.channels[1].pin = "A6".into()),
+            ),
+            (
+                "repeated ID",
+                rehashed(&lab, |lab| lab.acquisition.channels[1].id = "tx".into()),
+            ),
+            (
+                "repeated CSV field",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.channels[1].csv_name = "tx_counts".into();
+                }),
+            ),
+            (
+                "not ADC counts",
+                rehashed(&lab, |lab| lab.acquisition.channels[0].units = "V".into()),
+            ),
+            (
+                "reserved led_state",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.channels[0].csv_name = "led_state".into();
+                }),
+            ),
+            (
+                "reserved led_state_name",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.channels[0].csv_name = "LED_State_Name".into();
+                }),
+            ),
+            (
+                "reserved cycle_index",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.channels[0].csv_name = "cycle_index".into();
+                }),
+            ),
+            (
+                "_V column collides",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.channels[0].csv_name = "rx_V".into();
+                    lab.acquisition.channels[1].csv_name = "rx".into();
+                }),
+            ),
+            (
+                "pressure column collides",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.channels[0].csv_name = "rx_kPa".into();
+                    lab.acquisition.channels[1].allowed_conversions =
+                        vec!["counts_volts".into(), "mpxv_pressure".into()];
+                }),
+            ),
+            (
+                "invalid CSV field",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.channels[0].csv_name = "tx counts".into();
+                }),
+            ),
+            (
+                "legacy 250 µs dwell",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.state_dwell_us = Some(250);
+                    lab.acquisition.sample_rate_hz = 1_000;
+                }),
+            ),
+            (
+                "999 µs dwell",
+                rehashed(&lab, |lab| lab.acquisition.state_dwell_us = Some(999)),
+            ),
+            (
+                "5001 µs dwell",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.state_dwell_us = Some(5_001);
+                    lab.acquisition.sample_rate_hz = 200;
+                }),
+            ),
+            (
+                "no dwell",
+                rehashed(&lab, |lab| lab.acquisition.state_dwell_us = None),
+            ),
+            (
+                "rate not from dwell",
+                rehashed(&lab, |lab| lab.acquisition.state_dwell_us = Some(2_000)),
+            ),
+            (
+                "4-state cycle rate",
+                rehashed(&lab, |lab| lab.acquisition.sample_rate_hz = 250),
+            ),
+            (
+                "same RED and IR pin",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.digital_outputs[1].pin = "D5".into()
+                }),
+            ),
+            (
+                "no IR output",
+                rehashed(&lab, |lab| lab.acquisition.digital_outputs.truncate(1)),
+            ),
+            (
+                "IR not sequenced",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.digital_outputs[1].behavior = AlwaysLow;
+                }),
+            ),
+            (
+                "another output",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.digital_outputs.push(DigitalOutput {
+                        pin: "D4".into(),
+                        label: "Green LED".into(),
+                        behavior: AlwaysLow,
+                        pulse_ox_role: None,
+                    });
+                }),
+            ),
+            (
+                "two RED roles",
+                rehashed(&lab, |lab| {
+                    lab.acquisition.digital_outputs[0].pulse_ox_role = Some(PulseOxRole::Red);
+                    lab.acquisition.digital_outputs.push(DigitalOutput {
+                        pin: "D4".into(),
+                        label: "Spare".into(),
+                        behavior: AcquisitionSequenced,
+                        pulse_ox_role: Some(PulseOxRole::Red),
+                    });
+                }),
+            ),
+            (
+                "firmware build 0x00010006",
+                rehashed(&lab, |lab| {
+                    lab.required_firmware.build = "0x00010006".into()
+                }),
+            ),
+            (
+                "firmware build 0x00010008",
+                rehashed(&lab, |lab| {
+                    lab.required_firmware.build = "0x00010008".into()
+                }),
+            ),
+            (
+                "plot defaults miss rx",
+                rehashed(&lab, |lab| lab.plot_defaults.groups.truncate(1)),
+            ),
+            (
+                "plot defaults name an LED-state trace",
+                rehashed(&lab, |lab| {
+                    lab.plot_defaults.groups[0].channel_ids = vec!["red_tx".into()];
+                }),
+            ),
+        ];
+        for (rule, profile) in refused {
+            assert!(profile.verify_integrity().is_ok(), "{rule}");
+            assert!(profile.validate().is_err(), "{rule} was accepted");
+        }
+        // A sequenced lab never drives D5/D6 HIGH while recording.
+        let high = rehashed(&lab, |lab| {
+            lab.acquisition.digital_outputs[1].behavior = HighWhileRecording;
+        });
+        assert!(high.validate().is_err());
+
+        // The firmware build is checked before the hash: an old build is
+        // reported as such even when the stored hash no longer matches.
+        let mut old_build = lab.clone();
+        old_build.required_firmware.build = "0x00010006".into();
+        let error = old_build
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("an old build was accepted"));
+        assert!(
+            error.to_string().contains("build 0x00010007 or later"),
+            "{error}"
+        );
+
+        // Accepted variants: 2.5 ms (400 records/s), six channels, no plot
+        // defaults, and explicit roles that override the labels.
+        for profile in [
+            rehashed(&lab, |lab| {
+                lab.acquisition.state_dwell_us = Some(2_500);
+                lab.acquisition.sample_rate_hz = 400;
+            }),
+            rehashed(&lab, |lab| {
+                lab.acquisition.state_dwell_us = Some(5_000);
+                lab.acquisition.sample_rate_hz = 200;
+            }),
+            rehashed(&lab, |lab| {
+                lab.acquisition.channels = ["A5", "A4", "A3", "A2", "A1", "A0"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, pin)| ProfileChannel {
+                        pin: pin.into(),
+                        id: format!("ch{index}"),
+                        label: format!("Channel {index}"),
+                        csv_name: format!("ch{index}_counts"),
+                        units: "ADC counts".into(),
+                        allowed_conversions: Vec::new(),
+                        default_display_unit: None,
+                        default_visible: true,
+                        split_by_led_state: false,
+                    })
+                    .collect();
+                lab.plot_defaults = PlotDefaults::default();
+            }),
+            rehashed(&lab, |lab| {
+                lab.acquisition.digital_outputs[0].label = "660 nm".into();
+                lab.acquisition.digital_outputs[0].pulse_ox_role = Some(PulseOxRole::Red);
+                lab.acquisition.digital_outputs[1].pin = "D4".into();
+                lab.acquisition.digital_outputs[1].label = "940 nm".into();
+                lab.acquisition.digital_outputs[1].pulse_ox_role = Some(PulseOxRole::Ir);
+            }),
+        ] {
+            profile
+                .validate_for_authoring()
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+
+        // A dwell the firmware cannot run is named before a recording.
+        let mut short = lab.acquisition.clone();
+        short.state_dwell_us = Some(500);
+        assert!(short
+            .firmware_configuration_issue()
+            .is_some_and(|issue| issue.contains("1000-5000")));
+    }
+
+    #[test]
+    fn show_by_led_state_and_the_new_reserved_columns_apply_by_mode() {
+        // The display-only split flag exists only in the LED-sequenced mode.
+        let simultaneous = rehashed(&factory_lab(ECG_ID), |lab| {
+            lab.acquisition.channels[0].split_by_led_state = true;
+        });
+        assert!(simultaneous.validate().is_err());
+        let four_state = rehashed(&legacy_pulse_ox_lab(), |lab| {
+            lab.acquisition.channels.push(ProfileChannel {
+                pin: "A0".into(),
+                id: "channel_1".into(),
+                label: "Channel 1".into(),
+                csv_name: "channel_1_counts".into(),
+                units: "ADC counts".into(),
+                allowed_conversions: Vec::new(),
+                default_display_unit: None,
+                default_visible: true,
+                split_by_led_state: true,
+            });
+        });
+        assert!(four_state.validate().is_err());
+
+        // A stored simultaneous lab whose CSV field is now reserved still
+        // loads; only a revision saved now must rename it.
+        let stored = rehashed(&factory_lab(ECG_ID), |lab| {
+            lab.acquisition.channels[0].csv_name = "led_state".into();
+        });
+        assert!(stored.validate().is_ok());
+        assert!(stored.validate_for_authoring().is_err());
+        assert!(RESERVED_CSV_COLUMNS.contains(&"led_state_name"));
+    }
+
+    #[test]
+    fn led_sequenced_drafts_follow_the_dwell_and_name_the_firmware_build_that_has_the_mode() {
+        let mut draft = sequenced_test_lab();
+        draft.status = ProfileStatus::Draft;
+        draft.required_firmware.build = "0x00010006".into();
+        draft.acquisition.state_dwell_us = Some(2_500);
+        draft.acquisition.sample_rate_hz = 77;
+        draft.acquisition.analog_inputs = Some(PulseOxInputs {
+            tx: "A0".into(),
+            rx: "A1".into(),
+        });
+        draft.acquisition.led_outputs = Some(LedOutputs {
+            green: None,
+            red: Some("D5".into()),
+            ir: Some("D6".into()),
+        });
+        let channels = draft.acquisition.channels.clone();
+        normalize_authoring_draft(&mut draft);
+        assert_eq!(draft.acquisition.sample_rate_hz, 400);
+        assert_eq!(draft.required_firmware.build, "0x00010007");
+        assert_eq!(draft.acquisition.analog_inputs, None);
+        assert_eq!(draft.acquisition.led_outputs, None);
+        // Channels are kept: unlike the 4-state mode they are what is read.
+        assert_eq!(draft.acquisition.channels, channels);
+        // A dwell out of range keeps the rate for validation to refuse.
+        draft.acquisition.state_dwell_us = Some(700);
+        normalize_authoring_draft(&mut draft);
+        assert_eq!(draft.acquisition.sample_rate_hz, 400);
+        // A build already new enough is kept.
+        let mut current = sequenced_test_lab();
+        normalize_authoring_draft(&mut current);
+        assert_eq!(current.required_firmware.build, "0x00010007");
+        // Other modes keep their build.
+        let mut ecg = factory_lab(ECG_ID);
+        normalize_authoring_draft(&mut ecg);
+        assert_eq!(ecg.required_firmware.build, "0x00010006");
+
+        // Save, list, edit, and reload a new LED-sequenced lab.
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = dir.path().join("profiles");
+        let store = ProfileStore::with_root(root.clone()).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut new_lab = sequenced_test_lab();
+        new_lab.profile_id = "team.sequenced".into();
+        new_lab.status = ProfileStatus::Draft;
+        new_lab.source = ProfileSource::Instructor;
+        let saved = store
+            .save_lab_draft(new_lab, None, "save-sequenced-0001".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(saved.profile_version, "1.0.0");
+        assert!(saved.acquisition.is_led_sequenced());
+        let edited = store
+            .begin_lab_edit("team.sequenced")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(edited.acquisition.channels, saved.acquisition.channels);
+        let reopened = ProfileStore::with_root(root).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            reopened
+                .get_locked("team.sequenced")
+                .unwrap_or_else(|error| panic!("{error}")),
+            saved
+        );
+    }
+
     #[test]
     fn builtin_profiles_are_valid_and_hashed() {
         let profiles = built_in_profiles().unwrap_or_else(|e| panic!("{e}"));
@@ -5670,6 +6421,118 @@ mod tests {
                     .contains("pulse_ox_role")
             );
         }
+    }
+
+    /// The built-in pulse-ox lab 1.1.0: the LED-sequenced mode with the same
+    /// identity, notices and export name as 1.0.0, which stays published in
+    /// `profiles/legacy/` (not compiled in) for rollback and old recordings.
+    #[test]
+    fn built_in_pulse_ox_lab_1_1_0_is_led_sequenced_and_keeps_1_0_0_in_legacy() {
+        let lab = factory_lab(PULSE_ID);
+        let legacy = legacy_pulse_ox_lab();
+        assert_eq!(lab.profile_version, "1.1.0");
+        assert_eq!(legacy.profile_version, "1.0.0");
+        assert!(lab.validate_for_authoring().is_ok());
+        assert!(factory_lock().contains(&FactoryLabLockEntry::of(&lab)));
+        assert_eq!(
+            published_lab_text(PULSE_ID, "1.0.0"),
+            LEGACY_PULSE_OX_LAB_TEXT
+        );
+        assert!(!FACTORY_LAB_FILES
+            .iter()
+            .any(|(_, text)| normalized_text(text) == normalized_text(LEGACY_PULSE_OX_LAB_TEXT)));
+
+        // The design's lab: tx (A0) and rx (A1), both shown by LED state,
+        // D5 RED and D6 IR, 1000 µs per state, 1000 records/s, build 7.
+        let design = sequenced_test_lab();
+        assert_eq!(lab.acquisition, design.acquisition);
+        assert_eq!(lab.plot_defaults, design.plot_defaults);
+        assert_eq!(lab.required_firmware, design.required_firmware);
+        assert_eq!(
+            lab.acquisition.record_field_names(),
+            ["led_state", "tx_counts", "rx_counts"]
+        );
+        assert!(lab
+            .acquisition
+            .channels
+            .iter()
+            .all(|channel| channel.split_by_led_state));
+        assert_eq!(
+            lab.acquisition
+                .resolved_digital_outputs()
+                .iter()
+                .map(|output| (output.pin.as_str(), output.label.as_str(), &output.behavior))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "D5",
+                    "Red LED",
+                    &DigitalOutputBehavior::AcquisitionSequenced
+                ),
+                ("D6", "IR LED", &DigitalOutputBehavior::AcquisitionSequenced)
+            ]
+        );
+
+        // Same identity, notices (raw only, no SpO2) and export name.
+        assert_eq!(lab.profile_id, legacy.profile_id);
+        assert_eq!(lab.display_name, legacy.display_name);
+        assert_eq!(lab.category, legacy.category);
+        assert_eq!(lab.source, legacy.source);
+        assert_eq!(lab.status, legacy.status);
+        assert_eq!(lab.safety, legacy.safety);
+        assert_eq!(lab.export, legacy.export);
+        assert!(lab
+            .safety
+            .notices
+            .iter()
+            .any(|notice| notice.contains("no SpO2")));
+    }
+
+    /// The published 1.0.0 file in `profiles/legacy/` is a rollback: Install
+    /// lab file accepts it (it is a published factory version), and it then
+    /// records in the legacy 4-state mode until Restore course default.
+    #[test]
+    fn the_published_pulse_ox_1_0_0_file_installs_as_a_4_state_rollback() {
+        let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let file = dir
+            .path()
+            .join("pulseox_tx_rx_course_capture_1.0.0.profile.json");
+        fs::write(&file, LEGACY_PULSE_OX_LAB_TEXT).unwrap_or_else(|error| panic!("{error}"));
+        let store = ProfileStore::with_root(dir.path().join("profiles"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let summary = store
+            .inspect_lab_file(&file)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(summary.refusal, None);
+        assert_eq!(summary.acquisition_mode, AcquisitionMode::Pulseox4State);
+        assert_eq!(
+            summary.replaces.map(|replaced| replaced.profile_version),
+            Some("1.1.0".to_string())
+        );
+        let installed = store
+            .install_lab_file(&file, false)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(installed.profile_version, "1.0.0");
+        assert_eq!(installed.source, ProfileSource::Imported);
+        let active = store
+            .get_locked(PULSE_ID)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(active.profile_version, "1.0.0");
+        assert_eq!(
+            active.acquisition.acquisition_mode,
+            AcquisitionMode::Pulseox4State
+        );
+        store
+            .set_mode(ProfileMode::InstructorAuthoring, true)
+            .unwrap_or_else(|error| panic!("{error}"));
+        store
+            .restore_course_default(PULSE_ID)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let restored = store
+            .get_locked(PULSE_ID)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(restored.profile_version, "1.1.0");
+        assert!(restored.acquisition.is_led_sequenced());
     }
 
     #[test]
@@ -6708,7 +7571,7 @@ mod tests {
 
     #[test]
     fn authoring_drafts_use_explicit_outputs_and_an_empty_list_is_authoritative() {
-        let mut legacy = factory_lab(PULSE_ID);
+        let mut legacy = legacy_pulse_ox_lab();
         legacy.acquisition.digital_outputs.clear();
         normalize_authoring_draft(&mut legacy);
         assert!(legacy.acquisition.led_outputs.is_none());
@@ -6748,7 +7611,7 @@ mod tests {
     #[test]
     fn pulse_ox_drafts_have_no_phantom_channel_and_keep_the_rate_tied_to_dwell() {
         let dir = tempdir().unwrap_or_else(|error| panic!("{error}"));
-        let store = instructor_store(&dir.path().join("profiles"));
+        let store = four_state_pulse_ox_store(&dir.path().join("profiles"));
         let mut draft = store
             .begin_lab_edit(PULSE_ID)
             .unwrap_or_else(|error| panic!("{error}"));
@@ -6765,11 +7628,12 @@ mod tests {
             allowed_conversions: vec!["counts_volts".into()],
             default_display_unit: Some("counts".into()),
             default_visible: true,
+            split_by_led_state: false,
         });
         draft.acquisition.state_dwell_us = Some(2_000);
         draft.acquisition.sample_rate_hz = 125;
         let saved = store
-            .save_lab_draft(draft, Some("1.0.0".into()), "pulse-save-00001".into())
+            .save_lab_draft(draft, Some("1.0.1".into()), "pulse-save-00001".into())
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(saved.acquisition.channels.is_empty());
         assert_eq!(saved.acquisition.sample_rate_hz, 125);
@@ -6779,7 +7643,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         wrong_rate.acquisition.sample_rate_hz = 1_000;
         let error = store
-            .save_lab_draft(wrong_rate, Some("1.0.1".into()), "pulse-save-00002".into())
+            .save_lab_draft(wrong_rate, Some("1.0.2".into()), "pulse-save-00002".into())
             .err()
             .unwrap_or_else(|| panic!("a rate that does not follow the dwell must be refused"));
         assert!(error.to_string().contains("cycle rate"), "{error}");
@@ -6799,7 +7663,7 @@ mod tests {
         let error = store
             .save_lab_draft(
                 extra_output,
-                Some("1.0.1".into()),
+                Some("1.0.2".into()),
                 "pulse-save-00003".into(),
             )
             .err()
@@ -6808,6 +7672,63 @@ mod tests {
             error.to_string().contains("only their RED and IR"),
             "{error}"
         );
+
+        // The built-in pulse-ox lab 1.1.0 (LED-sequenced) edits as its real
+        // channels, and its record rate must follow the dwell.
+        let fresh = instructor_store(&dir.path().join("fresh"));
+        let mut sequenced = fresh
+            .begin_lab_edit(PULSE_ID)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(sequenced.acquisition.is_led_sequenced());
+        assert_eq!(sequenced.acquisition.analog_pins(), ["A0", "A1"]);
+        assert!(sequenced.acquisition.led_outputs.is_none());
+        assert!(sequenced.acquisition.analog_inputs.is_none());
+        assert_eq!(sequenced.acquisition.digital_outputs.len(), 2);
+        sequenced.acquisition.state_dwell_us = Some(2_000);
+        sequenced.acquisition.sample_rate_hz = 125;
+        let error = fresh
+            .save_lab_draft(
+                sequenced.clone(),
+                Some("1.1.0".into()),
+                "pulse-save-00004".into(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a record rate that does not follow the dwell"));
+        assert!(error.to_string().contains("record rate"), "{error}");
+        sequenced.acquisition.sample_rate_hz = 500;
+        let saved = fresh
+            .save_lab_draft(sequenced, Some("1.1.0".into()), "pulse-save-00005".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(saved.profile_version, "1.1.1");
+        assert_eq!(saved.acquisition.sample_rate_hz, 500);
+        assert_eq!(saved.acquisition.analog_pins(), ["A0", "A1"]);
+    }
+
+    /// An instructor store whose active pulse-ox lab is a legacy 4-state
+    /// revision (1.0.1: the published 1.0.0 saved by an instructor), as on a
+    /// lab PC that edited the pulse-ox lab before it moved to 1.1.0.
+    fn four_state_pulse_ox_store(root: &Path) -> ProfileStore {
+        let mut revision = legacy_pulse_ox_lab();
+        revision.profile_version = "1.0.1".into();
+        revision.source = ProfileSource::Instructor;
+        revision
+            .refresh_hash()
+            .unwrap_or_else(|error| panic!("{error}"));
+        write_catalog(
+            root,
+            &[serde_json::to_string_pretty(&revision).unwrap_or_default()],
+            &[(PULSE_ID, "1.0.1")],
+        );
+        let store = instructor_store(root);
+        let active = store
+            .get_locked(PULSE_ID)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(active.profile_version, "1.0.1");
+        assert_eq!(
+            active.acquisition.acquisition_mode,
+            AcquisitionMode::Pulseox4State
+        );
+        store
     }
 
     #[test]
@@ -7436,7 +8357,7 @@ mod tests {
     /// A pulse-ox revision as the v1.0.2 editor saved it: an unused
     /// "Channel 1 / A0" plus the legacy `led_outputs` next to the outputs.
     fn v1_0_2_pulse_ox_revision() -> AcquisitionProfile {
-        let mut pulse = factory_lab(PULSE_ID);
+        let mut pulse = legacy_pulse_ox_lab();
         pulse.profile_version = "1.0.1".into();
         pulse.source = ProfileSource::Instructor;
         pulse.description.push_str(" Edited in v1.0.2.");
@@ -7449,6 +8370,7 @@ mod tests {
             allowed_conversions: vec!["counts_volts".into()],
             default_display_unit: Some("counts".into()),
             default_visible: true,
+            split_by_led_state: false,
         });
         pulse
             .refresh_hash()
@@ -7919,8 +8841,8 @@ mod tests {
         assert_eq!(kept[0]["profile_version"], "0.9.0");
     }
 
-    /// A copy of the repository's factory lab folder (the compiled-in files
-    /// and the lock).
+    /// A copy of the repository's factory lab folder (the compiled-in files,
+    /// the lock, and the published versions kept in `legacy/`).
     fn factory_lab_folder(root: &Path) -> PathBuf {
         let dir = root.join("profiles");
         fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("{error}"));
@@ -7932,7 +8854,20 @@ mod tests {
             include_str!("../../profiles/factory-labs.lock.json"),
         )
         .unwrap_or_else(|error| panic!("{error}"));
+        let legacy = dir.join(FACTORY_LAB_LEGACY_FOLDER);
+        fs::create_dir_all(&legacy).unwrap_or_else(|error| panic!("{error}"));
+        for path in repository_legacy_lab_files() {
+            fs::copy(&path, legacy.join(file_name_of(&path)))
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
         dir
+    }
+
+    /// The published factory lab versions kept in the repository's
+    /// `profiles/legacy/`.
+    fn repository_legacy_lab_files() -> Vec<PathBuf> {
+        factory_lab_files_in(&repository_profiles_dir().join(FACTORY_LAB_LEGACY_FOLDER))
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// The folder's lab files as the compiled-in list a rebuild would give.
@@ -7979,7 +8914,12 @@ mod tests {
         let clean = factory_lab_folder(&dir.path().join("clean"));
         let report = factory_lab_check(&clean, FACTORY_LAB_FILES);
         assert!(report.is_ok(), "{:#?}", report.problems);
-        assert_eq!(report.labs.len(), factory_lab_count());
+        let legacy_files = repository_legacy_lab_files();
+        assert!(!legacy_files.is_empty());
+        assert_eq!(report.labs.len(), factory_lab_count() + legacy_files.len());
+        assert!(report.labs.iter().any(
+            |line| line.starts_with("legacy/pulseox_tx_rx_course_capture_1.0.0.profile.json: ")
+        ));
 
         let mut case = 0;
         let mut problems_after = |edit: &dyn Fn(&Path)| -> Vec<String> {
@@ -8166,7 +9106,7 @@ mod tests {
         assert!(refused.to_string().contains("would lose it"), "{refused}");
         assert_eq!(file_text(&lab_path), edited);
         assert_eq!(file_text(&lock_path), original_lock);
-        assert!(!folder.join(FACTORY_LAB_LEGACY_FOLDER).exists());
+        assert!(!legacy_path.exists());
 
         // --bump-minor publishes 1.1.0; only the version and hash text change,
         // and the committed 1.0.0 is kept in legacy/ byte for byte.

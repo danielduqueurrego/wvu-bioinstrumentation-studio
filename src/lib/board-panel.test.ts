@@ -57,6 +57,25 @@ describe('Board panel state chip and fitting action', () => {
     expect(boardStatus({ ...base, compatibility: 'upload_in_progress' })).toMatchObject({ state: 'restoring' });
   });
 
+  it('says which side is out of date when the board has another WVU firmware build', () => {
+    const older = boardStatus({ ...base, compatibility: 'verification_failed', lastFailureCategory: 'older_wvu_firmware' });
+    expect(older).toMatchObject({ state: 'older_firmware', label: 'Older WVU firmware', tone: 'problem', action: 'restore' });
+    expect(older.hint).toContain('Restore the WVU firmware to update it');
+    const newer = boardStatus({ ...base, compatibility: 'verification_failed', lastFailureCategory: 'newer_wvu_firmware' });
+    expect(newer).toMatchObject({ state: 'newer_firmware', label: 'Newer WVU firmware', tone: 'problem', action: 'restore' });
+    expect(newer.hint).toContain('Update the app on this computer');
+    expect(newer.hint).toContain('COM5');
+    // A Retry connection or Start that proved it withdraws readiness without a Verify failure.
+    expect(boardStatus({ ...base, compatibility: 'verification_failed', connectionFailureCategory: 'newer_wvu_firmware' }))
+      .toMatchObject({ state: 'newer_firmware' });
+    expect(boardStatus({ ...base, compatibility: 'verification_failed', lastFailureCategory: 'protocol_verification_failed', connectionFailureCategory: 'older_wvu_firmware' }))
+      .toMatchObject({ state: 'older_firmware' });
+    // Ready firmware and a busy port still come first; a connection result alone does not override "not checked".
+    expect(boardStatus({ ...base, compatibility: 'wvu_protocol_compatible', firmwareReady: true, connectionFailureCategory: 'newer_wvu_firmware' }).state).toBe('ready');
+    expect(boardStatus({ ...base, lastFailureCategory: 'port_busy', connectionFailureCategory: 'older_wvu_firmware' }).state).toBe('busy');
+    expect(boardStatus({ ...base, connectionFailureCategory: 'older_wvu_firmware' }).state).toBe('not_checked');
+  });
+
   it('treats firmware verified on another port as not checked on this one', () => {
     expect(boardStatus({ ...base, compatibility: 'wvu_protocol_compatible', firmwareReady: false })).toMatchObject({ state: 'not_checked', action: 'verify' });
   });

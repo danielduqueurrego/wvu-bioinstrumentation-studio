@@ -1,5 +1,6 @@
 <script lang="ts">
   import { formatClock } from '$lib/recording-status';
+  import { recordingTimingDetails } from '$lib/recording-result';
   import type { FirmwareCompatibility } from '$lib/board-controls';
   import type {
     FirmwareEnvironment,
@@ -43,6 +44,8 @@
   const yesNoUnknown = (value: boolean | undefined | null) => value === true ? 'yes' : value === false ? 'no' : 'unknown';
   const diagnostics = $derived(session.connection_diagnostics);
   const lastRestore = $derived(firmwareWorkflow.last_restore);
+  // The last recording's timing checks: skipped deadlines, LED settle, per-state intervals.
+  const timingLines = $derived(recordingTimingDetails(session.last_summary));
 </script>
 
 <details class="advanced-details">
@@ -101,6 +104,7 @@
       <p>Plot detail: {lastPlotError.detail}</p>
     {/if}
     {#if session.last_summary}<p>Last recording stop reason: {session.last_summary.stop_reason} ({session.last_summary.recording_status})</p>{/if}
+    {#each timingLines as line}<p>Last recording: {line}</p>{/each}
     {#if session.last_error}<p>Recent connection error: {session.last_error}</p>{/if}
   </div>
 </details>

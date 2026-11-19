@@ -6,11 +6,18 @@ export type ConnectionActionState = {
 };
 
 /**
- * Problems a new handshake cannot fix: a folder or disk problem, and a lab
- * the connected firmware cannot run (Restore WVU Firmware or the instructor
- * can help instead).
+ * Problems a new handshake cannot fix: a folder or disk problem, a lab the
+ * connected firmware cannot run (Restore WVU Firmware or the instructor can
+ * help instead), and a board that identified itself as an older or newer WVU
+ * firmware build (a retry gets the same answer; Restore WVU Firmware, or for
+ * a newer board an app update on this computer, is the fix).
  */
-const NON_CONNECTION_FAILURES = new Set(['recording_storage_error', 'lab_not_supported_by_firmware']);
+const NON_CONNECTION_FAILURES = new Set([
+  'recording_storage_error',
+  'lab_not_supported_by_firmware',
+  'older_wvu_firmware',
+  'newer_wvu_firmware'
+]);
 
 /**
  * Keeps recovery controls unavailable while a controller owns a session.

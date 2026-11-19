@@ -98,6 +98,12 @@ pub enum FirmwareErrorCategory {
     ManualResetRequired,
     ProtocolVerificationFailed,
     WrongFirmwareIdentity,
+    /// Verify found the WVU device ID with an older build than this app's
+    /// reference firmware. Restore WVU Firmware updates the board.
+    OlderWvuFirmware,
+    /// Verify found the WVU device ID with a newer build than this app's
+    /// reference firmware: the app on this computer is out of date.
+    NewerWvuFirmware,
     Canceled,
     /// Cancel was refused because the board is being written.
     UploadCannotBeCanceled,
@@ -545,7 +551,7 @@ impl FirmwareWorkflow {
         }
         let failure = (!verification.compatible).then(|| {
             FirmwareFailure::new(
-                FirmwareErrorCategory::ProtocolVerificationFailed,
+                verification_failure_category(&result.diagnostics),
                 FirmwareJobStage::VerifyingFirmware,
                 verification.explanation.clone(),
                 format!("diagnostics: {:?}", result.diagnostics.failure_category),
@@ -1282,7 +1288,27 @@ fn disproves_reference_firmware(category: &ConnectionFailureCategory) -> bool {
             | ConnectionFailureCategory::WrongProtocolVersion
             | ConnectionFailureCategory::MissingFirmwareIdentity
             | ConnectionFailureCategory::IncompatibleFirmwareIdentity
+            | ConnectionFailureCategory::OlderWvuFirmware
+            | ConnectionFailureCategory::NewerWvuFirmware
     )
+}
+
+/// The failure a Verify that opened the board but did not prove this app's
+/// firmware records. Another build of the WVU firmware keeps its own
+/// category, so the Board card can say which side is out of date; anything
+/// else is "No WVU firmware".
+fn verification_failure_category(
+    diagnostics: &crate::session::ConnectionDiagnostics,
+) -> FirmwareErrorCategory {
+    match diagnostics.failure_category {
+        Some(ConnectionFailureCategory::OlderWvuFirmware) => {
+            FirmwareErrorCategory::OlderWvuFirmware
+        }
+        Some(ConnectionFailureCategory::NewerWvuFirmware) => {
+            FirmwareErrorCategory::NewerWvuFirmware
+        }
+        _ => FirmwareErrorCategory::ProtocolVerificationFailed,
+    }
 }
 
 fn verification_from_handshake(
@@ -1453,6 +1479,8 @@ fn failure_copy(category: FirmwareErrorCategory) -> (&'static str, &'static str)
         FirmwareErrorCategory::ManualResetRequired => ("Board reset needed", "While Restore WVU Firmware is open, press the board Reset button twice to switch safely to the upload interface."),
         FirmwareErrorCategory::ProtocolVerificationFailed => ("Firmware verification failed", "Use Restore WVU Firmware before using Acquisition."),
         FirmwareErrorCategory::WrongFirmwareIdentity => ("Firmware update required", "Use Restore WVU Firmware before using Acquisition."),
+        FirmwareErrorCategory::OlderWvuFirmware => ("Older WVU firmware", "Use Restore WVU Firmware to update the board's firmware for this app."),
+        FirmwareErrorCategory::NewerWvuFirmware => ("Newer WVU firmware", "This computer's app is older than the board's firmware. Update the app on this computer, or use Restore WVU Firmware to put this app's firmware back on the board."),
         FirmwareErrorCategory::Canceled => ("Operation canceled", "Reconnect the board if needed, then restore the WVU firmware again."),
         FirmwareErrorCategory::UploadCannotBeCanceled => ("The board is being written", "Wait for the restore to finish. Do not unplug the board."),
         FirmwareErrorCategory::ToolTimedOut => ("Arduino tools stopped responding", "Unplug the board and plug it back in, select Refresh Board, then try again. If it keeps happening, restart the application."),
@@ -1859,6 +1887,8 @@ mod tests {
             ConnectionFailureCategory::WrongProtocolVersion,
             ConnectionFailureCategory::MissingFirmwareIdentity,
             ConnectionFailureCategory::IncompatibleFirmwareIdentity,
+            ConnectionFailureCategory::OlderWvuFirmware,
+            ConnectionFailureCategory::NewerWvuFirmware,
         ] {
             verify("COM12");
             workflow
@@ -2156,6 +2186,45 @@ mod tests {
         );
         assert_eq!(scan.category, FirmwareErrorCategory::ToolTimedOut);
         assert!(scan.recommended_action.contains("Refresh Board"));
+    }
+
+    #[test]
+    fn a_verify_that_finds_another_wvu_build_says_which_side_is_out_of_date() {
+        let category = |connection: Option<ConnectionFailureCategory>| {
+            verification_failure_category(&ConnectionDiagnostics {
+                failure_category: connection,
+                ..verified_diagnostics()
+            })
+        };
+        assert_eq!(
+            category(Some(ConnectionFailureCategory::OlderWvuFirmware)),
+            FirmwareErrorCategory::OlderWvuFirmware
+        );
+        assert_eq!(
+            category(Some(ConnectionFailureCategory::NewerWvuFirmware)),
+            FirmwareErrorCategory::NewerWvuFirmware
+        );
+        for other in [
+            Some(ConnectionFailureCategory::IncompatibleFirmwareIdentity),
+            Some(ConnectionFailureCategory::NonProtocolBytes),
+            Some(ConnectionFailureCategory::HandshakeIncomplete),
+            None,
+        ] {
+            assert_eq!(
+                category(other.clone()),
+                FirmwareErrorCategory::ProtocolVerificationFailed,
+                "{other:?}"
+            );
+        }
+        let (title, action) = failure_copy(FirmwareErrorCategory::NewerWvuFirmware);
+        assert_eq!(title, "Newer WVU firmware");
+        assert!(
+            action.contains("Update the app on this computer"),
+            "{action}"
+        );
+        assert!(action.contains("Restore WVU Firmware"), "{action}");
+        let (_, action) = failure_copy(FirmwareErrorCategory::OlderWvuFirmware);
+        assert!(action.contains("Restore WVU Firmware"), "{action}");
     }
 
     #[test]

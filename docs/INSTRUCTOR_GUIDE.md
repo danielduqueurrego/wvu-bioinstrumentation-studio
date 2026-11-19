@@ -16,9 +16,31 @@ Choose **Edit** on a lab (or **Edit selected lab**, or **Duplicate selected lab*
 - Allowed conversions and digital outputs
 - Default plot groups
 
-For pulse oximetry, the mode and RED/DARK 1/IR/DARK 2 order remain fixed. TX/RX pins, RED/IR pins, dwell, labels, and plot defaults are editable within firmware limits. The rules for channel names, rates, and outputs are in [Lab Configuration](LAB_CONFIGURATION.md).
+For pulse oximetry, the RED/DARK 1/IR/DARK 2 order is fixed. New pulse-ox labs use the **LED-sequenced** mode (see [Pulse ox with other analog signals](#pulse-ox-with-other-analog-signals)): its channels, RED/IR pins, dwell, labels, and plot defaults are editable within firmware limits. **Pulse Oximetry — legacy 4-state** is offered only while you edit a lab that already uses it; there the TX/RX pins, RED/IR pins, dwell, labels, and plot defaults are editable. The rules for channel names, rates, and outputs are in [Lab Configuration](LAB_CONFIGURATION.md).
 
 Select **Save changes as new version** once to create the next revision and make it active. **Discard draft** drops the draft without creating a version. Closing Manage Labs with an unsaved draft asks for confirmation first. Existing recordings retain their embedded lab snapshot.
+
+## Pulse ox with other analog signals
+
+The built-in **Pulse Oximetry — TX + RX Raw Capture** lab (1.1.0) uses the LED-sequenced mode: the board steps the LEDs RED, DARK 1, IR, DARK 2, and at the end of every state it reads every input of the lab while that state's LEDs are unchanged and writes one row. Every input is therefore recorded in every LED state, so one lab can record a pulse-ox photodetector together with other analog signals.
+
+To make such a lab, for example a photodetector on A0 and other signals on A1–A5:
+
+1. In **Manage Labs**, select the pulse-ox lab and **Duplicate selected lab** (a new lab ID), or **Edit** it for a new revision of the course lab. A lab you start from another lab can be switched with **Acquisition mode** → **Pulse Oximetry — LED-sequenced**, which starts with TX on A0 and RX on A1.
+2. In the channel grid, set channel 1 to the photodetector on **A0**, for example ID `ppg`, label `Photodetector`, CSV field `ppg_counts`. Keep **By LED state** ticked for it.
+3. Change or **Remove** channel 2, then select **Add channel** for each other signal on **A1–A5** (at most six channels in all), with its own ID, label, CSV field, and **Calibration capability** (for example `pressure`, `pressure_counts`, MPXV pressure). Leave **By LED state** unticked for a signal that does not depend on the LEDs: it is then drawn as one trace at the full row rate. This choice affects the live plot only; every channel is recorded in every row either way.
+4. Keep **RED output** on D5 and **IR output** on D6 (or choose two other pins of D4–D6), and set **State dwell (µs)**: 1000 µs gives 1000 rows/s, 250 per LED state. A longer dwell (up to 5000 µs) gives the photodetector more settle time and fewer rows.
+5. Choose each channel's **Plot**, then **Save changes as new version** and try the lab with **Simulator (practice)**.
+
+The lab needs WVU firmware build `0x00010007`; boards restored by this version of the application have it.
+
+**Reading the recording.** The CSV has one row per LED state:
+
+```text
+record_sequence,t_us,cycle_index,led_state,led_state_name,ppg_counts,ppg_V,pressure_counts,pressure_V,…
+```
+
+`led_state` is 0–3 and `led_state_name` is `RED`, `DARK1`, `IR`, or `DARK2`; `cycle_index` numbers the RED-to-DARK 2 cycles. For post-processing, select the rows of one LED state (for example `led_state_name == "RED"`): each LED state's samples are at **a quarter of the row rate** (250 per second at 1000 µs), one per `cycle_index`, so a filter or spectrum of one state must use that sampling rate. Signals that do not depend on the LEDs can use every row at the full row rate. Within a row the inputs are read one after another, a few tens of microseconds apart (see [Hardware](HARDWARE.md#pulse-oximetry)). The application calculates no SpO2 or other physiological value. [Calibration and Units](CALIBRATION_AND_UNITS.md#csv) lists every column.
 
 ## Course defaults and versions
 
@@ -91,6 +113,8 @@ The lab field `display.voltage_reference_v` is informational: conversions use th
 ## Firmware recovery
 
 Use the **Board** card to refresh, verify, or restore the WVU reference firmware. Restore is available whenever a supported UNO R4 WiFi and the bundled Arduino tools are available, even when the firmware is outdated or silent.
+
+**After updating to this version, restore every board once.** This version uses WVU firmware build `0x00010007` (it adds the LED-sequenced pulse-ox mode), and the application accepts only its own build. A board restored by version 1.0.x shows **Older WVU firmware** until it is restored. **Update the application on every lab computer before you restore any board**: version 1.0.x meeting a restored board reports its firmware build as incompatible and points to restoring the firmware of version 1.0.x, which would put the older firmware back and undo the update for the next class. From this version on, an application older than a board's firmware says **Newer WVU firmware** and asks for the application to be updated.
 
 For a class recovery:
 
