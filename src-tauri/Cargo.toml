@@ -36,7 +36,7 @@ serialport = "4.9.0"
 fs2 = "0.4.3"
 tauri-plugin-dialog = "2"
 sha2 = "0.10"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
