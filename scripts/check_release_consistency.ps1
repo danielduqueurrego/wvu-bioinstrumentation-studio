@@ -24,6 +24,18 @@ Reads files only and changes nothing. It checks that:
   @tauri-apps/plugin-*) is on the same major.minor release as its crate in
   src-tauri/Cargo.lock (tauri, tauri-plugin-*); `tauri build` refuses a
   mismatch.
+- The installed license copies src-tauri/resources/licenses/LICENSE.txt and
+  NOTICE.txt are byte-identical to the root LICENSE and NOTICE, and
+  tauri.conf.json bundle.resources lists both. The copyright line in NOTICE
+  equals tauri.conf.json bundle.copyright.
+- tauri.conf.json bundle.windows.nsis.template is nsis/installer.nsi. The
+  Tauri CLI version recorded in src-tauri/nsis/README.md equals
+  @tauri-apps/cli and @tauri-apps/cli-win32-x64-msvc (which embeds the
+  template) in package-lock.json and, when installed, in node_modules.
+  src-tauri/nsis/installer.upstream.nsi has the SHA-256 recorded there (with
+  LF line endings), and installer.nsi equals it outside the
+  "; WVU-LEGACY-PUBLISHER BEGIN" / "END" regions, which must still hold the
+  1.0.x publisher fallbacks and the error-flag reset after them.
 
 All text comparisons are exact (case-sensitive).
 
@@ -350,6 +362,237 @@ if ($null -ne $packageLockPackages -and $null -ne $cargoLockText) {
 }
 if ($null -ne $packageLock -and $null -ne $cargoLockText -and -not $tauriApiCompared) {
   Add-Problem 'Could not compare @tauri-apps/api in package-lock.json with the tauri crate in src-tauri/Cargo.lock: one of them is missing.'
+}
+
+# --- License and notice copies installed with the app -------------------------
+
+# The installers ship copies of the root LICENSE and NOTICE from
+# src-tauri/resources/licenses/. Compare bytes, not text: a copy must not drift
+# from the reviewed original, even in whitespace.
+$bundleResources = @(Get-JsonProperty (Get-JsonProperty $tauriConfig 'bundle') 'resources')
+foreach ($pair in @(
+  @{ Original = 'LICENSE'; Copy = 'src-tauri/resources/licenses/LICENSE.txt'; Resource = 'resources/licenses/LICENSE.txt' },
+  @{ Original = 'NOTICE'; Copy = 'src-tauri/resources/licenses/NOTICE.txt'; Resource = 'resources/licenses/NOTICE.txt' }
+)) {
+  $originalPath = Join-Path $root $pair.Original
+  $copyPath = Join-Path $root $pair.Copy
+  $bothExist = $true
+  foreach ($relative in @($pair.Original, $pair.Copy)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $root $relative) -PathType Leaf)) {
+      Add-Problem "$relative is missing."
+      $bothExist = $false
+    }
+  }
+  if ($bothExist) {
+    $originalHash = (Get-FileHash -LiteralPath $originalPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $copyHash = (Get-FileHash -LiteralPath $copyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($originalHash -ceq $copyHash) {
+      $passed.Add("$($pair.Copy) is identical to $($pair.Original) (SHA-256 $originalHash)")
+    } else {
+      Add-Problem ("$($pair.Copy) differs from $($pair.Original). Copy the root file over it unchanged:" +
+        [Environment]::NewLine + "    $($pair.Original): $originalHash" +
+        [Environment]::NewLine + "    $($pair.Copy): $copyHash")
+    }
+  }
+  if ($null -ne $tauriConfig) {
+    if ($bundleResources -ccontains $pair.Resource) {
+      $passed.Add("src-tauri/tauri.conf.json bundle.resources lists $($pair.Resource)")
+    } else {
+      Add-Problem "src-tauri/tauri.conf.json bundle.resources does not list $($pair.Resource), so the installers would not ship it."
+    }
+  }
+}
+
+# A missing NOTICE is already reported above.
+$noticeCopyright = $null
+if (Test-Path -LiteralPath (Join-Path $root 'NOTICE') -PathType Leaf) {
+  $noticeCopyright = Get-RegexValue (Read-RepoText 'NOTICE') '(?m)^(Copyright [^\r\n]+?)\s*$' 'a Copyright line in NOTICE'
+}
+Test-SameValue 'Copyright line' ([ordered]@{
+  'NOTICE' = $noticeCopyright
+  'src-tauri/tauri.conf.json bundle.copyright' = Get-JsonProperty (Get-JsonProperty $tauriConfig 'bundle') 'copyright'
+})
+
+# --- Custom NSIS installer template ------------------------------------------
+
+# The NSIS setup is built from src-tauri/nsis/installer.nsi: the installed Tauri
+# CLI's own template plus regions that let it upgrade 1.0.x installs, which
+# were published as "wvu" (see src-tauri/nsis/README.md). A CLI update would
+# keep building from the old copy without any error, so the recorded upstream
+# version must match the CLI, and installer.nsi may differ from the recorded
+# upstream copy only inside the marked regions.
+$nsisReadmePath = 'src-tauri/nsis/README.md'
+$nsisUpstreamPath = 'src-tauri/nsis/installer.upstream.nsi'
+$nsisTemplatePath = 'src-tauri/nsis/installer.nsi'
+# bundle.windows.nsis.template is relative to src-tauri, where `tauri build`
+# runs the bundler.
+$nsisTemplateSetting = 'nsis/installer.nsi'
+$nsisRegionBegin = '; WVU-LEGACY-PUBLISHER BEGIN'
+$nsisRegionEnd = '; WVU-LEGACY-PUBLISHER END'
+$nsisResyncAdvice = 'Tauri CLI changed: re-sync src-tauri/nsis/installer.nsi from the new upstream template'
+# ISO-8859-1 maps each byte to one character, so text read with it compares
+# bytes exactly.
+$latin1 = [Text.Encoding]::GetEncoding(28591)
+
+# Returns the file's bytes as text with CRLF normalized to LF: Git may check
+# these files out with either line ending.
+function Read-RepoLfText {
+  param([Parameter(Mandatory = $true)][string]$RelativePath)
+  $path = Join-Path $root $RelativePath
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    Add-Problem "$RelativePath is missing."
+    return $null
+  }
+  return $latin1.GetString([IO.File]::ReadAllBytes($path)).Replace("`r`n", "`n")
+}
+
+if ($null -ne $tauriConfig) {
+  $configuredTemplate = Get-JsonProperty (Get-JsonProperty (Get-JsonProperty (Get-JsonProperty $tauriConfig 'bundle') 'windows') 'nsis') 'template'
+  if ([string]$configuredTemplate -ceq $nsisTemplateSetting) {
+    $passed.Add("src-tauri/tauri.conf.json bundle.windows.nsis.template: $nsisTemplateSetting")
+  } else {
+    Add-Problem ("src-tauri/tauri.conf.json bundle.windows.nsis.template is '$configuredTemplate', not '$nsisTemplateSetting'. " +
+      'Without it the NSIS setup cannot upgrade 1.0.x installs (src-tauri/nsis/README.md).')
+  }
+}
+
+$nsisReadme = Read-RepoText $nsisReadmePath
+$recordedCliVersion = Get-RegexValue $nsisReadme '(?m)^\|\s*Tauri CLI version\s*\|\s*`([^`]+)`\s*\|' "the Tauri CLI version in the $nsisReadmePath table"
+$recordedUpstreamHash = Get-RegexValue $nsisReadme '(?m)^\|\s*SHA-256 of `installer\.upstream\.nsi`[^|]*\|\s*`([0-9A-Fa-f]{64})`\s*\|' "the upstream template SHA-256 in the $nsisReadmePath table"
+
+# (a) The recorded upstream template must belong to the CLI that builds the
+# installer. The lockfile always counts; node_modules counts when installed.
+# The bundler's template is embedded in the Windows x64 platform package,
+# which @tauri-apps/cli pins to its own version; check both packages.
+$cliVersions = [ordered]@{
+  "$nsisReadmePath Tauri CLI version" = $recordedCliVersion
+}
+foreach ($cliPackage in @('@tauri-apps/cli', '@tauri-apps/cli-win32-x64-msvc')) {
+  $cliVersions["package-lock.json $cliPackage"] = Get-JsonProperty (Get-JsonProperty $packageLockPackages "node_modules/$cliPackage") 'version'
+}
+foreach ($cliPackage in @('@tauri-apps/cli', '@tauri-apps/cli-win32-x64-msvc')) {
+  $installedCliManifest = "node_modules/$cliPackage/package.json"
+  if (Test-Path -LiteralPath (Join-Path $root $installedCliManifest) -PathType Leaf) {
+    $cliVersions["$installedCliManifest (installed)"] = Get-JsonProperty (ConvertFrom-RepoJson $installedCliManifest (Read-RepoText $installedCliManifest)) 'version'
+  }
+}
+$cliVersionMissing = @($cliVersions.Keys | Where-Object { [string]::IsNullOrWhiteSpace([string]$cliVersions[$_]) })
+$cliVersionMismatch = @($cliVersions.Keys | Where-Object { [string]$cliVersions[$_] -cne [string]$recordedCliVersion })
+if ($cliVersionMissing.Count -eq 0 -and $cliVersionMismatch.Count -eq 0) {
+  $passed.Add("NSIS template upstream matches Tauri CLI $recordedCliVersion")
+} else {
+  $detail = ($cliVersions.Keys | ForEach-Object {
+    $shown = if ([string]::IsNullOrWhiteSpace([string]$cliVersions[$_])) { '(missing)' } else { [string]$cliVersions[$_] }
+    "    ${_}: $shown"
+  }) -join [Environment]::NewLine
+  Add-Problem ("${nsisResyncAdvice}:" + [Environment]::NewLine + $detail +
+    [Environment]::NewLine + '    See "Re-syncing the NSIS template" in docs/DEVELOPER_GUIDE.md.')
+}
+
+$nsisUpstream = Read-RepoLfText $nsisUpstreamPath
+$nsisTemplate = Read-RepoLfText $nsisTemplatePath
+
+# The upstream copy must still be the recorded download, so that editing it
+# cannot hide a change to installer.nsi from the comparison below.
+if ($null -ne $nsisUpstream -and $null -ne $recordedUpstreamHash) {
+  $sha256 = [Security.Cryptography.SHA256]::Create()
+  try {
+    $upstreamHash = -join ($sha256.ComputeHash($latin1.GetBytes($nsisUpstream)) | ForEach-Object { $_.ToString('x2') })
+  } finally {
+    $sha256.Dispose()
+  }
+  if ($upstreamHash -ceq $recordedUpstreamHash.ToLowerInvariant()) {
+    $passed.Add("$nsisUpstreamPath is the recorded upstream template (SHA-256 $upstreamHash, LF line endings)")
+  } else {
+    Add-Problem ("$nsisUpstreamPath is not the upstream template recorded in ${nsisReadmePath}. Download it again unchanged:" +
+      [Environment]::NewLine + "    recorded: $($recordedUpstreamHash.ToLowerInvariant())" +
+      [Environment]::NewLine + "    computed (LF line endings): $upstreamHash")
+  }
+}
+
+# (b) Outside the marked regions installer.nsi must equal the upstream copy.
+if ($null -ne $nsisTemplate -and $null -ne $nsisUpstream) {
+  $keptLines = New-Object 'System.Collections.Generic.List[string]'
+  $regionText = New-Object 'System.Text.StringBuilder'
+  # Trimmed region lines, for fallbacks that must be whole instructions.
+  $regionLines = New-Object 'System.Collections.Generic.List[string]'
+  $regionCount = 0
+  $regionOpenedAt = 0
+  $markerProblem = $null
+  $lines = $nsisTemplate.Split("`n")
+  for ($index = 0; $index -lt $lines.Length; $index++) {
+    $marker = $lines[$index].Trim()
+    if ($marker -ceq $nsisRegionBegin) {
+      if ($regionOpenedAt -ne 0) { $markerProblem = "line $($index + 1) opens a region inside the one opened on line $regionOpenedAt."; break }
+      $regionOpenedAt = $index + 1
+    } elseif ($marker -ceq $nsisRegionEnd) {
+      if ($regionOpenedAt -eq 0) { $markerProblem = "line $($index + 1) closes a region that was never opened."; break }
+      $regionOpenedAt = 0
+      $regionCount++
+    } elseif ($regionOpenedAt -ne 0) {
+      [void]$regionText.AppendLine($lines[$index])
+      $regionLines.Add($lines[$index].Trim())
+    } else {
+      $keptLines.Add($lines[$index])
+    }
+  }
+  if ($null -eq $markerProblem -and $regionOpenedAt -ne 0) {
+    $markerProblem = "the region opened on line $regionOpenedAt is never closed."
+  }
+
+  if ($null -ne $markerProblem) {
+    Add-Problem "$nsisTemplatePath has unbalanced '$nsisRegionBegin' / '$nsisRegionEnd' markers: $markerProblem"
+  } else {
+    $upstreamLines = $nsisUpstream.Split("`n")
+    if (($keptLines -join "`n") -ceq $nsisUpstream) {
+      $passed.Add("$nsisTemplatePath equals $nsisUpstreamPath outside its $regionCount marked region(s)")
+    } else {
+      $firstDifference = 0
+      while ($firstDifference -lt $keptLines.Count -and $firstDifference -lt $upstreamLines.Length -and
+        $keptLines[$firstDifference] -ceq $upstreamLines[$firstDifference]) {
+        $firstDifference++
+      }
+      $upstreamShown = if ($firstDifference -lt $upstreamLines.Length) { $upstreamLines[$firstDifference] } else { '(end of file)' }
+      $templateShown = if ($firstDifference -lt $keptLines.Count) { $keptLines[$firstDifference] } else { '(end of file)' }
+      Add-Problem ("$nsisTemplatePath differs from $nsisUpstreamPath outside the '$nsisRegionBegin' / '$nsisRegionEnd' regions. " +
+        'Keep every WVU change inside a marked region. First difference, at upstream line ' + ($firstDifference + 1) + ':' +
+        [Environment]::NewLine + "    upstream:      $upstreamShown" +
+        [Environment]::NewLine + "    installer.nsi: $templateShown")
+    }
+
+    # A re-sync that drops the regions would also pass the comparison above,
+    # so require each 1.0.x fallback. Text is found anywhere in the regions;
+    # Lines must be consecutive whole lines (trimmed), so a comment cannot
+    # stand in for an instruction.
+    $regions = $regionText.ToString()
+    foreach ($fallback in @(
+      @{ Text = '!define LEGACY_MANUFACTURER "wvu"'; Count = 1; What = 'the legacy publisher "wvu"' },
+      @{ Text = '"${PRODUCTNAME}${LEGACY_MANUFACTURER}"'; Count = 1; What = 'detection of a 1.0.x MSI install' },
+      @{ Text = 'ReadRegStr $4 SHCTX "${LEGACY_MANUPRODUCTKEY}" ""'; Count = 2; What = 'the legacy install-folder reads in PageLeaveReinstall and RestorePreviousInstallLocation' },
+      # Without it the failed read of the new key leaves the error flag set,
+      # and a successful 1.0.x uninstall is reported as "Unable to uninstall".
+      @{ Lines = @('ClearErrors', 'ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"'); Count = 1; What = 'the error-flag reset at the end of the PageLeaveReinstall region' }
+    )) {
+      if ($fallback.ContainsKey('Lines')) {
+        $sequence = [string[]]$fallback.Lines
+        $expected = ($sequence -join ' / ') + ' (consecutive lines)'
+        $found = 0
+        for ($start = 0; $start -le $regionLines.Count - $sequence.Length; $start++) {
+          $matched = $true
+          for ($offset = 0; $offset -lt $sequence.Length; $offset++) {
+            if ($regionLines[$start + $offset] -cne $sequence[$offset]) { $matched = $false; break }
+          }
+          if ($matched) { $found++ }
+        }
+      } else {
+        $expected = $fallback.Text
+        $found = ([regex]::Matches($regions, [regex]::Escape($fallback.Text))).Count
+      }
+      if ($found -lt $fallback.Count) {
+        Add-Problem "$nsisTemplatePath is missing $($fallback.What) in its marked regions (expected $($fallback.Count)x: $expected)."
+      }
+    }
+  }
 }
 
 # --- Report -------------------------------------------------------------------

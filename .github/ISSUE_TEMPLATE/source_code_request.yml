@@ -1,0 +1,44 @@
+name: Request corresponding source for a bundled third-party tool
+description: Ask for the corresponding source code of a GPL or LGPL tool bundled with a release.
+title: "[Source request] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The Windows releases bundle third-party tools, such as Arduino CLI and the ARM GCC toolchain, under their own licenses. Some of those licenses entitle you to the corresponding source code.
+
+        Before asking, check the release's **Assets** on the [Releases](https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/releases) page: a third-party sources archive may already be attached. We reply in this issue, so do not include an email address or other personal information.
+  - type: input
+    id: release
+    attributes:
+      label: Release version
+      description: "The WVU Bioinstrumentation Studio release that contains the tool."
+      placeholder: "1.0.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - "Arduino CLI"
+        - "Arduino discovery and monitor tools (serial-discovery, mdns-discovery, serial-monitor, dfu-discovery)"
+        - "ARM GCC toolchain (arm-none-eabi-gcc)"
+        - "ctags"
+        - "Arduino Renesas UNO core (ArduinoCore-renesas)"
+        - "BOSSA uploader (bossac)"
+        - "OpenOCD"
+        - "dfu-util"
+        - "Other or not sure"
+    validations:
+      required: true
+  - type: input
+    id: component-version
+    attributes:
+      label: Component version or file path
+      description: "Optional. For example the version in the release's third-party notices, or the path inside arduino-runtime.zip."
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: "Anything else that identifies what you need."

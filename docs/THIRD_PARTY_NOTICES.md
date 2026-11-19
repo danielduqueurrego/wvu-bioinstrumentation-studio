@@ -1,6 +1,6 @@
 # Third-party components and notices
 
-The Apache-2.0 license in the repository root applies to the first-party WVU Bioinstrumentation Studio project. It does not change, replace, or grant licenses for third-party software.
+The Apache-2.0 license in the repository root applies to the first-party WVU Bioinstrumentation Studio project; the root `NOTICE` gives its copyright line. The installers place copies of both (`LICENSE.txt`, `NOTICE.txt`) in the application's `resources\licenses` folder. The license and NOTICE do not change, replace, or grant licenses for third-party software.
 
 The Windows distribution bundles or uses components including Tauri, Rust crates, Svelte, Vite, uPlot, WebView2 installation support, Arduino CLI, and the Arduino UNO R4/Renesas core and toolchain.
 

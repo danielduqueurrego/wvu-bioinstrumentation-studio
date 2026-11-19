@@ -1,0 +1,72 @@
+name: Lab request
+description: Ask for a new course lab or a change to an existing lab.
+title: "[Lab request] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Labs are for teaching use only. The application records raw signals; it does not diagnose, calculate SpO2 or heart rate, or interpret physiology.
+
+        Do not attach physiological recordings, participant data, or student-identifying information.
+  - type: dropdown
+    id: request-type
+    attributes:
+      label: Request type
+      options:
+        - "New lab"
+        - "Change to an existing lab"
+    validations:
+      required: true
+  - type: input
+    id: lab-name
+    attributes:
+      label: Lab name
+      description: "For a change, the lab name and version shown in the Lab card. For a new lab, the name students should see."
+    validations:
+      required: true
+  - type: input
+    id: course
+    attributes:
+      label: Course and session
+      placeholder: "BMEG 420L, week 6"
+  - type: textarea
+    id: inputs
+    attributes:
+      label: Analog inputs
+      description: "One line per signal: pin (A0-A5), signal name, and the unit students should see (counts, volts, or a calibrated unit)."
+      placeholder: |
+        A0 - Vmid - volts
+        A1 - Vout - volts
+    validations:
+      required: true
+  - type: textarea
+    id: acquisition
+    attributes:
+      label: Sampling and duration
+      description: "Sampling rate, ADC resolution, Timed or Until stopped (and the default duration), and how the plots should be grouped."
+    validations:
+      required: true
+  - type: textarea
+    id: outputs
+    attributes:
+      label: Digital outputs
+      description: "Any of D4 (green), D5 (red), or D6 (IR) the lab drives, and when. Write \"none\" if the lab drives no output."
+  - type: textarea
+    id: change
+    attributes:
+      label: What should change and why
+      description: "For a change, what is wrong or missing today. For a new lab, the learning goal and the course hardware it uses."
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety notes
+      description: "Notices students should see before recording, and who approved the hardware setup."
+  - type: textarea
+    id: lab-file
+    attributes:
+      label: Exported lab file (optional)
+      description: "If you built the lab in Lab Manager, paste the exported .lab.json here."
+      render: json

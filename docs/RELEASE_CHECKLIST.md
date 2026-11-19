@@ -16,6 +16,8 @@
   - The reference `.ino` SHA-256
   - The Arduino CLI and core versions
   - The Tauri npm/crate pairs
+  - The installed `LICENSE.txt` and `NOTICE.txt` copies and the copyright line
+  - The custom NSIS template (`src-tauri/nsis/`) against the Tauri CLI version and its upstream copy. After a CLI update, see [Re-syncing the NSIS template](DEVELOPER_GUIDE.md#re-syncing-the-nsis-template).
 - Run `npm ci`.
 - Run `npm run check`, then `npm run build`, then `npm test`. This order matters: a release-configuration test needs the built `build/index.html`, so `npm test` fails on a clean checkout without the build.
 - Run `cargo fmt --manifest-path src-tauri\Cargo.toml -- --check`.
@@ -83,6 +85,30 @@ Run these with the real runtime and an Arduino UNO R4 WiFi, using one applicatio
 - Regenerate installer, MSI, ZIP, manifest, and SHA-256 values for each candidate.
 - Verify the icon, no-console behavior, offline startup, and student-facing copy.
 
+## Upgrade from the previous release
+
+Test in Windows Sandbox or a disposable virtual machine, never on a lab or maintainer computer. Install the previous release, create a Project folder with a recording, then install the candidate. After each upgrade, confirm:
+
+- One Installed-apps entry, with the new version and publisher
+- The install folder and the Start-menu shortcut
+- The app starts
+- Project folders, recordings, calibration presets, and local labs are kept
+
+The upgrades to test:
+
+- NSIS to NSIS with the default **Uninstall before installing** option, once from the default folder and once from a custom folder. The previous uninstaller runs without "Unable to uninstall", the directory page proposes the previous folder, and the candidate installs there.
+- MSI to MSI. First read `UpgradeCode` from the previous release's MSI `Property` table (for example with Orca) and confirm it equals `bundle.windows.wix.upgradeCode` in `src-tauri/tauri.conf.json`. The previous MSI install is removed.
+- MSI to NSIS. The NSIS setup detects the MSI installation, removes it before installing, and leaves one Installed-apps entry.
+
+**1.0.x to 1.1.** The publisher changed from `wvu` to the department. The custom NSIS template (`src-tauri/nsis/README.md`) falls back to the 1.0.x registry key and publisher, so run every upgrade above with 1.0.2 as the previous release:
+
+- NSIS 1.0.2 to NSIS 1.1 from the default folder. To exercise the last-resort fallback once, repeat it after deleting `HKLM\SOFTWARE\wvu\WVU Bioinstrumentation Studio`: the setup must then take the folder from the registered `UninstallString`.
+- NSIS 1.0.2 to NSIS 1.1 from a custom folder. The candidate must propose and keep the custom folder.
+- MSI 1.0.2 to MSI 1.1. The WiX folder search uses the publisher key, so a custom 1.0.2 MSI folder is expected not to be reused: 1.1 installs into the default folder. Record what happens.
+- MSI 1.0.2 to NSIS 1.1. The NSIS setup must detect the 1.0.2 MSI, which is registered with Publisher `wvu`.
+
+After the NSIS upgrades, `HKLM\SOFTWARE\West Virginia University Department of Chemical and Biomedical Engineering\WVU Bioinstrumentation Studio` holds the install folder. `HKLM\SOFTWARE\wvu\WVU Bioinstrumentation Studio` may remain: the 1.0.2 uninstaller removes it only when **Delete the application data** is ticked. Make sure the release notes and [Installation](INSTALLATION.md) match what the tests show.
+
 ## Documentation
 
 - If the visible UI changed, refresh the README screenshots (see [Developer Guide](DEVELOPER_GUIDE.md#driving-and-screenshotting-the-window)). The Board card screenshot needs real hardware and the real runtime.
@@ -90,7 +116,7 @@ Run these with the real runtime and an Arduino UNO R4 WiFi, using one applicatio
 
 ## Publication review
 
-- Confirm a project-owner-approved root `LICENSE` exists before granting public reuse rights.
+- Confirm a project-owner-approved root `LICENSE` exists before granting public reuse rights, and that `NOTICE` and `tauri.conf.json` (`publisher`, `copyright`) name the approved copyright holder and year.
 - Confirm third-party notices for the bundled runtime.
 - Confirm no secrets, recordings, personal calibration files, or developer paths are tracked.
 - Confirm branding and code-signing decisions with the repository owner.

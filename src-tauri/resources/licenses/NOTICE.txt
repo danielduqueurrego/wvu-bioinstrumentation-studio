@@ -1,0 +1,19 @@
+WVU Bioinstrumentation Studio
+Copyright 2026 West Virginia University Department of Chemical and Biomedical Engineering
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Teaching use only. WVU Bioinstrumentation Studio is teaching software for
+biomedical-instrumentation laboratory courses. It is not a medical device and
+is not intended for diagnosis, treatment, or clinical decisions.
+
+Third-party components bundled with or used by this software remain under
+their own licenses; this notice does not change them. See:
+
+- Third-Party Notices: docs/THIRD_PARTY_NOTICES.md in the source repository,
+  and THIRD_PARTY_NOTICES.md in each release folder.
+- The bundled-component notices: BUNDLED_COMPONENTS.txt and the license files
+  beside it (src-tauri/resources/licenses/ in the source repository, and
+  resources\licenses\ in the application's installation folder), and the
+  upstream license and notice files kept inside the bundled Arduino runtime
+  archive (arduino-runtime.zip).

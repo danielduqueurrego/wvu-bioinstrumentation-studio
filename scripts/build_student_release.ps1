@@ -16,6 +16,8 @@ $iconSource = Join-Path $projectRoot 'assets\icon.svg'
 $tauriConfigPath = Join-Path $tauriRoot 'tauri.conf.json'
 $componentNoticePath = Join-Path $runtimeRoot 'licenses\BUNDLED_COMPONENTS.txt'
 $bossacLicensePath = Join-Path $runtimeRoot 'licenses\bossac-LICENSE.txt'
+$licensePath = Join-Path $projectRoot 'LICENSE'
+$noticePath = Join-Path $projectRoot 'NOTICE'
 $releaseManifest = Get-Content -LiteralPath $releaseManifestPath -Raw | ConvertFrom-Json
 $appVersion = [string]$releaseManifest.app_version
 if ($appVersion -notmatch '^\d+\.\d+\.\d+$') {
@@ -86,6 +88,8 @@ foreach ($required in @(
   $referenceFirmwarePath,
   $componentNoticePath,
   $bossacLicensePath,
+  $licensePath,
+  $noticePath,
   $releaseNotesPath
 )) {
   if (-not (Test-Path -LiteralPath $required)) {
@@ -96,8 +100,10 @@ foreach ($required in @(
 # One shared check, also run by CI: the application version in package.json,
 # package-lock.json, Cargo.toml, Cargo.lock, tauri.conf.json and the release
 # manifest; the CHANGELOG heading and release notes; the firmware protocol,
-# build and device ID; the reference .ino SHA-256; and the Arduino CLI and core
-# versions in the release manifest and the runtime manifests.
+# build and device ID; the reference .ino SHA-256; the Arduino CLI and core
+# versions in the release manifest and the runtime manifests; the LICENSE and
+# NOTICE copies the installers ship from src-tauri/resources/licenses; and the
+# custom NSIS template in src-tauri/nsis against the Tauri CLI version.
 & (Join-Path $PSScriptRoot 'check_release_consistency.ps1') -ProjectRoot $projectRoot
 if ($LASTEXITCODE -ne 0) {
   throw 'Release metadata is inconsistent (listed above). Release packaging stopped.'
@@ -219,7 +225,8 @@ Copy-Item -LiteralPath $nsis.FullName -Destination (Join-Path $distRoot $setupNa
 Copy-Item -LiteralPath $msi.FullName -Destination (Join-Path $distRoot $msiName)
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\STUDENT_QUICK_START.md') -Destination $distRoot
 Copy-Item -LiteralPath $releaseNotesPath -Destination $distRoot
-Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $distRoot
+Copy-Item -LiteralPath $licensePath -Destination $distRoot
+Copy-Item -LiteralPath $noticePath -Destination $distRoot
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\THIRD_PARTY_NOTICES.md') -Destination $distRoot
 
 foreach ($stale in @($zipPath, $zipChecksumPath, $buildInfoPath)) {

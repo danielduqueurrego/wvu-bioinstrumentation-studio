@@ -119,6 +119,16 @@ This section covers the `review-fixes` branch since 1.0.2, for maintainers. The 
 - Unused mobile icons and crate types were removed. `package.json` is private and requires Node 22 or later.
 - The documentation was updated to the current behavior.
 
+### Release details
+
+- A root `NOTICE` gives the copyright line "Copyright 2026 West Virginia University Department of Chemical and Biomedical Engineering". The installers now install `LICENSE.txt` and `NOTICE.txt` beside the bundled-component notices, without a license-acceptance page, and the release folder includes `NOTICE`. The consistency check keeps the copies byte-identical to the root files.
+- The executable's version resource and both installers name the department as publisher (CompanyName, Installed-apps Publisher, MSI Manufacturer) and copyright holder (LegalCopyright, NSIS branding text), and the Installed-apps entries link to the repository. The bundle's short and long descriptions state teaching use only, not a medical device, as package metadata; the current Windows installers do not display them. The MSI upgrade code is pinned to the value earlier MSIs used, so it cannot change with the product name.
+- **Upgrading 1.0.x under the new publisher.** 1.0.x used Tauri's default publisher `wvu`, taken from the identifier, and Tauri's NSIS template finds the previous install folder, and a previous MSI install, by publisher. With the stock template a 1.1 setup would start the 1.0.x uninstaller without its folder ("Unable to uninstall"), ignore a custom 1.0.x folder, and miss a 1.0.x MSI install. The NSIS setup is therefore built from a custom template, `src-tauri/nsis/installer.nsi`: Tauri CLI 2.11.4's template (kept unmodified beside it) plus marked regions that fall back to the `wvu` registry key, then to the folder of the registered uninstaller, and accept Publisher `wvu` when looking for an MSI install. It never starts the old uninstaller without a folder. The MSI needs no change: the pinned upgrade code makes a 1.1 MSI replace a 1.0.x MSI, although a custom 1.0.x MSI folder is not reused. The consistency check fails when the Tauri CLI version changes ("re-sync src-tauri/nsis/installer.nsi") or when the template differs from upstream outside the marked regions; the [Developer Guide](docs/DEVELOPER_GUIDE.md#re-syncing-the-nsis-template) describes the re-sync. The four upgrades from 1.0.2 still need a Windows Sandbox run ([Release Checklist](docs/RELEASE_CHECKLIST.md#upgrade-from-the-previous-release)).
+- `Cargo.toml` and `package.json` list the repository, homepage, and author.
+- `SECURITY.md` points to GitHub private vulnerability reporting and lists the supported versions. `CONTRIBUTING.md` states that contributions are licensed under Apache-2.0 (Section 5).
+- Issue forms: the bug report asks for the app version, installer type, firmware build, and lab; new forms for lab requests and for third-party source-code requests; blank issues are off, and security reports are pointed to the private form.
+- The README's AI-assisted-development disclosure also names Anthropic's Claude (through Claude Code).
+
 ## 1.0.2
 
 ### Firmware

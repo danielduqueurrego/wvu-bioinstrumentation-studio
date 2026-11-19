@@ -4,7 +4,11 @@ version = "1.0.2"
 default-run = "wvu_bioinstrumentation_studio"
 license = "Apache-2.0"
 description = "Firmware, acquisition, and calibration for BMEG 420L"
-authors = ["WVU BMEG 420L"]
+authors = ["West Virginia University Department of Chemical and Biomedical Engineering"]
+repository = "https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio"
+# The README, not the bare repository URL, which Cargo's redundant_homepage
+# lint flags.
+homepage = "https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio#readme"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

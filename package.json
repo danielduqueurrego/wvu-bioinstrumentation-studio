@@ -4,6 +4,15 @@
   "private": true,
   "license": "Apache-2.0",
   "description": "Firmware, acquisition, and calibration for BMEG 420L",
+  "author": "West Virginia University Department of Chemical and Biomedical Engineering",
+  "homepage": "https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=22"

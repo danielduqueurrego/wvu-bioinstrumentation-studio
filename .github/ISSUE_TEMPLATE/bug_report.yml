@@ -1,32 +1,77 @@
 name: Bug report
 description: Report a reproducible problem without recordings or participant data.
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
-      value: "Do not attach physiological recordings, participant data, or student-identifying information."
+      value: |
+        Do not attach physiological recordings, participant data, or student-identifying information.
+
+        Security problems go to the private [vulnerability report form](https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/security/advisories/new), not here.
   - type: input
     id: version
     attributes:
       label: Application version
+      description: "Shown in Windows Settings > Apps > Installed apps, in the installer file name, or as app_version in a recording's .metadata.json."
+      placeholder: "1.0.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: installer
+    attributes:
+      label: Installer type
+      options:
+        - "NSIS setup (..._x64-setup.exe)"
+        - "MSI package (..._x64.msi)"
+        - "Built from source"
+        - "Not sure"
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware build
+      description: "Open Advanced details (below the setup cards) and copy the Firmware build line. Write \"not shown\" if the line is missing."
+      placeholder: "65542"
+    validations:
+      required: true
   - type: input
     id: windows
     attributes:
       label: Windows version
+      placeholder: "Windows 11 24H2"
   - type: input
     id: board
     attributes:
       label: Board and port
-      description: "For example: Arduino UNO R4 WiFi — COM5"
+      description: "For example: Arduino UNO R4 WiFi on COM5"
   - type: input
     id: lab
     attributes:
       label: Selected lab
+      description: "The lab name and version shown in the Lab card, or \"Simulator\" if the problem happened in practice mode."
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: "What you expected, what happened instead, and any message the app showed."
+    validations:
+      required: true
   - type: textarea
     id: steps
     attributes:
       label: Steps to reproduce
+      placeholder: |
+        1. Select the lab ...
+        2. Select Start recording ...
+        3. ...
+    validations:
+      required: true
   - type: textarea
     id: details
     attributes:
       label: Advanced details or diagnostic-log excerpt
-      description: "Remove personal paths and sensitive data first."
+      description: "Copy diagnostics or the relevant log lines. Remove personal paths and sensitive data first."
+      render: text

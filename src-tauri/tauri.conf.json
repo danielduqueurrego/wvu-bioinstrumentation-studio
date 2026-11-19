@@ -28,10 +28,17 @@
   "bundle": {
     "active": true,
     "targets": "nsis",
+    "publisher": "West Virginia University Department of Chemical and Biomedical Engineering",
+    "copyright": "Copyright 2026 West Virginia University Department of Chemical and Biomedical Engineering",
+    "homepage": "https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio",
     "category": "Education",
+    "shortDescription": "Biomedical-instrumentation teaching software for BMEG 420L. Teaching use only; not a medical device.",
+    "longDescription": "WVU Bioinstrumentation Studio acquires, plots, calibrates, and saves biomedical-instrumentation signals from an Arduino UNO R4 WiFi for the BMEG 420L teaching laboratory.\n\nTeaching use only. It is not a medical device and must not be used for diagnosis, treatment, or clinical decisions.",
     "resources": [
       "resources/arduino-runtime.zip",
       "resources/arduino-runtime-manifest.json",
+      "resources/licenses/LICENSE.txt",
+      "resources/licenses/NOTICE.txt",
       "resources/licenses/BUNDLED_COMPONENTS.txt",
       "resources/licenses/bossac-LICENSE.txt"
     ],
@@ -39,8 +46,12 @@
       "webviewInstallMode": {
         "type": "offlineInstaller"
       },
+      "wix": {
+        "upgradeCode": "6e489616-048c-5235-969f-11e68577b5d7"
+      },
       "nsis": {
-        "installMode": "perMachine"
+        "installMode": "perMachine",
+        "template": "nsis/installer.nsi"
       }
     },
     "icon": [

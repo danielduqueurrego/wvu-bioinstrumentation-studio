@@ -167,7 +167,7 @@ For continuing development on a new computer or with a new coding agent, see the
 
 ## License
 
-WVU Bioinstrumentation Studio is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
+WVU Bioinstrumentation Studio is licensed under the Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 Third-party components bundled with or used by the project remain subject to their respective licenses. See [Third-Party Notices](docs/THIRD_PARTY_NOTICES.md).
 
@@ -177,6 +177,6 @@ WVU Bioinstrumentation Studio was developed for biomedical instrumentation teach
 
 ### AI-assisted development
 
-Development of WVU Bioinstrumentation Studio used OpenAI's ChatGPT and Codex as AI-assisted software-development tools for tasks including design exploration, code generation and refactoring, debugging, test planning, code review, and documentation. AI-generated suggestions were reviewed, modified where necessary, tested, and accepted by the project maintainer before integration.
+Development of WVU Bioinstrumentation Studio used OpenAI's ChatGPT and Codex, and Anthropic's Claude (through Claude Code), as AI-assisted software-development tools for tasks including design exploration, code generation and refactoring, debugging, test planning, code review, and documentation. AI-generated suggestions were reviewed, modified where necessary, tested, and accepted by the project maintainer before integration.
 
-OpenAI is not a sponsor of, and does not endorse, this project.
+OpenAI and Anthropic are not sponsors of, and do not endorse, this project.

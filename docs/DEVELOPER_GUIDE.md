@@ -29,7 +29,7 @@ cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets --locked -- -D w
 
 Build the frontend before `npm test`: a release-configuration test requires `build/index.html`. `--locked` makes cargo fail instead of silently rewriting an out-of-date `Cargo.lock`. Cargo needs `src-tauri/resources/arduino-runtime.zip`; see [Bundled Arduino runtime](#bundled-arduino-runtime).
 
-`scripts/check_release_consistency.ps1` compares the application version in `package.json`, the `package-lock.json` root, `Cargo.toml`, the `Cargo.lock` root package, `tauri.conf.json` and `release/release-manifest.json`; requires a `CHANGELOG.md` heading and `RELEASE_NOTES_<version>.md` for it; and checks the firmware protocol, build and device ID, the reference `.ino` SHA-256, and the Arduino CLI and core versions against the manifest and the Rust constants. It also requires each Tauri npm package (`@tauri-apps/api`, `@tauri-apps/plugin-*`) in `package-lock.json` to share its major.minor release with the matching crate (`tauri`, `tauri-plugin-*`) in `Cargo.lock`, because `tauri build` refuses a mismatch. Comparisons are exact, including case. It lists every mismatch and exits with code 1. CI and the release script run it, so bump all of these together.
+`scripts/check_release_consistency.ps1` compares the application version in `package.json`, the `package-lock.json` root, `Cargo.toml`, the `Cargo.lock` root package, `tauri.conf.json` and `release/release-manifest.json`; requires a `CHANGELOG.md` heading and `RELEASE_NOTES_<version>.md` for it; and checks the firmware protocol, build and device ID, the reference `.ino` SHA-256, and the Arduino CLI and core versions against the manifest and the Rust constants. It also requires each Tauri npm package (`@tauri-apps/api`, `@tauri-apps/plugin-*`) in `package-lock.json` to share its major.minor release with the matching crate (`tauri`, `tauri-plugin-*`) in `Cargo.lock`, because `tauri build` refuses a mismatch. It requires `src-tauri/resources/licenses/LICENSE.txt` and `NOTICE.txt`, which the installers ship, to be byte-identical to the root `LICENSE` and `NOTICE` and to be listed in `tauri.conf.json` `bundle.resources`, and the `Copyright` line in `NOTICE` to equal `bundle.copyright`; after editing `NOTICE`, copy it over `NOTICE.txt` unchanged. It requires `bundle.windows.nsis.template` to be `nsis/installer.nsi`, and that template to match the installed Tauri CLI (see [Re-syncing the NSIS template](#re-syncing-the-nsis-template)). Comparisons are exact, including case. It lists every mismatch and exits with code 1. CI and the release script run it, so bump all of these together.
 
 ## Continuous integration
 
@@ -83,6 +83,7 @@ Use `npm run tauri build` for a production executable and installers. It runs th
 - `firmware/reference_unor4wifi/`: controlled UNO R4 WiFi reference firmware.
 - `profiles/`: immutable factory course-lab definitions.
 - `docs/`: user, instructor, maintainer, protocol, and release documentation.
+- `src-tauri/nsis/`: the NSIS template the setup is built from, its unmodified upstream copy, and a README (see [Re-syncing the NSIS template](#re-syncing-the-nsis-template)).
 - `src-tauri/icons/`: only the icons `tauri.conf.json` `bundle.icon` lists (the Windows build uses `icon.ico`). If you regenerate them with `npm run tauri icon`, delete the Android, iOS and Microsoft Store (`Square*Logo.png`, `StoreLogo.png`) outputs it adds.
 - `scripts/build_student_release.ps1`: canonical distribution build script (PowerShell 7).
 - `scripts/check_release_consistency.ps1`: version, firmware and runtime metadata check used by CI and the release script.
@@ -93,6 +94,37 @@ Use `npm run tauri build` for a production executable and installers. It runs th
 ## Student Op Amp Lab installer
 
 `scripts/install_op_amp_lab_profile.zip` is the student download. It contains `install_op_amp_lab_profile.bat` and then `install_op_amp_lab_profile.ps1`, both with CRLF line endings, stored uncompressed with a fixed timestamp, so the same scripts always give the same ZIP bytes. `.gitattributes` checks out `*.bat`, `*.cmd` and `*.ps1` with CRLF on every host. After changing either script, run `pwsh -NoProfile -File scripts\package_op_amp_lab_installer.ps1` and commit the regenerated ZIP with the change; CI runs it with `-Check` and fails on a stale ZIP. Keep both scripts ASCII so Windows PowerShell 5.1 reads them unchanged, and do not edit the embedded profile JSON: a Rust test checks its canonical hash, and any profile change needs a new locked version and hash.
+
+## Re-syncing the NSIS template
+
+The NSIS setup is built from `src-tauri/nsis/installer.nsi`, not from the template inside the Tauri CLI. It is the CLI's template plus regions between `; WVU-LEGACY-PUBLISHER BEGIN` and `; WVU-LEGACY-PUBLISHER END` lines that let a 1.1 or later setup upgrade a 1.0.x install, which was published as `wvu`. [`src-tauri/nsis/README.md`](../src-tauri/nsis/README.md) explains the regions and records the upstream version, source, and SHA-256. The MSI uses Tauri's own WiX template.
+
+The bundler keeps using this copy after a CLI update, so the consistency check stops with "Tauri CLI changed: re-sync src-tauri/nsis/installer.nsi from the new upstream template" when `@tauri-apps/cli` or `@tauri-apps/cli-win32-x64-msvc` (whose binary embeds the template) in `package-lock.json`, or in `node_modules` when installed, differs from the recorded version. A pull request that updates the CLI, including one from Dependabot, needs the re-sync before CI passes. After updating the CLI:
+
+1. Download the new upstream template over `installer.upstream.nsi`, unchanged. The CLI's release tag is `tauri-cli-v<version>`:
+
+   ```powershell
+   $version = (Get-Content node_modules\@tauri-apps\cli\package.json -Raw | ConvertFrom-Json).version
+   $url = "https://raw.githubusercontent.com/tauri-apps/tauri/tauri-cli-v$version/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi"
+   Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile src-tauri\nsis\installer.upstream.nsi
+   (Get-FileHash src-tauri\nsis\installer.upstream.nsi -Algorithm SHA256).Hash.ToLowerInvariant()
+   ```
+
+2. Confirm that it is the template the installed CLI embeds. The Windows CLI binary stores it with CRLF line endings. This must print `True`; if it does not, find the tag that matches the CLI build before going on.
+
+   ```powershell
+   $latin1 = [Text.Encoding]::GetEncoding(28591)
+   $binary = $latin1.GetString([IO.File]::ReadAllBytes('node_modules\@tauri-apps\cli-win32-x64-msvc\cli.win32-x64-msvc.node'))
+   $template = $latin1.GetString([IO.File]::ReadAllBytes('src-tauri\nsis\installer.upstream.nsi')).Replace("`r`n", "`n")
+   $binary.Contains($template.Replace("`n", "`r`n")) -or $binary.Contains($template)
+   ```
+
+3. In the table in `src-tauri/nsis/README.md`, update the CLI version, the tag and its commit, the source URL, and the SHA-256 printed in step 1.
+4. Read what changed upstream: `git diff src-tauri/nsis/installer.upstream.nsi`.
+5. Copy the new `installer.upstream.nsi` over `installer.nsi`, then put each marked region from the previous version (`git show HEAD:src-tauri/nsis/installer.nsi`) back at the same place. Check each upstream change near them: the `MANUPRODUCTKEY` define, the MSI search loop in `PageReinstall`, the uninstall branch of `PageLeaveReinstall`, and `RestorePreviousInstallLocation`. If upstream changed what a region relies on, adapt the region. Keep `ClearErrors` and the second `UninstallString` read as the last lines of the `PageLeaveReinstall` region: the failed read of the new publisher key sets NSIS's error flag, and upstream's `${Errors}` check after `ExecWait` would otherwise report a successful 1.0.x uninstall as "Unable to uninstall". Change nothing outside the regions, and never write `{{` in a comment: both files are Handlebars templates.
+6. Run `pwsh -NoProfile -File scripts\check_release_consistency.ps1`. It compares `installer.nsi` with the upstream copy outside the regions and requires the 1.0.x fallbacks and the error-flag reset to be present.
+7. Run `npm run tauri build -- --bundles nsis` to compile the template with makensis. The CI placeholder runtime is enough for that; delete `src-tauri\target\release\bundle\nsis` afterwards, because that setup must not be distributed.
+8. Before the next release, repeat the upgrade tests in the [Release Checklist](RELEASE_CHECKLIST.md#upgrade-from-the-previous-release).
 
 ## Bundled Arduino runtime
 

@@ -23,7 +23,7 @@ The previous conversation is not required. Current source, manifests, logs, and 
 | Controlled firmware | Protocol `0.4`, build `0x00010006`, device ID `0x554E4F34`; the `.ino`, its SHA-256, the manifest, and `profiles/*.json` are unchanged on `review-fixes` |
 | Arduino tools | Arduino CLI `1.5.2-rc.1`, Renesas UNO core `1.6.0`, runtime bundle revision `3` |
 | Rust toolchain | `1.100.0`, pinned in `rust-toolchain.toml` |
-| First-party license | Apache-2.0; root `LICENSE` and package license metadata exist |
+| First-party license | Apache-2.0; root `LICENSE` and package license metadata exist (root `NOTICE` added on `release-1.1-prep`) |
 
 `review-fixes` holds one commit per phase of the 2026-11-17 whole-project review, oldest first, on top of `537be97`:
 
@@ -42,7 +42,7 @@ Nothing has been pushed, merged, tagged, or released. **Hardware verification is
 
 The tag commit IDs above are the peeled commits of annotated tags, not the tag-object IDs. Do not recreate or move an existing tag unless the maintainer explicitly asks for that operation.
 
-The README includes the reviewed AI-assisted-development disclosure and the teaching-use notice. Third-party licenses remain separate; see [Third-Party Notices](THIRD_PARTY_NOTICES.md). There is currently no root `NOTICE`; do not infer that it was lost during recovery. The maintainer previously confirmed ownership; do not invent a different institutional or personal copyright owner.
+The README includes the reviewed AI-assisted-development disclosure and the teaching-use notice. Third-party licenses remain separate; see [Third-Party Notices](THIRD_PARTY_NOTICES.md). On `release-1.1-prep`, the root [`NOTICE`](../NOTICE) carries the copyright line the maintainer chose on 2026-11-18, "Copyright 2026 West Virginia University Department of Chemical and Biomedical Engineering", which is also the installers' publisher and copyright. `LICENSE` is the unchanged Apache-2.0 text. Byte-identical copies of both, `src-tauri/resources/licenses/LICENSE.txt` and `NOTICE.txt`, install with the app, and `scripts/check_release_consistency.ps1` checks that they still match. The installed third-party notice is `src-tauri/resources/licenses/BUNDLED_COMPONENTS.txt`, with `bossac-LICENSE.txt` beside it. `docs/THIRD_PARTY_NOTICES.md` is a maintainer document that ships in the release folder only and is not installed; this narrows the round-2 plan, which also listed the third-party notices for `resources/licenses/`. The planned runtime-revision-4 work rewrites `BUNDLED_COMPONENTS.txt` as the installed source-and-license directions. Do not invent a different institutional or personal copyright owner.
 
 ### This computer
 
@@ -197,7 +197,7 @@ Check every command's exit code. In a multi-command PowerShell script, use `$Err
 **Production executable.**
 
 - The executable is `src-tauri/target/release/wvu_bioinstrumentation_studio.exe`.
-- The default Tauri bundle is NSIS, under `src-tauri/target/release/bundle/nsis/`.
+- The default Tauri bundle is NSIS, under `src-tauri/target/release/bundle/nsis/`. On `release-1.1-prep` it is built from the custom template `src-tauri/nsis/installer.nsi`; re-sync it on every Tauri CLI update ([Developer Guide](DEVELOPER_GUIDE.md#re-syncing-the-nsis-template)).
 - `frontendDist` is `../build`; only development uses `http://localhost:1420`. Validate the production executable with no Vite server running.
 - `mainBinaryName` and Cargo `default-run` explicitly select the GUI app, so a diagnostic binary cannot become the installer target.
 
@@ -378,9 +378,19 @@ The 2026-11-17 review recorded these items. They need hardware, legal review, or
 - Corresponding-source obligations for GPL tools in the bundled runtime (Arduino CLI, the gcc toolchain)
 - License texts for Rust crates and npm packages in the installers
 - The production pin on Arduino CLI `1.5.2-rc.1`, a pre-release
-- `SECURITY.md` has no private reporting channel
-- Installer publisher and copyright metadata
 - A documented rebuild recipe for `arduino-runtime.zip`
+
+Resolved on `release-1.1-prep`: `SECURITY.md` points to GitHub private vulnerability reporting, and the installers carry publisher and copyright metadata and a pinned MSI upgrade code.
+
+**Upgrade from 1.0.x under the new publisher (resolved in source; Sandbox test open).** The 1.0.x installers used Tauri's default publisher `wvu`, the second part of the identifier. Tauri CLI 2.11.4's NSIS template keys three things on the publisher: the install-folder key `Software\<publisher>\<product>` (HKLM for this per-machine install), which it passes to the old uninstaller as `_?=`; the folder it proposes; and the `DisplayName` plus `Publisher` match that finds an MSI install. With the stock template, a 1.1 setup would start the 1.0.x uninstaller with an empty `_?=`, ignore a custom 1.0.x folder, and miss a 1.0.x MSI install.
+
+The maintainer chose on 2026-11-18 to keep the department as publisher and ship a custom NSIS template. `bundle.windows.nsis.template` is `nsis/installer.nsi`: the CLI 2.11.4 template, kept unmodified as `src-tauri/nsis/installer.upstream.nsi`, plus regions between `; WVU-LEGACY-PUBLISHER BEGIN` and `END` lines. They fall back to `Software\wvu\<product>` when uninstalling and when proposing the folder; then to the folder of the registered `UninstallString` if the app binary is there; and otherwise show "Unable to uninstall!" and abort, never starting the uninstaller with an empty `_?=`. The abort returns to the reinstall page in the GUI. In passive mode (`/P`) it skips the page and installs without uninstalling 1.0.x, as upstream's own failure path does. When a folder is found, the region ends with `ClearErrors` and a second `UninstallString` read. The failed read of the new publisher key sets NSIS's sticky error flag, and without the reset upstream's `${Errors}` check would turn the old uninstaller's exit code 0 into 2 ("Unable to uninstall!") after 1.0.x had already been removed. The consistency check requires both lines. They also accept Publisher `wvu` in the MSI search. NSIS installer hooks could not do this: the hooks file is included before the template's `!define`s, and `NSIS_HOOK_PREINSTALL` runs after the reinstall page. [`src-tauri/nsis/README.md`](../src-tauri/nsis/README.md) records the upstream tag, commit, and SHA-256. The upstream file was matched byte for byte against the template embedded in the installed CLI binary.
+
+`scripts/check_release_consistency.ps1` fails with "Tauri CLI changed: re-sync src-tauri/nsis/installer.nsi from the new upstream template" when `@tauri-apps/cli` differs from the recorded version, and it fails when `installer.nsi` differs from the upstream copy outside the marked regions or lacks the fallbacks. Every Tauri CLI update needs the re-sync in [Developer Guide](DEVELOPER_GUIDE.md#re-syncing-the-nsis-template). makensis compiled the template on 2026-11-18 (`npm run tauri build -- --bundles nsis`, placeholder runtime; that setup was deleted).
+
+The MSI needs no template change. Tauri's WiX template has `MajorUpgrade` (`Schedule="afterInstallInitialize"`), and the pinned `UpgradeCode` equals the one the 1.0.x MSIs derived from the product name, so a 1.1 MSI removes a 1.0.x MSI install. Its folder search reads `HKCU\Software\<publisher>\<product>`, so a custom 1.0.x MSI folder is not reused; this is accepted.
+
+Still open: run the four upgrades from 1.0.2 in Windows Sandbox (NSIS to NSIS from the default folder and from a custom folder, MSI to MSI, MSI to NSIS), as listed in [Release Checklist](RELEASE_CHECKLIST.md#upgrade-from-the-previous-release). Only those tests exercise the fallbacks at run time. Until they pass, the 1.1 release notes and [Installation](INSTALLATION.md) must not promise a seamless upgrade.
 
 **Design**
 
