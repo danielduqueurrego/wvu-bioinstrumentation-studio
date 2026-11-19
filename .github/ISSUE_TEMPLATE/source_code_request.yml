@@ -7,7 +7,9 @@ body:
       value: |
         The Windows releases bundle third-party tools, such as Arduino CLI and the ARM GCC toolchain, under their own licenses. Some of those licenses entitle you to the corresponding source code.
 
-        Before asking, check the release's **Assets** on the [Releases](https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/releases) page: a third-party sources archive may already be attached. We reply in this issue, so do not include an email address or other personal information.
+        Before asking, check the release's **Assets** on the [Releases](https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/releases) page: a third-party sources archive (`WVU-Bioinstrumentation-Studio-<version>-third-party-sources.zip`) may already be attached; its README.txt lists what it holds. We reply in this issue, so do not include an email address or other personal information.
+
+        The OpenOCD and dfu-util programs were bundled only up to version 1.0.2 (later versions still carry three dfu-util source files compiled into dfu-discovery). Arduino has not published the exact source of those two program builds and we do not hold it: we forward such requests to Arduino and publish whatever source Arduino provides.
   - type: input
     id: release
     attributes:
@@ -22,13 +24,13 @@ body:
       label: Component
       options:
         - "Arduino CLI"
-        - "Arduino discovery and monitor tools (serial-discovery, mdns-discovery, serial-monitor, dfu-discovery)"
-        - "ARM GCC toolchain (arm-none-eabi-gcc)"
+        - "Arduino discovery and monitor tools (serial-discovery, mdns-discovery, serial-monitor, dfu-discovery, with libusb and dfu-util files)"
+        - "ARM GCC toolchain (arm-none-eabi-gcc) or its host libraries (GMP, MPFR, MPC, isl, libiconv, Expat, zlib)"
         - "ctags"
-        - "Arduino Renesas UNO core (ArduinoCore-renesas)"
+        - "Arduino Renesas UNO core (ArduinoCore-renesas, ArduinoCore-API)"
         - "BOSSA uploader (bossac)"
-        - "OpenOCD"
-        - "dfu-util"
+        - "OpenOCD (versions 1.0.0 to 1.0.2 only)"
+        - "dfu-util program (versions 1.0.0 to 1.0.2 only)"
         - "Other or not sure"
     validations:
       required: true

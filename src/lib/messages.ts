@@ -1,8 +1,8 @@
 /**
  * The one place that turns backend codes into student-facing text.
  *
- * Every `ConnectionFailureCategory`, `FaultOrigin`, and
- * `FirmwareErrorCategory` the Rust backend can report maps to a short
+ * Every `ConnectionFailureCategory`, `FaultOrigin`, `FirmwareErrorCategory`,
+ * and `ArduinoToolsFailureCategory` the Rust backend can report maps to a short
  * headline (what happened), one sentence (what to do), and at most one next
  * action button. The raw codes stay in Advanced details; students never see
  * them. `messages.test.ts` reads the Rust enums, so a new backend category
@@ -270,6 +270,21 @@ export const FIRMWARE_FAILURE_MESSAGES: Record<FirmwareErrorCategory, PlainMessa
   }
 };
 
+/** Rust `arduino_runtime::ArduinoToolsFailureCategory` (snake_case). */
+export type ArduinoToolsFailureCategory = 'runtime_path_too_long';
+
+/**
+ * Arduino-tools failures with their own text. `runtime_path_too_long` does
+ * not offer Repair Arduino tools: it would extract the tools to the same
+ * folder.
+ */
+export const ARDUINO_TOOLS_FAILURE_MESSAGES: Record<ArduinoToolsFailureCategory, PlainMessage> = {
+  runtime_path_too_long: {
+    headline: 'The Arduino tools cannot be set up for this Windows account',
+    sentence: 'The folder name of this Windows account is too long for the included compiler. Ask your IT support or instructor for help (Advanced details has the folder); Simulator recordings still work.'
+  }
+};
+
 function lookup<T extends string>(table: Record<T, PlainMessage>, key: string | null | undefined): PlainMessage | undefined {
   return key && Object.prototype.hasOwnProperty.call(table, key) ? table[key as T] : undefined;
 }
@@ -284,6 +299,10 @@ export function faultOriginMessage(origin: string | null | undefined): PlainMess
 
 export function firmwareFailureMessage(category: string | null | undefined): PlainMessage | undefined {
   return lookup(FIRMWARE_FAILURE_MESSAGES, category);
+}
+
+export function arduinoToolsFailureMessage(category: string | null | undefined): PlainMessage | undefined {
+  return lookup(ARDUINO_TOOLS_FAILURE_MESSAGES, category);
 }
 
 /** Categories that only a firmware restore (or the instructor) can fix. */
@@ -506,7 +525,8 @@ export type ProblemInput = {
   fault: FaultInput;
   /** `SessionStatus.storage_warning` while a recording runs. */
   storageWarning?: string | null;
-  arduinoTools: { state: 'preparing' | 'ready' | 'failed'; problem: string; repairable: boolean };
+  /** `category` is `ArduinoToolsFailure.category`, when the failure has one. */
+  arduinoTools: { state: 'preparing' | 'ready' | 'failed'; problem: string; repairable: boolean; category?: string };
   projectFolderNotice?: string;
   board: {
     source: 'hardware' | 'simulator';
@@ -546,6 +566,16 @@ export function problemBanner(input: ProblemInput): ProblemBanner | undefined {
     };
   }
   if (input.arduinoTools.state === 'failed' && input.board.source === 'hardware' && !input.active) {
+    const byCategory = arduinoToolsFailureMessage(input.arduinoTools.category);
+    if (byCategory) {
+      return {
+        id: `tools:failed:${input.arduinoTools.category}`,
+        severity: 'error',
+        headline: byCategory.headline,
+        sentence: byCategory.sentence,
+        nextAction: byCategory.nextAction
+      };
+    }
     return {
       id: 'tools:failed',
       severity: 'error',

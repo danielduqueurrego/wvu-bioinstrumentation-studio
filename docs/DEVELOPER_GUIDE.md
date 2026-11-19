@@ -9,7 +9,8 @@ Development is Windows-first. Install:
 - Git and Node.js 22 or later with npm (`package.json` `engines`; CI uses Node 22).
 - Rust through rustup with the MSVC host. `rust-toolchain.toml` pins the exact Rust version with rustfmt and Clippy; rustup installs it the first time cargo runs in the repository (or run `rustup toolchain install`). Change that pin deliberately and rerun every check, because a new Clippy can fail `-D warnings` on unchanged code.
 - The Visual Studio C++ build tools (MSVC) with a Windows 10/11 SDK, and the WebView2 runtime: the [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows).
-- PowerShell 7 (`pwsh`) for `scripts/build_student_release.ps1`. The other scripts also run in Windows PowerShell 5.1.
+- PowerShell 7.2 or later (`pwsh`) for `scripts/build_student_release.ps1`, `build_arduino_runtime.ps1`, `build_third_party_sources.ps1` and `check_third_party_sources.ps1`. The other scripts also run in Windows PowerShell 5.1.
+- Go (for example `winget install GoLang.Go`) only to build the third-party source bundles; see [Third-party source bundles](#third-party-source-bundles).
 
 `scripts/check_environment.ps1` checks these read-only and exits with code 1 when something required is missing; `-ReportPath` saves a copy. An Arduino IDE is not required for the distributed application; developers who run hardware tools outside the app need the approved UNO R4 environment.
 
@@ -33,7 +34,7 @@ Build the frontend before `npm test`: a release-configuration test requires `bui
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on Windows with the pinned toolchain and a Rust build cache, and runs the checks above. Third-party actions are pinned to commit SHAs, with the release tag in a comment.
+`.github/workflows/ci.yml` runs on Windows with the pinned toolchain and a Rust build cache, and runs the checks above plus `scripts/check_third_party_sources.ps1`, which validates the third-party source manifests without downloading anything. Third-party actions are pinned to commit SHAs, with the release tag in a comment.
 
 `.github/workflows/audit.yml` runs weekly, on demand, and for pull requests that change a manifest or lockfile. `npm audit --omit=dev --audit-level=high` and `cargo audit` block; `npm audit` over all dependencies and the full `cargo audit` report are informational. The blocking `cargo audit` ignores only the reviewed `zip` 2.x advisories listed in that workflow, whose fixes need a semver-major `zip` upgrade; remove each ignore once `zip` is upgraded. `.github/dependabot.yml` opens weekly update pull requests for npm, Cargo and GitHub Actions, grouping minor and patch updates. Tauri npm packages and their crates arrive in separate npm and Cargo pull requests; when one moves to a new minor release, CI fails on the Tauri version check until both are updated together.
 
@@ -50,6 +51,7 @@ To keep a development session away from your real lab catalog, calibration prese
 - **Release builds.** They ignore `WVU_STUDIO_DEV_LOCAL_DATA`.
 - **Starting fresh.** Delete the folder; Git ignores `.dev-sandbox/`.
 - **CI placeholder runtime.** With the CI placeholder `arduino-runtime.zip`, the Board card (or, with Source = Hardware, the message under the recording bar) reports that the Arduino tools need attention, and firmware restore cannot work. The Simulator, labs, calibration and recordings work normally.
+- **Real runtime.** The runtime goes to `<sandbox>\WVU-BMEG\rt`, never elsewhere. The compiler needs that path to be shorter than 60 characters (see [Runtime folder and the compiler's path limit](#runtime-folder-and-the-compilers-path-limit)); the default `.dev-sandbox` under a typical repository path is longer, so use `-SandboxRoot C:\wvu-sbx` to restore firmware from the sandbox.
 
 ### Driving and screenshotting the window
 
@@ -86,8 +88,10 @@ Use `npm run tauri build` for a production executable and installers. It runs th
 - `docs/`: user, instructor, maintainer, protocol, and release documentation.
 - `src-tauri/nsis/`: the NSIS template the setup is built from, its unmodified upstream copy, and a README (see [Re-syncing the NSIS template](#re-syncing-the-nsis-template)).
 - `src-tauri/icons/`: only the icons `tauri.conf.json` `bundle.icon` lists (the Windows build uses `icon.ico`). If you regenerate them with `npm run tauri icon`, delete the Android, iOS and Microsoft Store (`Square*Logo.png`, `StoreLogo.png`) outputs it adds.
-- `scripts/build_student_release.ps1`: canonical distribution build script (PowerShell 7).
+- `scripts/build_student_release.ps1`: canonical distribution build script (PowerShell 7.2).
 - `scripts/check_release_consistency.ps1`: version, firmware and runtime metadata check used by CI and the release script.
+- `scripts/build_arduino_runtime.ps1`, `scripts/build_third_party_sources.ps1`, `scripts/check_third_party_sources.ps1`, `scripts/audit_bundled_runtime_notices.ps1`: the offline Arduino runtime, its corresponding-source bundles and its notices (see [Bundled Arduino runtime](#bundled-arduino-runtime)). `release/arduino-runtime-entries.json`, `release/third-party-sources*.json` and `release/arduino-runtime-4.inventory.txt` are their inputs and records.
+- `src-tauri/examples/runtime_smoke.rs`: offline compile test of the bundled runtime.
 - `scripts/check_environment.ps1`: read-only check of the development prerequisites.
 - `scripts/start_dev_sandbox.ps1`: `npm run tauri dev` with disposable app data.
 - `scripts/update_factory_labs.ps1`: checks, re-hashes, or promotes factory lab files (PowerShell 7 and 5.1).
@@ -147,11 +151,71 @@ The bundler keeps using this copy after a CLI update, so the consistency check s
 
 ## Bundled Arduino runtime
 
-The release build requires `src-tauri/resources/arduino-runtime.zip`, which is intentionally not tracked because it contains third-party binary tooling. Its version is pinned by `arduino-runtime-manifest.json`; the release script verifies the reviewed archive SHA-256 and the reference-firmware SHA-256 before it stages artifacts. Tauri also validates resource existence during Cargo source checks. In CI, the workflow creates a disposable placeholder ZIP for those checks; a fresh local clone needs that same source-check preparation or the real archive. The placeholder cannot be used for firmware restore or student packaging. A maintainer must supply the reviewed real archive with its upstream notices and verify the manifest before building a student installer. Do not download or substitute “latest” Arduino tooling during a release build.
+The release build requires `src-tauri/resources/arduino-runtime.zip`, which is intentionally not tracked because it contains third-party binary tooling. The reviewed archive is **runtime revision 4**: Arduino CLI `1.6.0`, Arduino UNO R4 core `1.6.0`, SHA-256 `5baa8a5fc7fc0c2ae7fd9f49de1876d76859067af6d56e9b56546a88a5d02def` (193,000,375 bytes). `src-tauri/resources/arduino-runtime-manifest.json` (and its copy in `src-tauri/resources/arduino-runtime/`) names those versions, and `release/release-manifest.json` pins the archive SHA-256; the release script refuses any other archive. `release/arduino-runtime-4.inventory.txt` records what the archive holds and how it was built. Tauri also validates resource existence during Cargo source checks. In CI, the workflow creates a disposable placeholder ZIP for those checks; a fresh local clone needs that same source-check preparation or the real archive. The placeholder cannot be used for firmware restore or student packaging. Do not download or substitute "latest" Arduino tooling during a release build.
 
-Run `scripts/audit_bundled_runtime_notices.ps1` against the pinned archive before publishing an installer. It verifies the reviewed Arduino CLI license copy, the component-specific BOSSA license, required runtime components, and the retained LICENSE/COPYING/NOTICE inventory. A maintainer must still review upstream redistribution requirements when any bundled version changes.
+`release/arduino-runtime-entries.json` lists what the archive must contain (required entries, every tool and platform folder, license files with their SHA-256) and must not contain (the removed openocd and dfu-util, per-machine Arduino CLI files). `scripts/build_student_release.ps1`, `scripts/audit_bundled_runtime_notices.ps1`, `scripts/build_arduino_runtime.ps1` and `scripts/check_third_party_sources.ps1` all read it. Run the audit against the pinned archive before publishing an installer:
 
-`scripts/build_student_release.ps1` requires PowerShell 7 and a Git work tree. It stops on the first failed native command (including `git`), runs the consistency check, reinstalls npm packages with `npm ci` (network access or a warm npm cache), builds with `--locked`, and stages only installers created by that invocation. Do not reuse or manually copy an older installer after a failed release build. It builds the NSIS setup (the primary student installer) and an MSI package for managed IT deployment, one after the other. In `dist\`, the student folder's `SHA256SUMS.txt` lists the two installers and is identical to the copy inside the ZIP; `<zip>.sha256` beside the ZIP holds the ZIP's checksum; and `WVU-Bioinstrumentation-Studio-<version>-build-info.txt` records the source commit and tool versions. All checksum files use the `sha256sum` layout with LF line endings.
+```powershell
+pwsh -NoProfile -File scripts\audit_bundled_runtime_notices.ps1 -ArchivePath src-tauri\resources\arduino-runtime.zip
+```
+
+It also checks that `src-tauri/resources/licenses/BUNDLED_COMPONENTS.txt` names every bundled version and the source-request form, and that `bossac-LICENSE.txt` is the reviewed BOSSA license. A maintainer must still review upstream redistribution requirements when any bundled version changes.
+
+### Runtime folder and the compiler's path limit
+
+The application extracts the archive to `%LOCALAPPDATA%\WVU-BMEG\rt` (`arduino_runtime.rs`). The bundled GCC 7-2017q4 fails with a missing header, such as `bits/c++config.h: No such file or directory` (`bits/c++allocator.h` and `bits/cpu_defines.h` were also seen), when the runtime root has 60 or more characters: measured on 2026-11-18, 59 compiles and 60 fails. That root is 35 characters plus the Windows profile folder name, so profile folders longer than 24 characters (for example `<20 characters>.CAMPUS`) hit it, with revision 3 (1.0.x) as well. `RUNTIME_ROOT_LENGTH_LIMIT` records the limit, and `resolve_runtime_root` handles a longer root:
+
+- It uses `%ProgramData%\WVU-BMEG-<id>\rt` instead, where `<id>` is the first 12 hex digits of the SHA-256 of the user's SID (39 characters with `C:\ProgramData`). The folder is created with a protected access list (the user, SYSTEM, Administrators), because `%ProgramData%`'s inherited permissions would let every local user add files to another user's runtime, for example a `platform.local.txt` that changes the compile commands. An existing folder is used only if it is owned by the user (or SYSTEM or Administrators), has a protected access list whose allow entries name only those three accounts, and is not a link; the folder is then checked to be writable. A revision-3 copy left in `%LOCALAPPDATA%\WVU-BMEG\rt` by 1.0.x (about 700 MB) is not deleted; IT can remove it. Each user's folder sits directly in `%ProgramData%`, so no other account owns a folder above it.
+- If that is not possible, preparation fails with `RuntimeError::PathTooLong`. The page shows **The Arduino tools cannot be set up for this Windows account** (category `runtime_path_too_long`, `ARDUINO_TOOLS_FAILURE_MESSAGES` in `src/lib/messages.ts`) and asks the student to contact IT support; Repair is not offered, because it extracts to the same folder.
+- There is no 8.3 short-path step: Arduino CLI expands a short path back to the long one before it runs GCC (`runtime_smoke` with a 63-character root given as `C:\WVU-SM~2\WVULON~1\rt` still failed the same way).
+- **Known limitation: characters outside the Windows ANSI code page.** The MinGW-built GCC opens files through the ANSI code page. Measured on 2026-11-18 with `runtime_smoke` on a code page 1252 computer: a runtime root containing `Zoë` (in code page 1252) compiled; a runtime root containing `张伟` failed with `arm-none-eabi-g++: error: C:\...\??\rt\...\variants\UNOWIFIR4/defines.txt: Invalid argument`, and so did a short ASCII runtime root whose scratch folder (the job folder and Arduino's build cache) contained `张伟` (`...\sketch\reference_unor4wifi.ino.cpp.merged: Invalid argument`). Moving only the runtime to `%ProgramData%` would therefore not help: the app's job folder (`%LOCALAPPDATA%\WVU Bioinstrumentation Studio\firmware\logs\jobs`) and Arduino CLI's build cache (`%LOCALAPPDATA%\arduino\sketches`) are under the profile too. The app has no fallback for such a profile; firmware restore fails with that compiler error ([Troubleshooting](TROUBLESHOOTING.md#arduino-tools-cannot-be-set-up-for-this-windows-account)).
+- The debug-only `WVU_STUDIO_DEV_LOCAL_DATA` override is never redirected: the runtime stays in `<override>\WVU-BMEG\rt`, and a root of 60 or more characters only logs `ARDUINO_RUNTIME_ROOT_TOO_LONG_DEV`. The default sandbox (`<repository>\.dev-sandbox`) is usually that long; for a firmware restore from the sandbox, start it with a short `-SandboxRoot`, such as `C:\wvu-sbx`.
+
+### Offline smoke test of the runtime
+
+`src-tauri/examples/runtime_smoke.rs` extracts the archive into a scratch folder with the application's own code (`prepare_from_archive`, which applies the native-USB core shim and writes the application's `arduino-cli.yaml`), then compiles the reference sketch with `ArduinoCli::compile_to`, the application's compile command, while HTTP(S) goes to a dead proxy. LOCALAPPDATA, APPDATA, TEMP and TMP point into the scratch folder, so the Arduino build cache and the application log stay there; it never uploads and never touches `%LOCALAPPDATA%\WVU-BMEG\rt`.
+
+```powershell
+cargo run --manifest-path src-tauri\Cargo.toml --example runtime_smoke -- C:\wvu-smoke
+```
+
+The runtime goes to `C:\wvu-smoke\rt`; keep the scratch folder short, because a runtime root of 60 or more characters is refused. `--root <folder>` puts the runtime elsewhere: a long scratch folder with a short `--root` reproduces the `%ProgramData%` fallback (long job and build-cache paths, short runtime root). It prints the Arduino CLI and core versions, the `.ino` SHA-256, flash and RAM use, and exits 0 only if the sketch compiled and nothing was downloaded. On 2026-11-18 revision 4 compiled the `f3eb3fec…` sketch in about 7 s: flash 58,644 bytes (22%), RAM 11,712 bytes (35%). Delete the scratch folder afterwards (about 700 MB).
+
+### Rebuilding the Arduino runtime
+
+`scripts/build_arduino_runtime.ps1` (PowerShell 7.2 or later; about 3 GB of work space) builds a new archive from pinned inputs: the Arduino CLI release ZIP (SHA-256 pinned and checked against the release's checksum file), `arduino:renesas_uno@1.6.0` from the signed package index, and the gnu.org GPL-2.0 and LGPL-2.1 texts (SHA-256 pinned). It pins every tool version Arduino CLI installs, including the built-in discovery, monitor and ctags tools that Arduino CLI takes from the current package index, and stops on any difference, because a new tool needs a license and source review. It compiles the reference sketch offline three times (all tools, without openocd and dfu-util, and from the finished ZIP) at a 59-character runtime root, writes a deterministic ZIP, its `.sha256` and `arduino-runtime-<revision>.inventory.txt`, and compares the ZIP with `release/arduino-runtime-entries.json` (enforced when that file describes the same revision).
+
+```powershell
+pwsh -NoProfile -File scripts\build_arduino_runtime.ps1 -OutputZip C:\wvu-rtout\arduino-runtime.zip -BundleRevision 5 -DownloadCache C:\wvu-arduino-downloads
+```
+
+- The default work folder is `C:\wvu-rtbuild`. The script marks it (`.wvu-runtime-build`), and `-Force` empties only a marked folder. `-DownloadCache` must be outside it.
+- `-KeepUnusedTools` keeps openocd and dfu-util. `-CheckDeterminism` writes the ZIP twice and compares.
+- `-OutputZip` must be outside the repository: review the inventory and notices, then copy the archive to `src-tauri\resources\arduino-runtime.zip` yourself.
+- Two builds are not byte-identical: Arduino CLI writes the core's `installed.json` with its tools in random order, and the indexes change over time. The reviewed archive, not the script, is what a release pins.
+
+After a rebuild, in one change: bump `bundle_revision` (so installed copies extract the new runtime) in both runtime manifests, update `arduino_cli_version` and `arduino_runtime_archive_sha256` in `release/release-manifest.json`, `release/arduino-runtime-entries.json`, `release/third-party-sources.json` (with a new source bundle), `BUNDLED_COMPONENTS.txt`, [Third-Party Notices](THIRD_PARTY_NOTICES.md), the inventory under `release/`, and the handoff's irreplaceable-asset hash. Then run the audit, `runtime_smoke`, the full check list and a hardware restore.
+
+### Third-party source bundles
+
+The runtime holds GPL and LGPL programs, so every release publishes their corresponding source beside its installers. `release/third-party-sources.json` describes the bundle for the current runtime (`WVU-Bioinstrumentation-Studio-1.1.0-third-party-sources`) and `release/third-party-sources-runtime3.json` the one for 1.0.0 to 1.0.2 (`WVU-Bioinstrumentation-Studio-1.0.x-third-party-sources`). Each lists every component with its version, SPDX license, paths in the runtime, source URL, SHA-256, Git commit, published checksum, and the bundle's README text: the project description, build directions, license references, and, for the OpenOCD and dfu-util builds whose exact source only Arduino holds, what the bundle contains instead.
+
+`scripts/build_third_party_sources.ps1` (PowerShell 7.2, Go, network access) downloads each source into its own folder, verifies the pinned SHA-256, published checksums and the commit in each GitHub archive, vendors the Go modules of Arduino CLI and the discovery tools with `go mod vendor` and `go mod verify`, cross-checks the shipped Go executables' build information against the vendored modules (`-Runtime`), and writes `<bundle>.zip` (one wrapper folder, sorted entries, fixed timestamps) and `<bundle>.zip.sha256`:
+
+```powershell
+pwsh -NoProfile -File scripts\build_third_party_sources.ps1 -Manifest release\third-party-sources.json -OutputDir C:\wvu-srcout -Runtime src-tauri\resources\arduino-runtime.zip
+pwsh -NoProfile -File scripts\build_third_party_sources.ps1 -Manifest release\third-party-sources-runtime3.json -OutputDir C:\wvu-srcout
+```
+
+- **Pins.** Downloads are pinned by SHA-256. A Go vendor tree is pinned by content, not by ZIP bytes: `vendor.go_version`, the module and file counts, `files_sha256` (the SHA-256 of one line `<file SHA-256>  <path under vendor/>` per file, `modules.txt` excluded, sorted by path) and `modules_txt_sha256`. Go writes the vendor tree and `modules.txt`, so the script sets `GOTOOLCHAIN` to the manifest's `go_toolchain` (`go1.27.4`); a Go 1.21 or later of another version downloads exactly that release, verified by the checksum database. The ZIP bytes depend on .NET's Deflate encoder: two runs with the same PowerShell and .NET produce identical ZIPs (checked on 2026-11-18 with PowerShell 7.7.0 and .NET 11.0.0), but another .NET may not, so the bundle's own `.sha256` is what users check.
+- **New pins.** After adding a component or changing a version, leave its `sha256` or `vendor` values empty, review the downloads, and run once with `-RecordHashes`: it fills only empty values and never replaces a pinned one.
+- **Folders.** The default work folder is `C:\wvu-srcbuild` (marked `.wvu-third-party-sources`; a non-empty unmarked folder is refused). Each run uses its own subfolder; a successful run deletes its downloads and Go caches and keeps `logs\` and `build-log.txt` unless `-KeepRunFolder`. `-Clean` deletes earlier run folders. `-DownloadCache` and `-GoModCache` reuse verified downloads across runs.
+- **Checks without downloads.** `-ValidateOnly` checks one manifest. `scripts/check_third_party_sources.ps1`, which CI and the release script run, validates both, requires every pin, and checks that the current manifest covers the runtime: the versions and archive SHA-256 in the runtime and release manifests, every tool and platform folder and root file in `release/arduino-runtime-entries.json`, and every removed tool. `-VerifyBundle <bundle>.zip` checks a finished bundle against its manifest, read only and without Go: the wrapper folder and entry names, every file against `SHA256SUMS.txt`, the manifest copy, every component's pinned SHA-256, every vendor ZIP's content pins, and no other file. Run it on a bundle before publishing it, for example the 1.0.x bundle.
+- **Releases.** `scripts/build_student_release.ps1` builds the bundle for the release version into `dist\`, or checks one given with `-ThirdPartySourcesZip` (its `.sha256`, then `-VerifyBundle`). The 1.0.x bundle is not attached to the 1.0.0-1.0.2 releases; doing so changes published releases and needs the maintainer's explicit go-ahead.
+
+### Release script
+
+`scripts/build_student_release.ps1` requires PowerShell 7.2 and a Git work tree. It stops on the first failed native command (including `git`), runs the consistency check, checks the runtime archive against `release/arduino-runtime-entries.json` and runs the notice audit, validates the third-party source manifests and builds (or, with `-ThirdPartySourcesZip`, verifies) the source bundle, reinstalls npm packages with `npm ci` (network access or a warm npm cache), builds with `--locked`, and stages only installers created by that invocation. Do not reuse or manually copy an older installer after a failed release build. It builds the NSIS setup (the primary student installer) and an MSI package for managed IT deployment, one after the other. In `dist\`, the student folder's `SHA256SUMS.txt` lists the two installers and is identical to the copy inside the ZIP; `<zip>.sha256` beside the ZIP holds the ZIP's checksum; `WVU-Bioinstrumentation-Studio-<version>-third-party-sources.zip` and its `.sha256` sit beside the ZIP (not inside it: about 280 MB); and `WVU-Bioinstrumentation-Studio-<version>-build-info.txt` records the source commit, tool versions, runtime and source-bundle hashes. All checksum files use the `sha256sum` layout with LF line endings.
 
 ## Firmware
 

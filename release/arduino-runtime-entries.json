@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "description": "What the reviewed offline Arduino runtime archive (src-tauri/resources/arduino-runtime.zip, not in Git) must and must not contain. Read by scripts/build_student_release.ps1, scripts/audit_bundled_runtime_notices.ps1, scripts/build_arduino_runtime.ps1 and scripts/check_third_party_sources.ps1. Update it together with the runtime manifests, release/release-manifest.json, release/third-party-sources.json and src-tauri/resources/licenses/BUNDLED_COMPONENTS.txt.",
+  "bundle_revision": 4,
+  "arduino_cli": "1.6.0",
+  "renesas_uno_core": "1.6.0",
+  "platforms": [
+    { "package": "arduino", "architecture": "renesas_uno", "version": "1.6.0" }
+  ],
+  "tools": [
+    { "package": "arduino", "name": "arm-none-eabi-gcc", "version": "7-2017q4" },
+    { "package": "arduino", "name": "bossac", "version": "1.9.1-arduino5" },
+    { "package": "builtin", "name": "ctags", "version": "5.8-arduino12" },
+    { "package": "builtin", "name": "dfu-discovery", "version": "0.1.2" },
+    { "package": "builtin", "name": "mdns-discovery", "version": "1.1.0" },
+    { "package": "builtin", "name": "serial-discovery", "version": "1.5.2" },
+    { "package": "builtin", "name": "serial-monitor", "version": "0.15.0" }
+  ],
+  "required_entries": [
+    "runtime-manifest.json",
+    "arduino-cli.exe",
+    "arduino-cli-LICENSE.txt",
+    "GPL-2.0.txt",
+    "LGPL-2.1.txt",
+    "data/package_index.json",
+    "data/library_index.json",
+    "data/packages/arduino/hardware/renesas_uno/1.6.0/platform.txt",
+    "data/packages/arduino/hardware/renesas_uno/1.6.0/boards.txt",
+    "data/packages/arduino/hardware/renesas_uno/1.6.0/LICENSE",
+    "data/packages/arduino/hardware/renesas_uno/1.6.0/cores/arduino/usb/SerialUSB.h",
+    "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/bin/arm-none-eabi-g++.exe",
+    "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/share/doc/gcc-arm-none-eabi/license.txt",
+    "data/packages/arduino/tools/bossac/1.9.1-arduino5/bossac.exe",
+    "data/packages/builtin/tools/ctags/5.8-arduino12/ctags.exe",
+    "data/packages/builtin/tools/dfu-discovery/0.1.2/dfu-discovery.exe",
+    "data/packages/builtin/tools/dfu-discovery/0.1.2/LICENSE.txt",
+    "data/packages/builtin/tools/mdns-discovery/1.1.0/mdns-discovery.exe",
+    "data/packages/builtin/tools/mdns-discovery/1.1.0/LICENSE.txt",
+    "data/packages/builtin/tools/serial-discovery/1.5.2/serial-discovery.exe",
+    "data/packages/builtin/tools/serial-discovery/1.5.2/LICENSE.txt",
+    "data/packages/builtin/tools/serial-monitor/0.15.0/serial-monitor.exe",
+    "data/packages/builtin/tools/serial-monitor/0.15.0/LICENSE.txt"
+  ],
+  "license_entries": [
+    { "path": "arduino-cli-LICENSE.txt", "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986", "license": "GNU GPL version 3 (the Arduino CLI 1.6.0 release's LICENSE.txt)" },
+    { "path": "GPL-2.0.txt", "sha256": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6", "license": "GNU GPL version 2 (gnu.org text; covers ctags)" },
+    { "path": "LGPL-2.1.txt", "sha256": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95", "license": "GNU LGPL version 2.1 (gnu.org text)" },
+    { "path": "data/packages/arduino/hardware/renesas_uno/1.6.0/LICENSE", "sha256": "f3b3469d7b15d5c7ee61d7f88012b58357ca1279b6ac4ae6c29e9b4381286947", "license": "Arduino UNO R4 core LICENSE" },
+    { "path": "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/share/doc/gcc-arm-none-eabi/license.txt", "sha256": "2910954c032f57c563194f1cd2a23b1c7b0d121d2af8b5c7cb42c65017288089", "license": "GNU Arm Embedded Toolchain component licenses" },
+    { "path": "data/packages/builtin/tools/dfu-discovery/0.1.2/LICENSE.txt", "sha256": "8b1ba204bb69a0ade2bfcf65ef294a920f6bb361b317dba43c7ef29d96332b9b", "license": "GNU GPL version 3 (dfu-discovery)" },
+    { "path": "data/packages/builtin/tools/mdns-discovery/1.1.0/LICENSE.txt", "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986", "license": "GNU GPL version 3 (mdns-discovery)" },
+    { "path": "data/packages/builtin/tools/serial-discovery/1.5.2/LICENSE.txt", "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986", "license": "GNU GPL version 3 (serial-discovery)" },
+    { "path": "data/packages/builtin/tools/serial-monitor/0.15.0/LICENSE.txt", "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986", "license": "GNU GPL version 3 (serial-monitor)" }
+  ],
+  "forbidden_prefixes": [
+    "arduino-cli.yaml",
+    "data/inventory.yaml",
+    "downloads/",
+    "sketchbook/",
+    "data/tmp/",
+    "data/packages/arduino/tools/openocd/",
+    "data/packages/arduino/tools/dfu-util/"
+  ]
+}

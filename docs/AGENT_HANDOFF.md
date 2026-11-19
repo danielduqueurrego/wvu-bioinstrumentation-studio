@@ -21,7 +21,7 @@ The previous conversation is not required. Current source, manifests, logs, and 
 | `v1.0.2` commit | `94c4bef7561cba3914a673c2c6a6f4bdaadf5b83` |
 | Application version | `1.0.2` in package, Cargo, Tauri, and release metadata (unchanged on `review-fixes`) |
 | Controlled firmware | Protocol `0.4`, build `0x00010006`, device ID `0x554E4F34`; the `.ino`, its SHA-256, the manifest, and `profiles/*.json` are unchanged on `review-fixes` |
-| Arduino tools | Arduino CLI `1.5.2-rc.1`, Renesas UNO core `1.6.0`, runtime bundle revision `3` |
+| Arduino tools | Releases 1.0.0-1.0.2: Arduino CLI `1.5.2-rc.1`, Renesas UNO core `1.6.0`, runtime bundle revision `3` (`4e068c54…`). On `release-1.1-prep`: Arduino CLI `1.6.0`, core `1.6.0`, runtime bundle revision `4` (`5baa8a5f…`), without OpenOCD and dfu-util |
 | Rust toolchain | `1.100.0`, pinned in `rust-toolchain.toml` |
 | First-party license | Apache-2.0; root `LICENSE` and package license metadata exist (root `NOTICE` added on `release-1.1-prep`) |
 
@@ -49,11 +49,13 @@ The README includes the reviewed AI-assisted-development disclosure and the teac
 This computer was set up for the review work:
 
 - **Toolchain.** It has Node 22, Rust `1.100.0` through rustup and `rust-toolchain.toml` (with rustfmt and Clippy), and the Visual Studio 2022 Build Tools (MSVC with a Windows SDK). `npm ci` has been run.
-- **Runtime archive.** `src-tauri/resources/arduino-runtime.zip` currently holds the **CI placeholder** (269 bytes), created with the procedure in `.github/workflows/ci.yml`. It satisfies Cargo source checks only.
-  - Before any hardware test or release build, replace it with the real hash-pinned ZIP from the private recovery archive. That archive is not on this computer; [Verify the irreplaceable asset](#verify-the-irreplaceable-asset) gives the hash.
-  - The file is ignored by Git; never commit, package, or test hardware with the placeholder.
+- **Runtime archive.** Since 2026-11-18, `src-tauri/resources/arduino-runtime.zip` holds the real **runtime revision 4** (SHA-256 `5baa8a5f…`, 193,000,375 bytes), built on this computer with `scripts/build_arduino_runtime.ps1` (see [Runtime revision 4](#runtime-revision-4-and-the-third-party-source-bundles)). It is the only copy besides the build scratch folders: archive it privately (see [Verify the irreplaceable asset](#verify-the-irreplaceable-asset)).
+  - The revision-3 archive of releases 1.0.0-1.0.2 (`4e068c54…`) is not on this computer; it is in the 2026-10-05 recovery archive.
+  - The file is ignored by Git; never commit it. A clone without it needs the CI placeholder (`.github/workflows/ci.yml`) for Cargo source checks only; never package or test hardware with the placeholder.
+- **Go.** Go 1.27.4 (`C:\Program Files\Go`) is installed for building the third-party source bundles.
 - **Existing app data.** The existing real app data on this computer was left untouched by the review work: `%LOCALAPPDATA%\WVU Bioinstrumentation Studio`, including firmware logs from August 2026 and `project-folder.json`, and `%LOCALAPPDATA%\WVU-BMEG\rt`.
-- **UI testing.** All UI testing used `scripts\start_dev_sandbox.ps1`, with data in the Git-ignored `.dev-sandbox\` folder, the Simulator, and the placeholder runtime. The sandbox therefore shows "Arduino tools need attention" and has no board.
+- **UI testing.** All UI testing used `scripts\start_dev_sandbox.ps1`, with data in the Git-ignored `.dev-sandbox\` folder, the Simulator, and the placeholder runtime. The sandbox therefore shows "Arduino tools need attention" and has no board. With the real runtime, the default sandbox path is too long for the compiler (see [Runtime revision 4](#runtime-revision-4-and-the-third-party-source-bundles)); use `-SandboxRoot C:\wvu-sbx` for a firmware restore from the sandbox.
+- **Disposable build folders (2026-11-18).** None of these is needed for recovery; delete them when the runtime and bundles are archived: `C:\wvu-rtbuild` (about 3 GB, the revision-4 build and earlier source-bundle runs), `C:\wvu-srcbuild` (source-bundle run logs), the empty `C:\wvu-naE` (left by the non-ASCII `runtime_smoke` runs), and the agent session's temporary `groupE`, `groupE2` and `fixE` folders under `%TEMP%\claude` (build logs, download and Go module caches; `fixE\bundles` holds the bundles listed under [Runtime revision 4](#runtime-revision-4-and-the-third-party-source-bundles), `groupE2\bundles-final` the superseded first build). The copy of the revision-4 ZIP in `groupE` is identical to `src-tauri/resources/arduino-runtime.zip`; keep it until the ZIP is archived.
 
 ## Hardware verification checklist for review-fixes
 
@@ -80,6 +82,11 @@ None of these can run without the real runtime ZIP and an Arduino UNO R4 WiFi. U
 - [ ] D4/D5/D6 read LOW after Stop, after a fault, and after the 5 s watchdog (for example, end the app's process mid-recording).
 - [ ] Pulse-ox RED/IR timing passes the [Release Checklist](RELEASE_CHECKLIST.md) pulse-ox criteria, and RED and IR are never HIGH together.
 
+**Arduino runtime revision 4 (release-1.1-prep)**
+
+- [ ] With the network disconnected, the first start of a `release-1.1-prep` build extracts revision 4 (it replaces revision 3 once), and Restore WVU Firmware compiles and uploads. The restore log shows Arduino CLI `1.6.0`, core `1.6.0` and the reference `.ino` SHA-256 of `release/release-manifest.json`.
+- [ ] On a Windows account whose profile folder name is longer than 24 characters (a disposable local account is enough), the app uses `%ProgramData%\WVU-BMEG-<id>\rt` (`ARDUINO_RUNTIME_ROOT reason=program_data` in `application.log`), the folder's access list shows only that user, SYSTEM and Administrators (`icacls`), and a restore compiles. A second account cannot open the folder.
+
 **Labs (release-1.1-prep)**
 
 - [ ] On the maintainer's own catalog, the first start of a `release-1.1-prep` build retires the Op Amp Lab 2.0.1 copy, leaves a `lab_state.pre-migration-*.json` backup, and shows the migration notice in the Lab card. A second start shows no notice and makes no new backup.
@@ -95,7 +102,8 @@ None of these can run without the real runtime ZIP and an Arduino UNO R4 WiFi. U
 | Data | Location relative to the repository or current Windows user | Recovery importance |
 | --- | --- | --- |
 | Source, docs, scripts | Repository working tree and Git history | `master` is on GitHub. **`review-fixes` exists only on this computer** until it is pushed or bundled. |
-| Real offline Arduino runtime | `src-tauri/resources/arduino-runtime.zip` | Ignored by Git; required for genuine firmware restore and release packaging. **Currently the CI placeholder on this computer.** |
+| Real offline Arduino runtime | `src-tauri/resources/arduino-runtime.zip` | Ignored by Git; required for genuine firmware restore and release packaging. **Revision 4 (`5baa8a5f…`) exists only on this computer: archive it privately.** Keep the revision-3 archive (`4e068c54…`) of 1.0.x too. |
+| Third-party source bundles | Rebuilt from `release/third-party-sources*.json` with `scripts/build_third_party_sources.ps1` | Reproducible from the manifests while the upstream URLs last; keep the published bundles with the release records |
 | Instructor lab catalog | `%LOCALAPPDATA%\WVU Bioinstrumentation Studio\profiles\lab_state.json` | Local labs are not automatically uploaded to GitHub |
 | Catalog backups and audit logs | Same `profiles` directory (`lab_state.reset-*.json`, `lab_state.corrupt-*.json`, `lab_state.pre-migration-*.json`, audit logs) | Preserve with the catalog |
 | Calibration presets | `%LOCALAPPDATA%\WVU Bioinstrumentation Studio\calibrations\*.json` | User-specific; preserve if present |
@@ -159,26 +167,49 @@ git log -1 --oneline
 5. Select the new Project folder in the app. Old absolute paths in preferences and historical logs may refer to the former Windows account. Let the app prepare a fresh `%LOCALAPPDATA%\WVU-BMEG\rt`; its native-USB core shim is applied automatically.
 6. Authenticate GitHub and the coding agent again through their normal sign-in methods if required. No credentials are included in the recovery archive.
 
-The release script requires PowerShell 7 (`#Requires -Version 7.0`). The other scripts also run in Windows PowerShell 5.1.
+The release script and the runtime and source-bundle scripts require PowerShell 7.2 (`#Requires -Version 7.2`); building the source bundles also needs Go. The other scripts also run in Windows PowerShell 5.1.
 
 ### Verify the irreplaceable asset
 
-The real archive was checked against `release/release-manifest.json` on 2026-10-05:
+**Runtime revision 4** (`release-1.1-prep`, Arduino CLI 1.6.0, core 1.6.0) was built on 2026-11-18 and is pinned in `release/release-manifest.json`. It cannot be rebuilt byte for byte (Arduino CLI writes the core's `installed.json` in random order, and the indexes change), so **this exact file must be archived privately** with the next recovery archive, together with `release/arduino-runtime-4.inventory.txt`:
 
 ```text
-Arduino runtime ZIP SHA-256:
+Arduino runtime revision 4 ZIP SHA-256 (193,000,375 bytes):
+5baa8a5fc7fc0c2ae7fd9f49de1876d76859067af6d56e9b56546a88a5d02def
+```
+
+**Runtime revision 3** of releases 1.0.0-1.0.2 was checked against the v1.0.2 `release/release-manifest.json` on 2026-10-05 and is in the 2026-10-05 recovery archive. Keep it: it is the archive those releases shipped, and the 1.0.x source bundle should be cross-checked against it (`-Runtime`) before that bundle is published.
+
+```text
+Arduino runtime revision 3 ZIP SHA-256:
 4e068c540b485e8e7ceff29dac849db250b41efb56108b10edadfb033dc7d501
 
-Controlled reference .ino SHA-256:
+Controlled reference .ino SHA-256 (build 0x00010006):
 f3eb3fec0166189f66a8ddfeb058172a8d97a3c60d95d574b3234eecbd144aab
 ```
 
 ```powershell
 Get-FileHash src-tauri\resources\arduino-runtime.zip -Algorithm SHA256
 Get-FileHash firmware\reference_unor4wifi\reference_unor4wifi.ino -Algorithm SHA256
+pwsh -NoProfile -File scripts\audit_bundled_runtime_notices.ps1 -ArchivePath src-tauri\resources\arduino-runtime.zip
 ```
 
 Do not substitute a CI placeholder, download newer tools, or change the reviewed manifest merely to accept a different archive. Changes to firmware or bundled dependencies require a new review of matching identity, hashes, protocol/profile compatibility, and notices.
+
+## Runtime revision 4 and the third-party source bundles
+
+**Runtime.** `scripts/build_arduino_runtime.ps1` built revision 4 from the pinned Arduino CLI 1.6.0 release (`2769b9b2…`) and `arduino:renesas_uno@1.6.0`, removed OpenOCD and dfu-util (the UNO R4 WiFi uploads with bossac), and proved an offline compile of the reference sketch three times. The committed script carries the review fixes made after that build (default work folders and a guarded `-Force`, `-KeepUnusedTools`, relative paths, pinned built-in tool versions, `release/arduino-runtime-entries.json`, 59-character proofs); a validation rebuild with it passed all proofs (its ZIP differs, as every rebuild does). `src-tauri/examples/runtime_smoke.rs` compiled the `f3eb3fec…` sketch with the real ZIP offline: flash 58,644 bytes (22%), RAM 11,712 bytes (35%). `cli_config_text` now also writes `updater.enable_notification: false` and `network.cloud_api.skip_board_detection_calls: true`. [Developer Guide](DEVELOPER_GUIDE.md#bundled-arduino-runtime) has the rebuild recipe.
+
+**Path length.** GCC 7-2017q4 fails when the runtime root has 60 or more characters (59 compiles). `%LOCALAPPDATA%\WVU-BMEG\rt` is 35 characters plus the profile folder name, so profile folders longer than 24 characters fail; 1.0.2 has the same problem and no mitigation. `resolve_runtime_root` (`RUNTIME_ROOT_LENGTH_LIMIT` in `arduino_runtime.rs`) then uses `%ProgramData%\WVU-BMEG-<SHA-256 of the user SID, 12 hex>\rt`, created with a protected access list for the user, SYSTEM and Administrators; otherwise the page shows category `runtime_path_too_long` ("contact IT support"). The plan's 8.3 short-path step was dropped: Arduino CLI expands short paths back to the long path before running GCC (tested with `runtime_smoke`). The plan's `%ProgramData%\WVU-BMEG\<id>` layout with default permissions was changed to a per-user folder directly in `%ProgramData%` with a protected access list, because the default permissions let every local user add files (for example a `platform.local.txt` that changes compile commands) inside another user's runtime, and the first user to create `WVU-BMEG` would own the folder above everyone else's. An existing fallback folder is used only if its owner is the user, SYSTEM or Administrators, its access list is protected and its allow entries name only those three accounts, and it is not a link (junction). The debug-only `WVU_STUDIO_DEV_LOCAL_DATA` override is never redirected. The fallback's access-list code is unit-tested in a temporary folder only (creation, an unprotected folder, a protected folder that also allows Users, a junction); it has not run against the real `%ProgramData%` (see the hardware checklist). A profile folder name with characters outside the Windows ANSI code page is a separate, unmitigated limitation (see [Deferred decisions](#deferred-decisions)).
+
+**Source bundles.** `release/third-party-sources.json` (revision 4, `WVU-Bioinstrumentation-Studio-1.1.0-third-party-sources`) and `release/third-party-sources-runtime3.json` (1.0.0-1.0.2) describe them; `scripts/build_third_party_sources.ps1` builds them, `scripts/check_third_party_sources.ps1` (CI) validates the manifests offline, and `build_third_party_sources.ps1 -VerifyBundle` checks a finished bundle offline (the release script runs it on `-ThirdPartySourcesZip`). Bundles rebuilt on 2026-11-18 after the review fixes, which reworded the OpenOCD component of the 1.0.x manifest and the removed-tool notes of the 1.1.0 manifest (identical in two runs each; the 1.1.0 bundle with `-Runtime` against the real revision-4 ZIP; both pass `-VerifyBundle`; not uploaded anywhere):
+
+```text
+WVU-Bioinstrumentation-Studio-1.1.0-third-party-sources.zip  SHA-256 a55586d4ddd330e7de3e4dc15d941f542050b85a26e28deee82f25bde28c402a (279,590,658 bytes)
+WVU-Bioinstrumentation-Studio-1.0.x-third-party-sources.zip  SHA-256 b97bd6983a3fd449c2d282ba23feb21746808958cf4e9b898677dcb38bd61105 (289,631,695 bytes)
+```
+
+These hashes hold only for the committed manifests and PowerShell 7.7.0/.NET 11.0.0; any manifest change, or another .NET, gives a new bundle. The 1.1 notices (`BUNDLED_COMPONENTS.txt` and the 1.1.0 bundle's README) do not refer to the unpublished 1.0.x bundle: for OpenOCD and dfu-util they point to `release/third-party-sources-runtime3.json` and the issue form. The 1.0.x bundle's written offer does not promise source the maintainers do not hold: for OpenOCD 0.11.0-arduino2 and dfu-util 0.11.0-arduino5 it lists what is included (the upstream releases, Arduino's OpenOCD fork at the commit the binary names, Arduino's OpenOCD build scripts with their static libraries), says Arduino holds the exact build sources, and says requests are forwarded to Arduino and anything received is published, for at least three years. The 1.0.x bundle was built without `-Runtime` (only the real extracted `%LOCALAPPDATA%\WVU-BMEG\rt` held revision 3 here, and it was not touched), so its `runtime_archive_sha256` has not been checked against the actual archive yet.
 
 ## Build and check
 
@@ -241,6 +272,7 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 | Project/Output path validation | `src-tauri/src/project_paths.rs`, `src/lib/project-folder.ts` |
 | Restore, Verify, CLI process flags, runtime deployment | `src-tauri/src/firmware_workflow.rs`, `arduino_cli.rs`, `arduino_runtime.rs`, `reference_firmware.rs` |
 | Controlled sketch | `firmware/reference_unor4wifi/reference_unor4wifi.ino` |
+| Runtime build, source bundles, notices | `scripts/build_arduino_runtime.ps1`, `build_third_party_sources.ps1`, `check_third_party_sources.ps1`, `audit_bundled_runtime_notices.ps1`; `release/arduino-runtime-entries.json`, `release/third-party-sources*.json`, `release/arduino-runtime-4.inventory.txt`; `src-tauri/examples/runtime_smoke.rs`; `src-tauri/resources/licenses/BUNDLED_COMPONENTS.txt` |
 | Release pins, packaging, consistency | `release/release-manifest.json`, `src-tauri/tauri.conf.json`, `scripts/build_student_release.ps1`, `scripts/check_release_consistency.ps1` |
 
 ### Accepted behavior to preserve
@@ -297,7 +329,8 @@ For UI work without hardware, use `scripts\start_dev_sandbox.ps1` (see [Develope
 - Pulse-ox phase deadlines advance absolutely with `nextTickMicros += stateDwellUs`. ADC and record creation are isolated from frame encoding, CRC, and serial transmission by bounded queues and partial writes. Host recording retains actual per-record timestamps and per-state timing checks.
 - MPXV uses `(Vout / Vsupply - 0.04) / 0.009` kPa and `kPa * 7.5006` mmHg. EMG pressure supports counts, volts, kPa, and mmHg. XGZP uses its selected local linear calibration, with at most one active preset per channel. The preset list follows the saved files (a preset deleted elsewhere is dropped with its selection; only the one this window just saved is kept while the list catches up), and it is read again when the window regains focus outside a recording. Pulse ox remains raw-only, with no ambient subtraction or physiological computations.
 - Tool-version provenance is best effort: versions are cached, and a failed query records `"unavailable"` instead of failing a recording or restore. Restore logs record `git_revision` from the `GIT_COMMIT` embedded at build time, or `null`.
-- `WVU_STUDIO_DEV_LOCAL_DATA` relocates the extracted runtime **in debug builds only**; release builds ignore it.
+- `WVU_STUDIO_DEV_LOCAL_DATA` relocates the extracted runtime **in debug builds only**; release builds ignore it, and the runtime under it is never redirected.
+- The runtime root stays shorter than `RUNTIME_ROOT_LENGTH_LIMIT` (60) characters, the bundled GCC's limit: a longer `%LOCALAPPDATA%\WVU-BMEG\rt` moves to the user's private `%ProgramData%\WVU-BMEG-<id>\rt`, or fails as `runtime_path_too_long` instead of failing in the compiler.
 - Preserve hidden subprocess creation (`CREATE_NO_WINDOW`), the GUI Windows subsystem, offline runtime deployment, precise Advanced details, serial ownership cleanup, and transactional catalog writes.
 
 ## Recent issues and evidence
@@ -394,10 +427,11 @@ The 2026-11-17 review recorded these items. They need hardware, legal review, or
 
 **Release and legal**
 
-- Corresponding-source obligations for GPL tools in the bundled runtime (Arduino CLI, the gcc toolchain)
 - License texts for Rust crates and npm packages in the installers
-- The production pin on Arduino CLI `1.5.2-rc.1`, a pre-release
-- A documented rebuild recipe for `arduino-runtime.zip`
+- The permissive (MIT, BSD, Apache-2.0) license texts of the Go modules linked into Arduino CLI and the discovery tools are only in the source bundle's vendor ZIPs, not in the installer (a notices file generated from `vendor/modules.txt` would fix it). The core's `bootloaders/*.hex` and `.elf` have no stated license or source pointer upstream.
+- **1.0.x source bundle (maintainer decision).** Attaching `WVU-Bioinstrumentation-Studio-1.0.x-third-party-sources.zip` to v1.0.0-v1.0.2 changes published releases and needs an explicit go-ahead, after a rebuild with `-Runtime` pointing at the revision-3 archive. Ask Arduino now for the exact OpenOCD 0.11.0-arduino2 and dfu-util 0.11.0-arduino5 build sources, so a forwarded request can be answered.
+
+Resolved on `release-1.1-prep`: corresponding source for the bundled GPL/LGPL tools (per-release source bundles and a written offer), the pre-release Arduino CLI pin (now 1.6.0), and the runtime rebuild recipe (`scripts/build_arduino_runtime.ps1`).
 
 Resolved on `release-1.1-prep`: `SECURITY.md` points to GitHub private vulnerability reporting, and the installers carry publisher and copyright metadata and a pinned MSI upgrade code.
 
@@ -415,7 +449,7 @@ Still open: run the four upgrades from 1.0.2 in Windows Sandbox (NSIS to NSIS fr
 
 - The Op Amp Lab's shared General Analog ID: resolved on `release-1.1-prep` by shipping it as a factory lab with its own ID (`wvu.bmeg420l.op_amp.course.capture.v1`, CSV fields `vmid_counts`/`vout_counts`), retiring the student installer, and migration `op_amp_builtin_v1` for catalogs where the old 2.0.1 copy is active; see [Op Amp Lab](#op-amp-lab-built-in-and-the-migration-of-the-old-copy). The old copy's `01_counts` field stays as it was in that stored revision.
 - Numbering of local revisions versus future factory patches of the same ID: resolved by version policy P2 (factory versions `MAJOR.MINOR.0`, edited revisions PATCH ≥ 1, `profiles/factory-labs.lock.json`); see [Lab Configuration](LAB_CONFIGURATION.md#factory-lab-versions). A new lab ID starts locally at 1.0.0, so `next_factory_lab_version` also counts the revision a factory version is made from (`promote`, "Save as course default file…"): a new lab saved as 1.0.x becomes factory 1.1.0. Every lock entry stays held by a file (`profiles/` or `profiles/legacy/<file>_<version>.profile.json`); `fix`/`promote` keep a replaced published version there (from the file, or from `git cat-file blob HEAD:profiles/<file>` in the example tool), and `check` reports a missing one. Install lab file refuses a `built_in` file that is not in the compiled lock with that hash (a course default file for a later build). A stored lab that still collides with a course default is kept and reported, never erased.
-- Non-ASCII Windows usernames in the extracted toolchain path
+- Windows profile folder names with characters outside the ANSI code page. Measured on 2026-11-18 with `runtime_smoke` (code page 1252): a runtime root with `Zoë` compiles; `张伟` fails with `Invalid argument` both in the runtime root and, with an ASCII runtime root, in the job folder and Arduino build cache under `LOCALAPPDATA`. Moving only the runtime to `%ProgramData%` would not fix it: the app's job folder and Arduino CLI's build path would have to move too (an ASCII-only private folder, `--build-path`). Documented as a known limitation in [Troubleshooting](TROUBLESHOOTING.md#arduino-tools-cannot-be-set-up-for-this-windows-account) and the [Developer Guide](DEVELOPER_GUIDE.md#runtime-folder-and-the-compilers-path-limit); the app shows the compiler error, not a dedicated message.
 - A recovery tool for `.bmeg.part` files
 - A CSV `elapsed_s` column and a separate markers CSV
 - Push versus poll for display data (currently polled)

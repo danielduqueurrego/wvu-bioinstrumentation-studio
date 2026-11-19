@@ -2,11 +2,13 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  ARDUINO_TOOLS_FAILURE_MESSAGES,
   CONNECTION_FAILURE_MESSAGES,
   FAULT_ORIGIN_MESSAGES,
   FIRMWARE_FAILURE_MESSAGES,
   NEXT_ACTION_LABELS,
   VERIFY_INSTEAD_OF_RETRY,
+  arduinoToolsFailureMessage,
   connectionFailureMessage,
   faultBanner,
   faultConcernsSource,
@@ -45,8 +47,14 @@ describe('plain-language mapping covers every backend code', () => {
     expect(Object.keys(table).sort()).toEqual([...variants].sort());
   });
 
+  it('arduino_runtime.rs ArduinoToolsFailureCategory', () => {
+    const variants = rustEnumVariants('arduino_runtime.rs', 'ArduinoToolsFailureCategory');
+    expect(variants).toContain('runtime_path_too_long');
+    expect(Object.keys(ARDUINO_TOOLS_FAILURE_MESSAGES).sort()).toEqual([...variants].sort());
+  });
+
   it('gives every entry a headline, a full sentence, and no raw codes', () => {
-    for (const table of [CONNECTION_FAILURE_MESSAGES, FAULT_ORIGIN_MESSAGES, FIRMWARE_FAILURE_MESSAGES, { storage_refused_before_start: STORAGE_REFUSED_BEFORE_START }]) {
+    for (const table of [CONNECTION_FAILURE_MESSAGES, FAULT_ORIGIN_MESSAGES, FIRMWARE_FAILURE_MESSAGES, ARDUINO_TOOLS_FAILURE_MESSAGES, { storage_refused_before_start: STORAGE_REFUSED_BEFORE_START }]) {
       for (const [code, message] of Object.entries(table)) {
         expect(message.headline.trim(), code).not.toBe('');
         expect(message.sentence, code).toMatch(/[.!?]$/);
@@ -254,6 +262,27 @@ describe('problem banner priority', () => {
     const hardware = { ...quiet.board, source: 'hardware' as const };
     expect(problemBanner({ ...quiet, board: hardware, arduinoTools: { state: 'failed', problem: 'Broken', repairable: true } })?.nextAction).toBe('repair_arduino_tools');
     expect(problemBanner({ ...quiet, board: hardware, arduinoTools: { state: 'failed', problem: 'Reinstall', repairable: false } })?.nextAction).toBeUndefined();
+  });
+
+  it('explains a Windows profile path too long for the compiler, without offering Repair', () => {
+    const hardware = { ...quiet.board, source: 'hardware' as const };
+    const banner = problemBanner({
+      ...quiet,
+      board: hardware,
+      arduinoTools: { state: 'failed', problem: 'Arduino tools cannot be set up for this Windows account.', repairable: false, category: 'runtime_path_too_long' }
+    });
+    expect(banner?.id).toBe('tools:failed:runtime_path_too_long');
+    expect(banner?.headline).toBe(ARDUINO_TOOLS_FAILURE_MESSAGES.runtime_path_too_long.headline);
+    expect(banner?.sentence).toMatch(/IT support or instructor/);
+    expect(banner?.sentence).toMatch(/Simulator recordings still work/);
+    expect(banner?.nextAction).toBeUndefined();
+    // An unknown category falls back to the backend's own text.
+    const unknown = problemBanner({ ...quiet, board: hardware, arduinoTools: { state: 'failed', problem: 'Broken', repairable: true, category: 'something_new' } });
+    expect(unknown?.id).toBe('tools:failed');
+    expect(unknown?.nextAction).toBe('repair_arduino_tools');
+    expect(arduinoToolsFailureMessage('toString')).toBeUndefined();
+    // Simulator practice does not need the Arduino tools.
+    expect(problemBanner({ ...quiet, arduinoTools: { state: 'failed', problem: 'x', repairable: false, category: 'runtime_path_too_long' } })).toBeUndefined();
   });
 
   it('keeps Arduino-tools and board problems out of the banner during Simulator practice', () => {

@@ -37,7 +37,7 @@
   import { markerElapsedSeconds, markerFeedback, placeMarkers, type RecordingMarker } from '$lib/markers';
   import type { LabProfile } from '$lib/labs';
   import { connectionActions } from '$lib/connection-actions';
-  import { commandErrorDetail, commandErrorKeptPreviousTools, commandErrorRepairable, formatCommandError } from '$lib/errors';
+  import { commandErrorCategory, commandErrorDetail, commandErrorKeptPreviousTools, commandErrorRepairable, formatCommandError } from '$lib/errors';
   import { resolvedDigitalOutputs } from '$lib/lab-authoring';
   import { firmwareStepAnnouncement, firmwareStepIndex } from '$lib/firmware-job';
   import { durationRequest, type RecordingDurationRequest } from '$lib/duration';
@@ -204,6 +204,8 @@
   let arduinoToolsDetail = '';
   // False when the tools are missing or damaged: only a reinstall helps.
   let arduinoToolsRepairable = true;
+  // `ArduinoToolsFailure.category` (for example runtime_path_too_long), or ''.
+  let arduinoToolsCategory = '';
   // Why the window did not close (for example during a firmware restore).
   let closeBlockedNotice = '';
   let session: SessionStatus = {
@@ -535,7 +537,7 @@
     active: isActive,
     fault: faultInput,
     storageWarning: session.storage_warning,
-    arduinoTools: { state: arduinoToolsState, problem: arduinoToolsProblem, repairable: arduinoToolsRepairable },
+    arduinoTools: { state: arduinoToolsState, problem: arduinoToolsProblem, repairable: arduinoToolsRepairable, category: arduinoToolsCategory },
     projectFolderNotice,
     board: {
       source,
@@ -838,11 +840,12 @@
 
   const TOOLS_CHECK_FAILED = 'The Arduino tools could not be checked. Select Repair Arduino tools. If that does not help, restart the application or contact your instructor.';
 
-  function arduinoToolsFailed(problem: string, detail = '', repairable = true) {
+  function arduinoToolsFailed(problem: string, detail = '', repairable = true, category = '') {
     arduinoToolsState = 'failed';
     arduinoToolsProblem = problem;
     arduinoToolsDetail = detail;
     arduinoToolsRepairable = repairable;
+    arduinoToolsCategory = category;
     firmwareEnvironment = { expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [], ready: false, problem };
   }
 
@@ -853,6 +856,7 @@
       arduinoToolsProblem = firmwareEnvironment.ready ? '' : firmwareEnvironment.problem ?? TOOLS_CHECK_FAILED;
       arduinoToolsDetail = '';
       arduinoToolsRepairable = true;
+      arduinoToolsCategory = '';
     } catch {
       arduinoToolsFailed(TOOLS_CHECK_FAILED);
     }
@@ -868,6 +872,7 @@
         arduinoToolsState = 'ready';
         arduinoToolsProblem = '';
         arduinoToolsDetail = '';
+        arduinoToolsCategory = '';
       } else {
         arduinoToolsFailed(TOOLS_CHECK_FAILED);
       }
@@ -875,7 +880,7 @@
       // An `ArduinoToolsFailure`: title, explanation, and Repair or reinstall.
       // The Board card (or, with Source = Hardware, the banner) shows it once;
       // the information line does not repeat it.
-      arduinoToolsFailed(formatCommandError(error), commandErrorDetail(error), commandErrorRepairable(error));
+      arduinoToolsFailed(formatCommandError(error), commandErrorDetail(error), commandErrorRepairable(error), commandErrorCategory(error));
     }
   }
 
@@ -896,7 +901,7 @@
         statusMessage = `The Arduino tools were not repaired; the tools already in place were kept. ${formatCommandError(error)}`;
         return;
       }
-      arduinoToolsFailed(formatCommandError(error), commandErrorDetail(error), commandErrorRepairable(error));
+      arduinoToolsFailed(formatCommandError(error), commandErrorDetail(error), commandErrorRepairable(error), commandErrorCategory(error));
       statusMessage = 'The Arduino tools were not repaired. The Board card explains what to do next.';
       return;
     }

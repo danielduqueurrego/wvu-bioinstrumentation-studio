@@ -21,6 +21,12 @@ const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 const RETAINED_LOG_FILES: usize = 5;
 
 fn log_path() -> Option<PathBuf> {
+    // Unit tests exercise code that logs (runtime preparation, for example);
+    // they must never write to the real application log of the developer's
+    // own installation. The tests below write to temporary files instead.
+    if cfg!(test) {
+        return None;
+    }
     std::env::var_os("LOCALAPPDATA").map(|root| {
         PathBuf::from(root)
             .join(APP_DATA_FOLDER)

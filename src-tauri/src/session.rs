@@ -8445,7 +8445,7 @@ mod tests {
             executable: PathBuf::from("arduino-cli.exe"),
             config_file: PathBuf::from("arduino-cli.yaml"),
             root: PathBuf::from("rt"),
-            cli_version: "1.5.2-rc.1".into(),
+            cli_version: "1.6.0".into(),
             core_version: "1.6.0".into(),
         };
         let no_probe = || -> Result<ToolVersions, CliError> {
@@ -8457,7 +8457,7 @@ mod tests {
         // A failed earlier probe falls back to the bundled runtime's versions.
         let pinned = provenance_tool_versions(None, Some(&runtime), no_probe)
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(pinned.arduino_cli_version, "1.5.2-rc.1");
+        assert_eq!(pinned.arduino_cli_version, "1.6.0");
         assert_eq!(pinned.uno_r4_core_version, "1.6.0");
         // Only a development build without the bundled runtime probes.
         let probed_now = provenance_tool_versions(None, None, || Ok(probed.clone()))

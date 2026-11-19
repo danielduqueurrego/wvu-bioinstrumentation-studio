@@ -72,11 +72,23 @@ If the message under the recording bar says **The Arduino tools need attention**
 
 - **What Repair does.** It extracts the offline Arduino tools included with the application again; nothing is downloaded. It is unavailable while a recording or board operation is running; finish or stop that first.
 - **Automatic check.** The app also checks the prepared tools at every start and extracts them again if a file is missing or its size changed, for example after an antivirus scan. This check compares each file's presence and size, not its content.
-- **Where the tools are.** They are kept in `%LOCALAPPDATA%\WVU-BMEG\rt`, outside the installation folder, so reinstalling alone does not replace them; use Repair first.
+- **Where the tools are.** They are kept in `%LOCALAPPDATA%\WVU-BMEG\rt`, outside the installation folder, so reinstalling alone does not replace them; use Repair first. On an account with a long Windows profile folder name they are kept in `%ProgramData%\WVU-BMEG-<id>\rt` instead (see the next section).
 - **If Repair fails.** When the tools already in place are still complete (for example another program held a file, so nothing was replaced), they are kept and **Restore WVU Firmware** stays available; the information line says why the repair failed. Otherwise the Board card asks for Repair again.
 - **If the tools are missing.** If the app or Repair reports that the included tools are missing or incomplete, reinstall the course distribution. Repair is not offered then, because it cannot help. Share Advanced details or the diagnostic log with the instructor.
 
 Simulator recordings still work while the tools need attention.
+
+## Arduino tools cannot be set up for this Windows account
+
+The included Arduino compiler fails when the folder that holds the tools has 60 or more characters. The usual folder, `C:\Users\<profile folder>\AppData\Local\WVU-BMEG\rt`, has 35 characters plus the Windows profile folder name, so profile folders with more than 24 characters are too long, for example `firstname.lastname.CAMPUSDOMAIN` or a long name with a `.000` suffix. In PowerShell, `$env:LOCALAPPDATA` shows the profile folder.
+
+- **What the app does.** In that case it keeps the tools in `%ProgramData%\WVU-BMEG-<id>\rt` (`<id>` is derived from the Windows account), a folder that only this account, SYSTEM and Administrators can open. Nothing changes for the student.
+- **When that is not possible.** If `%ProgramData%` cannot be used (for example the computer's policy blocks it, or a folder of that name already belongs to another account), the Board card (or, with Source = Hardware, the message under the recording bar) says **The Arduino tools cannot be set up for this Windows account**. Repair is not offered: it extracts the tools to the same folder. Advanced details shows the folder and its length.
+- **For IT support.** Allow standard users to create folders in `%ProgramData%` (the Windows default), remove a stale `%ProgramData%\WVU-BMEG-<id>` folder that another account owns, or give the student an account with a shorter profile folder name. `application.log` records `ARDUINO_RUNTIME_ROOT` (fallback used), `ARDUINO_RUNTIME_SHARED_ROOT_REFUSED` (why the fallback folder was refused) or `ARDUINO_RUNTIME_ROOT_TOO_LONG`. Once the fallback is in use, an old `%LOCALAPPDATA%\WVU-BMEG\rt` left by version 1.0.x (about 700 MB) is no longer used and can be deleted; the app never deletes it.
+- **Versions 1.0.0 to 1.0.2.** They have the same compiler limit without the fallback: firmware restore fails with a compiler error such as `bits/c++config.h: No such file or directory`. Update the app on that computer.
+- **Profile folder names with other alphabets (known limitation).** The included compiler also fails when the Windows profile folder name has a character that the computer's Windows "language for non-Unicode programs" cannot represent, for example Chinese characters on a computer set to English: firmware restore stops with a compiler error ending in `Invalid argument`, and the path in it shows `??` in place of those characters. Characters of that language, such as `ë`, `é` or `ñ` on an English computer, work. The app has no fallback for this case: use a Windows account whose profile folder name uses only such characters. Simulator recordings still work.
+
+Simulator recordings still work.
 
 ## Board did not answer
 

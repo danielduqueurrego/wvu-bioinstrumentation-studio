@@ -10,8 +10,9 @@ releases or hardware work need. The exit code is 1 when any check fails.
 
 Checked: Git; Node.js 22 or later with npm; rustup with the toolchain pinned in
 rust-toolchain.toml (cargo installs it on first use); the Visual Studio C++
-build tools (MSVC) and a Windows 10/11 SDK; the WebView2 runtime; PowerShell 7
-(required by scripts/build_student_release.ps1); and whether
+build tools (MSVC) and a Windows 10/11 SDK; the WebView2 runtime; PowerShell
+7.2 or later (required by scripts/build_student_release.ps1 and the runtime
+and source-bundle scripts); and whether
 src-tauri/resources/arduino-runtime.zip is the reviewed archive, a CI
 placeholder, or missing.
 
@@ -165,11 +166,14 @@ if ($webView -and $webView -ne '0.0.0.0') {
 
 # --- PowerShell 7 -------------------------------------------------------------
 
+# The release, runtime and source-bundle scripts declare #Requires -Version 7.2.
 $pwsh = Invoke-Probe 'pwsh' @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()')
-if ($pwsh -and $pwsh -match '^(\d+)\.' -and [int]$Matches[1] -ge 7) {
+if (-not $pwsh) {
+  Add-Result 'WARN' 'PowerShell 7' 'pwsh 7.2 or later was not found. scripts/build_student_release.ps1, build_arduino_runtime.ps1 and build_third_party_sources.ps1 require it.'
+} elseif ($pwsh -match '^(\d+)\.(\d+)' -and ([int]$Matches[1] -gt 7 -or ([int]$Matches[1] -eq 7 -and [int]$Matches[2] -ge 2))) {
   Add-Result 'OK' 'PowerShell 7' $pwsh
 } else {
-  Add-Result 'WARN' 'PowerShell 7' 'pwsh 7 was not found. scripts/build_student_release.ps1 requires it.'
+  Add-Result 'WARN' 'PowerShell 7' "pwsh $pwsh is too old. scripts/build_student_release.ps1, build_arduino_runtime.ps1 and build_third_party_sources.ps1 require 7.2 or later."
 }
 
 # --- Arduino runtime archive --------------------------------------------------

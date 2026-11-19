@@ -1,0 +1,595 @@
+{
+  "schema": 2,
+  "bundle_name": "WVU-Bioinstrumentation-Studio-1.1.0-third-party-sources",
+  "title": "Corresponding source for the third-party tools in the offline Arduino runtime, bundle revision 4",
+  "project": {
+    "name": "WVU Bioinstrumentation Studio",
+    "description": "teaching software for the Arduino UNO R4 WiFi. It is for teaching use only and is not a medical device",
+    "license": "the Apache License 2.0",
+    "url": "https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio",
+    "maintainers": "The WVU Bioinstrumentation Studio maintainers (West Virginia University Department of Chemical and Biomedical Engineering)",
+    "installed_notices": "The installers also carry resources\\licenses\\BUNDLED_COMPONENTS.txt, which lists every component with its license, path and source, and bossac-LICENSE.txt."
+  },
+  "applies_to": {
+    "app_versions": [
+      "1.1.0"
+    ],
+    "installers": [
+      "WVU_Bioinstrumentation_Studio_1.1.0_x64-setup.exe",
+      "WVU_Bioinstrumentation_Studio_1.1.0_x64.msi"
+    ],
+    "runtime_archive": "resources\\arduino-runtime.zip (inside the installation folder)",
+    "runtime_extracted_to": "%LOCALAPPDATA%\\WVU-BMEG\\rt (or, when that path has 60 or more characters, %ProgramData%\\WVU-BMEG-<user id>\\rt)",
+    "runtime_bundle_revision": 4,
+    "runtime_arduino_cli": "1.6.0",
+    "runtime_renesas_uno_core": "1.6.0",
+    "runtime_archive_sha256": "5baa8a5fc7fc0c2ae7fd9f49de1876d76859067af6d56e9b56546a88a5d02def"
+  },
+  "source_request_url": "https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/issues/new?template=source_code_request.yml",
+  "written_offer_years": 3,
+  "zip_timestamp": "2026-11-18T00:00:00",
+  "go_toolchain": "go1.27.4",
+  "removed_components": [
+    {
+      "component": "OpenOCD",
+      "version": "0.11.0-arduino2",
+      "removed_in_revision": 4,
+      "notes": "Debug-probe tool, never used by the UNO R4 WiFi (it uploads with bossac). Shipped in runtime revision 3 (app 1.0.0-1.0.2). The source available for it is listed in release/third-party-sources-runtime3.json in the project's source repository; ask for it with the issue form in section 7."
+    },
+    {
+      "component": "dfu-util",
+      "version": "0.11.0-arduino5",
+      "removed_in_revision": 4,
+      "notes": "DFU uploader used by the UNO R4 Minima, not the UNO R4 WiFi. Shipped in runtime revision 3 (app 1.0.0-1.0.2). The source available for it is listed in release/third-party-sources-runtime3.json in the project's source repository; ask for it with the issue form in section 7. dfu-util 0.11 source files are still compiled into dfu-discovery, so the dfu-util 0.11 tarball below remains part of this bundle."
+    }
+  ],
+  "directions": [
+    {
+      "title": "Checking the files",
+      "text": "In Git Bash or Linux run \"sha256sum -c SHA256SUMS.txt\" in this folder; in PowerShell compare \"Get-FileHash -Algorithm SHA256 <file>\" with SHA256SUMS.txt. GitHub tag and commit archives are git archive output: \"gzip -dc <file>.tar.gz | git get-tar-commit-id\" prints the commit, which the build script checked against the Git line of each component. The vendor tree SHA-256 of a Go component identifies its vendored files independently of how the vendor ZIP was compressed: extract the ZIP, then hash a text with one line \"<SHA-256 of the file>  <path under vendor/>\" per file, modules.txt excluded, sorted by path in byte order, each line ending with a line feed. third-party-sources.json also pins the SHA-256 of vendor/modules.txt and the Go release that wrote it."
+    },
+    {
+      "title": "Go programs (Arduino CLI and the Arduino discovery and monitor tools)",
+      "components": [
+        "arduino-cli",
+        "serial-discovery",
+        "mdns-discovery",
+        "serial-monitor",
+        "dfu-discovery"
+      ],
+      "text": "Extract the .tar.gz, then extract the matching <component>-<version>-vendor.zip into the folder that holds go.mod, so that vendor/ sits next to go.mod. \"go build -mod=vendor\" then builds without network access. The vendor ZIP is the output of \"go mod vendor\" for the tagged go.mod and go.sum, checked with \"go mod verify\"; every module the shipped executable links has the same version and h1: hash in go.sum. Each shipped executable records the Go version, -ldflags, CGO_ENABLED and commit it was built with; \"go version -m <executable>\" prints them, and the Upstream build line repeats them. Build with GOOS=windows GOARCH=amd64. serial-discovery and dfu-discovery were built with CGO_ENABLED=1 and a MinGW-w64 C cross-compiler (Arduino uses the docker.elastic.co/beats-dev/golang-crossbuild images; see each repository's DistTasks.yml)."
+    },
+    {
+      "title": "dfu-discovery's C code",
+      "components": [
+        "dfu-discovery",
+        "dfu-util",
+        "libusb"
+      ],
+      "text": "dfu-discovery also compiles three dfu-util files and links libusb statically. Extract dfu-util-0.11.tar.gz and copy src/dfu_util.c, src/dfuse_mem.c and src/quirks.c to dfu-util_dfu_util.c, dfu-util_dfuse_mem.c and dfu-util_quirks.c in the dfu-discovery folder (its \"task download-dfu-util\"); build libusb-1.0.26.tar.bz2 as a static library for the same target (\"./configure --host=x86_64-w64-mingw32 --enable-static --disable-shared && make\") and point CGO_CFLAGS and CGO_LDFLAGS at it, as DistTasks.yml does. With the complete dfu-discovery source here, you can also relink it against a modified libusb."
+    },
+    {
+      "title": "ctags",
+      "components": [
+        "ctags"
+      ],
+      "text": "Arduino's fork of Exuberant Ctags 5.8 is a C program. Arduino builds the Windows executable with the workflow .github/workflows/build.yml in the tag archive: on Linux, with llvm-mingw 20261020 (the workflow pins its SHA-256), it runs \"make -f mk_mingw.mak CC=x86_64-w64-mingw32-clang CFLAGS='-Wall -static -DPROGRAM_VERSION=\\\"5.8-arduino12\\\"' ctags.exe\" and strips the result. mk_mingw.mak and source.mak list the source files."
+    },
+    {
+      "title": "GNU Arm Embedded Toolchain",
+      "components": [
+        "arm-none-eabi-gcc",
+        "gcc-host-gmp",
+        "gcc-host-mpfr",
+        "gcc-host-mpc",
+        "gcc-host-isl",
+        "gcc-host-libiconv",
+        "gcc-host-expat",
+        "gcc-host-zlib"
+      ],
+      "text": "gcc-arm-none-eabi-7-2017-q4-major-src.tar.bz2 is Arm's source release for the binaries in data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4 (Arduino repackages Arm's Windows release without rebuilding it). It holds the sources of GCC, Binutils, Newlib and GDB, Arm's release notes, How-to-build-toolchain.pdf and the build scripts (install-sources.sh, build-prerequisites.sh, build-toolchain.sh) that build the Windows-hosted toolchain on Linux with MinGW-w64. Arm's install-sources.sh downloads the host libraries that the Windows executables link statically (GMP, MPFR, MPC, isl, Expat, GNU libiconv, zlib); this bundle includes those exact versions in the sources/gcc-host-* folders, so place them in the src/ folder as install-sources.sh would instead of downloading them. build-common.sh also lists libelf 0.8.13, which none of the shipped executables links, and a Python 2.7.13 installer used only to build arm-none-eabi-gdb-py.exe, which loads a separately installed Python 2.7 at run time (Python is not shipped)."
+    },
+    {
+      "title": "Arduino UNO R4 core",
+      "components": [
+        "ArduinoCore-renesas",
+        "ArduinoCore-API"
+      ],
+      "text": "The folder data/packages/arduino/hardware/renesas_uno/1.6.0 is itself source code (apart from the prebuilt files listed in its notes). Arduino builds it from the ArduinoCore-renesas 1.6.0 tag with extras/package.sh, which needs ArduinoCore-API checked out beside it as ../ArduinoCore-API and copies its api/ folder into cores/arduino/api. At extraction, WVU Bioinstrumentation Studio inserts one marked line into cores/arduino/usb/SerialUSB.h (a write_raw compatibility method, labelled \"WVU native-USB compatibility shim\"); the code that does so is src-tauri/src/arduino_runtime.rs in the project repository."
+    },
+    {
+      "title": "Installing a modified tool",
+      "text": "The tools run from the runtime folder named in section 1. WVU Bioinstrumentation Studio compares that folder with its runtime archive and offers \"Repair Arduino tools\", which restores the original files. To use modified tools permanently, use them from your own Arduino CLI installation, or rebuild resources\\arduino-runtime.zip with them (scripts/build_arduino_runtime.ps1 and docs/DEVELOPER_GUIDE.md in the project repository describe how)."
+    }
+  ],
+  "license_refs": {
+    "LicenseRef-Newlib": "the Newlib C library carries many BSD-style and similar permissive notices, listed in share/doc/gcc-arm-none-eabi/license.txt in the toolchain folder.",
+    "LicenseRef-Microsoft-DPInst": "dpinst-amd64.exe and dpinst-x86.exe in the core's drivers folder are Microsoft's Driver Package Installer, distributed by Arduino under Microsoft's redistribution terms; they are not open source and are not covered by this bundle."
+  },
+  "components": [
+    {
+      "id": "arduino-cli",
+      "component": "Arduino CLI",
+      "version": "1.6.0",
+      "kind": "source",
+      "license": "GPL-3.0-only",
+      "bundled_paths": [
+        "arduino-cli.exe",
+        "arduino-cli-LICENSE.txt"
+      ],
+      "source_url": "https://github.com/arduino/arduino-cli/archive/refs/tags/v1.6.0.tar.gz",
+      "source_filename": "arduino-cli-1.6.0.tar.gz",
+      "sha256": "d513a9fbac5a30e63dde600d3e44e3376d68a7e2c11e9c692c1afa9b479479b4",
+      "git": {
+        "repository": "https://github.com/arduino/arduino-cli",
+        "ref": "v1.6.0",
+        "commit": "50a0e80daf5d5a4e6cdf57b51fbfd71f07a43462"
+      },
+      "go_vendored": true,
+      "vendor": {
+        "go_version": "go1.27.4",
+        "modules": 192,
+        "files": 6143,
+        "files_sha256": "84ba8ba4f4cd78ac9a1f7ec27ec210019a1540e45a4ca469961ba898157e0863",
+        "modules_txt_sha256": "1209ede3784a96ec67d469b6fbbfcc81990e1f97ed93e6ea01bfd3133acb8427"
+      },
+      "go_binaries": [
+        "arduino-cli.exe"
+      ],
+      "build_hint": "go1.27.3, GOOS=windows GOARCH=amd64 GOAMD64=v1 CGO_ENABLED=0, in the module folder: go build -mod=vendor -ldflags \"-X github.com/arduino/arduino-cli/internal/version.versionString=1.6.0 -X github.com/arduino/arduino-cli/internal/version.commit=50a0e80da -X github.com/arduino/arduino-cli/internal/version.date=2026-11-10T15:30:44Z\" (from the build information embedded in the shipped executable)",
+      "exact": true,
+      "notes": "Binary from https://downloads.arduino.cc/arduino-cli/arduino-cli_1.6.0_Windows_64bit.zip (SHA-256 2769b9b2..., equal to the release's 1.6.0-checksums.txt). Its embedded Go build info names vcs.revision 50a0e80daf5d5a4e6cdf57b51fbfd71f07a43462 (the v1.6.0 tag), vcs.modified=false, CGO_ENABLED=0, go1.27.3. Go module dependencies (various licenses: Apache-2.0, BSD-3-Clause, MIT, MPL-2.0 and others; each module's license file is in the vendor tree) are in the vendor ZIP."
+    },
+    {
+      "id": "serial-discovery",
+      "component": "Arduino serial-discovery",
+      "version": "1.5.2",
+      "kind": "source",
+      "license": "GPL-3.0-only",
+      "bundled_paths": [
+        "data/packages/builtin/tools/serial-discovery/1.5.2/"
+      ],
+      "source_url": "https://github.com/arduino/serial-discovery/archive/refs/tags/v1.5.2.tar.gz",
+      "source_filename": "serial-discovery-1.5.2.tar.gz",
+      "sha256": "b378887e69a077e59a1cc583833766feb318140bb92e4140a8c79635f4339015",
+      "git": {
+        "repository": "https://github.com/arduino/serial-discovery",
+        "ref": "v1.5.2",
+        "commit": "fcbd39ac7c612a1dd8a9a300d0534324315e5908"
+      },
+      "go_vendored": true,
+      "vendor": {
+        "go_version": "go1.27.4",
+        "modules": 155,
+        "files": 5380,
+        "files_sha256": "61fc78d1f0b95b41b5c440cffe1ef846fbbaed37be5c69cfacf6027737b2175b",
+        "modules_txt_sha256": "1f81d84d81202bb709ae27113d3f6b5348754c42af96bea734797e4bb7b335ca"
+      },
+      "go_binaries": [
+        "data/packages/builtin/tools/serial-discovery/1.5.2/serial-discovery.exe"
+      ],
+      "build_hint": "go1.26.0, GOOS=windows GOARCH=amd64 GOAMD64=v1 CGO_ENABLED=1, in the module folder: go build -mod=vendor -ldflags \"-X github.com/arduino/serial-discovery/version.Version=v1.5.2 -X github.com/arduino/serial-discovery/version.Commit=fcbd39a -X github.com/arduino/serial-discovery/version.Timestamp=2026-07-23T11:39:55Z\" (from the build information embedded in the shipped executable)",
+      "exact": true,
+      "notes": "Installed by Arduino CLI from https://downloads.arduino.cc/discovery/serial-discovery/serial-discovery_v1.5.2_Windows_64bit.zip (checked by Arduino CLI against the signed package index). Embedded Go build info: vcs.revision fcbd39ac (tag v1.5.2), vcs.modified=false, CGO_ENABLED=1 (MinGW-w64 C runtime only), go1.26.0. go.bug.st/serial is replaced by github.com/facchinm/go-serial v0.0.0-20260721142242-f705fc98b886 (BSD-3-Clause), included in the vendor ZIP."
+    },
+    {
+      "id": "mdns-discovery",
+      "component": "Arduino mdns-discovery",
+      "version": "1.1.0",
+      "kind": "source",
+      "license": "GPL-3.0-only",
+      "bundled_paths": [
+        "data/packages/builtin/tools/mdns-discovery/1.1.0/"
+      ],
+      "source_url": "https://github.com/arduino/mdns-discovery/archive/refs/tags/v1.1.0.tar.gz",
+      "source_filename": "mdns-discovery-1.1.0.tar.gz",
+      "sha256": "df56ab93f4db4bfcdf508dd8861cea6293704b967fb255b6f01782e22bac1e0c",
+      "git": {
+        "repository": "https://github.com/arduino/mdns-discovery",
+        "ref": "v1.1.0",
+        "commit": "435f0445a9d70f48d7bbd4910da23394e8a44bf9"
+      },
+      "go_vendored": true,
+      "vendor": {
+        "go_version": "go1.27.4",
+        "modules": 11,
+        "files": 789,
+        "files_sha256": "cc47e5738d1dff02aafd70d7b6dd865a57227860ce15678a41754167a20eeb78",
+        "modules_txt_sha256": "928ac7943237d766687ca448d5dc58d290e44acc208b6d6d64898e31f05465b7"
+      },
+      "go_binaries": [
+        "data/packages/builtin/tools/mdns-discovery/1.1.0/mdns-discovery.exe"
+      ],
+      "build_hint": "go1.25.2, GOOS=windows GOARCH=amd64 GOAMD64=v1 CGO_ENABLED=0, in the module folder: go build -mod=vendor -ldflags \"-X github.com/arduino/mdns-discovery/version.Version=v1.1.0 -X github.com/arduino/mdns-discovery/version.Commit=435f044 -X github.com/arduino/mdns-discovery/version.Timestamp=2026-07-03T10:24:12Z\" (from the build information embedded in the shipped executable)",
+      "exact": true,
+      "notes": "Installed by Arduino CLI from https://downloads.arduino.cc/discovery/mdns-discovery/mdns-discovery_v1.1.0_Windows_64bit.zip. Embedded Go build info: vcs.revision 435f0445 (tag v1.1.0), vcs.modified=false, CGO_ENABLED=0, go1.25.2. github.com/hashicorp/mdns is replaced by github.com/cmaglie/mdns v1.0.6-0.20260615092725-1cef078b7fd6 (MIT), included in the vendor ZIP."
+    },
+    {
+      "id": "serial-monitor",
+      "component": "Arduino serial-monitor",
+      "version": "0.15.0",
+      "kind": "source",
+      "license": "GPL-3.0-only",
+      "bundled_paths": [
+        "data/packages/builtin/tools/serial-monitor/0.15.0/"
+      ],
+      "source_url": "https://github.com/arduino/serial-monitor/archive/refs/tags/v0.15.0.tar.gz",
+      "source_filename": "serial-monitor-0.15.0.tar.gz",
+      "sha256": "3cc0e71794df985cba982d757706e259cd6ee960891ccf7b03d252b4afb6e343",
+      "git": {
+        "repository": "https://github.com/arduino/serial-monitor",
+        "ref": "v0.15.0",
+        "commit": "13b8e8058fd5c3eb24e97cba091f3a897aa20afb"
+      },
+      "go_vendored": true,
+      "vendor": {
+        "go_version": "go1.27.4",
+        "modules": 7,
+        "files": 418,
+        "files_sha256": "f04181239a2659b5641d2856ff9bbd079e30daed5451257f76634b8737d89c6c",
+        "modules_txt_sha256": "b7571530da923a2b5bf4b0783f69ac569d77d60e2bcfbd9e25c529dc02e754ee"
+      },
+      "go_binaries": [
+        "data/packages/builtin/tools/serial-monitor/0.15.0/serial-monitor.exe"
+      ],
+      "build_hint": "go1.24.1, GOOS=windows GOARCH=amd64 GOAMD64=v1 CGO_ENABLED=0, in the module folder: go build -mod=vendor -ldflags \"-X github.com/arduino/serial-monitor/version.Version=v0.15.0 -X github.com/arduino/serial-monitor/version.Commit=13b8e80 -X github.com/arduino/serial-monitor/version.Timestamp=2025-03-18T11:28:44Z\" (from the build information embedded in the shipped executable)",
+      "exact": true,
+      "notes": "Installed by Arduino CLI from https://downloads.arduino.cc/monitor/serial-monitor/serial-monitor_v0.15.0_Windows_64bit.zip. Embedded Go build info: vcs.revision 13b8e805 (tag v0.15.0), vcs.modified=false, CGO_ENABLED=0, go1.24.1."
+    },
+    {
+      "id": "dfu-discovery",
+      "component": "Arduino dfu-discovery",
+      "version": "0.1.2",
+      "kind": "source",
+      "license": "GPL-3.0-only",
+      "bundled_paths": [
+        "data/packages/builtin/tools/dfu-discovery/0.1.2/"
+      ],
+      "source_url": "https://github.com/arduino/dfu-discovery/archive/refs/tags/v0.1.2.tar.gz",
+      "source_filename": "dfu-discovery-0.1.2.tar.gz",
+      "sha256": "3f03cab77b01eea5f8c954ddd46663899386d92a05b5148c77cd16291f6e093f",
+      "git": {
+        "repository": "https://github.com/arduino/dfu-discovery",
+        "ref": "v0.1.2",
+        "commit": "d8474a7eb0279e7afb30ebd0a5f5de97fbb29530"
+      },
+      "go_vendored": true,
+      "vendor": {
+        "go_version": "go1.27.4",
+        "modules": 6,
+        "files": 83,
+        "files_sha256": "04a46f4719a2e439877d9b5d9e00b1c7d7b4fe6c95a15d61c9260a3adaa13015",
+        "modules_txt_sha256": "938ec74d7977f7022847ec5223e9de400f490c3f20f3fbb257eb19bb56b50c46"
+      },
+      "go_binaries": [
+        "data/packages/builtin/tools/dfu-discovery/0.1.2/dfu-discovery.exe"
+      ],
+      "build_hint": "go1.19.3, GOOS=windows GOARCH=amd64 GOAMD64=v1 CGO_ENABLED=1, in the module folder: go build -mod=vendor -ldflags \"-X github.com/arduino/dfu-discovery/version.Version=v0.1.2 -X github.com/arduino/dfu-discovery/version.Commit=d8474a7 -X github.com/arduino/dfu-discovery/version.Timestamp=2023-03-14T11:12:58Z\" (from the build information embedded in the shipped executable)",
+      "exact": true,
+      "notes": "Installed by Arduino CLI from https://downloads.arduino.cc/discovery/dfu-discovery/dfu-discovery_v0.1.2_Windows_64bit.zip. Embedded Go build info: vcs.revision d8474a7e (tag v0.1.2), vcs.modified=false, CGO_ENABLED=1, go1.19.3. It is a cgo program: its Taskfile.yml (task download-dfu-util) copies dfu_util.c, dfuse_mem.c and quirks.c from dfu-util-0.11.tar.gz, and DistTasks.yml statically links libusb 1.0.26 built from libusb-1.0.26.tar.bz2 (the binary contains the path /home/build/libusb-1.0.26/libusb). Both tarballs are in this bundle (entries dfu-util and libusb). The repository's LICENSE.txt is GPLv3; its README points to GPLv2; the compiled dfu-util files are GPL-2.0-or-later, so the combined binary is distributable under GPLv3."
+    },
+    {
+      "id": "dfu-util",
+      "component": "dfu-util (source files compiled into dfu-discovery)",
+      "version": "0.11",
+      "kind": "source",
+      "license": "GPL-2.0-or-later",
+      "bundled_paths": [
+        "data/packages/builtin/tools/dfu-discovery/0.1.2/dfu-discovery.exe"
+      ],
+      "source_url": "https://dfu-util.sourceforge.net/releases/dfu-util-0.11.tar.gz",
+      "source_filename": "dfu-util-0.11.tar.gz",
+      "sha256": "b4b53ba21a82ef7e3d4c47df2952adf5fa494f499b6b0b57c58c5d04ae8ff19e",
+      "published_checksum": {
+        "algorithm": "MD5",
+        "value": "31c983543a1fe8f03260ca4d56ad4f43",
+        "url": "https://dfu-util.sourceforge.net/releases/dfu-util-0.11.tar.gz.md5"
+      },
+      "go_vendored": false,
+      "exact": true,
+      "notes": "The exact tarball named by dfu-discovery v0.1.2 Taskfile.yml (DFU_UTIL_VERSION: dfu-util-0.11). The dfu-util program itself is no longer in the runtime from revision 4."
+    },
+    {
+      "id": "libusb",
+      "component": "libusb (statically linked into dfu-discovery)",
+      "version": "1.0.26",
+      "kind": "source",
+      "license": "LGPL-2.1-or-later",
+      "bundled_paths": [
+        "data/packages/builtin/tools/dfu-discovery/0.1.2/dfu-discovery.exe"
+      ],
+      "source_url": "https://github.com/libusb/libusb/releases/download/v1.0.26/libusb-1.0.26.tar.bz2",
+      "source_filename": "libusb-1.0.26.tar.bz2",
+      "sha256": "12ce7a61fc9854d1d2a1ffe095f7b5fac19ddba095c259e6067a46500381b5a5",
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Official release tarball (the libusb project marks the .tar.bz2, not GitHub's generated .tar.gz, as the release file; a detached PGP signature libusb-1.0.26.tar.bz2.asc is published beside it). dfu-discovery v0.1.2 DistTasks.yml downloads this URL and links it statically. Because the complete source of dfu-discovery is also in this bundle, a recipient can modify libusb and relink dfu-discovery (LGPL-2.1 section 6)."
+    },
+    {
+      "id": "ctags",
+      "component": "Exuberant Ctags, Arduino build",
+      "version": "5.8-arduino12",
+      "kind": "source",
+      "license": "GPL-2.0-or-later",
+      "bundled_paths": [
+        "data/packages/builtin/tools/ctags/5.8-arduino12/"
+      ],
+      "source_url": "https://github.com/arduino/ctags/archive/refs/tags/v5.8-arduino12.tar.gz",
+      "source_filename": "ctags-5.8-arduino12.tar.gz",
+      "sha256": "6b865cfdd1a4ab2cb62b46b61e5a4bcd5652aedf27f2c592881ae773f367c16e",
+      "git": {
+        "repository": "https://github.com/arduino/ctags",
+        "ref": "v5.8-arduino12",
+        "commit": "740e75e1dca4adaaae8e66f16fc1573220235107"
+      },
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Installed by Arduino CLI from https://downloads.arduino.cc/tools/ctags/ctags-5.8-arduino12-windows_amd64.tar.gz. The tag is v5.8-arduino12 (with a leading v, unlike earlier tags). The runtime archive has no license file for ctags; the GPLv2 text is at GPL-2.0.txt in the runtime archive root. The source files say they are released under \"the GNU General Public License\" without naming a version, and COPYING holds GPL version 2; GPL section 9 then lets the recipient choose any version, hence GPL-2.0-or-later."
+    },
+    {
+      "id": "arm-none-eabi-gcc",
+      "component": "GNU Arm Embedded Toolchain (GCC, Binutils, Newlib, GDB)",
+      "version": "7-2017q4",
+      "kind": "source",
+      "license": "GPL-3.0-or-later AND GPL-3.0-or-later WITH GCC-exception-3.1 AND GPL-2.0-or-later AND LGPL-3.0-or-later AND LGPL-2.1-or-later AND LicenseRef-Newlib",
+      "bundled_paths": [
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/"
+      ],
+      "source_url": "https://developer.arm.com/-/media/Files/downloads/gnu-rm/7-2017q4/gcc-arm-none-eabi-7-2017-q4-major-src.tar.bz2",
+      "source_filename": "gcc-arm-none-eabi-7-2017-q4-major-src.tar.bz2",
+      "sha256": "e9927d5a3bdcfe9d57206ec9930c617692b5a200ebe549c3b58f2742853d351b",
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Arduino repackages Arm's Windows binary release 7-2017-q4-major (https://downloads.arduino.cc/tools/gcc-arm-none-eabi-7-2017-q4-major-win32-arduino1.zip). This is Arm's source package for that release: GCC, Binutils, Newlib and GDB, plus Arm's build scripts (install-sources.sh, build-common.sh, build-prerequisites.sh, build-toolchain.sh), How-to-build-toolchain.pdf and release notes. Arm publishes only an MD5 on its JavaScript-rendered download page, which could not be retrieved automatically; the SHA-256 was recorded on first download. The full component license list is share/doc/gcc-arm-none-eabi/license.txt inside the runtime. The URL redirects to armkeil.blob.core.windows.net. Arm's package does not contain the sources of the host libraries that the Windows executables link statically; its install-sources.sh downloads them. They are the gcc-host-* entries of this manifest (GMP 6.1.0, MPFR 3.1.4, MPC 1.0.3, isl 0.15, GNU libiconv 1.14, Expat 2.1.1, zlib 1.2.8). build-common.sh also lists libelf 0.8.13, which none of the shipped executables links (no libelf strings in any of them), and a Python 2.7.13 installer used only to build arm-none-eabi-gdb-py.exe, which loads a separately installed Python at run time."
+    },
+    {
+      "id": "gcc-host-gmp",
+      "component": "GMP (GNU Multiple Precision library), toolchain host library",
+      "version": "6.1.0",
+      "kind": "source",
+      "license": "LGPL-3.0-or-later OR GPL-2.0-or-later",
+      "bundled_paths": [
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/cc1.exe",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/cc1plus.exe",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/lto1.exe"
+      ],
+      "source_url": "https://ftp.gnu.org/gnu/gmp/gmp-6.1.0.tar.bz2",
+      "source_filename": "gmp-6.1.0.tar.bz2",
+      "sha256": "498449a994efeba527885c10405993427995d3f86b8768d8cdf8d9dd7c6b73e8",
+      "published_checksum": {
+        "algorithm": "SHA512",
+        "value": "3c82aeab9c1596d4da8afac2eec38e429e84f3211e1a572cf8fd2b546493c44c039b922a1133eaaa48bd7f3e11dbe795a384e21ed95cbe3ecc58d7ac02246117",
+        "url": "https://gcc.gnu.org/pub/gcc/infrastructure/sha512.sum"
+      },
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Statically linked into the GNU Arm toolchain's Windows executables. Arm's source package does not contain it: install-sources.sh downloads it (version and file name from build-common.sh). Arm downloaded it from gmplib.org; this is the GNU mirror copy, checked against GCC's published SHA-512 list. cc1.exe, cc1plus.exe and lto1.exe contain the version string 6.1.0."
+    },
+    {
+      "id": "gcc-host-mpfr",
+      "component": "MPFR, toolchain host library",
+      "version": "3.1.4",
+      "kind": "source",
+      "license": "LGPL-3.0-or-later",
+      "bundled_paths": [
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/cc1.exe",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/cc1plus.exe",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/lto1.exe"
+      ],
+      "source_url": "https://ftp.gnu.org/gnu/mpfr/mpfr-3.1.4.tar.bz2",
+      "source_filename": "mpfr-3.1.4.tar.bz2",
+      "sha256": "d3103a80cdad2407ed581f3618c4bed04e0c92d1cf771a65ead662cc397f7775",
+      "published_checksum": {
+        "algorithm": "SHA512",
+        "value": "51066066ff2c12ed2198605ecf68846b0c96b548adafa5b80e0c786d0df488411a5e8973358fce7192dc977ad4e68414cf14500e3c39746de62465eb145bb819",
+        "url": "https://gcc.gnu.org/pub/gcc/infrastructure/sha512.sum"
+      },
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Statically linked into the GNU Arm toolchain's Windows executables. Arm's source package does not contain it: install-sources.sh downloads it (version and file name from build-common.sh). The same URL Arm's script uses; checked against GCC's published SHA-512 list. cc1.exe, cc1plus.exe and lto1.exe contain the version string 3.1.4."
+    },
+    {
+      "id": "gcc-host-mpc",
+      "component": "GNU MPC, toolchain host library",
+      "version": "1.0.3",
+      "kind": "source",
+      "license": "LGPL-3.0-or-later",
+      "bundled_paths": [
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/cc1.exe",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/cc1plus.exe",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/lto1.exe"
+      ],
+      "source_url": "https://ftp.gnu.org/gnu/mpc/mpc-1.0.3.tar.gz",
+      "source_filename": "mpc-1.0.3.tar.gz",
+      "sha256": "617decc6ea09889fb08ede330917a00b16809b8db88c29c31bfbb49cbf88ecc3",
+      "published_checksum": {
+        "algorithm": "SHA512",
+        "value": "0028b76df130720c1fad7de937a0d041224806ce5ef76589f19c7b49d956071a683e2f20d154c192a231e69756b19e48208f2889b0c13950ceb7b3cfaf059a43",
+        "url": "https://gcc.gnu.org/pub/gcc/infrastructure/sha512.sum"
+      },
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Statically linked into the GNU Arm toolchain's Windows executables. Arm's source package does not contain it: install-sources.sh downloads it (version and file name from build-common.sh). Arm's script used the ftp:// form of this URL; checked against GCC's published SHA-512 list. cc1.exe, cc1plus.exe and lto1.exe contain the version string 1.0.3."
+    },
+    {
+      "id": "gcc-host-isl",
+      "component": "isl (Integer Set Library), toolchain host library",
+      "version": "0.15",
+      "kind": "source",
+      "license": "MIT",
+      "bundled_paths": [
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/cc1.exe",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/cc1plus.exe",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/lto1.exe"
+      ],
+      "source_url": "https://gcc.gnu.org/pub/gcc/infrastructure/isl-0.15.tar.bz2",
+      "source_filename": "isl-0.15.tar.bz2",
+      "sha256": "8ceebbf4d9a81afa2b4449113cee4b7cb14a687d7a549a963deb5e2a41458b6b",
+      "published_checksum": {
+        "algorithm": "SHA512",
+        "value": "1e27b7798f7428abcb5e9b2e3fbe3842fede54c03bbd7bd3cf83703e1e4cca7d95c51326ab90253fe55b38c002183e8e78dfbb4d2cf20b0aabe02443c8e7d50f",
+        "url": "https://gcc.gnu.org/pub/gcc/infrastructure/sha512.sum"
+      },
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Statically linked into the GNU Arm toolchain's Windows executables. Arm's source package does not contain it: install-sources.sh downloads it (version and file name from build-common.sh). Permissive license; included because it is part of the GPL executables' complete source. Arm's URL (isl.gforge.inria.fr) no longer exists; this is GCC's infrastructure copy, checked against GCC's published SHA-512 list. cc1.exe, cc1plus.exe and lto1.exe contain the string isl-0.15."
+    },
+    {
+      "id": "gcc-host-libiconv",
+      "component": "GNU libiconv, toolchain host library",
+      "version": "1.14",
+      "kind": "source",
+      "license": "LGPL-2.0-or-later AND GPL-3.0-or-later",
+      "bundled_paths": [
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/bin/",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/lib/gcc/arm-none-eabi/7.2.1/"
+      ],
+      "source_url": "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-1.14.tar.gz",
+      "source_filename": "libiconv-1.14.tar.gz",
+      "sha256": "72b24ded17d687193c3366d0ebe7cde1e6b18f0df8c55438ac95be39e8a30613",
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Statically linked into the GNU Arm toolchain's Windows executables. Arm's source package does not contain it: install-sources.sh downloads it (version and file name from build-common.sh). The same URL Arm's script uses (a GPG signature .sig is published beside it). Arm's build passes --with-libiconv-prefix to GCC and GDB; the GCC drivers, cc1, cc1plus, lto1, collect2 and gcov reference iconv. The library is LGPL-2.0-or-later; the iconv program in the archive is GPL-3.0-or-later and is not shipped."
+    },
+    {
+      "id": "gcc-host-expat",
+      "component": "Expat XML parser, toolchain host library",
+      "version": "2.1.1",
+      "kind": "source",
+      "license": "MIT",
+      "bundled_paths": [
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/bin/arm-none-eabi-gdb.exe",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/bin/arm-none-eabi-gdb-py.exe"
+      ],
+      "source_url": "https://github.com/libexpat/libexpat/releases/download/R_2_1_1/expat-2.1.1.tar.bz2",
+      "source_filename": "expat-2.1.1.tar.bz2",
+      "sha256": "aff584e5a2f759dcfc6d48671e9529f6afe1e30b0cd6a4cec200cbe3f793de67",
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Statically linked into the GNU Arm toolchain's Windows executables. Arm's source package does not contain it: install-sources.sh downloads it (version and file name from build-common.sh). Permissive license; included because it is part of GDB's complete source. Arm downloaded it from SourceForge, which no longer serves it; this is the Expat project's release file on GitHub. Both GDB executables contain the string expat_2.1.1."
+    },
+    {
+      "id": "gcc-host-zlib",
+      "component": "zlib, toolchain host library",
+      "version": "1.2.8",
+      "kind": "source",
+      "license": "Zlib",
+      "bundled_paths": [
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/bin/",
+        "data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/arm-none-eabi/bin/"
+      ],
+      "source_url": "https://www.zlib.net/fossils/zlib-1.2.8.tar.gz",
+      "source_filename": "zlib-1.2.8.tar.gz",
+      "sha256": "36658cb768a54c1d4dec43c3116c27ed893e88b02ecfcb44f2166f9c0b7f2a0d",
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Statically linked into the GNU Arm toolchain's Windows executables. Arm's source package does not contain it: install-sources.sh downloads it (version and file name from build-common.sh). Permissive license; included because it is part of the Binutils and GDB executables' complete source. The same URL Arm's script uses. The Binutils and GDB executables contain the strings 'inflate 1.2.8' and 'deflate 1.2.8'."
+    },
+    {
+      "id": "ArduinoCore-renesas",
+      "component": "Arduino UNO R4 core (ArduinoCore-renesas, renesas_uno)",
+      "version": "1.6.0",
+      "kind": "source",
+      "license": "LGPL-2.1-or-later AND MIT AND BSD-3-Clause AND Apache-2.0 AND LicenseRef-Microsoft-DPInst",
+      "bundled_paths": [
+        "data/packages/arduino/hardware/renesas_uno/1.6.0/"
+      ],
+      "source_url": "https://github.com/arduino/ArduinoCore-renesas/archive/refs/tags/1.6.0.tar.gz",
+      "source_filename": "ArduinoCore-renesas-1.6.0.tar.gz",
+      "sha256": "087b05975c41e4eb2f6717d53e36f14eecd973a52745a354c5d0a013f3f729f6",
+      "git": {
+        "repository": "https://github.com/arduino/ArduinoCore-renesas",
+        "ref": "1.6.0",
+        "commit": "424e86eff92d37f72123c2b641dd8bbf06a38b47"
+      },
+      "go_vendored": false,
+      "exact": true,
+      "notes": "The runtime holds the core as Arduino ships it (https://downloads.arduino.cc/cores/staging/ArduinoCore-renesas_uno-1.6.0.tar.bz2), which is itself mostly source code. Arduino's extras/package.sh builds that package from this tag: it follows the cores/arduino/api symlink to a checkout of ArduinoCore-API (see the ArduinoCore-API entry) and leaves out extras/. Not source: variants/*/libs/libfsp.a (Renesas FSP, BSD-3-Clause, built from the extras/fsp submodule https://github.com/arduino/fsp), bootloaders/*.hex and .elf, and drivers/dpinst-*.exe (Microsoft Driver Package Installer, a Microsoft redistributable, not open source). The GitHub tag archive does not contain git submodules."
+    },
+    {
+      "id": "ArduinoCore-API",
+      "component": "Arduino core API (shipped as cores/arduino/api in the UNO R4 core)",
+      "version": "1.5.2",
+      "kind": "source",
+      "license": "LGPL-2.1-or-later",
+      "bundled_paths": [
+        "data/packages/arduino/hardware/renesas_uno/1.6.0/cores/arduino/api/"
+      ],
+      "source_url": "https://github.com/arduino/ArduinoCore-API/archive/refs/tags/1.5.2.tar.gz",
+      "source_filename": "ArduinoCore-API-1.5.2.tar.gz",
+      "sha256": "2c76d4dcea29d1d093d821804dcc1ccd83d172ef0d359d7c651cdbba6e6bfa57",
+      "git": {
+        "repository": "https://github.com/arduino/ArduinoCore-API",
+        "ref": "1.5.2",
+        "commit": "cd91833d90b4fe50e428021ba5051e2b7ceafc84"
+      },
+      "go_vendored": false,
+      "exact": true,
+      "notes": "ArduinoCore-renesas 1.6.0 (tagged 2026-05-28) cloned ArduinoCore-API master at packaging time; master's last change to api/ is tag 1.5.2 (later commits change only the README). All 46 files under the core's cores/arduino/api/ are byte-identical to api/ in this archive (checked for runtime revisions 3 and 4)."
+    },
+    {
+      "id": "bossac",
+      "component": "BOSSA uploader (bossac), Arduino build",
+      "version": "1.9.1-arduino5",
+      "kind": "license-only",
+      "license": "BSD-3-Clause",
+      "bundled_paths": [
+        "data/packages/arduino/tools/bossac/1.9.1-arduino5/"
+      ],
+      "source_url": "https://raw.githubusercontent.com/arduino/BOSSA/496620b2720e2ab78f41eaefea66c52f950414fe/LICENSE",
+      "source_filename": "BOSSA-LICENSE.txt",
+      "sha256": "f442f8564a2e424673470c4e10c204161eccdc872404d3c7cb348c7701ab3c0f",
+      "go_vendored": false,
+      "exact": true,
+      "notes": "BSD-licensed, so no source is required; only the license is included. Source: https://github.com/arduino/BOSSA (Arduino publishes no 1.9.1-arduino5 tag; the nearest tags are 1.9.1-arduino2 and 1.9.1-arduino6, and the unor4wifi branch). The LICENSE text is identical at both tags (this copy is from tag 1.9.1-arduino6, commit 496620b2) and matches the installer's resources\\licenses\\bossac-LICENSE.txt apart from line endings. Binary: https://downloads.arduino.cc/tools/bossac-1.9.1-arduino5-windows.tar.gz."
+    },
+    {
+      "id": "license-GPL-3.0",
+      "component": "GNU General Public License version 3 text",
+      "version": "3",
+      "kind": "license-text",
+      "license": "LicenseRef-GNU-license-text",
+      "bundled_paths": [
+        "arduino-cli-LICENSE.txt"
+      ],
+      "source_url": "https://www.gnu.org/licenses/gpl-3.0.txt",
+      "source_filename": "GPL-3.0.txt",
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Reference copy, byte-identical (SHA-256 3972dc97...) to arduino-cli-LICENSE.txt and the LICENSE.txt of the Arduino discovery tools. Each source archive keeps its own license files."
+    },
+    {
+      "id": "license-GPL-2.0",
+      "component": "GNU General Public License version 2 text",
+      "version": "2",
+      "kind": "license-text",
+      "license": "LicenseRef-GNU-license-text",
+      "bundled_paths": [
+        "GPL-2.0.txt"
+      ],
+      "source_url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt",
+      "source_filename": "GPL-2.0.txt",
+      "sha256": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6",
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Same text and SHA-256 as GPL-2.0.txt at the runtime archive root."
+    },
+    {
+      "id": "license-LGPL-2.1",
+      "component": "GNU Lesser General Public License version 2.1 text",
+      "version": "2.1",
+      "kind": "license-text",
+      "license": "LicenseRef-GNU-license-text",
+      "bundled_paths": [
+        "LGPL-2.1.txt"
+      ],
+      "source_url": "https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt",
+      "source_filename": "LGPL-2.1.txt",
+      "sha256": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95",
+      "go_vendored": false,
+      "exact": true,
+      "notes": "Same text and SHA-256 as LGPL-2.1.txt at the runtime archive root."
+    }
+  ]
+}

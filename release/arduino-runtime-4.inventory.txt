@@ -1,0 +1,143 @@
+WVU Bioinstrumentation Studio - bundled Arduino runtime inventory
+Generated (UTC): 2026-11-19T02:29:21Z by build_arduino_runtime.ps1
+PowerShell 7.7.0, .NET 11.0.0
+
+Archive
+  file: arduino-runtime.zip
+  SHA-256: 5baa8a5fc7fc0c2ae7fd9f49de1876d76859067af6d56e9b56546a88a5d02def
+  size: 193000375 bytes
+  entries: 6339 (6337 files, 2 empty-folder entries); 701807263 bytes uncompressed
+  entry timestamp: 2026-11-10T00:00:00 for every entry; ordinal order; '/' separators; no wrapper folder
+  determinism: a second ZIP from the same folder had the same SHA-256 (PowerShell 7.7.0, .NET 11.0.0)
+  longest entry path: 171 characters (data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/arm-none-eabi/include/c++/7.2.1/ext/pb_ds/detail/gp_hash_table_map_/constructor_destructor_no_store_hash_fn_imps.hpp)
+    an extraction root of up to 87 characters keeps every path under MAX_PATH (260)
+
+runtime-manifest.json
+  {
+    "runtime_schema": 1,
+    "arduino_cli": "1.6.0",
+    "renesas_uno_core": "1.6.0",
+    "bundle_revision": 4
+  }
+
+Arduino CLI
+  version: 1.6.0 (commit 50a0e80da, date 2026-11-10T15:30:44Z)
+  source: https://downloads.arduino.cc/arduino-cli/arduino-cli_1.6.0_Windows_64bit.zip
+  source SHA-256: 2769b9b282ce597db9679d8ec14d726d57004ca4205ef4d7a795bf36b6cdc9d8 (pinned; equals 1.6.0-checksums.txt from the GitHub release)
+  arduino-cli.exe SHA-256: dcdb8823469d2590fbc9690d704efeebb458077ee249dbaae10556140be1f4c2; Authenticode: NotSigned
+
+Core
+  arduino:renesas_uno 1.6.0 (core install --skip-post-install)
+  SerialUSB.h shipped unpatched; shim marker found 1 time(s)
+
+Tools in the archive (package:name version, files, bytes)
+  arduino:arm-none-eabi-gcc 7-2017q4  5266 files  435463130 bytes
+  arduino:bossac 1.9.1-arduino5  1 files  3879608 bytes
+  builtin:ctags 5.8-arduino12  1 files  323072 bytes
+  builtin:dfu-discovery 0.1.2  2 files  7278358 bytes
+  builtin:mdns-discovery 1.1.0  2 files  6028621 bytes
+  builtin:serial-discovery 1.5.2  2 files  4035405 bytes
+  builtin:serial-monitor 0.15.0  2 files  4471629 bytes
+Tools removed (unused by the UNO R4 WiFi)
+  arduino:openocd 0.11.0-arduino2  810 files  6688684 bytes - removed; offline proof p2 passed without it
+  arduino:dfu-util 0.11.0-arduino5  1 files  1597777 bytes - removed; offline proof p2 passed without it
+
+Indexes (data/)
+  package_index.json  1747675 bytes  SHA-256 65c3673ca62d4ca0678b4ca30bf3acf8a9050a2975f15f0f9f84863eff01b137
+  package_index.json.sig  566 bytes  SHA-256 bf30940e487c54a8db5e804ebeb766193111ede399f6b39a09aa850625d2db12
+  library_index.json  60820772 bytes  SHA-256 0d36991f4152c27b673c8657f2d895088b6baa524fb208ae5639de0015a4bf5a
+  library_index.json.sig  566 bytes  SHA-256 f94f732d9ce7e0c9191466e8cd0254bb2720e1bc1de2aa11433a350de94a9f79
+Removed before packaging: data/tmp, data/inventory.yaml
+
+License and notice files (13; SHA-256  bytes  path)
+  3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986    35149  arduino-cli-LICENSE.txt
+  508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1     1036  data/packages/arduino/hardware/renesas_uno/1.6.0/libraries/Arduino_FreeRTOS/src/lib/FreeRTOS-Kernel-v10.5.1/LICENSE.md
+  f3b3469d7b15d5c7ee61d7f88012b58357ca1279b6ac4ae6c29e9b4381286947     1072  data/packages/arduino/hardware/renesas_uno/1.6.0/LICENSE
+  b638f531ca4d5fe25dce06cdb5c21f690cacd850bc1aa10254a162c355e1a3e4    40842  data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/share/doc/gcc-arm-none-eabi/html/gcc/Copying.html
+  cdcb16e414af042f5dcf1ee02ae61957683e6226676ae609a6cfbf7c0cc6d4cf    40842  data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/share/doc/gcc-arm-none-eabi/html/gccint/Copying.html
+  0490ebc16b3e6c761331fa6b44050a7af48a72b71ea60a8ab492b715f707e33f    40653  data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/share/doc/gcc-arm-none-eabi/html/gdb/Copying.html
+  2910954c032f57c563194f1cd2a23b1c7b0d121d2af8b5c7cb42c65017288089   553131  data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/share/doc/gcc-arm-none-eabi/license.txt
+  8b1ba204bb69a0ade2bfcf65ef294a920f6bb361b317dba43c7ef29d96332b9b    35148  data/packages/builtin/tools/dfu-discovery/0.1.2/LICENSE.txt
+  3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986    35149  data/packages/builtin/tools/mdns-discovery/1.1.0/LICENSE.txt
+  3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986    35149  data/packages/builtin/tools/serial-discovery/1.5.2/LICENSE.txt
+  3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986    35149  data/packages/builtin/tools/serial-monitor/0.15.0/LICENSE.txt
+  edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6    17984  GPL-2.0.txt
+  20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95    26419  LGPL-2.1.txt
+
+Offline proofs (all HTTP(S) to http://127.0.0.1:9; reference_unor4wifi.ino SHA-256 f3eb3fec0166189f66a8ddfeb058172a8d97a3c60d95d574b3234eecbd144aab)
+  compile --fqbn arduino:renesas_uno:unor4wifi --build-property "build.defines=-DF_CPU=48000000 -DBACKTRACE_SUPPORT -DARDUINO_UNOR4_WIFI" --output-dir <job>\compile <job>\reference_unor4wifi
+  p1-all-tools: PASSED
+    runtime root: C:\wvu-rtbuild\p1\studentxxxx\AppData\Local\WVU-BMEG\rt (55 characters)
+    version: arduino-cli Version: 1.6.0 Commit: 50a0e80da Date: 2026-11-10T15:30:44Z
+    core list installed_version: 1.6.0
+    flash: 58668 bytes (22%) of 262144; RAM: 11712 bytes (35%) of 32768, 21056 bytes left for locals
+    reference_unor4wifi.ino.bin: 58676 bytes, SHA-256 5d52fa24039dc31273eb369504aea93db138a76658f1259a683552635a75df0b; compile 9.5 s
+    board details: tools.bossac.path=C:\wvu-rtbuild\p1\studentxxxx\AppData\Local\WVU-BMEG\rt\data\packages\arduino\tools\bossac\1.9.1-arduino5; upload tool bossac
+    files added in the runtime: data/inventory.yaml
+    files changed in the runtime: (none)
+    data/inventory.yaml keys written by Arduino CLI: build_cache.compilation_count_since_last_purge, installation.id, installation.secret
+    default build cache %LOCALAPPDATA%\arduino folders: cores, sketches
+    stderr: (empty)
+  p2-without-unused-tools: PASSED
+    runtime root: C:\wvu-rtbuild\p2\studentxxxx\AppData\Local\WVU-BMEG\rt (55 characters)
+    version: arduino-cli Version: 1.6.0 Commit: 50a0e80da Date: 2026-11-10T15:30:44Z
+    core list installed_version: 1.6.0
+    flash: 58668 bytes (22%) of 262144; RAM: 11712 bytes (35%) of 32768, 21056 bytes left for locals
+    reference_unor4wifi.ino.bin: 58676 bytes, SHA-256 5ec88e130fbd410a7c696155b5a758627162e30a618dfef5c1794981c11dbe79; compile 8.9 s
+    board details: tools.bossac.path=C:\wvu-rtbuild\p2\studentxxxx\AppData\Local\WVU-BMEG\rt\data\packages\arduino\tools\bossac\1.9.1-arduino5; upload tool bossac
+    files added in the runtime: data/inventory.yaml
+    files changed in the runtime: (none)
+    data/inventory.yaml keys written by Arduino CLI: build_cache.compilation_count_since_last_purge, installation.id, installation.secret
+    default build cache %LOCALAPPDATA%\arduino folders: cores, sketches
+    stderr: (empty)
+  p3-final-archive: PASSED
+    runtime root: C:\wvu-rtbuild\v\studentxxxxx\AppData\Local\WVU-BMEG\rt (55 characters)
+    version: arduino-cli Version: 1.6.0 Commit: 50a0e80da Date: 2026-11-10T15:30:44Z
+    core list installed_version: 1.6.0
+    flash: 58668 bytes (22%) of 262144; RAM: 11712 bytes (35%) of 32768, 21056 bytes left for locals
+    reference_unor4wifi.ino.bin: 58676 bytes, SHA-256 1be6d668a0efb55a67c4daaec9dfe5f73925da53827d5a2c29a1d6cf4868bf23; compile 9.1 s
+    board details: tools.bossac.path=C:\wvu-rtbuild\v\studentxxxxx\AppData\Local\WVU-BMEG\rt\data\packages\arduino\tools\bossac\1.9.1-arduino5; upload tool bossac
+    files added in the runtime: data/inventory.yaml
+    files changed in the runtime: (none)
+    data/inventory.yaml keys written by Arduino CLI: build_cache.compilation_count_since_last_purge, installation.id, installation.secret
+    default build cache %LOCALAPPDATA%\arduino folders: cores, sketches
+    stderr: (empty)
+
+Repository script expectations at build time (report only)
+  scripts/build_student_release.ps1 requires arduino-cli.exe : present
+  scripts/build_student_release.ps1 requires data/library_index.json : present
+  scripts/build_student_release.ps1 requires data/package_index.json : present
+  scripts/build_student_release.ps1 requires data/packages/arduino/hardware/renesas_uno/1.6.0/platform.txt : present
+  scripts/build_student_release.ps1 requires data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/bin/arm-none-eabi-g++.exe : present
+  scripts/build_student_release.ps1 requires data/packages/arduino/tools/bossac/1.9.1-arduino5/bossac.exe : present
+  scripts/build_student_release.ps1 requires data/packages/builtin/tools/serial-discovery/1.5.2/serial-discovery.exe : present
+  scripts/build_student_release.ps1 requires runtime-manifest.json : present
+  scripts/audit_bundled_runtime_notices.ps1 requires arduino-cli.exe : present
+  scripts/audit_bundled_runtime_notices.ps1 requires data/packages/arduino/hardware/renesas_uno/1.6.0/LICENSE : present
+  scripts/audit_bundled_runtime_notices.ps1 requires data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/share/doc/gcc-arm-none-eabi/license.txt : present
+  scripts/audit_bundled_runtime_notices.ps1 requires data/packages/arduino/tools/bossac/1.9.1-arduino5/bossac.exe : present
+  scripts/audit_bundled_runtime_notices.ps1 requires data/packages/builtin/tools/serial-discovery/1.5.2/LICENSE.txt : present
+  scripts/audit_bundled_runtime_notices.ps1 GPLv3 SHA-256 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986 : arduino-cli-LICENSE.txt matches; serial-discovery 1.5.2 LICENSE.txt matches
+
+Arduino CLI commands run
+  arduino-cli --config-file C:\wvu-rtbuild\config\build-config.yaml version --format json
+  arduino-cli --config-file C:\wvu-rtbuild\config\build-config.yaml config get directories.data
+  arduino-cli --config-file C:\wvu-rtbuild\config\build-config.yaml config get build_cache.path
+  arduino-cli --config-file C:\wvu-rtbuild\config\build-config.yaml config get updater.enable_notification
+  arduino-cli --config-file C:\wvu-rtbuild\config\build-config.yaml config get network.cloud_api.skip_board_detection_calls
+  arduino-cli --config-file C:\wvu-rtbuild\config\build-config.yaml core update-index
+  arduino-cli --config-file C:\wvu-rtbuild\config\build-config.yaml core install arduino:renesas_uno@1.6.0 --skip-post-install
+  arduino-cli --config-file C:\wvu-rtbuild\config\build-config.yaml lib update-index
+  arduino-cli --config-file C:\wvu-rtbuild\config\build-config.yaml core list --format json
+  arduino-cli --config-file C:\wvu-rtbuild\p1\studentxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml version
+  arduino-cli --config-file C:\wvu-rtbuild\p1\studentxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml core list --format json
+  arduino-cli --config-file C:\wvu-rtbuild\p1\studentxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml compile --fqbn arduino:renesas_uno:unor4wifi --build-property "build.defines=-DF_CPU=48000000 -DBACKTRACE_SUPPORT -DARDUINO_UNOR4_WIFI" --output-dir "C:\wvu-rtbuild\p1\studentxxxx\AppData\Local\WVU Bioinstrumentation Studio\firmware\logs\jobs\job_1\compile" "C:\wvu-rtbuild\p1\studentxxxx\AppData\Local\WVU Bioinstrumentation Studio\firmware\logs\jobs\job_1\reference_unor4wifi"
+  arduino-cli --config-file C:\wvu-rtbuild\p1\studentxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml board details -b arduino:renesas_uno:unor4wifi --show-properties
+  arduino-cli --config-file C:\wvu-rtbuild\p2\studentxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml version
+  arduino-cli --config-file C:\wvu-rtbuild\p2\studentxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml core list --format json
+  arduino-cli --config-file C:\wvu-rtbuild\p2\studentxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml compile --fqbn arduino:renesas_uno:unor4wifi --build-property "build.defines=-DF_CPU=48000000 -DBACKTRACE_SUPPORT -DARDUINO_UNOR4_WIFI" --output-dir "C:\wvu-rtbuild\p2\studentxxxx\AppData\Local\WVU Bioinstrumentation Studio\firmware\logs\jobs\job_1\compile" "C:\wvu-rtbuild\p2\studentxxxx\AppData\Local\WVU Bioinstrumentation Studio\firmware\logs\jobs\job_1\reference_unor4wifi"
+  arduino-cli --config-file C:\wvu-rtbuild\p2\studentxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml board details -b arduino:renesas_uno:unor4wifi --show-properties
+  arduino-cli --config-file C:\wvu-rtbuild\v\studentxxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml version
+  arduino-cli --config-file C:\wvu-rtbuild\v\studentxxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml core list --format json
+  arduino-cli --config-file C:\wvu-rtbuild\v\studentxxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml compile --fqbn arduino:renesas_uno:unor4wifi --build-property "build.defines=-DF_CPU=48000000 -DBACKTRACE_SUPPORT -DARDUINO_UNOR4_WIFI" --output-dir "C:\wvu-rtbuild\v\studentxxxxx\AppData\Local\WVU Bioinstrumentation Studio\firmware\logs\jobs\job_1\compile" "C:\wvu-rtbuild\v\studentxxxxx\AppData\Local\WVU Bioinstrumentation Studio\firmware\logs\jobs\job_1\reference_unor4wifi"
+  arduino-cli --config-file C:\wvu-rtbuild\v\studentxxxxx\AppData\Local\WVU-BMEG\rt\arduino-cli.yaml board details -b arduino:renesas_uno:unor4wifi --show-properties

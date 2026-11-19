@@ -22,9 +22,13 @@
 - Run `npm run check`, then `npm run build`, then `npm test`. This order matters: a release-configuration test needs the built `build/index.html`, so `npm test` fails on a clean checkout without the build.
 - Run `cargo fmt --manifest-path src-tauri\Cargo.toml -- --check`.
 - Run `cargo check`, `cargo test`, and `cargo clippy` with `--locked` (Clippy with `--all-targets -- -D warnings`). The Rust version comes from `rust-toolchain.toml`.
+- Run `pwsh -NoProfile -File scripts\check_third_party_sources.ps1`. It validates both third-party source manifests without downloading and checks that `release/third-party-sources.json` covers the bundled runtime.
 - Run `npm run tauri build`; do not substitute `cargo build --release` for a production application build.
 - Launch the resulting Tauri release executable with no Vite or Node development server running. It must load bundled frontend assets and never request localhost.
-- Use the real, hash-pinned `src-tauri/resources/arduino-runtime.zip`. The CI placeholder satisfies source checks only and must never be packaged or used for hardware tests.
+- Use the real, hash-pinned `src-tauri/resources/arduino-runtime.zip`. The CI placeholder satisfies source checks only and must never be packaged or used for hardware tests. Verify it:
+  - `(Get-FileHash src-tauri\resources\arduino-runtime.zip -Algorithm SHA256).Hash.ToLowerInvariant()` equals `arduino_runtime_archive_sha256` in `release/release-manifest.json` (runtime revision 4: `5baa8a5fc7fc0c2ae7fd9f49de1876d76859067af6d56e9b56546a88a5d02def`).
+  - `pwsh -NoProfile -File scripts\audit_bundled_runtime_notices.ps1 -ArchivePath src-tauri\resources\arduino-runtime.zip` passes.
+  - `cargo run --manifest-path src-tauri\Cargo.toml --example runtime_smoke -- C:\wvu-smoke` prints `PASS`: the runtime compiles the reference sketch offline. Record the flash and RAM use, then delete `C:\wvu-smoke`.
 
 ## Functional smoke
 
@@ -64,6 +68,7 @@ Run these with the real runtime and an Arduino UNO R4 WiFi, using one applicatio
 - Restore with two UNO R4 WiFi boards connected is refused.
 - **Cancel restore** is unavailable once the upload starts.
 - Restoring a board that runs the native-USB WVU firmware shows the double-reset countdown, and a double press of RESET continues the restore.
+- **Offline restore.** With the computer's network disconnected (Wi-Fi off, cable out), a first start after installing extracts the tools (or **Repair Arduino tools** extracts them again), and **Restore WVU Firmware** compiles and uploads. The restore log (`firmware_job_*.json`) shows Arduino CLI and core versions matching the runtime manifest (revision 4: CLI `1.6.0`, core `1.6.0`) and the reference `.ino` SHA-256 from `release/release-manifest.json`.
 - The window stays responsive (plots, scrolling, other cards) during Verify, Restore, and Start.
 
 **Outputs**
@@ -73,11 +78,14 @@ Run these with the real runtime and an Arduino UNO R4 WiFi, using one applicatio
 
 ## Installer and distribution
 
-- Validate the Arduino runtime manifest and bundled archive before running `pwsh -NoProfile -File scripts\build_student_release.ps1` (PowerShell 7, clean Git work tree). The script builds the NSIS setup and the MSI package serially and stages both.
+- Validate the Arduino runtime manifest and bundled archive before running `pwsh -NoProfile -File scripts\build_student_release.ps1` (PowerShell 7.2, clean Git work tree). The script builds the NSIS setup and the MSI package serially and stages both.
+- **Third-party source bundle.** The release script builds `dist\WVU-Bioinstrumentation-Studio-<version>-third-party-sources.zip` and its `.sha256` from `release/third-party-sources.json` (network access and Go; see [Third-party source bundles](DEVELOPER_GUIDE.md#third-party-source-bundles)), or verifies a bundle built earlier with `-ThirdPartySourcesZip <path>` (its `.sha256`, then `build_third_party_sources.ps1 -VerifyBundle`: every file against `SHA256SUMS.txt`, the manifest copy, every pinned component and vendor tree). `release/third-party-sources.json` must name this version (`bundle_name`, `applies_to.app_versions`, `installers`) and the pinned runtime. Before publishing, open its `README.txt`: it names this version's installers and runtime, and its written offer points to the "Request corresponding source" issue form.
 - Check the checksums:
   - `dist\WVU-Bioinstrumentation-Studio-<version>\SHA256SUMS.txt` covers both installers. The same file is inside the ZIP.
   - `<zip>.sha256` beside the ZIP covers the ZIP.
-  - Keep `...-build-info.txt` with the release records.
+  - `...-third-party-sources.zip.sha256` covers the source bundle; `sha256sum -c SHA256SUMS.txt` inside the extracted bundle passes.
+  - Keep `...-build-info.txt` with the release records. It lists the runtime and source-bundle SHA-256.
+- **Attach** the setup, the MSI, the distribution ZIP, the checksum files and the third-party source bundle with its `.sha256` to the GitHub Release. The source bundle must be published with the installers, never later.
 - Install the NSIS package on a clean or isolated Windows user if available. Confirm Program Files installation and standard-user operation.
 - The MSI ships beside NSIS for managed IT deployment. Test it on a separate clean machine, never on top of an NSIS installation. Confirm the [Installation](INSTALLATION.md) guidance (one installer type per computer) still holds.
 - Confirm uninstall preserves Project folders and recordings.
@@ -116,6 +124,7 @@ After the NSIS upgrades, `HKLM\SOFTWARE\West Virginia University Department of C
 ## Publication review
 
 - Confirm a project-owner-approved root `LICENSE` exists before granting public reuse rights, and that `NOTICE` and `tauri.conf.json` (`publisher`, `copyright`) name the approved copyright holder and year.
-- Confirm third-party notices for the bundled runtime.
+- Confirm third-party notices for the bundled runtime: `BUNDLED_COMPONENTS.txt` and [Third-Party Notices](THIRD_PARTY_NOTICES.md) name the bundled versions, and the release carries the matching third-party source bundle.
+- The 1.0.x source bundle (`release/third-party-sources-runtime3.json`) is a separate decision: attaching it to the published v1.0.0-v1.0.2 releases changes those releases and needs the maintainer's explicit go-ahead. Build it with `-Runtime` pointing at the v1.0.2 runtime archive (SHA-256 `4e068c54…`, from the private recovery archive) so its runtime pin is checked too, and check the result with `-VerifyBundle` before uploading it. The 1.1 notices do not depend on that decision: `BUNDLED_COMPONENTS.txt` and the 1.1 bundle's README point to `release/third-party-sources-runtime3.json` and the issue form for OpenOCD and dfu-util, not to the 1.0.x bundle.
 - Confirm no secrets, recordings, personal calibration files, or developer paths are tracked.
 - Confirm branding and code-signing decisions with the repository owner.

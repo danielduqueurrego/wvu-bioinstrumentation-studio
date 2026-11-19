@@ -68,6 +68,16 @@ export function commandErrorKeptPreviousTools(error: unknown): boolean {
   return structuredFailure(error)?.previous_runtime_kept === true;
 }
 
+/**
+ * The `category` of a structured failure (`ArduinoToolsFailure.category`,
+ * for example `runtime_path_too_long`), or '' when there is none. Messages
+ * map it to student text (`arduinoToolsFailureMessage`); it is never shown.
+ */
+export function commandErrorCategory(error: unknown): string {
+  const category = structuredFailure(error)?.category;
+  return typeof category === 'string' ? category.trim() : '';
+}
+
 /** The technical detail of a structured failure, for Advanced details only. */
 export function commandErrorDetail(error: unknown): string {
   const failure = structuredFailure(error);

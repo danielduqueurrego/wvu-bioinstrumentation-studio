@@ -1,7 +1,30 @@
-#Requires -Version 7.0
+<#
+.SYNOPSIS
+Builds the student distribution: installers, release folder, ZIP, checksums,
+and the third-party source bundle.
+
+.PARAMETER AllowDirty
+Build from a working tree with uncommitted changes (an explicitly reviewed
+temporary candidate only).
+
+.PARAMETER ThirdPartySourcesZip
+A source bundle already built with scripts/build_third_party_sources.ps1 for
+this version (WVU-Bioinstrumentation-Studio-<version>-third-party-sources.zip,
+with its .sha256 beside it). It is verified against release/third-party-sources.json
+(build_third_party_sources.ps1 -VerifyBundle: SHA256SUMS.txt, the manifest copy,
+every pinned component and vendor tree) and copied to dist/. Without it, the bundle is built into dist/, which needs
+network access and Go (docs/DEVELOPER_GUIDE.md).
+
+.PARAMETER SourcesDownloadCache
+Passed to build_third_party_sources.ps1 as -DownloadCache when the bundle is
+built here.
+#>
+#Requires -Version 7.2
 [CmdletBinding()]
 param(
-  [switch]$AllowDirty
+  [switch]$AllowDirty,
+  [string]$ThirdPartySourcesZip,
+  [string]$SourcesDownloadCache
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +41,11 @@ $componentNoticePath = Join-Path $runtimeRoot 'licenses\BUNDLED_COMPONENTS.txt'
 $bossacLicensePath = Join-Path $runtimeRoot 'licenses\bossac-LICENSE.txt'
 $licensePath = Join-Path $projectRoot 'LICENSE'
 $noticePath = Join-Path $projectRoot 'NOTICE'
+$runtimeEntriesPath = Join-Path $projectRoot 'release\arduino-runtime-entries.json'
+$sourcesManifestPath = Join-Path $projectRoot 'release\third-party-sources.json'
+# Relative paths are resolved against PowerShell's current location.
+if ($ThirdPartySourcesZip) { $ThirdPartySourcesZip = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($ThirdPartySourcesZip) }
+if ($SourcesDownloadCache) { $SourcesDownloadCache = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($SourcesDownloadCache) }
 $releaseManifest = Get-Content -LiteralPath $releaseManifestPath -Raw | ConvertFrom-Json
 $appVersion = [string]$releaseManifest.app_version
 if ($appVersion -notmatch '^\d+\.\d+\.\d+$') {
@@ -29,6 +57,10 @@ $distRoot = Join-Path $distParent "WVU-Bioinstrumentation-Studio-$appVersion"
 $zipPath = Join-Path $distParent "WVU-Bioinstrumentation-Studio-$appVersion-Windows-x64.zip"
 $zipChecksumPath = "$zipPath.sha256"
 $buildInfoPath = Join-Path $distParent "WVU-Bioinstrumentation-Studio-$appVersion-build-info.txt"
+# Published beside the installers (not inside the student ZIP: it is large).
+$sourcesBundleName = "WVU-Bioinstrumentation-Studio-$appVersion-third-party-sources"
+$sourcesBundlePath = Join-Path $distParent "$sourcesBundleName.zip"
+$sourcesBundleChecksumPath = "$sourcesBundlePath.sha256"
 
 function Invoke-NativeChecked {
   param(
@@ -90,7 +122,9 @@ foreach ($required in @(
   $bossacLicensePath,
   $licensePath,
   $noticePath,
-  $releaseNotesPath
+  $releaseNotesPath,
+  $runtimeEntriesPath,
+  $sourcesManifestPath
 )) {
   if (-not (Test-Path -LiteralPath $required)) {
     throw "Required pinned release asset is missing: $required"
@@ -134,21 +168,23 @@ if (-not $runtimeArchiveHash.Equals($expectedRuntimeArchiveSha256, [System.Strin
   throw "Arduino runtime archive hash does not match the reviewed manifest: $runtimeArchiveHash"
 }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+# What the reviewed archive must and must not contain, shared with
+# audit_bundled_runtime_notices.ps1 (which checks the license files too).
+$runtimeEntryRules = Get-Content -LiteralPath $runtimeEntriesPath -Raw | ConvertFrom-Json
+foreach ($field in @('arduino_cli', 'renesas_uno_core', 'bundle_revision')) {
+  if ([string]$runtimeEntryRules.$field -cne [string]$runtimeManifest.$field) {
+    throw "release/arduino-runtime-entries.json $field '$($runtimeEntryRules.$field)' does not match arduino-runtime-manifest.json '$($runtimeManifest.$field)'."
+  }
+}
 $runtimeZip = [System.IO.Compression.ZipFile]::OpenRead($runtimeArchive)
 try {
   $runtimeEntries = @($runtimeZip.Entries | ForEach-Object FullName)
-  $coreVersion = [string]$releaseManifest.arduino_core
-  foreach ($entry in @(
-    'runtime-manifest.json',
-    'arduino-cli.exe',
-    'data/package_index.json',
-    'data/library_index.json',
-    "data/packages/arduino/hardware/renesas_uno/$coreVersion/platform.txt",
-    'data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/bin/arm-none-eabi-g++.exe',
-    'data/packages/arduino/tools/bossac/1.9.1-arduino5/bossac.exe',
-    'data/packages/builtin/tools/serial-discovery/1.5.2/serial-discovery.exe'
-  )) {
-    if ($runtimeEntries -notcontains $entry) { throw "Arduino runtime archive is missing: $entry" }
+  foreach ($entry in @($runtimeEntryRules.required_entries)) {
+    if ($runtimeEntries -cnotcontains $entry) { throw "Arduino runtime archive is missing: $entry" }
+  }
+  foreach ($prefix in @($runtimeEntryRules.forbidden_prefixes)) {
+    $forbidden = @($runtimeEntries | Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) } | Select-Object -First 1)
+    if ($forbidden.Count -gt 0) { throw "Arduino runtime archive contains an entry it must not ship: $($forbidden[0])" }
   }
   # The application accepts an extracted runtime only when its
   # runtime-manifest.json equals arduino-runtime-manifest.json.
@@ -169,6 +205,62 @@ try {
   $runtimeZip.Dispose()
 }
 & (Join-Path $projectRoot 'scripts\audit_bundled_runtime_notices.ps1') -ArchivePath $runtimeArchive
+
+# The corresponding-source bundle for the GPL/LGPL tools in the runtime is a
+# release asset of this version, published beside the installers.
+& (Join-Path $PSScriptRoot 'check_third_party_sources.ps1') -ProjectRoot $projectRoot
+if ($LASTEXITCODE -ne 0) {
+  throw 'The third-party source manifests are inconsistent (listed above). Release packaging stopped.'
+}
+$sourcesManifest = Get-Content -LiteralPath $sourcesManifestPath -Raw | ConvertFrom-Json
+if ($sourcesManifest.bundle_name -cne $sourcesBundleName -or @($sourcesManifest.applies_to.app_versions) -cnotcontains $appVersion) {
+  throw "release/third-party-sources.json describes $($sourcesManifest.bundle_name) for $(@($sourcesManifest.applies_to.app_versions) -join ', '), not $sourcesBundleName. Update its bundle_name, applies_to.app_versions and installers for $appVersion."
+}
+New-Item -ItemType Directory -Force -Path $distParent | Out-Null
+foreach ($stale in @($sourcesBundlePath, $sourcesBundleChecksumPath)) {
+  if ((Test-Path -LiteralPath $stale) -and -not ($ThirdPartySourcesZip -and $ThirdPartySourcesZip -ieq $sourcesBundlePath)) {
+    Remove-Item -LiteralPath $stale -Force
+  }
+}
+if ($ThirdPartySourcesZip) {
+  # A bundle built earlier: same name, its own .sha256, and the content the
+  # repository's manifest describes.
+  if ([IO.Path]::GetFileName($ThirdPartySourcesZip) -cne "$sourcesBundleName.zip") {
+    throw "-ThirdPartySourcesZip must be $sourcesBundleName.zip: $ThirdPartySourcesZip"
+  }
+  $providedChecksum = "$ThirdPartySourcesZip.sha256"
+  foreach ($required in @($ThirdPartySourcesZip, $providedChecksum)) {
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Third-party source bundle file is missing: $required" }
+  }
+  $recordedHash = ((Get-Content -LiteralPath $providedChecksum -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+  $actualHash = (Get-FileHash -LiteralPath $ThirdPartySourcesZip -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actualHash -cne $recordedHash) { throw "$ThirdPartySourcesZip has SHA-256 $actualHash; its .sha256 file records $recordedHash." }
+  # Offline and read only: SHA256SUMS.txt, the manifest copy (it must be
+  # release/third-party-sources.json), every component's pinned SHA-256, the
+  # vendor-tree pins, and no other file. A sidecar alone would accept a
+  # damaged or altered bundle whose .sha256 was rewritten.
+  & (Join-Path $PSScriptRoot 'build_third_party_sources.ps1') -Manifest $sourcesManifestPath -VerifyBundle $ThirdPartySourcesZip
+  if ($LASTEXITCODE -ne 0) {
+    throw "$ThirdPartySourcesZip is not the bundle release/third-party-sources.json describes (listed above). Rebuild it."
+  }
+  if ($ThirdPartySourcesZip -ine $sourcesBundlePath) {
+    Copy-Item -LiteralPath $ThirdPartySourcesZip -Destination $sourcesBundlePath
+    Copy-Item -LiteralPath $providedChecksum -Destination $sourcesBundleChecksumPath
+  }
+} else {
+  $sourcesArguments = @{
+    Manifest = $sourcesManifestPath
+    OutputDir = $distParent
+    Runtime = $runtimeArchive
+    Force = $true
+  }
+  if ($SourcesDownloadCache) { $sourcesArguments.DownloadCache = $SourcesDownloadCache }
+  & (Join-Path $PSScriptRoot 'build_third_party_sources.ps1') @sourcesArguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "build_third_party_sources.ps1 failed with exit code $LASTEXITCODE. Release packaging stopped."
+  }
+}
+Write-Host "Third-party source bundle: $sourcesBundlePath"
 
 # npm ci installs exactly package-lock.json (it needs network access or a warm
 # npm cache). Cargo commands use --locked so an out-of-date Cargo.lock stops
@@ -258,7 +350,9 @@ $buildInfo = @(
   "node: $nodeVersion",
   "npm: $npmVersion",
   "@tauri-apps/cli: $tauriCliVersion",
-  "PowerShell: $($PSVersionTable.PSVersion)"
+  "PowerShell: $($PSVersionTable.PSVersion)",
+  "Arduino runtime: $([System.IO.Path]::GetFileName($runtimeArchive)) SHA-256 $($runtimeArchiveHash.ToLowerInvariant()) (bundle revision $($runtimeManifest.bundle_revision))",
+  "Third-party source bundle: $([System.IO.Path]::GetFileName($sourcesBundlePath)) SHA-256 $((Get-FileHash -LiteralPath $sourcesBundlePath -Algorithm SHA256).Hash.ToLowerInvariant())"
 )
 [IO.File]::WriteAllText($buildInfoPath, (($buildInfo -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
 
@@ -268,3 +362,4 @@ Write-Host "ZIP checksum: $zipChecksumPath"
 Write-Host "Build information: $buildInfoPath"
 Write-Host "NSIS: $(Join-Path $distRoot $setupName)"
 Write-Host "MSI: $(Join-Path $distRoot $msiName)"
+Write-Host "Third-party source bundle (attach to the release with the installers): $sourcesBundlePath and $sourcesBundleChecksumPath"

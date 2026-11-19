@@ -104,7 +104,7 @@ function installBackend() {
   firmwareStatus = { compatibility: 'unknown', job: null, verified_port: null };
   backend.handlers = {
     get_project_folder: () => ({ project_folder: 'C:\\BMEG 420L', available: true, notice: null }),
-    prepare_arduino_runtime: () => ({ ready: true, cli_version: '1.5.2', core_version: '1.5.0', message: '' }),
+    prepare_arduino_runtime: () => ({ ready: true, cli_version: '1.6.0', core_version: '1.6.0', message: '' }),
     firmware_environment: () => ({ ready: true, expected_fqbn: 'arduino:renesas_uno:unor4wifi', boards: [] }),
     list_boards: () => [],
     get_session_status: () => session,
@@ -550,7 +550,7 @@ describe('Acquisition page: board, firmware, plots, and the finished recording',
       name: 'Repair Arduino tools',
       setup: () => {
         backend.handlers.prepare_arduino_runtime = () => { throw { title: 'Arduino tools need repair', explanation: 'A tool file is damaged.', recommended_action: 'Select Repair Arduino tools.', repairable: true }; };
-        backend.handlers.repair_arduino_runtime = () => ({ ready: true, cli_version: '1.5.2', core_version: '1.5.0', message: '' });
+        backend.handlers.repair_arduino_runtime = () => ({ ready: true, cli_version: '1.6.0', core_version: '1.6.0', message: '' });
       },
       chooseHardware: true,
       expectCall: { command: 'repair_arduino_runtime', args: {} }

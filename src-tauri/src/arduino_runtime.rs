@@ -8,6 +8,10 @@
 //! bundled archive is present with its archived size; otherwise it is
 //! extracted again (the archive's CRC-32 checks run during extraction).
 //! Repair Arduino tools forces that re-extraction.
+//!
+//! The runtime root must stay shorter than `RUNTIME_ROOT_LENGTH_LIMIT`
+//! characters for the bundled compiler; `resolve_runtime_root` picks a
+//! private `%ProgramData%` folder when the usual one is too long.
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -33,10 +37,25 @@ static TOOLS_IN_USE: RwLock<()> = RwLock::new(());
 const PREPARATION_LOCK_WAIT: Duration = Duration::from_secs(10 * 60);
 const PREPARATION_LOCK_POLL: Duration = Duration::from_millis(250);
 /// Archive files that are rewritten after extraction by design: the generated
-/// CLI configuration and Arduino CLI's own inventory file. They must still be
-/// present, but their archived size is not compared. The version-pinned core
-/// header patch is handled by `patched_core_header`.
+/// CLI configuration and Arduino CLI's own inventory file. If an archive
+/// lists them they must still be present, but their archived size is not
+/// compared. Runtime revision 4 ships neither (scripts/build_arduino_runtime.ps1
+/// leaves them out), so this only matters for an older archive. The
+/// version-pinned core header patch is handled by `patched_core_header`.
 const REWRITTEN_RUNTIME_FILES: &[&str] = &["arduino-cli.yaml", "data/inventory.yaml"];
+/// GCC 7-2017q4, the bundled arm-none-eabi toolchain, builds its C++ multilib
+/// include paths from its own folder with unresolved `..` segments, so a long
+/// runtime folder pushes them past the Windows path limit. Measured on
+/// 2026-11-18 with runtime revision 4 and the reference sketch: a runtime root
+/// of 59 characters compiles; from 60 characters on GCC stops with a missing
+/// header, such as "bits/c++config.h: No such file or directory" (also
+/// "bits/c++allocator.h" or "bits/cpu_defines.h"). Revision 3 has the same
+/// compiler and limit. The usual root,
+/// `C:\Users\<profile folder>\AppData\Local\WVU-BMEG\rt`, is 35 characters
+/// plus the profile folder name, so it reaches the limit with profile folder
+/// names longer than 24 characters. A runtime root must be shorter than this;
+/// `resolve_runtime_root` moves a longer one to `%ProgramData%`.
+pub const RUNTIME_ROOT_LENGTH_LIMIT: usize = 60;
 
 #[derive(Clone, Debug)]
 pub struct RuntimePaths {
@@ -75,12 +94,31 @@ pub enum RuntimeError {
     InvalidBundle,
     #[error("Another copy of WVU Bioinstrumentation Studio is preparing the Arduino tools.")]
     Busy,
+    /// No usable runtime folder is shorter than `RUNTIME_ROOT_LENGTH_LIMIT`.
+    #[error(
+        "The Arduino tools folder {} is {length} characters long; the included compiler needs fewer than {} characters, and no shorter folder (a private %ProgramData% folder) could be used.",
+        .path.display(),
+        RUNTIME_ROOT_LENGTH_LIMIT
+    )]
+    PathTooLong { path: PathBuf, length: usize },
+}
+
+/// Tool failures that the page explains with its own text
+/// (`ARDUINO_TOOLS_FAILURE_MESSAGES` in `src/lib/messages.ts`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArduinoToolsFailureCategory {
+    /// The Windows profile path is too long for the bundled compiler and no
+    /// shorter folder could be used (`RuntimeError::PathTooLong`).
+    RuntimePathTooLong,
 }
 
 /// The student-facing form of a tool-preparation problem, returned by the
 /// prepare and repair commands. Technical details stay in Advanced details.
 #[derive(Clone, Debug, Serialize)]
 pub struct ArduinoToolsFailure {
+    /// Set for failures with their own text on the page; `null` otherwise.
+    pub category: Option<ArduinoToolsFailureCategory>,
     pub title: String,
     pub explanation: String,
     pub recommended_action: String,
@@ -104,6 +142,7 @@ impl ArduinoToolsFailure {
         repairable: bool,
     ) -> Self {
         Self {
+            category: None,
             title: title.into(),
             explanation: explanation.into(),
             recommended_action: recommended_action.into(),
@@ -111,6 +150,11 @@ impl ArduinoToolsFailure {
             repairable,
             previous_runtime_kept: false,
         }
+    }
+
+    fn with_category(mut self, category: ArduinoToolsFailureCategory) -> Self {
+        self.category = Some(category);
+        self
     }
 
     /// Records whether the tools in use before a failed Repair are still in
@@ -176,6 +220,15 @@ impl RuntimeError {
                 self.to_string(),
                 true,
             ),
+            // Repair extracts to the same folder, so it cannot help.
+            Self::PathTooLong { .. } => ArduinoToolsFailure::new(
+                "Arduino tools cannot be set up for this Windows account",
+                "The folder name of this Windows user account is too long for the included Arduino compiler, and no shorter folder could be used on this computer.",
+                "Ask your IT support or instructor for help and show them Advanced details. Simulator recordings still work.",
+                self.to_string(),
+                false,
+            )
+            .with_category(ArduinoToolsFailureCategory::RuntimePathTooLong),
         }
     }
 }
@@ -266,24 +319,535 @@ impl RuntimeLayout {
             .map_err(|_| RuntimeError::MissingBundle)?
             .join("resources");
         // The bundled Renesas GCC toolchain has path-length-sensitive C++
-        // multilib discovery on Windows. Keep its app-owned extraction root
-        // deliberately short while ordinary application data stays in
-        // Tauri's normal directory.
-        let local_data_root = match dev_local_data_root() {
-            Some(root) => root,
-            None => app
-                .path()
-                .app_local_data_dir()
-                .map_err(|_| RuntimeError::MissingBundle)?
-                .parent()
-                .map(Path::to_path_buf)
-                .ok_or(RuntimeError::InvalidBundle)?,
+        // multilib discovery on Windows (`RUNTIME_ROOT_LENGTH_LIMIT`). Keep
+        // its app-owned extraction root deliberately short while ordinary
+        // application data stays in Tauri's normal directory.
+        let destination = match dev_local_data_root() {
+            // A development override keeps everything inside the folder the
+            // developer chose, even one too long for the compiler (the
+            // Simulator and labs do not need it); see start_dev_sandbox.ps1.
+            Some(root) => {
+                let preferred = root.join("WVU-BMEG").join("rt");
+                if !fits_compiler_limit(&preferred) {
+                    crate::app_log::record(
+                        "WARN",
+                        &format!(
+                            "ARDUINO_RUNTIME_ROOT_TOO_LONG_DEV length={} path={} (compiles need a root shorter than {RUNTIME_ROOT_LENGTH_LIMIT} characters)",
+                            path_length(&preferred),
+                            preferred.display()
+                        ),
+                    );
+                }
+                preferred
+            }
+            None => {
+                let local_data_root = app
+                    .path()
+                    .app_local_data_dir()
+                    .map_err(|_| RuntimeError::MissingBundle)?
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .ok_or(RuntimeError::InvalidBundle)?;
+                let preferred = local_data_root.join("WVU-BMEG").join("rt");
+                resolve_runtime_root(&preferred, true)?.into_path()
+            }
         };
         Ok(Self {
             archive: resource_root.join("arduino-runtime.zip"),
             manifest: resource_root.join("arduino-runtime-manifest.json"),
-            destination: local_data_root.join("WVU-BMEG").join("rt"),
+            destination,
         })
+    }
+}
+
+/// The folder the runtime is extracted to, and why it was chosen.
+///
+/// There is deliberately no 8.3 short-path step: Arduino CLI expands a short
+/// runtime path back to the long one before it runs the compiler. Measured on
+/// 2026-11-18 with `examples/runtime_smoke.rs`: a 63-character root given as
+/// its 23-character short form still failed with "bits/c++config.h: No such
+/// file or directory", and Arduino CLI reported the long platform path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeRoot {
+    /// The usual folder, `%LOCALAPPDATA%\WVU-BMEG\rt`, which is short enough.
+    Preferred(PathBuf),
+    /// `%ProgramData%\WVU-BMEG-<user id>\rt`, a folder only this Windows user
+    /// (with SYSTEM and Administrators) can open.
+    SharedFallback(PathBuf),
+}
+
+impl RuntimeRoot {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Preferred(path) | Self::SharedFallback(path) => path,
+        }
+    }
+
+    pub fn into_path(self) -> PathBuf {
+        match self {
+            Self::Preferred(path) | Self::SharedFallback(path) => path,
+        }
+    }
+}
+
+/// The length of a path as Windows counts it (UTF-16 code units).
+pub fn path_length(path: &Path) -> usize {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().count()
+    }
+    #[cfg(not(windows))]
+    {
+        path.as_os_str().to_string_lossy().chars().count()
+    }
+}
+
+fn fits_compiler_limit(path: &Path) -> bool {
+    path_length(path) < RUNTIME_ROOT_LENGTH_LIMIT
+}
+
+/// Chooses the runtime folder for `preferred` (normally
+/// `%LOCALAPPDATA%\WVU-BMEG\rt`): that folder when it is shorter than
+/// `RUNTIME_ROOT_LENGTH_LIMIT`; otherwise, when `allow_shared_fallback`, a
+/// private per-user folder under `%ProgramData%` if that is short enough and
+/// can be prepared; otherwise `RuntimeError::PathTooLong`, which the page
+/// explains to the student instead of a compiler error. Callers that must not
+/// write outside their own folder (`examples/runtime_smoke.rs`) pass
+/// `allow_shared_fallback = false`.
+pub fn resolve_runtime_root(
+    preferred: &Path,
+    allow_shared_fallback: bool,
+) -> Result<RuntimeRoot, RuntimeError> {
+    let root = choose_runtime_root(
+        preferred,
+        || {
+            if allow_shared_fallback {
+                shared_runtime_root()
+            } else {
+                None
+            }
+        },
+        prepare_shared_runtime_root,
+    );
+    match &root {
+        Ok(RuntimeRoot::Preferred(_)) => {}
+        Ok(RuntimeRoot::SharedFallback(path)) => crate::app_log::record(
+            "INFO",
+            &format!(
+                "ARDUINO_RUNTIME_ROOT reason=program_data preferred_length={} preferred={} path={}",
+                path_length(preferred),
+                preferred.display(),
+                path.display()
+            ),
+        ),
+        Err(error) => crate::app_log::record(
+            "WARN",
+            &format!("ARDUINO_RUNTIME_ROOT_TOO_LONG detail={error}"),
+        ),
+    }
+    root
+}
+
+/// The decision of `resolve_runtime_root`, with the file-system work
+/// injected so tests never touch a real profile or `%ProgramData%`.
+/// `shared_fallback` names the `%ProgramData%` folder, or `None` when it is
+/// not allowed or unknown; `prepare_shared` creates it privately and checks
+/// that it is writable.
+fn choose_runtime_root(
+    preferred: &Path,
+    shared_fallback: impl FnOnce() -> Option<PathBuf>,
+    prepare_shared: impl FnOnce(&Path) -> bool,
+) -> Result<RuntimeRoot, RuntimeError> {
+    if fits_compiler_limit(preferred) {
+        return Ok(RuntimeRoot::Preferred(preferred.to_path_buf()));
+    }
+    if let Some(shared) = shared_fallback().filter(|shared| fits_compiler_limit(shared)) {
+        if prepare_shared(&shared) {
+            return Ok(RuntimeRoot::SharedFallback(shared));
+        }
+    }
+    Err(RuntimeError::PathTooLong {
+        path: preferred.to_path_buf(),
+        length: path_length(preferred),
+    })
+}
+
+/// `%ProgramData%\WVU-BMEG-<id>\rt`, where `<id>` is the first 12 hex digits
+/// of the SHA-256 of the current user's SID: stable for the account, short,
+/// and distinct per user. Each user's folder sits directly in
+/// `%ProgramData%`, which lets users create folders but not remove or change
+/// another user's, so no other account controls a folder above it.
+fn shared_runtime_root() -> Option<PathBuf> {
+    use sha2::Digest;
+    let program_data = platform::program_data_folder()?;
+    let sid = platform::current_user_sid()?;
+    let digest = sha2::Sha256::digest(sid.as_bytes());
+    let id: String = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(program_data.join(format!("WVU-BMEG-{id}")).join("rt"))
+}
+
+/// Creates the folder that holds `root` (and the runtime's lock and staging
+/// siblings) for this user only, or accepts it if it already is, and checks
+/// that it is writable. `%ProgramData%`'s default permissions would let every
+/// local user add files inside it (for example a `platform.local.txt` that
+/// changes the compile commands), so the folder gets a protected access list:
+/// this user, SYSTEM and Administrators. An existing folder is used only if
+/// this user (or SYSTEM or Administrators) owns it, its access list is
+/// protected and allows no other account, and it is not a link.
+fn prepare_shared_runtime_root(root: &Path) -> bool {
+    let Some(folder) = root.parent() else {
+        return false;
+    };
+    match platform::ensure_private_folder(folder) {
+        Ok(()) => folder_is_writable(folder),
+        Err(error) => {
+            crate::app_log::record(
+                "WARN",
+                &format!(
+                    "ARDUINO_RUNTIME_SHARED_ROOT_REFUSED path={} detail={error}",
+                    folder.display()
+                ),
+            );
+            false
+        }
+    }
+}
+
+/// Creates, writes and removes a probe file. A probe that already exists (left
+/// by another process with the same ID) is not this call's file: it is left
+/// alone and the check fails.
+fn folder_is_writable(folder: &Path) -> bool {
+    use std::io::Write;
+    let probe = folder.join(format!(".write-test-{}", std::process::id()));
+    let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    else {
+        return false;
+    };
+    let written = file.write_all(b"ok");
+    drop(file);
+    let removed = fs::remove_file(&probe);
+    written.is_ok() && removed.is_ok()
+}
+
+/// Windows-only file-system helpers for `resolve_runtime_root`.
+#[cfg(windows)]
+mod platform {
+    use std::{
+        ffi::OsString,
+        io,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+        path::{Path, PathBuf},
+        ptr,
+    };
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, HANDLE},
+        Security::{
+            AclSizeInformation,
+            Authorization::{
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+            },
+            GetAce, GetAclInformation, GetSecurityDescriptorControl, GetTokenInformation,
+            TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+            SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        },
+        Storage::FileSystem::{CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT},
+        System::{
+            Com::CoTaskMemFree,
+            Threading::{GetCurrentProcess, OpenProcessToken},
+        },
+        UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
+    };
+
+    /// Accounts accepted besides the user, as the owner of an existing
+    /// private folder and in its access list: LocalSystem and the
+    /// Administrators group (an elevated copy of the application creates
+    /// folders owned by Administrators).
+    const TRUSTED_ACCOUNTS: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
+    /// `ACE_HEADER::AceType` values (winnt.h; windows-sys keeps them in
+    /// `Win32_System_SystemServices`, which this crate does not enable).
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    /// Reads a NUL-terminated UTF-16 string.
+    ///
+    /// # Safety
+    /// `text` must point to a NUL-terminated UTF-16 string.
+    unsafe fn read_wide(text: *const u16) -> OsString {
+        let mut length = 0usize;
+        // SAFETY: the caller guarantees a terminating NUL.
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        // SAFETY: `length` units before the NUL were just read.
+        OsString::from_wide(unsafe { std::slice::from_raw_parts(text, length) })
+    }
+
+    /// `%ProgramData%` from the Known Folder API.
+    pub fn program_data_folder() -> Option<PathBuf> {
+        let mut raw: windows_sys::core::PWSTR = ptr::null_mut();
+        // SAFETY: `raw` receives a NUL-terminated string allocated by the
+        // shell; it is read before CoTaskMemFree, which runs whether or not
+        // the call succeeded, as the API requires.
+        let path = unsafe {
+            let result = SHGetKnownFolderPath(
+                &FOLDERID_ProgramData,
+                KF_FLAG_DEFAULT as u32,
+                ptr::null_mut(),
+                &mut raw,
+            );
+            let path = (result >= 0 && !raw.is_null()).then(|| PathBuf::from(read_wide(raw)));
+            if !raw.is_null() {
+                CoTaskMemFree(raw as *const core::ffi::c_void);
+            }
+            path
+        };
+        path.filter(|path| path.is_absolute())
+    }
+
+    /// The SID text (S-1-5-21-...) of `sid`.
+    ///
+    /// # Safety
+    /// `sid` must point to a valid SID.
+    unsafe fn sid_text(sid: PSID) -> Option<String> {
+        let mut text: windows_sys::core::PWSTR = ptr::null_mut();
+        // SAFETY: on success `text` is a NUL-terminated string allocated
+        // with LocalAlloc, freed below.
+        unsafe {
+            if ConvertSidToStringSidW(sid, &mut text) == 0 || text.is_null() {
+                return None;
+            }
+            let value = read_wide(text).into_string().ok();
+            LocalFree(text.cast());
+            value
+        }
+    }
+
+    /// The SID text of the user this process runs as.
+    pub fn current_user_sid() -> Option<String> {
+        // SAFETY: the token handle is closed before returning; the buffer is
+        // u64-aligned (TOKEN_USER holds a pointer) and sized by the first
+        // GetTokenInformation call; the SID it points to lives in the buffer.
+        unsafe {
+            let mut token: HANDLE = ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return None;
+            }
+            let mut needed = 0u32;
+            GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut needed);
+            let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+            let ok = GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                &mut needed,
+            );
+            CloseHandle(token);
+            if ok == 0 {
+                return None;
+            }
+            let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+            sid_text(user.User.Sid)
+        }
+    }
+
+    /// The descriptor of a private folder: owned by `user`, with a protected
+    /// access list that gives `user`, SYSTEM and Administrators full control,
+    /// inherited by everything inside.
+    fn private_folder_sddl(user: &str) -> String {
+        format!("O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+    }
+
+    /// Creates `folder` with a protected access list (this user, SYSTEM,
+    /// Administrators; inherited by everything inside), or checks that an
+    /// existing one is owned by this user (or SYSTEM or Administrators), has
+    /// a protected access list that allows no other account, and is not a
+    /// link.
+    pub fn ensure_private_folder(folder: &Path) -> io::Result<()> {
+        let user = current_user_sid().ok_or_else(|| io::Error::other("user SID unavailable"))?;
+        if create_folder_with_sddl(folder, &private_folder_sddl(&user))? {
+            return Ok(());
+        }
+        verify_private_folder(folder, &user)
+    }
+
+    /// Creates `folder` with the security descriptor `sddl`. `Ok(false)` when
+    /// something of that name already exists (it is left as it is).
+    pub(super) fn create_folder_with_sddl(folder: &Path, sddl: &str) -> io::Result<bool> {
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `sddl` is NUL-terminated; the descriptor is LocalAlloc'd
+        // and freed after CreateDirectoryW.
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            };
+            let created = CreateDirectoryW(wide(folder).as_ptr(), &attributes);
+            let error = io::Error::last_os_error();
+            LocalFree(descriptor);
+            if created == 0 && error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+                return Err(error);
+            }
+            Ok(created != 0)
+        }
+    }
+
+    /// The SID texts that the allow entries of `dacl` name. Deny entries only
+    /// take access away and are skipped; any other entry type is refused, and
+    /// so is a missing access list, which lets everyone in.
+    ///
+    /// # Safety
+    /// `dacl` must be null or point to a valid access list.
+    unsafe fn allowed_accounts(dacl: *const ACL) -> io::Result<Vec<String>> {
+        if dacl.is_null() {
+            return Err(io::Error::other("no access list (everyone has access)"));
+        }
+        let mut information = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        // SAFETY: `dacl` is a valid access list (the caller's guarantee);
+        // every entry GetAce returns starts with an ACE_HEADER, and an
+        // ACCESS_ALLOWED_ACE's SID starts at its `SidStart` field.
+        unsafe {
+            if GetAclInformation(
+                dacl,
+                (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let mut accounts = Vec::new();
+            for index in 0..information.AceCount {
+                let mut entry: *mut core::ffi::c_void = ptr::null_mut();
+                if GetAce(dacl, index, &mut entry) == 0 || entry.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                match (*(entry as *const ACE_HEADER)).AceType {
+                    ACCESS_DENIED_ACE_TYPE => {}
+                    ACCESS_ALLOWED_ACE_TYPE => {
+                        let allowed = entry as *const ACCESS_ALLOWED_ACE;
+                        let sid = ptr::addr_of!((*allowed).SidStart) as PSID;
+                        accounts.push(
+                            sid_text(sid)
+                                .ok_or_else(|| io::Error::other("access entry unreadable"))?,
+                        );
+                    }
+                    other => {
+                        return Err(io::Error::other(format!(
+                            "unexpected access entry type {other}"
+                        )))
+                    }
+                }
+            }
+            Ok(accounts)
+        }
+    }
+
+    fn verify_private_folder(folder: &Path, user: &str) -> io::Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(folder)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::other("not a plain folder"));
+        }
+        let mut owner: PSID = ptr::null_mut();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: on success `owner` and `dacl` point into `descriptor`, a
+        // LocalAlloc'd block read here and freed before returning.
+        let (owner_text, protected, allowed) = unsafe {
+            let status = GetNamedSecurityInfoW(
+                wide(folder).as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            );
+            if status != 0 {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            let owner_text = sid_text(owner);
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            let protected = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision)
+                != 0
+                && control & SE_DACL_PROTECTED != 0;
+            let allowed = allowed_accounts(dacl);
+            LocalFree(descriptor);
+            (owner_text, protected, allowed)
+        };
+        let owner_text = owner_text.ok_or_else(|| io::Error::other("owner unreadable"))?;
+        if owner_text != user && !TRUSTED_ACCOUNTS.contains(&owner_text.as_str()) {
+            return Err(io::Error::other(format!(
+                "owned by another account ({owner_text})"
+            )));
+        }
+        if !protected {
+            return Err(io::Error::other("access list is not protected"));
+        }
+        if let Some(other) = allowed?
+            .into_iter()
+            .find(|account| account != user && !TRUSTED_ACCOUNTS.contains(&account.as_str()))
+        {
+            return Err(io::Error::other(format!(
+                "access list allows another account ({other})"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+mod platform {
+    use std::{
+        io,
+        path::{Path, PathBuf},
+    };
+
+    pub fn program_data_folder() -> Option<PathBuf> {
+        None
+    }
+
+    pub fn current_user_sid() -> Option<String> {
+        None
+    }
+
+    pub fn ensure_private_folder(_folder: &Path) -> io::Result<()> {
+        Err(io::Error::other("only available on Windows"))
     }
 }
 
@@ -402,10 +966,12 @@ fn prepare_with(
 
 /// Arduino CLI configuration for the app-owned runtime. Every path is written
 /// as a quoted scalar, so a Windows profile path containing ` #` (a YAML
-/// comment), `: `, or quotes is read literally.
+/// comment), `: `, or quotes is read literally. The runtime is offline: no
+/// update notification, and no Arduino Cloud lookup of detected boards.
+/// scripts/build_arduino_runtime.ps1 writes the same text for its proofs.
 fn cli_config_text(data: &Path, downloads: &Path, user: &Path) -> String {
     format!(
-        "directories:\n  data: {}\n  downloads: {}\n  user: {}\n",
+        "directories:\n  data: {}\n  downloads: {}\n  user: {}\nupdater:\n  enable_notification: false\nnetwork:\n  cloud_api:\n    skip_board_detection_calls: true\n",
         yaml_path(data),
         yaml_path(downloads),
         yaml_path(user)
@@ -903,7 +1469,7 @@ mod tests {
     use tempfile::tempdir;
     use zip::{write::SimpleFileOptions, ZipWriter};
 
-    const MANIFEST: &str = r#"{"runtime_schema":1,"arduino_cli":"1.5.2-rc.1","renesas_uno_core":"1.6.0","bundle_revision":1}"#;
+    const MANIFEST: &str = r#"{"runtime_schema":1,"arduino_cli":"1.6.0","renesas_uno_core":"1.6.0","bundle_revision":1}"#;
     const SERIAL_USB_HEADER: &str =
         "data/packages/arduino/hardware/renesas_uno/1.6.0/cores/arduino/usb/SerialUSB.h";
     const BOSSAC: &str = "data/packages/arduino/tools/bossac/1.9.1-arduino5/bossac.exe";
@@ -1202,12 +1768,14 @@ mod tests {
         assert!(!runtime_paths_intact(&prepared));
         fs::write(&header, patched).unwrap_or_else(|error| panic!("{error}"));
         assert!(runtime_paths_intact(&prepared));
-        // Other tool versions in the folder are not the tools in use.
-        fs::write(
-            root.join("runtime-manifest.json"),
-            MANIFEST.replace("1.5.2-rc.1", "1.6.0"),
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
+        // Other tool versions in the folder are not the tools in use. The CLI
+        // and the core are both 1.6.0, so replace the CLI field only.
+        let older_cli =
+            MANIFEST.replace(r#""arduino_cli":"1.6.0""#, r#""arduino_cli":"1.5.2-rc.1""#);
+        assert_ne!(older_cli, MANIFEST);
+        assert!(older_cli.contains(r#""renesas_uno_core":"1.6.0""#));
+        fs::write(root.join("runtime-manifest.json"), older_cli)
+            .unwrap_or_else(|error| panic!("{error}"));
         assert!(!runtime_paths_intact(&prepared));
         // Only a failed Repair reports it; preparation failures never do.
         assert!(!RuntimeError::Busy.failure().previous_runtime_kept);
@@ -1303,6 +1871,7 @@ mod tests {
         let values: Vec<String> = text
             .lines()
             .skip(1)
+            .take(3)
             .map(|line| {
                 let (_, value) = line
                     .split_once(": ")
@@ -1321,6 +1890,258 @@ mod tests {
                 "C:/Users/Lab #3/sketchbook".to_owned(),
             ]
         );
+        // The offline settings that follow the three directories.
+        assert!(text.starts_with("directories:\n  data: "), "{text}");
+        assert!(
+            text.ends_with(
+                "\nupdater:\n  enable_notification: false\nnetwork:\n  cloud_api:\n    skip_board_detection_calls: true\n"
+            ),
+            "{text}"
+        );
+    }
+
+    fn long_path(characters: usize) -> PathBuf {
+        let base = "C:\\Users\\";
+        let suffix = "\\AppData\\Local\\WVU-BMEG\\rt";
+        let user = "u".repeat(characters - base.len() - suffix.len());
+        PathBuf::from(format!("{base}{user}{suffix}"))
+    }
+
+    #[test]
+    fn a_runtime_root_shorter_than_the_compiler_limit_is_used_as_is() {
+        let preferred = long_path(RUNTIME_ROOT_LENGTH_LIMIT - 1);
+        assert_eq!(path_length(&preferred), 59);
+        let root = choose_runtime_root(
+            &preferred,
+            || panic!("no fallback needed"),
+            |_| panic!("no fallback needed"),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(root, RuntimeRoot::Preferred(preferred));
+    }
+
+    #[test]
+    fn a_long_runtime_root_uses_the_private_program_data_folder() {
+        for length in [RUNTIME_ROOT_LENGTH_LIMIT, 80] {
+            let preferred = long_path(length);
+            let shared = PathBuf::from("C:\\ProgramData\\WVU-BMEG-0123456789ab\\rt");
+            let offered = shared.clone();
+            let mut prepared = None;
+            let root = choose_runtime_root(
+                &preferred,
+                || Some(offered),
+                |path| {
+                    prepared = Some(path.to_path_buf());
+                    true
+                },
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(root.path(), shared);
+            assert_eq!(root, RuntimeRoot::SharedFallback(shared.clone()));
+            assert_eq!(prepared.as_deref(), Some(shared.as_path()));
+        }
+    }
+
+    #[test]
+    fn no_usable_short_folder_is_a_path_too_long_error_for_the_student() {
+        let preferred = long_path(70);
+        let cases: [(Option<PathBuf>, bool); 4] = [
+            // runtime_smoke, or no %ProgramData% folder: no fallback.
+            (None, true),
+            // %ProgramData% itself is redirected to a long path.
+            (Some(long_path(RUNTIME_ROOT_LENGTH_LIMIT)), true),
+            // The folder exists but belongs to another account, or is not writable.
+            (
+                Some(PathBuf::from("C:\\ProgramData\\WVU-BMEG-0123456789ab\\rt")),
+                false,
+            ),
+            (None, false),
+        ];
+        for (shared, preparable) in cases {
+            let tried_long_fallback = shared
+                .as_ref()
+                .is_some_and(|path| path_length(path) >= RUNTIME_ROOT_LENGTH_LIMIT);
+            let error = choose_runtime_root(
+                &preferred,
+                || shared,
+                |_| {
+                    assert!(
+                        !tried_long_fallback,
+                        "a too-long fallback is never prepared"
+                    );
+                    preparable
+                },
+            )
+            .err()
+            .unwrap_or_else(|| panic!("no folder is short enough"));
+            assert!(
+                matches!(&error, RuntimeError::PathTooLong { path, length } if *path == preferred && *length == 70),
+                "{error:?}"
+            );
+            let failure = error.failure();
+            assert_eq!(
+                failure.category,
+                Some(ArduinoToolsFailureCategory::RuntimePathTooLong)
+            );
+            assert!(!failure.repairable, "Repair extracts to the same folder");
+            assert!(failure.recommended_action.contains("IT support"));
+            assert!(!failure.recommended_action.contains("Repair"));
+            assert!(failure.technical_details.contains("70 characters"));
+            // The page reads the category by this name.
+            let serialized =
+                serde_json::to_value(&failure).unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(serialized["category"], "runtime_path_too_long");
+        }
+        // Other failures carry no category.
+        let other = serde_json::to_value(RuntimeError::Busy.failure())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(other["category"].is_null());
+    }
+
+    #[test]
+    fn path_length_counts_utf16_units_like_windows() {
+        assert_eq!(path_length(Path::new("C:\\Users\\Zoë")), 12);
+        assert_eq!(path_length(&long_path(RUNTIME_ROOT_LENGTH_LIMIT)), 60);
+    }
+
+    #[test]
+    fn a_short_runtime_root_resolves_without_touching_other_folders() {
+        let folder = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let preferred = folder.path().join("rt");
+        if path_length(&preferred) >= RUNTIME_ROOT_LENGTH_LIMIT {
+            // A very long temporary folder: the decision tests cover it.
+            return;
+        }
+        let root =
+            resolve_runtime_root(&preferred, false).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(root.path(), preferred);
+        assert!(
+            !preferred.exists(),
+            "resolving does not create the runtime folder"
+        );
+    }
+
+    #[test]
+    fn a_too_long_root_without_a_fallback_is_refused_before_anything_is_written() {
+        let folder = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let mut preferred = folder.path().to_path_buf();
+        while path_length(&preferred.join("rt")) < RUNTIME_ROOT_LENGTH_LIMIT {
+            preferred.push("long-profile-folder-name");
+        }
+        let preferred = preferred.join("rt");
+        let error = resolve_runtime_root(&preferred, false)
+            .err()
+            .unwrap_or_else(|| panic!("a root of 60 or more characters must be refused"));
+        assert!(
+            matches!(error, RuntimeError::PathTooLong { .. }),
+            "{error:?}"
+        );
+        assert!(!preferred.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_private_runtime_folder_is_created_for_this_user_only() {
+        let folder = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let private = folder.path().join("WVU-BMEG-test");
+        platform::ensure_private_folder(&private).unwrap_or_else(|error| panic!("{error}"));
+        assert!(folder_is_writable(&private));
+        // Accepted again: owned by this user, protected access list.
+        platform::ensure_private_folder(&private).unwrap_or_else(|error| panic!("{error}"));
+        assert!(prepare_shared_runtime_root(&private.join("rt")));
+        // An ordinary folder inherits its parent's permissions: refused.
+        let ordinary = folder.path().join("WVU-BMEG-ordinary");
+        fs::create_dir(&ordinary).unwrap_or_else(|error| panic!("{error}"));
+        let refused = platform::ensure_private_folder(&ordinary)
+            .err()
+            .unwrap_or_else(|| panic!("an unprotected folder must be refused"));
+        assert!(refused.to_string().contains("not protected"), "{refused}");
+        assert!(!prepare_shared_runtime_root(&ordinary.join("rt")));
+        assert!(platform::current_user_sid().is_some_and(|sid| sid.starts_with("S-1-")));
+        // The shared folder name depends only on the account.
+        if let Some(root) = shared_runtime_root() {
+            let name = root
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            assert!(name.starts_with("WVU-BMEG-") && name.len() == 21, "{name}");
+            assert_eq!(shared_runtime_root(), Some(root));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_protected_folder_that_allows_another_account_is_refused() {
+        let folder = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let user = platform::current_user_sid().unwrap_or_else(|| panic!("no user SID"));
+        let own = format!("(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+        let create = |name: &str, dacl: &str| {
+            let path = folder.path().join(name);
+            let created = platform::create_folder_with_sddl(&path, &format!("O:{user}D:P{dacl}"))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(created, "{name} already existed");
+            path
+        };
+        // Protected and owned by this user, but Users may write, directly or
+        // only through what is created inside.
+        for (name, extra) in [
+            ("WVU-BMEG-users", "(A;OICI;0x1301bf;;;BU)"),
+            ("WVU-BMEG-inherit-only", "(A;OICIIO;FA;;;BU)"),
+        ] {
+            let shared = create(name, &format!("{own}{extra}"));
+            let refused = platform::ensure_private_folder(&shared)
+                .err()
+                .unwrap_or_else(|| panic!("{name} allows Users and must be refused"));
+            assert!(
+                refused
+                    .to_string()
+                    .contains("allows another account (S-1-5-32-545)"),
+                "{refused}"
+            );
+            assert!(!prepare_shared_runtime_root(&shared.join("rt")));
+        }
+        // A deny entry only takes access away (Guests, which this user is not).
+        let denied = create("WVU-BMEG-deny", &format!("(D;OICI;FA;;;BG){own}"));
+        platform::ensure_private_folder(&denied).unwrap_or_else(|error| panic!("{error}"));
+        assert!(prepare_shared_runtime_root(&denied.join("rt")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_link_named_like_the_private_folder_is_refused() {
+        let folder = tempdir().unwrap_or_else(|error| panic!("{error}"));
+        // The link points at a folder that would itself be accepted.
+        let target = folder.path().join("target");
+        platform::ensure_private_folder(&target).unwrap_or_else(|error| panic!("{error}"));
+        let link = folder.path().join("WVU-BMEG-link");
+        // A directory junction needs no privilege (a symbolic link would).
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap_or_else(|error| panic!("cmd: {error}"));
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let refused = platform::ensure_private_folder(&link)
+            .err()
+            .unwrap_or_else(|| panic!("a junction must be refused"));
+        assert!(
+            refused.to_string().contains("not a plain folder"),
+            "{refused}"
+        );
+        assert!(!prepare_shared_runtime_root(&link.join("rt")));
+        // Nothing was written through the link.
+        let written = fs::read_dir(&target)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .count();
+        assert_eq!(written, 0);
     }
 
     #[test]

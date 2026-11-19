@@ -1,25 +1,118 @@
 WVU Bioinstrumentation Studio bundled-component notice
 
-This directory accompanies the app's pinned offline Arduino runtime.
+This directory accompanies the app's pinned offline Arduino runtime,
+resources\arduino-runtime.zip: bundle revision 4, Arduino CLI 1.6.0 and the
+Arduino UNO R4 core 1.6.0. The app extracts the archive to
+%LOCALAPPDATA%\WVU-BMEG\rt (or, when that path is 60 characters or longer,
+to %ProgramData%\WVU-BMEG-<user id>\rt) and runs the tools from there. Each
+"Path" below is relative to the archive root, which is the same as that
+folder.
 
-Arduino CLI 1.5.2-rc.1
-  Source: https://github.com/arduino/arduino-cli/tree/v1.5.2-rc.1
-  License: GNU General Public License version 3
-  The runtime archive retains an exact GPLv3 license copy supplied by the
-  Arduino discovery tools. The release audit verifies that copy byte-for-byte
-  against the Arduino CLI v1.5.2-rc.1 license.
+Corresponding source: each release that carries this runtime publishes
+WVU-Bioinstrumentation-Studio-<version>-third-party-sources.zip (for example
+WVU-Bioinstrumentation-Studio-1.1.0-third-party-sources.zip) beside its
+installers on the project's GitHub Releases page:
+https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/releases
+It holds the source of every GPL- and LGPL-licensed component below (with
+the Go module dependencies of the Go programs and the libraries the
+toolchain links statically), the BOSSA license, a README.txt with build
+directions and a written offer, and SHA-256 sums. To ask for source, or to
+report something missing, open a "Request corresponding source" issue:
+https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/issues/new?template=source_code_request.yml
 
-Arduino BOSSA uploader 1.9.1-arduino5
+The archive root keeps the Arduino CLI release's own LICENSE.txt as
+arduino-cli-LICENSE.txt (GNU GPL version 3), and copies of the GNU GPL
+version 2 (GPL-2.0.txt) and GNU LGPL version 2.1 (LGPL-2.1.txt). The other
+upstream license and notice files stay in place inside the archive.
+
+Arduino CLI 1.6.0
+  License: GNU General Public License version 3 (GPL-3.0-only)
+  Path: arduino-cli.exe (license: arduino-cli-LICENSE.txt)
+  Upstream source: https://github.com/arduino/arduino-cli/tree/v1.6.0
+
+Arduino serial-discovery 1.5.2
+  License: GNU General Public License version 3 (GPL-3.0-only)
+  Path: data/packages/builtin/tools/serial-discovery/1.5.2/
+  Upstream source: https://github.com/arduino/serial-discovery/tree/v1.5.2
+
+Arduino mdns-discovery 1.1.0
+  License: GNU General Public License version 3 (GPL-3.0-only)
+  Path: data/packages/builtin/tools/mdns-discovery/1.1.0/
+  Upstream source: https://github.com/arduino/mdns-discovery/tree/v1.1.0
+
+Arduino serial-monitor 0.15.0
+  License: GNU General Public License version 3 (GPL-3.0-only)
+  Path: data/packages/builtin/tools/serial-monitor/0.15.0/
+  Upstream source: https://github.com/arduino/serial-monitor/tree/v0.15.0
+
+Arduino dfu-discovery 0.1.2
+  License: GNU General Public License version 3 (GPL-3.0-only); it compiles
+    in three dfu-util 0.11 source files (GPL-2.0-or-later) and links
+    libusb 1.0.26 statically (LGPL-2.1-or-later)
+  Path: data/packages/builtin/tools/dfu-discovery/0.1.2/
+  Upstream source: https://github.com/arduino/dfu-discovery/tree/v0.1.2
+    https://dfu-util.sourceforge.net/releases/dfu-util-0.11.tar.gz
+    https://github.com/libusb/libusb/releases/download/v1.0.26/libusb-1.0.26.tar.bz2
+
+Exuberant Ctags 5.8-arduino12
+  License: GNU General Public License version 2 or later (GPL-2.0-or-later);
+    the archive has no ctags license file, see GPL-2.0.txt
+  Path: data/packages/builtin/tools/ctags/5.8-arduino12/
+  Upstream source: https://github.com/arduino/ctags/tree/v5.8-arduino12
+
+GNU Arm Embedded Toolchain 7-2017q4 (GCC 7.2.1, Binutils, Newlib, GDB)
+  License: GNU GPL version 3 or later (GCC runtime libraries with the GCC
+    Runtime Library Exception 3.1), GNU GPL version 2 or later, GNU LGPL,
+    and Newlib's BSD-style notices; the full list is
+    share/doc/gcc-arm-none-eabi/license.txt in the toolchain folder
+  Path: data/packages/arduino/tools/arm-none-eabi-gcc/7-2017q4/
+  Upstream source: https://developer.arm.com/-/media/Files/downloads/gnu-rm/7-2017q4/gcc-arm-none-eabi-7-2017-q4-major-src.tar.bz2
+  Host libraries linked statically into the Windows executables (Arm's
+  source package downloads them at build time; the source bundle includes
+  them): GMP 6.1.0 (LGPL-3.0-or-later or GPL-2.0-or-later), MPFR 3.1.4
+  (LGPL-3.0-or-later), MPC 1.0.3 (LGPL-3.0-or-later), GNU libiconv 1.14
+  (LGPL-2.0-or-later), isl 0.15 (MIT), Expat 2.1.1 (MIT), zlib 1.2.8 (Zlib)
+
+Arduino UNO R4 core (ArduinoCore-renesas) 1.6.0
+  License: MIT (the core's LICENSE), with LGPL-2.1-or-later files (the
+    Arduino core API in cores/arduino/api and several libraries) and
+    third-party BSD-3-Clause, MIT and other notices kept in their files
+  Path: data/packages/arduino/hardware/renesas_uno/1.6.0/
+  Upstream source: https://github.com/arduino/ArduinoCore-renesas/tree/1.6.0
+    and, for cores/arduino/api, https://github.com/arduino/ArduinoCore-API/tree/1.5.2
+  At extraction the app inserts one marked line ("WVU native-USB
+  compatibility shim") into cores/arduino/usb/SerialUSB.h.
+
+  Microsoft Driver Package Installer (DPInst)
+    Path: data/packages/arduino/hardware/renesas_uno/1.6.0/drivers/dpinst-amd64.exe
+          data/packages/arduino/hardware/renesas_uno/1.6.0/drivers/dpinst-x86.exe
+    Microsoft redistributable that Arduino ships with the core's USB driver
+    package (renesas.inf, renesas.cat). It is Microsoft software under
+    Microsoft's redistribution terms, not open source; WVU Bioinstrumentation
+    Studio does not run it.
+
+Arduino BOSSA uploader (bossac) 1.9.1-arduino5
+  License: BSD 3-Clause terms in bossac-LICENSE.txt in this directory
+  Path: data/packages/arduino/tools/bossac/1.9.1-arduino5/
   Distribution source: Arduino package index and downloads.arduino.cc
   Upstream source: https://github.com/arduino/BOSSA
-  License: BSD 3-Clause-style terms in bossac-LICENSE.txt
+  Corresponding source: not required by its license; the license is also
+    in the third-party source bundle
 
-Arduino Renesas UNO core 1.6.0 and bundled compiler/discovery tools
-  Their upstream license and notice files remain inside arduino-runtime.zip.
+No longer included (removed in runtime revision 4)
+  OpenOCD 0.11.0-arduino2 (GPL-2.0-or-later) and dfu-util 0.11.0-arduino5
+  (GPL-2.0-or-later) were in data/packages/arduino/tools/ of runtime
+  revision 3, which versions 1.0.0 to 1.0.2 carried. The UNO R4 WiFi never
+  uses them: it uploads with bossac, and this version does not include
+  them. The source that is available for them, as far as Arduino has
+  published it, is listed in release/third-party-sources-runtime3.json in
+  the project's source repository; ask for it, or for the rest, through the
+  "Request corresponding source" issue form above.
 
 Microsoft Edge WebView2 Runtime
-  The Windows installer uses Tauri's offline WebView2 installation mode.
-  Microsoft software-license terms remain applicable:
+  The Windows installer uses Tauri's offline WebView2 installation mode and
+  carries Microsoft's WebView2 Runtime installer. Microsoft software-license
+  terms remain applicable:
   https://www.microsoft.com/software-download/retailLicenseTerms
 
 These notices do not replace or modify any upstream license.

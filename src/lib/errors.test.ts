@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { commandErrorDetail, commandErrorKeptPreviousTools, commandErrorRepairable, formatCommandError } from './errors';
+import { commandErrorCategory, commandErrorDetail, commandErrorKeptPreviousTools, commandErrorRepairable, formatCommandError } from './errors';
 
 const portBusy = {
   category: 'port_busy',
@@ -74,6 +74,35 @@ describe('a failed Repair that kept the tools in use', () => {
     expect(commandErrorKeptPreviousTools(failure)).toBe(false);
     expect(commandErrorKeptPreviousTools('Arduino tool repair task failed')).toBe(false);
     expect(commandErrorKeptPreviousTools(undefined)).toBe(false);
+  });
+});
+
+describe('command error category', () => {
+  const pathTooLong = {
+    category: 'runtime_path_too_long',
+    title: 'Arduino tools cannot be set up for this Windows account',
+    explanation: 'The folder name of this Windows user account is too long for the included Arduino compiler, and no shorter folder could be used on this computer.',
+    recommended_action: 'Ask your IT support or instructor for help and show them Advanced details. Simulator recordings still work.',
+    technical_details: 'The Arduino tools folder C:\\Users\\a-very-long-profile-folder-name.CAMPUS\\AppData\\Local\\WVU-BMEG\\rt is 70 characters long',
+    repairable: false,
+    previous_runtime_kept: false
+  };
+
+  it('reads the category of an Arduino tools failure without showing it', () => {
+    expect(commandErrorCategory(pathTooLong)).toBe('runtime_path_too_long');
+    expect(commandErrorCategory(JSON.stringify(pathTooLong))).toBe('runtime_path_too_long');
+    expect(commandErrorRepairable(pathTooLong)).toBe(false);
+    const message = formatCommandError(pathTooLong);
+    expect(message).toContain('IT support');
+    expect(message).not.toContain('runtime_path_too_long');
+    expect(message).not.toContain('70 characters');
+  });
+
+  it('is empty for failures without one', () => {
+    expect(commandErrorCategory({ ...pathTooLong, category: null })).toBe('');
+    expect(commandErrorCategory({ title: 'Arduino tools missing' })).toBe('');
+    expect(commandErrorCategory('Arduino tool preparation task failed')).toBe('');
+    expect(commandErrorCategory(undefined)).toBe('');
   });
 });
 

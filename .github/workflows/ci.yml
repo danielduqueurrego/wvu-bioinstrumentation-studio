@@ -41,6 +41,11 @@ jobs:
       - name: Release metadata consistency
         shell: pwsh
         run: ./scripts/check_release_consistency.ps1
+      # Structure, pins and runtime coverage of release/third-party-sources*.json.
+      # Nothing is downloaded; the release script builds the bundle itself.
+      - name: Third-party source manifests
+        shell: pwsh
+        run: ./scripts/check_third_party_sources.ps1
       - name: Install frontend dependencies
         run: npm ci
       - name: Svelte check

@@ -208,6 +208,17 @@ impl ArduinoCli {
         Err(CliError::NotFound)
     }
 
+    /// The CLI of a runtime prepared by `arduino_runtime::prepare_from_archive`,
+    /// with its generated configuration. The application itself uses
+    /// `discover`, which reads the runtime prepared at startup;
+    /// `examples/runtime_smoke.rs` prepares one in a scratch folder.
+    pub fn for_runtime(runtime: &crate::arduino_runtime::RuntimePaths) -> Self {
+        Self {
+            executable: runtime.executable.clone(),
+            config_file: Some(runtime.config_file.clone()),
+        }
+    }
+
     pub fn executable(&self) -> &Path {
         &self.executable
     }
