@@ -102,9 +102,15 @@ Nothing below has been done yet, unless it says so.
 10. **README Board screenshot.** Retake it on hardware with the real runtime (also in the checklist).
 11. **Clean up.** Once the runtime ZIP and the 1.1.0 bundle are archived, delete `C:\wvu-rtbuild`, `C:\wvu-srcbuild`, `C:\wvu-naE`, `C:\wvu-smoke-cd`, `C:\wvu-rvcd`, `C:\wvu-rvfe`, and the agent sessions' `%TEMP%\claude` folders (see [This computer](#this-computer)).
 
-After the release-prep commit, the maintainer's agent records a local release-candidate build here. That build is for checking only and is not for distribution.
+**Local release-candidate build (2026-11-19), for testing only, not for distribution.** `scripts\build_student_release.ps1 -ThirdPartySourcesZip <fixE bundle>` passed from a clean tree at `0aa813b` (`dist\WVU-Bioinstrumentation-Studio-1.1.0-build-info.txt`): runtime revision 4 `5baa8a5f…`, 1.1.0 source bundle `a55586d4…` (verified against the manifest), Tauri CLI 2.11.4, Rust 1.100.0, Node 22.23.2. It is in this computer's Git-ignored `dist\` folder:
 
-Local release-candidate build: not run yet.
+```text
+WVU_Bioinstrumentation_Studio_1.1.0_x64-setup.exe     SHA-256 27b7d2a67f0bd879c5c385efc7287d98a2c9bf87af0dfbfb3c74630a5098ab13 (387,207,499 bytes)
+WVU_Bioinstrumentation_Studio_1.1.0_x64.msi           SHA-256 9daa21f49fb85a31a4de800a74cd7a6568b853b7cd4d441b00c184e3f38ebf36 (409,583,616 bytes)
+WVU-Bioinstrumentation-Studio-1.1.0-Windows-x64.zip   SHA-256 9a48f81572237181be646bbd972e481540e1faaec6dd74a0094f47c67528daad
+```
+
+It was not launched on this computer: a release build ignores the sandbox redirection and would replace the real extracted runtime in `%LOCALAPPDATA%\WVU-BMEG\rt`. Its first start on the maintainer's test computer is therefore its first run (hardware checklist, first item). Hardware results recorded against this build hold for a later build of the same commit. Any code, firmware, profile or runtime change needs a new candidate, and the published release must be rebuilt from the tagged commit.
 
 **After 1.1.0.** The [Dependency upgrade plan](DEPENDENCY_UPGRADE_PLAN.md) is the plan for the next major-version dependency upgrades (Tauri 2.12, `zip` 9, TypeScript 6, Vite 8, Vitest 5, SvelteKit 3, and optionally `chrono` to `jiff`). It is a plan only: nothing in it has been upgraded. The maintainer decided on 2026-11-19 to start it after 1.1.0 is released, in the plan's order (Tauri, `zip`, tooling, SvelteKit 3; `chrono` deferred); the plan's Principles section gives the reasons.
 
