@@ -30,6 +30,10 @@ This release adds LED-sequenced pulse oximetry, so a pulse-ox photodetector and 
 - Board actions (Verify, Retry connection, Restore) no longer freeze the window. Restore is refused while more than one UNO R4 WiFi is connected. A COM port held by another program is reported as busy and does not change the firmware result.
 - The storage check includes room for the CSV, Windows stays awake during a recording, and changing the lab no longer loads the previous lab's calibrations.
 
+## Known limitation
+
+- **LED-sequenced labs with more than two channels need a dwell of at least 2000 µs.** While the board sends data over USB, it sometimes takes a reading late. The next reading is on time again, and nothing is lost or mislabeled: every reading stays in its LED state at least half a dwell after the LEDs change, and `t_us` holds its measured time. With the built-in pulse-ox lab (two channels, 1000 µs), this happens about once a second, by up to about 0.5 ms. With three to six channels at 1000 µs, it happens after most groups of ten rows and sometimes lengthens a state. For such labs, set **State dwell** to 2000 µs or more (500 rows/s, 125 per LED state); six channels at 2000 µs were tested on hardware. See [Hardware](https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/blob/master/docs/HARDWARE.md#pulse-oximetry).
+
 The [changelog](https://github.com/danielduqueurrego/wvu-bioinstrumentation-studio/blob/v1.1.0/CHANGELOG.md) lists every change.
 
 ## Third-party source code

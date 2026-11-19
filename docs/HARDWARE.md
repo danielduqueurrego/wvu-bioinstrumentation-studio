@@ -54,6 +54,16 @@ The LED sequence is RED, DARK 1, IR, DARK 2. Each state lasts one dwell. State d
 
 **Minimum settle.** If the loop runs late, the next deadline could fall almost immediately after an LED change. The firmware then lengthens the state that just started by whole dwells until its sample is at least half a dwell after its LED edge. States are never shortened below that, skipped, or reordered. The skipped deadlines are counted and flagged, and the shortest settle the board measured is reported at Stop (`minimum_pulse_settle_us` in the recording metadata).
 
+**USB timing limit (firmware build `0x00010007`).** While the computer collects a USB packet, the board's USB driver can hold up the sampling loop, so the first record after a batch of ten is sometimes read late. The next record is on schedule again, because the deadlines are absolute. Late records keep their measured timestamp and their LED state, and the minimum-settle guard still applies, so no data are lost or mislabeled. Measured on hardware (60 s recordings, firmware build `0x00010007`):
+
+| Lab | Intervals outside ±5% | Late records | Skipped deadlines | Minimum settle |
+| --- | --- | --- | --- | --- |
+| Built-in pulse ox: 2 channels, 1000 µs | 70-91 of 60,000 | about one per second, up to 0.26 ms late (once 0.5 ms in a shorter run) | 0 (once 1) | 677-683 µs |
+| 4 channels, 1000 µs | 7,474 of 60,000 | at most batch boundaries, up to 0.62 ms late | 5 | 525 µs |
+| 6 channels, 2000 µs | 8 of 30,000 | 4 in 60 s, up to 0.26 ms late | 0 | 1560 µs |
+
+More channels make each batch longer, so it needs more USB packets. **For LED-sequenced labs with more than two channels, use a dwell of at least 2000 µs.** Simultaneous labs at 1000 frames/s show the same isolated late records.
+
 The application generates no processed optical result: it does not subtract ambient light or calculate SpO2 or heart rate. Bounded raw-batch and transmit queues keep encoding and USB backpressure outside the timing-critical sampling path. Overflow and skipped deadlines are reported rather than hidden (see [USB Protocol](USB_PROTOCOL.md#sampling-and-timestamps)).
 
 Teaching use only — not a medical device.

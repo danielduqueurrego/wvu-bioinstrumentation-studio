@@ -168,7 +168,7 @@ For simultaneous analog labs, an instructor can configure one to six unique A0�
 For **LED-sequenced** pulse-ox labs the same channel grid is used, with at most six channels and an extra **By LED state** column, plus:
 
 - **RED output** and **IR output** (two different pins of D4–D6, both `acquisition_sequenced`; no other output);
-- **State dwell (µs)** (1000–5000), which sets the record rate: `round(1,000,000 / dwell)` records/s, shown as rows per second for each channel and per LED state;
+- **State dwell (µs)** (1000–5000), which sets the record rate: `round(1,000,000 / dwell)` records/s, shown as rows per second for each channel and per LED state. Use at least 2000 µs when the lab has more than two channels: at 1000 µs the board then reads many rows late (see [Hardware](HARDWARE.md#pulse-oximetry));
 - the CSV columns the lab will write.
 
 Choosing the mode for a lab starts from TX on A0 and RX on A1 (`tx_counts`, `rx_counts`), both shown by LED state, 14-bit, 1000 µs, D5 RED and D6 IR. Add channels for other signals (A2–A5, for example a pressure sensor or a second photodetector); a channel added later is not shown by LED state unless you tick it. **By LED state** (`split_by_led_state`) is display only: it decides whether the live plot draws the channel as four traces (RED, DARK 1, IR, DARK 2) or as one trace at the full record rate. It never changes acquisition, the recorded data, or the CSV, and students can change it during a recording with **Show by LED state** in Live signals.
